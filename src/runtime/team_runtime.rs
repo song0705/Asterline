@@ -141,6 +141,7 @@ impl TeamRuntime {
                     .map(|s| s.status)
                     .unwrap_or(MemberStatus::Idle),
                 session: self.sessions.get(&m.id).map(|s| s.0.clone()),
+                cwd: m.resolved_cwd(&self.config.workspace).display().to_string(),
             })
             .collect();
         RuntimeEvent::Ready {

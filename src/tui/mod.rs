@@ -3,6 +3,7 @@
 //! driven entirely by `RuntimeEvent`s; no string matching.
 
 pub mod app_state;
+pub mod attach;
 pub mod chat_view;
 pub mod commands;
 pub mod completion;
@@ -75,10 +76,54 @@ fn run_loop(
             handle_action(action, state, handle);
         }
 
+        if let Some(req) = state.take_attach_request() {
+            attach_to_member(terminal, state, &req)?;
+        }
+
         if state.should_quit() {
             return Ok(());
         }
     }
+}
+
+/// Hand the whole terminal to the member's real interactive CLI (resuming its
+/// session), then restore Asterline when that CLI exits.
+fn attach_to_member(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut AppState,
+    req: &attach::AttachRequest,
+) -> io::Result<()> {
+    let (program, args) = req.command();
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    println!(
+        "\n── {} · {} {} ──  (exit the session to return to Asterline)\n",
+        req.display_name,
+        program,
+        args.join(" ")
+    );
+
+    let result = std::process::Command::new(&program)
+        .args(&args)
+        .current_dir(&req.cwd)
+        .status();
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    match result {
+        Ok(_) => state.apply(RuntimeEvent::Notice(format!(
+            "returned from {}",
+            req.display_name
+        ))),
+        Err(err) => state.apply(RuntimeEvent::Notice(format!(
+            "could not launch {program}: {err}"
+        ))),
+    }
+    Ok(())
 }
 
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
@@ -151,11 +196,9 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 return;
             }
             if let Some(idx) = state.header_selected() {
-                if let Some(member) = state.members().get(idx) {
-                    let member_id = member.id.clone();
-                    state.toggle_drawer(drawers::Drawer::MemberLogs(member_id));
-                }
-                state.clear_header_selection();
+                // Selecting a member and pressing Enter attaches to its live
+                // backend session (hands the terminal to the real codex/claude).
+                state.request_attach(idx);
                 return;
             }
             submit(state, handle);

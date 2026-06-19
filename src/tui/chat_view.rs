@@ -945,6 +945,7 @@ mod tests {
                     role: "implementation".to_string(),
                     status: MemberStatus::Running,
                     session: None,
+                    cwd: String::new(),
                 },
                 MemberSummary {
                     id: MemberId::new("reviewer"),
@@ -953,6 +954,7 @@ mod tests {
                     role: "review".to_string(),
                     status: MemberStatus::Idle,
                     session: None,
+                    cwd: String::new(),
                 },
             ],
         });
@@ -995,6 +997,7 @@ mod tests {
                 role: "impl".to_string(),
                 status: MemberStatus::Idle,
                 session: None,
+                cwd: String::new(),
             }],
         });
         for ch in "/a".chars() {
@@ -1057,6 +1060,7 @@ mod tests {
                 role: "impl".to_string(),
                 status: MemberStatus::Idle,
                 session: None,
+                cwd: String::new(),
             }],
         });
         state.apply(RuntimeEvent::UserMessage {

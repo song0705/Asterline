@@ -8,6 +8,7 @@ use crate::domain::event::{
     ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
 };
 use crate::domain::team::{BackendKind, MemberId};
+use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
@@ -23,6 +24,7 @@ pub struct MemberView {
     pub role: String,
     pub status: MemberStatus,
     pub session: Option<String>,
+    pub cwd: String,
 }
 
 /// A pending approval awaiting a decision.
@@ -53,6 +55,7 @@ pub struct AppState {
     active_reasoning: HashMap<MemberId, String>,
     pending_user_messages: Vec<String>,
     header_selected: Option<usize>,
+    attach_request: Option<AttachRequest>,
 }
 
 impl AppState {
@@ -78,6 +81,7 @@ impl AppState {
             active_reasoning: HashMap::new(),
             pending_user_messages: Vec::new(),
             header_selected: None,
+            attach_request: None,
         }
     }
 
@@ -101,6 +105,7 @@ impl AppState {
                         role: m.role,
                         status: m.status,
                         session: m.session,
+                        cwd: m.cwd,
                     })
                     .collect();
             }
@@ -388,6 +393,35 @@ impl AppState {
         self.pending_approvals.first().map(|a| a.id)
     }
 
+    /// Request attaching to the member at `idx`'s live backend session. Skipped
+    /// (with a notice) while that member is running, to avoid two processes on
+    /// one session.
+    pub fn request_attach(&mut self, idx: usize) {
+        let Some(member) = self.members.get(idx) else {
+            self.header_selected = None;
+            return;
+        };
+        if member.status == MemberStatus::Running {
+            let name = member.display_name.clone();
+            self.push(ChatItem::Notice {
+                text: format!("{name} is running — /abort before attaching to its session"),
+            });
+            self.header_selected = None;
+            return;
+        }
+        self.attach_request = Some(AttachRequest {
+            display_name: member.display_name.clone(),
+            backend: member.backend,
+            session: member.session.clone(),
+            cwd: member.cwd.clone(),
+        });
+        self.header_selected = None;
+    }
+
+    pub fn take_attach_request(&mut self) -> Option<AttachRequest> {
+        self.attach_request.take()
+    }
+
     // --- composer editing (each edit resets the completion popup) --------
 
     fn member_ids(&self) -> Vec<String> {
@@ -570,6 +604,7 @@ mod tests {
                 role: "impl".to_string(),
                 status: MemberStatus::Idle,
                 session: None,
+                cwd: String::new(),
             }],
         }
     }
@@ -739,6 +774,7 @@ mod tests {
                 role: "impl".to_string(),
                 status: MemberStatus::Idle,
                 session: None,
+                cwd: String::new(),
             },
             MemberView {
                 id: MemberId::new("reviewer"),
@@ -747,6 +783,7 @@ mod tests {
                 role: "review".to_string(),
                 status: MemberStatus::Idle,
                 session: None,
+                cwd: String::new(),
             },
         ];
         assert_eq!(state.header_selected(), None);
