@@ -9,6 +9,7 @@ pub mod completion;
 pub mod composer;
 pub mod drawers;
 pub mod keymap;
+pub mod markdown;
 
 use std::io;
 use std::sync::mpsc::Receiver;

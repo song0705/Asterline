@@ -13,6 +13,7 @@ use crate::domain::team::BackendKind;
 use crate::tui::app_state::AppState;
 use crate::tui::completion::Completion;
 use crate::tui::drawers::Drawer;
+use crate::tui::markdown;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let chunks = Layout::default()
@@ -198,7 +199,10 @@ fn render_item(item: &ChatItem, width: usize, out: &mut Vec<Line<'static>>) {
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
-            push_wrapped(text, width, "  ", Style::default(), out);
+            // Agent output is rendered as Markdown (headings, bold, code, lists).
+            for line in markdown::render(text, width.saturating_sub(2).max(1)) {
+                out.push(indent_line(line, "  "));
+            }
             out.push(Line::raw(""));
         }
         ChatItem::Tool {
@@ -260,9 +264,16 @@ fn push_wrapped(
     out: &mut Vec<Line<'static>>,
 ) {
     let wrap_width = width.saturating_sub(indent.len()).max(1);
-    for line in wrap(text, wrap_width) {
+    for line in markdown::wrap(text, wrap_width) {
         out.push(Line::from(Span::styled(format!("{indent}{line}"), style)));
     }
+}
+
+/// Prepend a plain-text indent to an already-styled line.
+fn indent_line(line: Line<'static>, indent: &str) -> Line<'static> {
+    let mut spans = vec![Span::raw(indent.to_string())];
+    spans.extend(line.spans);
+    Line::from(spans)
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -471,73 +482,9 @@ fn log_color(level: LogLevel) -> Color {
     }
 }
 
-/// Greedy word-wrap that hard-breaks words longer than `width`.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    for raw in text.split('\n') {
-        let mut line = String::new();
-        let mut len = 0usize;
-        for word in raw.split_whitespace() {
-            let wlen = word.chars().count();
-            if wlen > width {
-                if len > 0 {
-                    out.push(std::mem::take(&mut line));
-                }
-                let mut chunk = String::new();
-                let mut clen = 0usize;
-                for ch in word.chars() {
-                    if clen == width {
-                        out.push(std::mem::take(&mut chunk));
-                        clen = 0;
-                    }
-                    chunk.push(ch);
-                    clen += 1;
-                }
-                line = chunk;
-                len = clen;
-            } else if len == 0 {
-                line = word.to_string();
-                len = wlen;
-            } else if len + 1 + wlen <= width {
-                line.push(' ');
-                line.push_str(word);
-                len += 1 + wlen;
-            } else {
-                out.push(std::mem::take(&mut line));
-                line = word.to_string();
-                len = wlen;
-            }
-        }
-        out.push(line);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wrap_breaks_on_words_and_long_tokens() {
-        assert_eq!(wrap("hello world", 20), vec!["hello world".to_string()]);
-        assert_eq!(
-            wrap("hello world", 5),
-            vec!["hello".to_string(), "world".to_string()]
-        );
-        assert_eq!(
-            wrap("abcdefgh", 3),
-            vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
-        );
-    }
-
-    #[test]
-    fn wrap_preserves_blank_lines() {
-        assert_eq!(
-            wrap("a\n\nb", 10),
-            vec!["a".to_string(), String::new(), "b".to_string()]
-        );
-    }
 
     #[test]
     fn renders_a_clean_layout_snapshot() {
@@ -619,5 +566,33 @@ mod tests {
         assert!(view.contains("commands"));
         assert!(view.contains("/ask"));
         assert!(view.contains("/all"));
+    }
+
+    #[test]
+    fn renders_markdown_agent_message() {
+        use crate::domain::event::ChatItem;
+        use crate::domain::team::MemberId;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let chat = vec![ChatItem::Agent {
+            member: MemberId::new("reviewer"),
+            display_name: "Reviewer".to_string(),
+            backend: BackendKind::Claude,
+            text: "## Findings\n\nThe parser drops a **trailing newline**. Use `trim_end`.\n\n- check the lexer\n- add a test\n\n```rust\nlet x = 1;\n```"
+                .to_string(),
+        }];
+        let state = AppState::new(chat);
+
+        let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Findings")); // heading, '##' stripped
+        assert!(view.contains("• check the lexer")); // bullet marker
+        assert!(view.contains("let x = 1;")); // code block body
+        assert!(!view.contains("```")); // fences stripped
+        assert!(!view.contains("**")); // bold markers consumed
     }
 }
