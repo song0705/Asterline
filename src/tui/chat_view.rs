@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
 use crate::domain::event::{ChatItem, LogLevel, MemberStatus};
 use crate::domain::team::BackendKind;
@@ -35,35 +35,35 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled(
-            format!(" {} ", state.team()),
+            "Asterline",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
         Span::styled(
-            state.workspace().to_string(),
+            format!("  {}", state.team()),
             Style::default().fg(Color::DarkGray),
         ),
-    ]);
+    ];
+    if !state.workspace().is_empty() {
+        title.push(Span::styled(
+            format!("  ·  {}", state.workspace()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     let mut chips = Vec::new();
     for (i, member) in state.members().iter().enumerate() {
         if i > 0 {
-            chips.push(Span::raw("  "));
+            chips.push(Span::raw("   "));
         }
         chips.push(Span::styled(
             member.display_name.clone(),
             Style::default()
                 .fg(backend_color(member.backend))
                 .add_modifier(Modifier::BOLD),
-        ));
-        chips.push(Span::styled(
-            format!("·{}", member.backend.as_str()),
-            Style::default().fg(Color::DarkGray),
         ));
         chips.push(Span::styled(
             format!(" {}", status_glyph(member.status)),
@@ -77,18 +77,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ));
     }
 
-    let paragraph = Paragraph::new(vec![title, Line::from(chips)]);
-    frame.render_widget(paragraph, area);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(title), Line::from(chips)]),
+        area,
+    );
 }
 
 fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let running = state.running_count();
-    let title = if running > 0 {
-        format!(" chat · {running} running ")
-    } else {
-        " chat ".to_string()
-    };
-    let block = Block::default().title(title).borders(Borders::ALL);
+    // No box around the conversation — just a one-column side margin.
+    let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -210,7 +207,9 @@ fn push_wrapped(
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" message (@member · /command) ")
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -256,7 +255,9 @@ fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: Dr
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(format!(" {} (Esc to close) ", drawer.title()))
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -475,5 +476,54 @@ mod tests {
             wrap("a\n\nb", 10),
             vec!["a".to_string(), String::new(), "b".to_string()]
         );
+    }
+
+    #[test]
+    fn renders_a_clean_layout_snapshot() {
+        use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
+        use crate::domain::team::MemberId;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "default-mixed".to_string(),
+            workspace: "/Users/me/proj".to_string(),
+            members: vec![
+                MemberSummary {
+                    id: MemberId::new("builder"),
+                    display_name: "Builder".to_string(),
+                    backend: BackendKind::Codex,
+                    role: "implementation".to_string(),
+                    status: MemberStatus::Running,
+                },
+                MemberSummary {
+                    id: MemberId::new("reviewer"),
+                    display_name: "Reviewer".to_string(),
+                    backend: BackendKind::Claude,
+                    role: "review".to_string(),
+                    status: MemberStatus::Idle,
+                },
+            ],
+        });
+        state.apply(RuntimeEvent::Notice("welcome to Asterline".to_string()));
+        state.apply(RuntimeEvent::Route {
+            turn: crate::domain::event::TurnId(1),
+            from: MemberId::new("builder"),
+            to: vec!["reviewer".to_string()],
+            body: "please review the parser".to_string(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Asterline"));
+        assert!(view.contains("Builder"));
+        assert!(view.contains("builder → reviewer"));
+        // The conversation is not wrapped in a box; the only border is the
+        // rounded composer at the bottom.
+        assert!(view.contains('╭') && view.contains('╰'));
     }
 }
