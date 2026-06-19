@@ -52,6 +52,15 @@ where
         state,
     } = prepared;
 
+    println!(
+        "\x1b[1;36m      _       _             _ _\n\
+     / \\   __| |_ ___  _ __| (_)_ __   ___\n\
+    / _ \\ / _` \\ __/ _ \\| '__| | | '_ \\ / _ \\\n\
+   / ___ \\ (_| | ||  __/| |  | | | | | |  __/\n\
+  /_/   \\_\\__,_|\\__\\___||_|  |_|_|_| |_|\\___|\x1b[0m\n\
+  Multi-Agent Coding Console\n"
+    );
+
     tui::run(handle, events, state)?;
     let _ = join.join();
     Ok(())

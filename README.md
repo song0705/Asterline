@@ -106,10 +106,13 @@ default roster:
 ### Keys
 
 - `Enter` — send the composer.
-- `Esc` — close the open drawer.
+- `Esc` — close the open drawer or cancel roster selection.
 - `Ctrl+L` — logs drawer · `Ctrl+R` — team drawer · `Ctrl+P` — command palette.
 - `Ctrl+C` — cancel running members, else clear the composer, else quit.
 - `Ctrl+U` — clear line · `Ctrl+W` — delete word · `Ctrl+A`/`Ctrl+E` — line start/end.
+- `Ctrl+N` / `Ctrl+B` — start cycling focus to next / previous member in the top roster.
+- `←`/`→` — cycle member selection (when roster focus is active).
+- `Enter` (when roster focus is active) — open the selected member's detailed log drawer.
 - `↑`/`↓`/`PageUp`/`PageDown` — scroll the conversation.
 
 ### Slash commands
@@ -118,7 +121,7 @@ Start typing `/` to see the available commands, or `@` to see members — a
 popup filters as you type. `↑`/`↓` move the selection, `Tab`/`Enter` accept, and
 `Esc` dismisses it.
 
-- `/ask <member> <message>` or `@<member> <message>` — send to one member.
+- `/ask <member> <message>` or `@<member> <message>` — send to one member. Supports `all` as member to broadcast (e.g. `/ask all` or `@all`).
 - `/all <message>` — send to everyone.
 - `/team`, `/sessions`, `/status` — open the team drawer.
 - `/logs` — open the logs drawer.

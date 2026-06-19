@@ -35,9 +35,14 @@ pub fn parse(input: &str) -> Submission {
         if member.is_empty() || body.is_empty() {
             return Submission::Empty;
         }
+        let target = if member == "all" {
+            MessageTarget::All
+        } else {
+            MessageTarget::Member(MemberId::new(member))
+        };
         return Submission::Runtime(UiCommand::UserMessage {
-            target: MessageTarget::Member(MemberId::new(member)),
-            body: body.to_string(),
+            target,
+            body: trimmed.to_string(),
         });
     }
 
@@ -55,9 +60,14 @@ fn parse_slash(rest: &str) -> Submission {
             if member.is_empty() || body.is_empty() {
                 Submission::Help
             } else {
+                let target = if member == "all" {
+                    MessageTarget::All
+                } else {
+                    MessageTarget::Member(MemberId::new(member))
+                };
                 Submission::Runtime(UiCommand::UserMessage {
-                    target: MessageTarget::Member(MemberId::new(member)),
-                    body: body.to_string(),
+                    target,
+                    body: format!("@{} {}", member, body),
                 })
             }
         }
@@ -67,7 +77,7 @@ fn parse_slash(rest: &str) -> Submission {
             } else {
                 Submission::Runtime(UiCommand::UserMessage {
                     target: MessageTarget::All,
-                    body: arg.to_string(),
+                    body: format!("@all {}", arg),
                 })
             }
         }
@@ -111,7 +121,7 @@ mod tests {
             parse("@reviewer please check"),
             Submission::Runtime(UiCommand::UserMessage {
                 target: MessageTarget::Member(MemberId::new("reviewer")),
-                body: "please check".to_string(),
+                body: "@reviewer please check".to_string(),
             })
         );
     }
@@ -122,7 +132,18 @@ mod tests {
             parse("/ask builder implement it"),
             Submission::Runtime(UiCommand::UserMessage {
                 target: MessageTarget::Member(MemberId::new("builder")),
-                body: "implement it".to_string(),
+                body: "@builder implement it".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn ask_all_command_broadcasts() {
+        assert_eq!(
+            parse("/ask all implement it"),
+            Submission::Runtime(UiCommand::UserMessage {
+                target: MessageTarget::All,
+                body: "@all implement it".to_string(),
             })
         );
     }
@@ -133,7 +154,7 @@ mod tests {
             parse("/all status?"),
             Submission::Runtime(UiCommand::UserMessage {
                 target: MessageTarget::All,
-                body: "status?".to_string(),
+                body: "@all status?".to_string(),
             })
         );
     }

@@ -140,6 +140,7 @@ impl TeamRuntime {
                     .get(&m.id)
                     .map(|s| s.status)
                     .unwrap_or(MemberStatus::Idle),
+                session: self.sessions.get(&m.id).map(|s| s.0.clone()),
             })
             .collect();
         RuntimeEvent::Ready {
@@ -212,6 +213,15 @@ impl TeamRuntime {
             targets: targets.clone(),
             body: body.clone(),
         });
+
+        let targets_str: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+        if let Some(first_target) = targets.first() {
+            self.log(
+                first_target,
+                LogEntry::info("user", format!("→ {}: {}", targets_str.join(", "), body)),
+                step,
+            );
+        }
 
         if self.approvals_enabled
             && let Some(kind) = risky_action_kind(&body)
@@ -538,6 +548,15 @@ impl TeamRuntime {
                 to: to_labels.clone(),
                 body: tmsg.body.clone(),
             });
+
+            self.log(
+                from,
+                LogEntry::info(
+                    from.as_str(),
+                    format!("→ {}: {}", to_labels.join(", "), tmsg.body),
+                ),
+                step,
+            );
         }
         for unknown in &resolved.unknown {
             step.events.push(RuntimeEvent::RouteError {
@@ -683,6 +702,7 @@ impl TeamRuntime {
         prompt: String,
         step: &mut RuntimeStep,
     ) {
+        let stripped_prompt = strip_routing_prefix(&prompt);
         let busy = self
             .members
             .get(member)
@@ -690,7 +710,10 @@ impl TeamRuntime {
             .unwrap_or(false);
         if busy {
             if let Some(state) = self.members.get_mut(member) {
-                state.queue.push_back(QueuedPrompt { turn, prompt });
+                state.queue.push_back(QueuedPrompt {
+                    turn,
+                    prompt: stripped_prompt,
+                });
                 state.status = MemberStatus::Queued;
             }
             step.events.push(RuntimeEvent::MemberStatus {
@@ -698,7 +721,7 @@ impl TeamRuntime {
                 status: MemberStatus::Queued,
             });
         } else {
-            self.start_run(member, turn, prompt, step);
+            self.start_run(member, turn, stripped_prompt, step);
         }
     }
 
@@ -808,6 +831,16 @@ impl TeamRuntime {
 
 fn relay_prompt(from_display: &str, body: &str) -> String {
     format!("[relay from {from_display}]\n{body}")
+}
+
+fn strip_routing_prefix(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if let Some(rest) = trimmed.strip_prefix('@')
+        && let Some(idx) = rest.find(char::is_whitespace)
+    {
+        return rest[idx..].trim().to_string();
+    }
+    prompt.to_string()
 }
 
 #[cfg(test)]
@@ -1126,7 +1159,13 @@ mod tests {
             member: Some(builder.clone()),
         });
         // The killed process exits unsuccessfully with no exit code.
-        let step = rt.on_agent_event(&builder, AgentEvent::Exited { code: None, ok: false });
+        let step = rt.on_agent_event(
+            &builder,
+            AgentEvent::Exited {
+                code: None,
+                ok: false,
+            },
+        );
 
         assert!(
             !step
@@ -1139,5 +1178,19 @@ mod tests {
             e,
             RuntimeEvent::Notice(text) if text.contains("cancelled")
         )));
+    }
+
+    #[test]
+    fn user_message_with_at_prefix_strips_prefix_for_agent_run() {
+        let mut rt = runtime();
+        let builder = MemberId::new("builder");
+        let step = rt.on_ui_command(UiCommand::UserMessage {
+            target: MessageTarget::Member(builder.clone()),
+            body: "@builder nihao".to_string(),
+        });
+
+        assert_eq!(step.actions.len(), 1);
+        assert_eq!(step.actions[0].member, builder);
+        assert_eq!(step.actions[0].prompt, "nihao");
     }
 }

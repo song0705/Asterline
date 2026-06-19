@@ -70,9 +70,16 @@ pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
                     return None;
                 }
                 let prefix: String = arg.iter().collect();
-                member_completion(&prefix, space + 1, members, "ask a member", |m| {
-                    format!("{m} ")
-                })
+                let mut candidates = vec!["all".to_string()];
+                candidates.extend(members.iter().cloned());
+                member_completion(
+                    &prefix,
+                    space + 1,
+                    &candidates,
+                    "ask a member",
+                    |m| m.to_string(),
+                    |m| format!("{m} "),
+                )
             }
         };
     }
@@ -86,9 +93,16 @@ pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
         .unwrap_or(0);
     if chars.get(word_start) == Some(&'@') {
         let prefix: String = chars[word_start + 1..].iter().collect();
-        return member_completion(&prefix, word_start, members, "mention a member", |m| {
-            format!("@{m} ")
-        });
+        let mut candidates = vec!["all".to_string()];
+        candidates.extend(members.iter().cloned());
+        return member_completion(
+            &prefix,
+            word_start,
+            &candidates,
+            "mention a member",
+            |m| format!("@{m}"),
+            |m| format!("@{m} "),
+        );
     }
 
     None
@@ -99,6 +113,7 @@ fn member_completion(
     token_start: usize,
     members: &[String],
     title: &'static str,
+    label: impl Fn(&str) -> String,
     insert: impl Fn(&str) -> String,
 ) -> Option<Completion> {
     let lower = prefix.to_lowercase();
@@ -106,7 +121,7 @@ fn member_completion(
         .iter()
         .filter(|m| m.to_lowercase().starts_with(&lower))
         .map(|m| CompletionItem {
-            label: m.clone(),
+            label: label(m),
             insert: insert(m),
         })
         .collect();
@@ -175,7 +190,8 @@ mod tests {
     #[test]
     fn ask_with_no_prefix_lists_all_members() {
         let c = compute("/ask ", &members()).unwrap();
-        assert_eq!(c.items.len(), 2);
+        assert_eq!(c.items.len(), 3);
+        assert_eq!(c.items[0].insert, "all ");
     }
 
     #[test]
@@ -193,14 +209,39 @@ mod tests {
     fn at_mention_completes_member() {
         let c = compute("@rev", &members()).unwrap();
         assert_eq!(c.token_start, 0);
-        assert_eq!(c.items[0].insert, "@reviewer ");
+        assert_eq!(
+            c.items[0],
+            CompletionItem {
+                label: "@reviewer".to_string(),
+                insert: "@reviewer ".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn at_mention_completes_all() {
+        let c = compute("@a", &members()).unwrap();
+        assert_eq!(c.token_start, 0);
+        assert_eq!(
+            c.items[0],
+            CompletionItem {
+                label: "@all".to_string(),
+                insert: "@all ".to_string()
+            }
+        );
     }
 
     #[test]
     fn at_mention_mid_text() {
         let c = compute("ping @bu", &members()).unwrap();
         assert_eq!(c.token_start, 5);
-        assert_eq!(c.items[0].insert, "@builder ");
+        assert_eq!(
+            c.items[0],
+            CompletionItem {
+                label: "@builder".to_string(),
+                insert: "@builder ".to_string()
+            }
+        );
     }
 
     #[test]

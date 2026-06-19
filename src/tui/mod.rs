@@ -87,8 +87,20 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::Backspace => state.backspace(),
         Action::DeleteWord => state.delete_word(),
         Action::ClearLine => state.clear_composer(),
-        Action::CursorLeft => state.cursor_left(),
-        Action::CursorRight => state.cursor_right(),
+        Action::CursorLeft => {
+            if state.header_selected().is_some() {
+                state.select_prev_member();
+            } else {
+                state.cursor_left();
+            }
+        }
+        Action::CursorRight => {
+            if state.header_selected().is_some() {
+                state.select_next_member();
+            } else {
+                state.cursor_right();
+            }
+        }
         Action::Home => state.cursor_home(),
         Action::End => state.cursor_end(),
         Action::ScrollUp => {
@@ -108,12 +120,17 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::ToggleLogs => state.toggle_drawer(drawers::Drawer::Logs),
         Action::ToggleTeam => state.toggle_drawer(drawers::Drawer::Team),
         Action::TogglePalette => state.toggle_drawer(drawers::Drawer::Palette),
+        Action::ToggleExpand => state.toggle_tools_expansion(),
+        Action::NextMember => state.select_next_member(),
+        Action::PrevMember => state.select_prev_member(),
         Action::Complete => {
             state.accept_completion();
         }
         Action::CloseOverlay => {
             if state.completion().is_some() {
                 state.dismiss_popup();
+            } else if state.header_selected().is_some() {
+                state.clear_header_selection();
             } else if state.drawer().is_some() {
                 state.close_drawer();
             }
@@ -133,6 +150,14 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             if state.completion().is_some() && state.accept_completion() {
                 return;
             }
+            if let Some(idx) = state.header_selected() {
+                if let Some(member) = state.members().get(idx) {
+                    let member_id = member.id.clone();
+                    state.toggle_drawer(drawers::Drawer::MemberLogs(member_id));
+                }
+                state.clear_header_selection();
+                return;
+            }
             submit(state, handle);
         }
     }
@@ -142,6 +167,9 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.take_composer();
     match commands::parse(&text) {
         Submission::Runtime(command) => {
+            if let UiCommand::UserMessage { target, body } = &command {
+                state.handle_user_message_submitted(target, body.clone());
+            }
             handle.send(command);
         }
         Submission::Drawer(drawer) => state.toggle_drawer(drawer),

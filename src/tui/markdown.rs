@@ -40,7 +40,7 @@ pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         if let Some(quote) = trimmed.strip_prefix('>') {
             let inner = quote.trim_start();
             for line in wrap(inner, width.saturating_sub(2).max(1)) {
-                let mut spans = vec![Span::styled("▎ ", Style::default().fg(Color::DarkGray))];
+                let mut spans = vec![Span::styled("> ", Style::default().fg(Color::DarkGray))];
                 spans.extend(inline_spans(&line, Style::default().fg(Color::Gray)));
                 out.push(Line::from(spans));
             }
@@ -85,10 +85,207 @@ fn bullet_item(line: &str) -> Option<&str> {
 
 fn code_line(raw: &str, width: usize) -> Line<'static> {
     let body: String = raw.chars().take(width.saturating_sub(2)).collect();
-    Line::from(vec![
-        Span::styled("▎ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(body, Style::default().fg(Color::Green)),
-    ])
+    let mut spans = vec![Span::styled("  ", Style::default())];
+    spans.extend(highlight_code(&body));
+    Line::from(spans)
+}
+
+fn highlight_code(body: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+
+    let mut current_text = String::new();
+    let mut current_style = Style::default();
+
+    let flush = |text: &mut String, style: Style, spans: &mut Vec<Span<'static>>| {
+        if !text.is_empty() {
+            spans.push(Span::styled(std::mem::take(text), style));
+        }
+    };
+
+    while i < chars.len() {
+        // 1. Comments
+        if (chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '/') || chars[i] == '#' {
+            flush(&mut current_text, current_style, &mut spans);
+            let comment_text: String = chars[i..].iter().collect();
+            spans.push(Span::styled(
+                comment_text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            break;
+        }
+
+        // 2. Strings
+        if chars[i] == '"' || chars[i] == '\'' {
+            flush(&mut current_text, current_style, &mut spans);
+            let quote_char = chars[i];
+            let mut s = String::new();
+            s.push(quote_char);
+            i += 1;
+            let mut escaped = false;
+            while i < chars.len() {
+                let c = chars[i];
+                s.push(c);
+                i += 1;
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == quote_char {
+                    break;
+                }
+            }
+            spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+            continue;
+        }
+
+        // 3. Numbers
+        if chars[i].is_ascii_digit() {
+            flush(&mut current_text, current_style, &mut spans);
+            let mut n = String::new();
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+                n.push(chars[i]);
+                i += 1;
+            }
+            spans.push(Span::styled(n, Style::default().fg(Color::Magenta)));
+            continue;
+        }
+
+        // 4. Identifiers
+        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            flush(&mut current_text, current_style, &mut spans);
+            let mut id = String::new();
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                id.push(chars[i]);
+                i += 1;
+            }
+
+            let mut is_func = false;
+            let mut j = i;
+            if j < chars.len() && chars[j] == '!' {
+                j += 1;
+            }
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if (j < chars.len() && chars[j] == '(')
+                || (j + 2 < chars.len()
+                    && chars[j] == ':'
+                    && chars[j + 1] == ':'
+                    && chars[j + 2] == '<')
+            {
+                is_func = true;
+            }
+
+            let style = if is_keyword(&id) {
+                Style::default().fg(Color::Yellow)
+            } else if is_type(&id) {
+                Style::default().fg(Color::Blue)
+            } else if is_func {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(id, style));
+            continue;
+        }
+
+        // 5. Punctuation / whitespace
+        let c = chars[i];
+        i += 1;
+        if current_style == Style::default() {
+            current_text.push(c);
+        } else {
+            flush(&mut current_text, current_style, &mut spans);
+            current_style = Style::default();
+            current_text.push(c);
+        }
+    }
+
+    flush(&mut current_text, current_style, &mut spans);
+    spans
+}
+
+fn is_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "fn" | "let"
+            | "mut"
+            | "pub"
+            | "use"
+            | "struct"
+            | "impl"
+            | "enum"
+            | "class"
+            | "def"
+            | "import"
+            | "from"
+            | "return"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "in"
+            | "match"
+            | "const"
+            | "static"
+            | "true"
+            | "false"
+            | "nil"
+            | "null"
+            | "None"
+            | "self"
+            | "Self"
+            | "break"
+            | "continue"
+            | "async"
+            | "await"
+            | "crate"
+            | "mod"
+            | "trait"
+            | "type"
+            | "var"
+            | "function"
+            | "new"
+            | "this"
+            | "super"
+    )
+}
+
+fn is_type(s: &str) -> bool {
+    if matches!(
+        s,
+        "i32"
+            | "u32"
+            | "i64"
+            | "u64"
+            | "usize"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "str"
+            | "int"
+            | "float"
+            | "double"
+            | "void"
+            | "string"
+            | "boolean"
+            | "object"
+            | "any"
+    ) {
+        return true;
+    }
+    if let Some(first_char) = s.chars().next()
+        && first_char.is_ascii_uppercase()
+    {
+        return true;
+    }
+    false
 }
 
 /// Parse inline `**bold**` and `` `code` `` spans within one already-wrapped line.

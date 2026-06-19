@@ -4,15 +4,15 @@
 
 use std::collections::HashMap;
 
-use crate::adapter::parser::summarize;
-use crate::domain::event::{ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, RuntimeEvent};
+use crate::domain::event::{
+    ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
+};
 use crate::domain::team::{BackendKind, MemberId};
 use crate::tui::completion::{self, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
 
 const MAX_LOGS: usize = 4000;
-const REASONING_MAX: usize = 200;
 
 /// Header view of one member.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +49,10 @@ pub struct AppState {
     popup_selected: usize,
     popup_dismissed: bool,
     should_quit: bool,
+    tools_expanded: bool,
+    active_reasoning: HashMap<MemberId, String>,
+    pending_user_messages: Vec<String>,
+    header_selected: Option<usize>,
 }
 
 impl AppState {
@@ -70,6 +74,10 @@ impl AppState {
             popup_selected: 0,
             popup_dismissed: false,
             should_quit: false,
+            tools_expanded: false,
+            active_reasoning: HashMap::new(),
+            pending_user_messages: Vec::new(),
+            header_selected: None,
         }
     }
 
@@ -92,13 +100,19 @@ impl AppState {
                         backend: m.backend,
                         role: m.role,
                         status: m.status,
-                        session: None,
+                        session: m.session,
                     })
                     .collect();
             }
-            RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {}
+            RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {
+                self.active_reasoning.clear();
+            }
             RuntimeEvent::UserMessage { body, .. } => {
-                self.push(ChatItem::User { body });
+                if let Some(pos) = self.pending_user_messages.iter().position(|m| m == &body) {
+                    self.pending_user_messages.remove(pos);
+                } else {
+                    self.push(ChatItem::User { body });
+                }
             }
             RuntimeEvent::MemberStatus { member, status } => self.set_status(&member, status),
             RuntimeEvent::MessageStarted { msg, member, .. } => {
@@ -120,17 +134,19 @@ impl AppState {
             }
             RuntimeEvent::MessageCompleted { msg, text } => {
                 if let Some(&idx) = self.message_index.get(&msg)
-                    && let Some(ChatItem::Agent { text: body, .. }) = self.chat.get_mut(idx)
+                    && let Some(ChatItem::Agent {
+                        text: body, member, ..
+                    }) = self.chat.get_mut(idx)
                 {
                     *body = text;
+                    let m = member.clone();
+                    self.active_reasoning.remove(&m);
+                    self.set_status(&m, MemberStatus::Idle);
                 }
                 self.message_index.remove(&msg);
             }
             RuntimeEvent::Reasoning { member, text } => {
-                let display = self.member_display(&member);
-                self.push(ChatItem::Notice {
-                    text: format!("{display} · thinking: {}", summarize(&text, REASONING_MAX)),
-                });
+                self.active_reasoning.insert(member, text);
             }
             RuntimeEvent::ToolStarted {
                 member,
@@ -251,6 +267,12 @@ impl AppState {
         if let Some(view) = self.members.iter_mut().find(|m| &m.id == member) {
             view.status = status;
         }
+        if status == MemberStatus::Idle
+            || status == MemberStatus::Failed
+            || status == MemberStatus::NeedsApproval
+        {
+            self.active_reasoning.remove(member);
+        }
     }
 
     fn member_meta(&self, member: &MemberId) -> (String, BackendKind) {
@@ -261,12 +283,59 @@ impl AppState {
             .unwrap_or_else(|| (member.to_string(), BackendKind::Codex))
     }
 
-    fn member_display(&self, member: &MemberId) -> String {
+    pub fn member_display(&self, member: &MemberId) -> String {
         self.members
             .iter()
             .find(|m| &m.id == member)
             .map(|m| m.display_name.clone())
             .unwrap_or_else(|| member.to_string())
+    }
+
+    pub fn has_active_message(&self, member_id: &MemberId) -> bool {
+        self.message_index.values().any(|&idx| {
+            if let Some(ChatItem::Agent { member, .. }) = self.chat.get(idx) {
+                member == member_id
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn handle_user_message_submitted(&mut self, target: &MessageTarget, body: String) {
+        self.pending_user_messages.push(body.clone());
+        self.push(ChatItem::User { body });
+        let targets = self.resolve_local_targets(target);
+        for member_id in targets {
+            self.set_status(&member_id, MemberStatus::Running);
+        }
+    }
+
+    pub fn resolve_local_targets(&self, target: &MessageTarget) -> Vec<MemberId> {
+        match target {
+            MessageTarget::Default => self
+                .members
+                .first()
+                .map(|m| vec![m.id.clone()])
+                .unwrap_or_default(),
+            MessageTarget::All => self.members.iter().map(|m| m.id.clone()).collect(),
+            MessageTarget::Member(id) => self.resolve_local_named(std::slice::from_ref(id)),
+            MessageTarget::Members(ids) => self.resolve_local_named(ids),
+        }
+    }
+
+    fn resolve_local_named(&self, ids: &[MemberId]) -> Vec<MemberId> {
+        let mut resolved = Vec::new();
+        for id in ids {
+            if let Some(member) = self
+                .members
+                .iter()
+                .find(|m| m.id == *id || m.display_name.eq_ignore_ascii_case(id.as_str()))
+                && !resolved.contains(&member.id)
+            {
+                resolved.push(member.id.clone());
+            }
+        }
+        resolved
     }
 
     // --- accessors for the renderer -------------------------------------
@@ -293,7 +362,10 @@ impl AppState {
         self.paused_routes
     }
     pub fn drawer(&self) -> Option<Drawer> {
-        self.drawer
+        self.drawer.clone()
+    }
+    pub fn header_selected(&self) -> Option<usize> {
+        self.header_selected
     }
     pub fn scroll(&self) -> usize {
         self.scroll
@@ -340,18 +412,22 @@ impl AppState {
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        self.header_selected = None;
         self.composer.insert(ch);
         self.reset_popup();
     }
     pub fn backspace(&mut self) {
+        self.header_selected = None;
         self.composer.backspace();
         self.reset_popup();
     }
     pub fn delete_word(&mut self) {
+        self.header_selected = None;
         self.composer.delete_word();
         self.reset_popup();
     }
     pub fn clear_composer(&mut self) {
+        self.header_selected = None;
         self.composer.clear();
         self.reset_popup();
     }
@@ -408,7 +484,7 @@ impl AppState {
     // --- UI actions -----------------------------------------------------
 
     pub fn toggle_drawer(&mut self, drawer: Drawer) {
-        self.drawer = if self.drawer == Some(drawer) {
+        self.drawer = if self.drawer.as_ref() == Some(&drawer) {
             None
         } else {
             Some(drawer)
@@ -417,6 +493,36 @@ impl AppState {
 
     pub fn close_drawer(&mut self) {
         self.drawer = None;
+    }
+
+    pub fn select_next_member(&mut self) {
+        let len = self.members.len();
+        if len == 0 {
+            return;
+        }
+        let next_idx = match self.header_selected {
+            None => 0,
+            Some(idx) => (idx + 1) % len,
+        };
+        self.header_selected = Some(next_idx);
+        self.reset_popup();
+    }
+
+    pub fn select_prev_member(&mut self) {
+        let len = self.members.len();
+        if len == 0 {
+            return;
+        }
+        let prev_idx = match self.header_selected {
+            None => len - 1,
+            Some(idx) => (idx + len - 1) % len,
+        };
+        self.header_selected = Some(prev_idx);
+        self.reset_popup();
+    }
+
+    pub fn clear_header_selection(&mut self) {
+        self.header_selected = None;
     }
 
     pub fn scroll_up(&mut self) {
@@ -433,6 +539,18 @@ impl AppState {
 
     pub fn quit(&mut self) {
         self.should_quit = true;
+    }
+
+    pub fn tools_expanded(&self) -> bool {
+        self.tools_expanded
+    }
+
+    pub fn toggle_tools_expansion(&mut self) {
+        self.tools_expanded = !self.tools_expanded;
+    }
+
+    pub fn active_reasoning(&self) -> &HashMap<MemberId, String> {
+        &self.active_reasoning
     }
 }
 
@@ -451,6 +569,7 @@ mod tests {
                 backend: BackendKind::Codex,
                 role: "impl".to_string(),
                 status: MemberStatus::Idle,
+                session: None,
             }],
         }
     }
@@ -607,5 +726,41 @@ mod tests {
         assert!(state.completion().is_none());
         state.insert_char('a');
         assert!(state.completion().is_some());
+    }
+
+    #[test]
+    fn header_roster_selection() {
+        let mut state = AppState::new(Vec::new());
+        state.members = vec![
+            MemberView {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "impl".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+            },
+            MemberView {
+                id: MemberId::new("reviewer"),
+                display_name: "Reviewer".to_string(),
+                backend: BackendKind::Claude,
+                role: "review".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+            },
+        ];
+        assert_eq!(state.header_selected(), None);
+
+        state.select_next_member();
+        assert_eq!(state.header_selected(), Some(0)); // builder
+
+        state.select_next_member();
+        assert_eq!(state.header_selected(), Some(1)); // reviewer
+
+        state.select_prev_member();
+        assert_eq!(state.header_selected(), Some(0)); // builder
+
+        state.insert_char('x');
+        assert_eq!(state.header_selected(), None); // cleared on typing
     }
 }

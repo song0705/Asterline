@@ -23,6 +23,9 @@ pub enum Action {
     CloseOverlay,
     Complete,
     Interrupt,
+    ToggleExpand,
+    NextMember,
+    PrevMember,
 }
 
 /// Map a key press to an action, or `None` if unbound. Function keys are
@@ -44,13 +47,18 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::Up | KeyCode::PageUp => Some(Action::ScrollUp),
         KeyCode::Down | KeyCode::PageDown => Some(Action::ScrollDown),
         KeyCode::Char('c') if ctrl => Some(Action::Interrupt),
+        KeyCode::Char('g') if ctrl => Some(Action::ToggleExpand),
         KeyCode::Char('l') if ctrl => Some(Action::ToggleLogs),
+        KeyCode::Char('o') if ctrl => Some(Action::ToggleExpand),
+        KeyCode::Char('t') if ctrl => Some(Action::ToggleExpand),
         KeyCode::Char('r') if ctrl => Some(Action::ToggleTeam),
         KeyCode::Char('p') if ctrl => Some(Action::TogglePalette),
         KeyCode::Char('u') if ctrl => Some(Action::ClearLine),
         KeyCode::Char('w') if ctrl => Some(Action::DeleteWord),
         KeyCode::Char('a') if ctrl => Some(Action::Home),
         KeyCode::Char('e') if ctrl => Some(Action::End),
+        KeyCode::Char('n') if ctrl => Some(Action::NextMember),
+        KeyCode::Char('b') if ctrl => Some(Action::PrevMember),
         KeyCode::Char(c) if !ctrl && !alt => Some(Action::InsertChar(c)),
         _ => None,
     }

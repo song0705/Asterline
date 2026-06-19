@@ -265,6 +265,7 @@ pub struct MemberSummary {
     pub backend: BackendKind,
     pub role: String,
     pub status: MemberStatus,
+    pub session: Option<String>,
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth
