@@ -4,3 +4,4 @@ pub mod domain;
 pub mod router;
 pub mod runtime;
 pub mod store;
+pub mod tui;
