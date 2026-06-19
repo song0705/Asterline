@@ -31,6 +31,7 @@ impl AttachRequest {
                 vec!["--resume".to_string(), session.clone()],
             ),
             (BackendKind::Claude, None) => ("claude".to_string(), Vec::new()),
+            (BackendKind::Gemini, _) => ("gemini".to_string(), Vec::new()),
         }
     }
 }

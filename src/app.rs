@@ -304,6 +304,7 @@ mod tests {
             crate::domain::config::DetectedBackends {
                 codex: true,
                 claude: true,
+                gemini: false,
             },
         )
         .unwrap();
@@ -327,6 +328,7 @@ mod tests {
             crate::domain::config::DetectedBackends {
                 codex: true,
                 claude: false,
+                gemini: false,
             },
         )
         .unwrap();

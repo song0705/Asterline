@@ -28,11 +28,12 @@ pub fn load_team_config(path: &Path) -> io::Result<TeamConfig> {
 pub struct DetectedBackends {
     pub codex: bool,
     pub claude: bool,
+    pub gemini: bool,
 }
 
 impl DetectedBackends {
     pub fn any(self) -> bool {
-        self.codex || self.claude
+        self.codex || self.claude || self.gemini
     }
 }
 
@@ -46,6 +47,7 @@ pub fn detect_backends() -> DetectedBackends {
     DetectedBackends {
         codex: binary_in_dirs(&dirs, "codex"),
         claude: binary_in_dirs(&dirs, "claude"),
+        gemini: binary_in_dirs(&dirs, "gemini"),
     }
 }
 
@@ -84,6 +86,10 @@ pub fn default_team(
             let claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "general");
             Some(TeamConfig::new("default-claude", workspace).with_member(claude))
         }
+        (false, false) if detected.gemini => {
+            let gemini = TeamMember::new("gemini", "Gemini", BackendKind::Gemini, "general");
+            Some(TeamConfig::new("default-gemini", workspace).with_member(gemini))
+        }
         (false, false) => None,
     }
 }
@@ -97,6 +103,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: true,
             claude: true,
+            gemini: false,
         };
         let config = default_team("/tmp/ws", detected).expect("mixed team");
 
@@ -112,6 +119,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: true,
             claude: false,
+            gemini: false,
         };
         let config = default_team("/tmp/ws", detected).expect("codex team");
 
@@ -124,6 +132,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: true,
+            gemini: false,
         };
         let config = default_team("/tmp/ws", detected).expect("claude team");
 
@@ -136,8 +145,21 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: false,
+            gemini: false,
         };
         assert!(default_team("/tmp/ws", detected).is_none());
+    }
+
+    #[test]
+    fn gemini_only_default_team_is_single_gemini() {
+        let detected = DetectedBackends {
+            codex: false,
+            claude: false,
+            gemini: true,
+        };
+        let config = default_team("/tmp/ws", detected).expect("gemini team");
+        assert_eq!(config.members.len(), 1);
+        assert_eq!(config.members[0].backend, BackendKind::Gemini);
     }
 
     #[test]
@@ -164,6 +186,7 @@ mod tests {
             DetectedBackends {
                 codex: true,
                 claude: true,
+                gemini: false,
             },
         )
         .unwrap();

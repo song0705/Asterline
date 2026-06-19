@@ -896,6 +896,7 @@ fn backend_color(backend: BackendKind) -> Color {
     match backend {
         BackendKind::Claude => Color::Magenta,
         BackendKind::Codex => Color::Cyan,
+        BackendKind::Gemini => Color::Blue,
     }
 }
 

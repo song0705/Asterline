@@ -129,3 +129,28 @@ fn real_claude_smoke() {
     let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
     assert_healthy_turn("claude", &events);
 }
+
+#[test]
+#[ignore = "calls the real gemini CLI; opt in with ASTERLINE_SMOKE_GEMINI=1"]
+fn real_gemini_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_GEMINI").as_deref() != Ok("1") {
+        return;
+    }
+    let member = TeamMember::new("gemini", "Gemini", BackendKind::Gemini, "smoke");
+    let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
+    // Gemini v1 is stateless (text output, no session), so only require a
+    // non-empty completed message and a clean exit.
+    report("gemini", &events);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageCompleted(t) if !t.trim().is_empty())),
+        "gemini: expected a non-empty completed message"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Exited { ok: true, .. })),
+        "gemini: expected a clean exit"
+    );
+}

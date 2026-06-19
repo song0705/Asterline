@@ -19,6 +19,7 @@ pub const DEFAULT_MAX_AUTO_RELAYS: u32 = 6;
 pub enum BackendKind {
     Claude,
     Codex,
+    Gemini,
 }
 
 impl BackendKind {
@@ -26,6 +27,7 @@ impl BackendKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -43,6 +45,7 @@ impl TryFrom<&str> for BackendKind {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "gemini" => Ok(Self::Gemini),
             other => Err(format!("unknown backend: {other}")),
         }
     }
