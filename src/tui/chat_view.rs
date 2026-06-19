@@ -15,6 +15,9 @@ use crate::tui::completion::Completion;
 use crate::tui::drawers::Drawer;
 use crate::tui::markdown;
 
+/// Subtle shaded background for user message bands.
+const USER_BG: Color = Color::Rgb(38, 40, 48);
+
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -169,13 +172,25 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_item(item: &ChatItem, width: usize, out: &mut Vec<Line<'static>>) {
     match item {
         ChatItem::User { body } => {
-            out.push(Line::from(Span::styled(
-                "You",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            push_wrapped(body, width, "  ", Style::default(), out);
+            out.push(band_line(
+                vec![Span::styled(
+                    "▌ You",
+                    Style::default()
+                        .fg(Color::Green)
+                        .bg(USER_BG)
+                        .add_modifier(Modifier::BOLD),
+                )],
+                width,
+            ));
+            for line in markdown::wrap(body, width.saturating_sub(2).max(1)) {
+                out.push(band_line(
+                    vec![Span::styled(
+                        format!("▌ {line}"),
+                        Style::default().fg(Color::Gray).bg(USER_BG),
+                    )],
+                    width,
+                ));
+            }
             out.push(Line::raw(""));
         }
         ChatItem::Agent {
@@ -213,13 +228,15 @@ fn render_item(item: &ChatItem, width: usize, out: &mut Vec<Line<'static>>) {
                 Some(true) => ("✓", Color::Green),
                 Some(false) => ("✗", Color::Red),
             };
-            let state_label = match ok {
-                None => "running",
-                Some(true) => "ok",
-                Some(false) => "failed",
-            };
-            let text = format!("{glyph} {name}: {summary}  [{state_label}]");
-            push_wrapped(&text, width, "", Style::default().fg(color), out);
+            // One compact line: glyph + tool name + a truncated command/summary.
+            let head_cols = glyph.chars().count() + 1 + name.chars().count() + 2;
+            let cmd = truncate(summary, width.saturating_sub(head_cols).max(8));
+            out.push(Line::from(vec![
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(name.clone(), Style::default().fg(color)),
+                Span::raw("  "),
+                Span::styled(cmd, Style::default().fg(Color::Gray)),
+            ]));
         }
         ChatItem::Route { from, to, body } => {
             out.push(Line::from(Span::styled(
@@ -276,6 +293,33 @@ fn indent_line(line: Line<'static>, indent: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Pad `spans` with a trailing background space run so the line reads as a
+/// full-width shaded band (used for user messages).
+fn band_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans = spans;
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(USER_BG),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Collapse whitespace and truncate to `max` columns with an ellipsis.
+fn truncate(text: &str, max: usize) -> String {
+    let max = max.max(1);
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let mut out: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" message (@member · /command) ")
@@ -285,17 +329,32 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = state.composer().text();
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(text),
-    ]))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    // Horizontally scroll a single input line so the cursor is always visible.
+    let chars: Vec<char> = state.composer().text().chars().collect();
+    let cursor = state.composer().cursor();
+    let prompt_cols = 2usize; // "> "
+    let avail = (inner.width as usize).saturating_sub(prompt_cols);
+    let (visible, cursor_in_view) = if avail == 0 {
+        (String::new(), 0)
+    } else {
+        let start = cursor.saturating_sub(avail.saturating_sub(1));
+        let end = (start + avail).min(chars.len());
+        (chars[start..end].iter().collect::<String>(), cursor - start)
+    };
 
-    let cursor_col = inner.x + 2 + state.composer().cursor() as u16;
-    let cursor_col = cursor_col.min(inner.x + inner.width.saturating_sub(1));
-    frame.set_cursor_position((cursor_col, inner.y));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(visible),
+        ])),
+        inner,
+    );
+
+    // Only show the cursor when the composer has focus (no drawer overlay).
+    if state.drawer().is_none() {
+        let col = inner.x + prompt_cols as u16 + cursor_in_view as u16;
+        frame.set_cursor_position((col, inner.y));
+    }
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -594,5 +653,55 @@ mod tests {
         assert!(view.contains("let x = 1;")); // code block body
         assert!(!view.contains("```")); // fences stripped
         assert!(!view.contains("**")); // bold markers consumed
+    }
+
+    #[test]
+    fn renders_user_band_and_compact_tool() {
+        use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent, TurnId};
+        use crate::domain::team::MemberId;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "impl".to_string(),
+                status: MemberStatus::Idle,
+            }],
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "run the tests".to_string(),
+        });
+        let long = "/bin/zsh -lc \"rg -n 'Codex is OpenAIs coding agent' /var/folders/ym/abc/openai-docs-cache/codex-manual.md and a lot more text that used to wrap\"";
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("builder"),
+            tool_id: "t1".to_string(),
+            name: "shell".to_string(),
+            summary: long.to_string(),
+        });
+        state.apply(RuntimeEvent::ToolCompleted {
+            member: MemberId::new("builder"),
+            tool_id: "t1".to_string(),
+            ok: true,
+            summary: long.to_string(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(72, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("▌ You"));
+        assert!(view.contains("run the tests"));
+        // The long command is truncated to a single line (ellipsis), not wrapped.
+        assert!(view.contains('…'));
+        assert!(view.contains("✓ shell"));
     }
 }
