@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::adapter::parser::summarize;
 use crate::domain::event::{ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, RuntimeEvent};
 use crate::domain::team::{BackendKind, MemberId};
+use crate::tui::completion::{self, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
 
@@ -45,6 +46,8 @@ pub struct AppState {
     composer: Composer,
     drawer: Option<Drawer>,
     scroll: usize,
+    popup_selected: usize,
+    popup_dismissed: bool,
     should_quit: bool,
 }
 
@@ -64,6 +67,8 @@ impl AppState {
             composer: Composer::new(),
             drawer: None,
             scroll: 0,
+            popup_selected: 0,
+            popup_dismissed: false,
             should_quit: false,
         }
     }
@@ -296,9 +301,6 @@ impl AppState {
     pub fn composer(&self) -> &Composer {
         &self.composer
     }
-    pub fn composer_mut(&mut self) -> &mut Composer {
-        &mut self.composer
-    }
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -312,6 +314,95 @@ impl AppState {
 
     pub fn first_pending_approval(&self) -> Option<ApprovalId> {
         self.pending_approvals.first().map(|a| a.id)
+    }
+
+    // --- composer editing (each edit resets the completion popup) --------
+
+    fn member_ids(&self) -> Vec<String> {
+        self.members.iter().map(|m| m.id.to_string()).collect()
+    }
+
+    /// The active completion popup for the current composer text, if any.
+    pub fn completion(&self) -> Option<Completion> {
+        if self.popup_dismissed {
+            return None;
+        }
+        completion::compute(&self.composer.head(), &self.member_ids())
+    }
+
+    pub fn popup_selected(&self) -> usize {
+        self.popup_selected
+    }
+
+    fn reset_popup(&mut self) {
+        self.popup_selected = 0;
+        self.popup_dismissed = false;
+    }
+
+    pub fn insert_char(&mut self, ch: char) {
+        self.composer.insert(ch);
+        self.reset_popup();
+    }
+    pub fn backspace(&mut self) {
+        self.composer.backspace();
+        self.reset_popup();
+    }
+    pub fn delete_word(&mut self) {
+        self.composer.delete_word();
+        self.reset_popup();
+    }
+    pub fn clear_composer(&mut self) {
+        self.composer.clear();
+        self.reset_popup();
+    }
+    pub fn cursor_left(&mut self) {
+        self.composer.left();
+        self.reset_popup();
+    }
+    pub fn cursor_right(&mut self) {
+        self.composer.right();
+        self.reset_popup();
+    }
+    pub fn cursor_home(&mut self) {
+        self.composer.home();
+        self.reset_popup();
+    }
+    pub fn cursor_end(&mut self) {
+        self.composer.end();
+        self.reset_popup();
+    }
+    pub fn take_composer(&mut self) -> String {
+        let text = self.composer.take();
+        self.reset_popup();
+        text
+    }
+
+    pub fn popup_up(&mut self) {
+        self.popup_selected = self.popup_selected.saturating_sub(1);
+    }
+    pub fn popup_down(&mut self) {
+        if let Some(completion) = self.completion()
+            && self.popup_selected + 1 < completion.items.len()
+        {
+            self.popup_selected += 1;
+        }
+    }
+    pub fn dismiss_popup(&mut self) {
+        self.popup_dismissed = true;
+    }
+
+    /// Accept the highlighted completion. Returns true if the composer changed
+    /// (false means the token already matched, so the caller should submit).
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(completion) = self.completion() else {
+            return false;
+        };
+        let index = self.popup_selected.min(completion.items.len() - 1);
+        let insert = completion.items[index].insert.clone();
+        let before = self.composer.text();
+        self.composer.replace_token(completion.token_start, &insert);
+        self.reset_popup();
+        self.composer.text() != before
     }
 
     // --- UI actions -----------------------------------------------------
@@ -478,5 +569,43 @@ mod tests {
         state.toggle_drawer(Drawer::Logs);
         assert_eq!(state.drawer(), None);
         let _ = AgentSessionId("x".to_string());
+    }
+
+    #[test]
+    fn slash_opens_command_popup_and_accept_inserts() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        for ch in "/as".chars() {
+            state.insert_char(ch);
+        }
+        let completion = state.completion().expect("command popup");
+        assert_eq!(completion.items[0].insert, "/ask ");
+        assert!(state.accept_completion());
+        assert_eq!(state.composer().text(), "/ask ");
+    }
+
+    #[test]
+    fn at_opens_member_popup_and_accepts() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        for ch in "@bu".chars() {
+            state.insert_char(ch);
+        }
+        let completion = state.completion().expect("member popup");
+        assert_eq!(completion.items[0].insert, "@builder ");
+        state.accept_completion();
+        assert_eq!(state.composer().text(), "@builder ");
+    }
+
+    #[test]
+    fn dismiss_hides_popup_until_text_changes() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        state.insert_char('/');
+        assert!(state.completion().is_some());
+        state.dismiss_popup();
+        assert!(state.completion().is_none());
+        state.insert_char('a');
+        assert!(state.completion().is_some());
     }
 }

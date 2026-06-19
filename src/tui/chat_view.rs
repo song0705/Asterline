@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wr
 use crate::domain::event::{ChatItem, LogLevel, MemberStatus};
 use crate::domain::team::BackendKind;
 use crate::tui::app_state::AppState;
+use crate::tui::completion::Completion;
 use crate::tui::drawers::Drawer;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
@@ -29,9 +30,69 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     render_composer(frame, chunks[2], state);
     render_footer(frame, chunks[3], state);
 
+    // The completion popup floats just above the composer (hidden behind a drawer).
+    if state.drawer().is_none()
+        && let Some(completion) = state.completion()
+    {
+        render_popup(frame, chunks[2], &completion, state.popup_selected());
+    }
+
     if let Some(drawer) = state.drawer() {
         render_drawer(frame, frame.area(), state, drawer);
     }
+}
+
+fn render_popup(
+    frame: &mut Frame<'_>,
+    composer_area: Rect,
+    completion: &Completion,
+    selected: usize,
+) {
+    const MAX_ROWS: usize = 6;
+    let count = completion.items.len();
+    let shown = count.min(MAX_ROWS);
+    let height = shown as u16 + 2;
+    let width = composer_area.width.min(60);
+    let area = Rect {
+        x: composer_area.x,
+        y: composer_area.y.saturating_sub(height),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(format!(" {} ", completion.title))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let selected = selected.min(count.saturating_sub(1));
+    let start = if selected >= shown {
+        selected + 1 - shown
+    } else {
+        0
+    };
+    let lines: Vec<Line> = completion
+        .items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(shown)
+        .map(|(i, item)| {
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(format!(" {} ", item.label), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -525,5 +586,38 @@ mod tests {
         // The conversation is not wrapped in a box; the only border is the
         // rounded composer at the bottom.
         assert!(view.contains('╭') && view.contains('╰'));
+    }
+
+    #[test]
+    fn renders_completion_popup() {
+        use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
+        use crate::domain::team::MemberId;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "impl".to_string(),
+                status: MemberStatus::Idle,
+            }],
+        });
+        for ch in "/a".chars() {
+            state.insert_char(ch);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("commands"));
+        assert!(view.contains("/ask"));
+        assert!(view.contains("/all"));
     }
 }

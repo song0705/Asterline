@@ -74,6 +74,25 @@ impl Composer {
         self.cursor = self.chars.len();
     }
 
+    /// The text before the cursor (used to compute completions).
+    pub fn head(&self) -> String {
+        self.chars[..self.cursor].iter().collect()
+    }
+
+    /// Replace the characters in `start..cursor` with `insert`, leaving the
+    /// cursor at the end of the inserted text. Used to accept a completion.
+    pub fn replace_token(&mut self, start: usize, insert: &str) {
+        let end = self.cursor.min(self.chars.len());
+        let start = start.min(end);
+        self.chars.drain(start..end);
+        let inserted: Vec<char> = insert.chars().collect();
+        let count = inserted.len();
+        for (offset, ch) in inserted.into_iter().enumerate() {
+            self.chars.insert(start + offset, ch);
+        }
+        self.cursor = start + count;
+    }
+
     /// Take the current text and clear the composer.
     pub fn take(&mut self) -> String {
         let text = self.text();

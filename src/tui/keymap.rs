@@ -21,6 +21,7 @@ pub enum Action {
     ToggleTeam,
     TogglePalette,
     CloseOverlay,
+    Complete,
     Interrupt,
 }
 
@@ -33,6 +34,7 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::F(_) => None,
         KeyCode::Enter => Some(Action::Submit),
+        KeyCode::Tab => Some(Action::Complete),
         KeyCode::Esc => Some(Action::CloseOverlay),
         KeyCode::Backspace => Some(Action::Backspace),
         KeyCode::Left => Some(Action::CursorLeft),

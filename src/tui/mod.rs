@@ -5,6 +5,7 @@
 pub mod app_state;
 pub mod chat_view;
 pub mod commands;
+pub mod completion;
 pub mod composer;
 pub mod drawers;
 pub mod keymap;
@@ -81,21 +82,38 @@ fn run_loop(
 
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     match action {
-        Action::InsertChar(ch) => state.composer_mut().insert(ch),
-        Action::Backspace => state.composer_mut().backspace(),
-        Action::DeleteWord => state.composer_mut().delete_word(),
-        Action::ClearLine => state.composer_mut().clear(),
-        Action::CursorLeft => state.composer_mut().left(),
-        Action::CursorRight => state.composer_mut().right(),
-        Action::Home => state.composer_mut().home(),
-        Action::End => state.composer_mut().end(),
-        Action::ScrollUp => state.scroll_up(),
-        Action::ScrollDown => state.scroll_down(),
+        Action::InsertChar(ch) => state.insert_char(ch),
+        Action::Backspace => state.backspace(),
+        Action::DeleteWord => state.delete_word(),
+        Action::ClearLine => state.clear_composer(),
+        Action::CursorLeft => state.cursor_left(),
+        Action::CursorRight => state.cursor_right(),
+        Action::Home => state.cursor_home(),
+        Action::End => state.cursor_end(),
+        Action::ScrollUp => {
+            if state.completion().is_some() {
+                state.popup_up();
+            } else {
+                state.scroll_up();
+            }
+        }
+        Action::ScrollDown => {
+            if state.completion().is_some() {
+                state.popup_down();
+            } else {
+                state.scroll_down();
+            }
+        }
         Action::ToggleLogs => state.toggle_drawer(drawers::Drawer::Logs),
         Action::ToggleTeam => state.toggle_drawer(drawers::Drawer::Team),
         Action::TogglePalette => state.toggle_drawer(drawers::Drawer::Palette),
+        Action::Complete => {
+            state.accept_completion();
+        }
         Action::CloseOverlay => {
-            if state.drawer().is_some() {
+            if state.completion().is_some() {
+                state.dismiss_popup();
+            } else if state.drawer().is_some() {
                 state.close_drawer();
             }
         }
@@ -103,17 +121,24 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             if state.running_count() > 0 {
                 handle.send(UiCommand::Cancel { member: None });
             } else if !state.composer().is_empty() {
-                state.composer_mut().clear();
+                state.clear_composer();
             } else {
                 state.quit();
             }
         }
-        Action::Submit => submit(state, handle),
+        Action::Submit => {
+            // With the popup open, Enter accepts the highlighted item; if the
+            // token is already complete (no change), fall through to submit.
+            if state.completion().is_some() && state.accept_completion() {
+                return;
+            }
+            submit(state, handle);
+        }
     }
 }
 
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
-    let text = state.composer_mut().take();
+    let text = state.take_composer();
     match commands::parse(&text) {
         Submission::Runtime(command) => {
             handle.send(command);
