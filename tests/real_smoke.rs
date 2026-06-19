@@ -85,6 +85,39 @@ fn real_codex_smoke() {
 }
 
 #[test]
+#[ignore = "calls the real codex CLI twice (fresh + resume); opt in with ASTERLINE_SMOKE_CODEX=1"]
+fn real_codex_resume_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_CODEX").as_deref() != Ok("1") {
+        return;
+    }
+    let member = TeamMember::new("codex", "Codex", BackendKind::Codex, "smoke");
+    let first = run_once(&member, "Remember the word ORANGE. Reply with: READY");
+    assert_healthy_turn("codex-fresh", &first);
+    let session = first
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionDiscovered(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a session id to resume");
+
+    // Resume the same session — this is the path that previously sent
+    // exec-only flags to `codex exec resume` and exited with code 2.
+    let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
+    let (tx, rx) = mpsc::channel();
+    runner.run(
+        RunRequest {
+            prompt: "Reply with the word you were asked to remember.".to_string(),
+            session: Some(session),
+            cancel: Arc::new(AtomicBool::new(false)),
+        },
+        tx,
+    );
+    let resumed: Vec<AgentEvent> = rx.iter().collect();
+    assert_healthy_turn("codex-resume", &resumed);
+}
+
+#[test]
 #[ignore = "calls the real claude CLI; opt in with ASTERLINE_SMOKE_CLAUDE=1"]
 fn real_claude_smoke() {
     if std::env::var("ASTERLINE_SMOKE_CLAUDE").as_deref() != Ok("1") {

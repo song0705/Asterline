@@ -38,17 +38,9 @@ impl CodexStreamAdapter {
         self
     }
 
-    fn base_flags(&self) -> Vec<String> {
-        let mut flags = vec![
-            "--json".to_string(),
-            "--color".to_string(),
-            "never".to_string(),
-            "--skip-git-repo-check".to_string(),
-            "-C".to_string(),
-            self.cwd.display().to_string(),
-            "-s".to_string(),
-            self.sandbox.codex_arg().to_string(),
-        ];
+    /// Flags accepted by both `exec` and `exec resume`.
+    fn common_flags(&self) -> Vec<String> {
+        let mut flags = vec!["--json".to_string(), "--skip-git-repo-check".to_string()];
         if let Some(model) = &self.model {
             flags.push("-m".to_string());
             flags.push(model.clone());
@@ -63,14 +55,23 @@ impl StreamAdapter for CodexStreamAdapter {
     }
 
     fn build_command(&self, prompt: &str, session: Option<&AgentSessionId>) -> AdapterCommand {
+        // `codex exec resume` accepts only a subset of `exec`'s flags — notably
+        // NOT --color, -C, or -s. The cwd is set on the spawned process and the
+        // sandbox is restored from the resumed session.
         let mut args = vec!["exec".to_string()];
         match session {
             Some(session) => {
                 args.push("resume".to_string());
-                args.extend(self.base_flags());
+                args.extend(self.common_flags());
                 args.push(session.as_str().to_string());
             }
-            None => args.extend(self.base_flags()),
+            None => {
+                args.extend(self.common_flags());
+                args.push("-C".to_string());
+                args.push(self.cwd.display().to_string());
+                args.push("-s".to_string());
+                args.push(self.sandbox.codex_arg().to_string());
+            }
         }
         args.push(prompt.to_string());
 
@@ -291,6 +292,11 @@ mod tests {
         );
         assert!(command.args.contains(&"thread-9".to_string()));
         assert_eq!(command.args.last().unwrap(), "again");
+        // `codex exec resume` rejects these exec-only flags — never send them.
+        assert!(command.args.contains(&"--json".to_string()));
+        assert!(!command.args.iter().any(|a| a == "--color"));
+        assert!(!command.args.iter().any(|a| a == "-C"));
+        assert!(!command.args.iter().any(|a| a == "-s"));
     }
 
     #[test]
