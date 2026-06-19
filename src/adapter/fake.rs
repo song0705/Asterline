@@ -77,6 +77,7 @@ mod tests {
                 prompt: prompt.to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
             },
             tx,
         );

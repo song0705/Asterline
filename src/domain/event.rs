@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::domain::team::{BackendKind, MemberId};
+use crate::domain::team::{BackendKind, Effort, MemberId};
 
 /// A turn groups everything that happens after one user submission.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -152,6 +152,8 @@ pub enum UiCommand {
     SetRelayPaused(bool),
     /// Continue (`true`) or drop (`false`) the next paused relay.
     ResolvePausedRoute { resume: bool },
+    /// Set a member's reasoning effort.
+    SetEffort { member: MemberId, effort: Effort },
     /// Begin a graceful shutdown.
     Shutdown,
 }
@@ -267,6 +269,7 @@ pub struct MemberSummary {
     pub status: MemberStatus,
     pub session: Option<String>,
     pub cwd: String,
+    pub effort: Option<Effort>,
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth
@@ -294,6 +297,10 @@ pub enum RuntimeEvent {
     MemberStatus {
         member: MemberId,
         status: MemberStatus,
+    },
+    MemberEffort {
+        member: MemberId,
+        effort: Effort,
     },
     /// A new agent message cell begins.
     MessageStarted {

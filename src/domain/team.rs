@@ -147,6 +147,65 @@ pub enum SessionPolicy {
     Fresh,
 }
 
+/// Reasoning effort for a member's backend model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// The value for Claude's `--effort`.
+    pub fn claude_arg(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The value for Codex's `model_reasoning_effort` (clamped to its range).
+    pub fn codex_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High | Self::Xhigh | Self::Max => "high",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.claude_arg()
+    }
+
+    /// Cycle to the next level (wraps), for the UI.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Xhigh,
+            Self::Xhigh => Self::Max,
+            Self::Max => Self::Low,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
 /// A single team member: a backend bound to a role and a stable id.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TeamMember {
@@ -168,6 +227,8 @@ pub struct TeamMember {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub session_policy: SessionPolicy,
+    #[serde(default)]
+    pub effort: Option<Effort>,
 }
 
 impl TeamMember {
@@ -190,6 +251,7 @@ impl TeamMember {
             permission_mode: None,
             allowed_tools: Vec::new(),
             session_policy: SessionPolicy::default(),
+            effort: None,
         }
     }
 

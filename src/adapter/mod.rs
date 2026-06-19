@@ -19,7 +19,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 
 use crate::domain::event::{AgentEvent, AgentSessionId};
-use crate::domain::team::{BackendKind, TeamMember};
+use crate::domain::team::{BackendKind, Effort, TeamMember};
 
 pub use claude_stream::ClaudeStreamAdapter;
 pub use codex_stream::CodexStreamAdapter;
@@ -33,6 +33,8 @@ pub struct RunRequest {
     pub session: Option<AgentSessionId>,
     /// Set to request cancellation of the run.
     pub cancel: Arc<AtomicBool>,
+    /// Reasoning effort for this run, if set.
+    pub effort: Option<Effort>,
 }
 
 /// Runs one member turn, streaming [`AgentEvent`]s to `events` until the run

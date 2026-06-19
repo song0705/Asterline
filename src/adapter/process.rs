@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::event::{AgentEvent, AgentSessionId};
-use crate::domain::team::BackendKind;
+use crate::domain::team::{BackendKind, Effort};
 
 /// A command line for a backend run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,7 +32,12 @@ pub struct AdapterCommand {
 /// Builds backend commands and stateful per-run line parsers.
 pub trait StreamAdapter: Send + Sync {
     fn backend(&self) -> BackendKind;
-    fn build_command(&self, prompt: &str, session: Option<&AgentSessionId>) -> AdapterCommand;
+    fn build_command(
+        &self,
+        prompt: &str,
+        session: Option<&AgentSessionId>,
+        effort: Option<Effort>,
+    ) -> AdapterCommand;
     fn parser(&self) -> Box<dyn LineParser>;
 }
 
@@ -65,7 +70,7 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
     fn run(&self, req: RunRequest, events: Sender<AgentEvent>) {
         let command = self
             .adapter
-            .build_command(&req.prompt, req.session.as_ref());
+            .build_command(&req.prompt, req.session.as_ref(), req.effort);
         let parser = self.adapter.parser();
         run_streaming(command, parser, req.cancel, events);
     }
@@ -211,6 +216,7 @@ mod tests {
             &self,
             _prompt: &str,
             _session: Option<&AgentSessionId>,
+            _effort: Option<Effort>,
         ) -> AdapterCommand {
             AdapterCommand {
                 program: "/bin/sh".to_string(),
@@ -243,6 +249,7 @@ mod tests {
                 prompt: "hi".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
             },
             tx,
         );
@@ -278,6 +285,7 @@ mod tests {
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
             },
             tx,
         );
@@ -330,6 +338,7 @@ mod tests {
                     prompt: "x".to_string(),
                     session: None,
                     cancel: cancel_for_thread,
+                    effort: None,
                 },
                 tx,
             );

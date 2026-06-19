@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::adapter::parser::{str_field, summarize};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
-use crate::domain::team::{BackendKind, SandboxPolicy, TeamMember};
+use crate::domain::team::{BackendKind, Effort, SandboxPolicy, TeamMember};
 
 const TOOL_SUMMARY_MAX: usize = 160;
 
@@ -54,7 +54,12 @@ impl StreamAdapter for CodexStreamAdapter {
         BackendKind::Codex
     }
 
-    fn build_command(&self, prompt: &str, session: Option<&AgentSessionId>) -> AdapterCommand {
+    fn build_command(
+        &self,
+        prompt: &str,
+        session: Option<&AgentSessionId>,
+        effort: Option<Effort>,
+    ) -> AdapterCommand {
         // `codex exec resume` accepts only a subset of `exec`'s flags — notably
         // NOT --color, -C, or -s. The cwd is set on the spawned process and the
         // sandbox is restored from the resumed session.
@@ -72,6 +77,10 @@ impl StreamAdapter for CodexStreamAdapter {
                 args.push("-s".to_string());
                 args.push(self.sandbox.codex_arg().to_string());
             }
+        }
+        if let Some(effort) = effort {
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort={}", effort.codex_value()));
         }
         args.push(prompt.to_string());
 
@@ -268,7 +277,7 @@ mod tests {
     fn fresh_command_targets_exec_json() {
         let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
         let adapter = CodexStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
-        let command = adapter.build_command("do it", None);
+        let command = adapter.build_command("do it", None, Some(Effort::Max));
 
         assert_eq!(command.program, "codex");
         assert_eq!(command.args[0], "exec");
@@ -276,6 +285,12 @@ mod tests {
         assert!(command.args.windows(2).any(|w| w == ["-C", "/tmp/ws"]));
         assert!(command.args.windows(2).any(|w| w == ["-s", "read-only"]));
         assert_eq!(command.args.last().unwrap(), "do it");
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["-c", "model_reasoning_effort=high"])
+        );
         // Never ephemeral on the product path.
         assert!(!command.args.iter().any(|a| a == "--ephemeral"));
     }
@@ -284,7 +299,8 @@ mod tests {
     fn resume_command_uses_resume_subcommand_with_session() {
         let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
         let adapter = CodexStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
-        let command = adapter.build_command("again", Some(&AgentSessionId("thread-9".to_string())));
+        let command =
+            adapter.build_command("again", Some(&AgentSessionId("thread-9".to_string())), None);
 
         assert_eq!(
             &command.args[0..2],

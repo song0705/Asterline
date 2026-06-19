@@ -19,6 +19,7 @@ pub fn dispatch(runner: Arc<dyn MemberRunner>, action: RunAction, input_tx: Send
         prompt,
         session,
         cancel,
+        effort,
     } = action;
 
     thread::spawn(move || {
@@ -40,6 +41,7 @@ pub fn dispatch(runner: Arc<dyn MemberRunner>, action: RunAction, input_tx: Send
                 prompt,
                 session,
                 cancel,
+                effort,
             },
             ev_tx,
         );

@@ -26,6 +26,7 @@ fn run_once(member: &TeamMember, prompt: &str) -> Vec<AgentEvent> {
             prompt: prompt.to_string(),
             session: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            effort: None,
         },
         tx,
     );
@@ -110,6 +111,7 @@ fn real_codex_resume_smoke() {
             prompt: "Reply with the word you were asked to remember.".to_string(),
             session: Some(session),
             cancel: Arc::new(AtomicBool::new(false)),
+            effort: None,
         },
         tx,
     );

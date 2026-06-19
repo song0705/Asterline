@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::domain::event::{
     ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
 };
-use crate::domain::team::{BackendKind, MemberId};
+use crate::domain::team::{BackendKind, Effort, MemberId};
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, Completion};
 use crate::tui::composer::Composer;
@@ -25,6 +25,7 @@ pub struct MemberView {
     pub status: MemberStatus,
     pub session: Option<String>,
     pub cwd: String,
+    pub effort: Option<Effort>,
 }
 
 /// A pending approval awaiting a decision.
@@ -106,6 +107,7 @@ impl AppState {
                         status: m.status,
                         session: m.session,
                         cwd: m.cwd,
+                        effort: m.effort,
                     })
                     .collect();
             }
@@ -120,6 +122,11 @@ impl AppState {
                 }
             }
             RuntimeEvent::MemberStatus { member, status } => self.set_status(&member, status),
+            RuntimeEvent::MemberEffort { member, effort } => {
+                if let Some(view) = self.members.iter_mut().find(|m| m.id == member) {
+                    view.effort = Some(effort);
+                }
+            }
             RuntimeEvent::MessageStarted { msg, member, .. } => {
                 let (display_name, backend) = self.member_meta(&member);
                 let idx = self.push(ChatItem::Agent {
@@ -605,6 +612,7 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                effort: None,
             }],
         }
     }
@@ -775,6 +783,7 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                effort: None,
             },
             MemberView {
                 id: MemberId::new("reviewer"),
@@ -784,6 +793,7 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                effort: None,
             },
         ];
         assert_eq!(state.header_selected(), None);

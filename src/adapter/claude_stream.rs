@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::adapter::parser::{str_field, summarize};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
-use crate::domain::team::{BackendKind, PermissionMode, TeamMember};
+use crate::domain::team::{BackendKind, Effort, PermissionMode, TeamMember};
 
 const TOOL_SUMMARY_MAX: usize = 160;
 
@@ -48,7 +48,12 @@ impl StreamAdapter for ClaudeStreamAdapter {
         BackendKind::Claude
     }
 
-    fn build_command(&self, prompt: &str, session: Option<&AgentSessionId>) -> AdapterCommand {
+    fn build_command(
+        &self,
+        prompt: &str,
+        session: Option<&AgentSessionId>,
+        effort: Option<Effort>,
+    ) -> AdapterCommand {
         let mut args = vec![
             "--print".to_string(),
             "--output-format".to_string(),
@@ -75,6 +80,10 @@ impl StreamAdapter for ClaudeStreamAdapter {
         if let Some(system_prompt) = &self.system_prompt {
             args.push("--append-system-prompt".to_string());
             args.push(system_prompt.clone());
+        }
+        if let Some(effort) = effort {
+            args.push("--effort".to_string());
+            args.push(effort.claude_arg().to_string());
         }
         // Prompt is the trailing positional argument.
         args.push(prompt.to_string());
@@ -269,7 +278,11 @@ mod tests {
         member.allowed_tools = vec!["Read".to_string(), "Bash".to_string()];
         let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
 
-        let command = adapter.build_command("hello", Some(&AgentSessionId("sess-1".to_string())));
+        let command = adapter.build_command(
+            "hello",
+            Some(&AgentSessionId("sess-1".to_string())),
+            Some(Effort::High),
+        );
         assert_eq!(command.program, "claude");
         assert!(command.args.contains(&"--output-format".to_string()));
         assert!(command.args.contains(&"stream-json".to_string()));
@@ -279,6 +292,7 @@ mod tests {
                 .contains(&"--include-partial-messages".to_string())
         );
         assert!(command.args.windows(2).any(|w| w == ["--resume", "sess-1"]));
+        assert!(command.args.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(
             command
                 .args

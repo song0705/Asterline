@@ -14,7 +14,7 @@ use crate::domain::event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, LogEntry, MemberStatus,
     MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
 };
-use crate::domain::team::{BackendKind, MemberId, TeamConfig};
+use crate::domain::team::{BackendKind, Effort, MemberId, TeamConfig};
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
 use crate::runtime::approval::risky_action_kind;
 use crate::runtime::session_registry::SessionRegistry;
@@ -33,6 +33,7 @@ pub struct RunAction {
     pub prompt: String,
     pub session: Option<AgentSessionId>,
     pub cancel: Arc<AtomicBool>,
+    pub effort: Option<Effort>,
 }
 
 struct RunningState {
@@ -52,15 +53,17 @@ struct MemberState {
     queue: VecDeque<QueuedPrompt>,
     running: Option<RunningState>,
     tools: HashMap<String, String>,
+    effort: Option<Effort>,
 }
 
 impl MemberState {
-    fn new() -> Self {
+    fn new(effort: Option<Effort>) -> Self {
         Self {
             status: MemberStatus::Idle,
             queue: VecDeque::new(),
             running: None,
             tools: HashMap::new(),
+            effort,
         }
     }
 }
@@ -100,7 +103,7 @@ impl TeamRuntime {
         let members = config
             .members
             .iter()
-            .map(|m| (m.id.clone(), MemberState::new()))
+            .map(|m| (m.id.clone(), MemberState::new(m.effort)))
             .collect();
         let relay = RelayGuard::new(config.max_auto_relays);
         Self {
@@ -142,6 +145,7 @@ impl TeamRuntime {
                     .unwrap_or(MemberStatus::Idle),
                 session: self.sessions.get(&m.id).map(|s| s.0.clone()),
                 cwd: m.resolved_cwd(&self.config.workspace).display().to_string(),
+                effort: self.members.get(&m.id).and_then(|s| s.effort),
             })
             .collect();
         RuntimeEvent::Ready {
@@ -179,6 +183,26 @@ impl TeamRuntime {
             }
             UiCommand::ResolvePausedRoute { resume } => {
                 self.resolve_next_paused_route(resume, &mut step)
+            }
+            UiCommand::SetEffort { member, effort } => {
+                match self.config.find(member.as_str()).map(|m| m.id.clone()) {
+                    Some(id) => {
+                        if let Some(state) = self.members.get_mut(&id) {
+                            state.effort = Some(effort);
+                        }
+                        step.events.push(RuntimeEvent::MemberEffort {
+                            member: id.clone(),
+                            effort,
+                        });
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} reasoning effort → {}",
+                            effort.as_str()
+                        )));
+                    }
+                    None => step
+                        .events
+                        .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
+                }
             }
             UiCommand::Shutdown => self.handle_cancel(None, &mut step),
         }
@@ -739,6 +763,7 @@ impl TeamRuntime {
             None
         };
         let cancel = Arc::new(AtomicBool::new(false));
+        let effort = self.members.get(member).and_then(|s| s.effort);
         if let Some(state) = self.members.get_mut(member) {
             state.running = Some(RunningState {
                 cancel: cancel.clone(),
@@ -758,6 +783,7 @@ impl TeamRuntime {
             prompt,
             session,
             cancel,
+            effort,
         });
     }
 
@@ -1193,5 +1219,23 @@ mod tests {
         assert_eq!(step.actions.len(), 1);
         assert_eq!(step.actions[0].member, builder);
         assert_eq!(step.actions[0].prompt, "nihao");
+    }
+
+    #[test]
+    fn set_effort_updates_member_and_carries_into_runs() {
+        let mut rt = runtime();
+        let builder = MemberId::new("builder");
+
+        let step = rt.on_ui_command(UiCommand::SetEffort {
+            member: builder.clone(),
+            effort: Effort::High,
+        });
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            RuntimeEvent::MemberEffort { effort, .. } if *effort == Effort::High
+        )));
+
+        let step = rt.on_ui_command(user("go"));
+        assert_eq!(step.actions[0].effort, Some(Effort::High));
     }
 }

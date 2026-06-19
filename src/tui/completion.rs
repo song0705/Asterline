@@ -23,6 +23,7 @@ pub struct Completion {
 const COMMANDS: &[(&str, &str, bool)] = &[
     ("ask", "send to one member", true),
     ("all", "send to everyone", true),
+    ("effort", "set reasoning effort (low…max)", true),
     ("team", "roster · sessions · approvals", false),
     ("logs", "raw logs · stderr · warnings", false),
     ("sessions", "session ids", false),
@@ -61,7 +62,7 @@ pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
             // Command chosen; only `/ask` completes its first argument (a member).
             Some(space) => {
                 let cmd: String = chars[1..space].iter().collect();
-                if cmd != "ask" {
+                if cmd != "ask" && cmd != "effort" {
                     return None;
                 }
                 let arg: Vec<char> = chars[space + 1..].to_vec();

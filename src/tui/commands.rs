@@ -2,7 +2,7 @@
 //! an approval decision, or help. Supports slash commands and `@member` prefixes.
 
 use crate::domain::event::{ApprovalDecision, MessageTarget, UiCommand};
-use crate::domain::team::MemberId;
+use crate::domain::team::{Effort, MemberId};
 use crate::tui::drawers::Drawer;
 
 /// What submitting the composer should do.
@@ -87,6 +87,16 @@ fn parse_slash(rest: &str) -> Submission {
         "retry" => Submission::Runtime(UiCommand::Retry),
         "approve" => Submission::ApproveFirst(ApprovalDecision::Approve),
         "reject" => Submission::ApproveFirst(ApprovalDecision::Reject),
+        "effort" => {
+            let (member, level) = split_first_word(arg);
+            match Effort::parse(level) {
+                Some(effort) if !member.is_empty() => Submission::Runtime(UiCommand::SetEffort {
+                    member: MemberId::new(member),
+                    effort,
+                }),
+                _ => Submission::Help,
+            }
+        }
         "help" => Submission::Help,
         _ => Submission::Help,
     }
@@ -179,5 +189,18 @@ mod tests {
         assert_eq!(parse("   "), Submission::Empty);
         assert_eq!(parse("/wat"), Submission::Help);
         assert_eq!(parse("/ask builder"), Submission::Help);
+    }
+
+    #[test]
+    fn effort_command_sets_member_effort() {
+        assert_eq!(
+            parse("/effort builder high"),
+            Submission::Runtime(UiCommand::SetEffort {
+                member: MemberId::new("builder"),
+                effort: Effort::High,
+            })
+        );
+        assert_eq!(parse("/effort builder"), Submission::Help);
+        assert_eq!(parse("/effort builder bogus"), Submission::Help);
     }
 }

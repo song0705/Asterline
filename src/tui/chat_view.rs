@@ -164,6 +164,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             format!(" ({})", status_glyph(member.status)),
             status_style,
         ));
+        if let Some(effort) = member.effort {
+            chips.push(Span::styled(
+                format!(" ·{}", effort.as_str()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
     if state.members().is_empty() {
         chips.push(Span::styled(
@@ -946,6 +952,7 @@ mod tests {
                     status: MemberStatus::Running,
                     session: None,
                     cwd: String::new(),
+                    effort: None,
                 },
                 MemberSummary {
                     id: MemberId::new("reviewer"),
@@ -955,6 +962,7 @@ mod tests {
                     status: MemberStatus::Idle,
                     session: None,
                     cwd: String::new(),
+                    effort: None,
                 },
             ],
         });
@@ -998,6 +1006,7 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                effort: None,
             }],
         });
         for ch in "/a".chars() {
@@ -1061,6 +1070,7 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                effort: None,
             }],
         });
         state.apply(RuntimeEvent::UserMessage {
