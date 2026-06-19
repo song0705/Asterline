@@ -52,13 +52,14 @@ pub fn spawn(
     store: SqliteStore,
     runners: Runners,
     events: Sender<RuntimeEvent>,
+    approvals: bool,
 ) -> (RuntimeHandle, JoinHandle<()>) {
     let (input_tx, input_rx) = mpsc::channel();
     let handle = RuntimeHandle {
         tx: input_tx.clone(),
     };
     let join = thread::spawn(move || {
-        run_loop(config, store, runners, events, input_tx, input_rx);
+        run_loop(config, store, runners, events, approvals, input_tx, input_rx);
     });
     (handle, join)
 }
@@ -68,10 +69,11 @@ fn run_loop(
     store: SqliteStore,
     runners: Runners,
     events: Sender<RuntimeEvent>,
+    approvals: bool,
     input_tx: Sender<RuntimeInput>,
     input_rx: Receiver<RuntimeInput>,
 ) {
-    let mut runtime = TeamRuntime::new(config, store);
+    let mut runtime = TeamRuntime::new(config, store).with_approvals(approvals);
     let _ = events.send(runtime.ready_event());
 
     while let Ok(input) = input_rx.recv() {
@@ -128,6 +130,7 @@ mod tests {
             SqliteStore::in_memory().unwrap(),
             runners,
             evt_tx,
+            true,
         );
 
         // First event is Ready.
