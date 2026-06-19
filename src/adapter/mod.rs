@@ -1,11 +1,7 @@
-pub mod claude_print;
+//! Backend adapters.
+//!
+//! The product path uses streaming adapters that translate each CLI's output
+//! into [`crate::domain::AgentEvent`]. `cli_pty` is retained as a raw-terminal /
+//! debug capability and is not part of the product path.
+
 pub mod cli_pty;
-pub mod codex_exec;
-pub mod fake;
-
-use crate::types::AgentId;
-
-pub trait AgentAdapter {
-    fn id(&self) -> AgentId;
-    fn handle_user_message(&self, body: &str) -> String;
-}
