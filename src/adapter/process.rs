@@ -95,6 +95,11 @@ pub fn run_streaming(
                 "failed to start {}: {err}",
                 command.program
             )));
+            // Always end a run with Exited so the runtime can finalize it.
+            let _ = events.send(AgentEvent::Exited {
+                code: None,
+                ok: false,
+            });
             return;
         }
     };
