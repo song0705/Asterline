@@ -319,9 +319,9 @@ impl SqliteStore {
 
     /// Most recent `limit` log entries, oldest-first.
     pub fn recent_logs(&self, limit: usize) -> Result<Vec<LogEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT level, source, message FROM logs ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT level, source, message FROM logs ORDER BY id DESC LIMIT ?1")?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(LogEntry {
                 level: parse_log_level(&row.get::<_, String>(0)?),
@@ -526,7 +526,7 @@ mod tests {
         let reviewer = MemberId::new("reviewer");
 
         store
-            .record_user(turn, &[builder.clone()], "build the parser")
+            .record_user(turn, std::slice::from_ref(&builder), "build the parser")
             .unwrap();
         store
             .record_agent(turn, &builder, "Builder", BackendKind::Codex, "on it")
@@ -535,15 +535,16 @@ mod tests {
             .record_tool(turn, &builder, "shell", "cargo test", Some(true))
             .unwrap();
         store
-            .record_route(
-                turn,
-                &builder,
-                &["reviewer".to_string()],
-                "please review",
-            )
+            .record_route(turn, &builder, &["reviewer".to_string()], "please review")
             .unwrap();
         store
-            .record_agent(turn, &reviewer, "Reviewer", BackendKind::Claude, "looks good")
+            .record_agent(
+                turn,
+                &reviewer,
+                "Reviewer",
+                BackendKind::Claude,
+                "looks good",
+            )
             .unwrap();
 
         let items = store.replay_chat().unwrap();
@@ -568,7 +569,10 @@ mod tests {
         ));
         assert!(matches!(
             &items[4],
-            ChatItem::Agent { backend: BackendKind::Claude, .. }
+            ChatItem::Agent {
+                backend: BackendKind::Claude,
+                ..
+            }
         ));
     }
 
@@ -603,7 +607,11 @@ mod tests {
         assert_eq!(store.session_for(&builder).unwrap(), None);
 
         store
-            .upsert_session(&builder, BackendKind::Codex, &AgentSessionId("thread-1".to_string()))
+            .upsert_session(
+                &builder,
+                BackendKind::Codex,
+                &AgentSessionId("thread-1".to_string()),
+            )
             .unwrap();
         assert_eq!(
             store.session_for(&builder).unwrap(),
@@ -611,7 +619,11 @@ mod tests {
         );
 
         store
-            .upsert_session(&builder, BackendKind::Codex, &AgentSessionId("thread-2".to_string()))
+            .upsert_session(
+                &builder,
+                BackendKind::Codex,
+                &AgentSessionId("thread-2".to_string()),
+            )
             .unwrap();
         assert_eq!(
             store.session_for(&builder).unwrap(),
@@ -624,7 +636,12 @@ mod tests {
         let store = store();
         let turn = store.create_turn().unwrap();
         let id = store
-            .insert_approval(Some(turn), Some(&MemberId::new("builder")), "git", "git push")
+            .insert_approval(
+                Some(turn),
+                Some(&MemberId::new("builder")),
+                "git",
+                "git push",
+            )
             .unwrap();
 
         let pending = store.pending_approvals().unwrap();
@@ -632,8 +649,16 @@ mod tests {
         assert_eq!(pending[0].id, id);
         assert_eq!(pending[0].action, "git");
 
-        assert!(store.resolve_approval(id, ApprovalDecision::Approve).unwrap());
-        assert!(!store.resolve_approval(id, ApprovalDecision::Reject).unwrap());
+        assert!(
+            store
+                .resolve_approval(id, ApprovalDecision::Approve)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .resolve_approval(id, ApprovalDecision::Reject)
+                .unwrap()
+        );
         assert!(store.pending_approvals().unwrap().is_empty());
     }
 
@@ -645,8 +670,12 @@ mod tests {
             .unwrap();
         assert_eq!(store.stream_event_count().unwrap(), 1);
 
-        store.record_log(&LogEntry::warn("builder", "stderr noise")).unwrap();
-        store.record_log(&LogEntry::error("runtime", "boom")).unwrap();
+        store
+            .record_log(&LogEntry::warn("builder", "stderr noise"))
+            .unwrap();
+        store
+            .record_log(&LogEntry::error("runtime", "boom"))
+            .unwrap();
         let logs = store.recent_logs(10).unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].message, "stderr noise");
@@ -657,8 +686,18 @@ mod tests {
     fn upsert_team_snapshots_roster() {
         let store = store();
         let config = TeamConfig::new("mixed", "/tmp/ws")
-            .with_member(TeamMember::new("builder", "Builder", BackendKind::Codex, "impl"))
-            .with_member(TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review"));
+            .with_member(TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+            ))
+            .with_member(TeamMember::new(
+                "reviewer",
+                "Reviewer",
+                BackendKind::Claude,
+                "review",
+            ));
         store.upsert_team(&config).unwrap();
         // Idempotent: a second snapshot replaces, not appends.
         store.upsert_team(&config).unwrap();

@@ -428,7 +428,8 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_json() {
-        let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+        let mut member =
+            TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
         member.sandbox = SandboxPolicy::WorkspaceWrite;
         member.allowed_tools = vec!["shell".to_string()];
         let config = TeamConfig::new("t", "/tmp/ws").with_member(member);

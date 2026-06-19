@@ -51,14 +51,24 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let builder = MemberId::new("builder");
         store
-            .upsert_session(&builder, BackendKind::Codex, &AgentSessionId("t-1".to_string()))
+            .upsert_session(
+                &builder,
+                BackendKind::Codex,
+                &AgentSessionId("t-1".to_string()),
+            )
             .unwrap();
 
-        let mut registry = SessionRegistry::from_store(&store, &[builder.clone()]);
-        assert_eq!(registry.get(&builder), Some(AgentSessionId("t-1".to_string())));
+        let mut registry = SessionRegistry::from_store(&store, std::slice::from_ref(&builder));
+        assert_eq!(
+            registry.get(&builder),
+            Some(AgentSessionId("t-1".to_string()))
+        );
 
         registry.set(builder.clone(), AgentSessionId("t-2".to_string()));
-        assert_eq!(registry.get(&builder), Some(AgentSessionId("t-2".to_string())));
+        assert_eq!(
+            registry.get(&builder),
+            Some(AgentSessionId("t-2".to_string()))
+        );
 
         registry.clear(&builder);
         assert_eq!(registry.get(&builder), None);

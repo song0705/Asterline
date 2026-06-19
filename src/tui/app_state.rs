@@ -5,9 +5,7 @@
 use std::collections::HashMap;
 
 use crate::adapter::parser::summarize;
-use crate::domain::event::{
-    ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, RuntimeEvent,
-};
+use crate::domain::event::{ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, RuntimeEvent};
 use crate::domain::team::{BackendKind, MemberId};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;

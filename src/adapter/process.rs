@@ -63,7 +63,9 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
     }
 
     fn run(&self, req: RunRequest, events: Sender<AgentEvent>) {
-        let command = self.adapter.build_command(&req.prompt, req.session.as_ref());
+        let command = self
+            .adapter
+            .build_command(&req.prompt, req.session.as_ref());
         let parser = self.adapter.parser();
         run_streaming(command, parser, req.cancel, events);
     }
@@ -205,7 +207,11 @@ mod tests {
         fn backend(&self) -> BackendKind {
             BackendKind::Codex
         }
-        fn build_command(&self, _prompt: &str, _session: Option<&AgentSessionId>) -> AdapterCommand {
+        fn build_command(
+            &self,
+            _prompt: &str,
+            _session: Option<&AgentSessionId>,
+        ) -> AdapterCommand {
             AdapterCommand {
                 program: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), self.script.clone()],
@@ -246,7 +252,10 @@ mod tests {
         assert!(events.contains(&AgentEvent::TextDelta("two".to_string())));
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::Exited { ok: true, code: Some(0) }
+            AgentEvent::Exited {
+                ok: true,
+                code: Some(0)
+            }
         )));
         // Each stdout line is also emitted raw for persistence.
         assert_eq!(
@@ -277,7 +286,10 @@ mod tests {
         assert!(events.contains(&AgentEvent::Stderr("boom".to_string())));
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::Exited { ok: false, code: Some(3) }
+            AgentEvent::Exited {
+                ok: false,
+                code: Some(3)
+            }
         )));
     }
 
@@ -324,7 +336,10 @@ mod tests {
         });
         // Wait for first output, then cancel.
         let first = rx.recv().expect("first event");
-        assert!(matches!(first, AgentEvent::Raw(_) | AgentEvent::TextDelta(_)));
+        assert!(matches!(
+            first,
+            AgentEvent::Raw(_) | AgentEvent::TextDelta(_)
+        ));
         cancel.store(true, Ordering::Relaxed);
         handle.join().expect("runner finishes after cancel");
 

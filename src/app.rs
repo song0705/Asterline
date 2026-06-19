@@ -13,7 +13,7 @@ use crate::adapter::{FakeRunner, MemberRunner, runner_for};
 use crate::domain::config::{default_team, detect_backends, load_team_config};
 use crate::domain::event::RuntimeEvent;
 use crate::domain::team::TeamConfig;
-use crate::runtime::{self, RuntimeHandle, Runners};
+use crate::runtime::{self, Runners, RuntimeHandle};
 use crate::store::sqlite::SqliteStore;
 use crate::tui;
 use crate::tui::app_state::AppState;
@@ -157,7 +157,10 @@ fn build_protocol(me: &str, teammates: &[String]) -> String {
     if teammates.is_empty() {
         protocol.push_str("You are the only member; there are no teammates to message.\n");
     } else {
-        protocol.push_str(&format!("Teammates you can message: {}.\n", teammates.join(", ")));
+        protocol.push_str(&format!(
+            "Teammates you can message: {}.\n",
+            teammates.join(", ")
+        ));
     }
     protocol.push_str("All other text you write is shown to the user.");
     protocol
@@ -186,7 +189,9 @@ impl AppConfig {
         while index < args.len() {
             let arg = args[index].as_str();
             match arg {
-                "--team" => config.team_path = Some(Self::value(&args, &mut index, "--team")?.into()),
+                "--team" => {
+                    config.team_path = Some(Self::value(&args, &mut index, "--team")?.into())
+                }
                 "--workspace" => {
                     config.workspace = Some(Self::value(&args, &mut index, "--workspace")?.into())
                 }
@@ -201,9 +206,7 @@ impl AppConfig {
                 _ if arg.starts_with("--workspace=") => {
                     config.workspace = Some(arg["--workspace=".len()..].into())
                 }
-                _ if arg.starts_with("--db=") => {
-                    config.db_path = Some(arg["--db=".len()..].into())
-                }
+                _ if arg.starts_with("--db=") => config.db_path = Some(arg["--db=".len()..].into()),
                 unknown => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -219,7 +222,10 @@ impl AppConfig {
     fn value(args: &[String], index: &mut usize, flag: &str) -> io::Result<String> {
         *index += 1;
         args.get(*index).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("{flag} requires a value"))
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{flag} requires a value"),
+            )
         })
     }
 
@@ -293,7 +299,9 @@ mod tests {
         )
         .unwrap();
         inject_team_protocol(&mut team);
-        let builder = team.member(&crate::domain::team::MemberId::new("builder")).unwrap();
+        let builder = team
+            .member(&crate::domain::team::MemberId::new("builder"))
+            .unwrap();
         let prompt = builder.system_prompt.as_ref().unwrap();
         assert!(prompt.contains("@@team_message"));
         assert!(prompt.contains("reviewer"));

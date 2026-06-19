@@ -156,7 +156,9 @@ impl ClaudeLineParser {
         };
         for block in content {
             if str_field(block, "type") == Some("tool_result") {
-                let id = str_field(block, "tool_use_id").unwrap_or_default().to_string();
+                let id = str_field(block, "tool_use_id")
+                    .unwrap_or_default()
+                    .to_string();
                 let is_error = block
                     .get("is_error")
                     .and_then(Value::as_bool)
@@ -262,21 +264,33 @@ mod tests {
 
     #[test]
     fn command_uses_stream_json_and_resume() {
-        let mut member =
-            TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+        let mut member = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
         member.permission_mode = Some(PermissionMode::Plan);
         member.allowed_tools = vec!["Read".to_string(), "Bash".to_string()];
         let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
 
-        let command =
-            adapter.build_command("hello", Some(&AgentSessionId("sess-1".to_string())));
+        let command = adapter.build_command("hello", Some(&AgentSessionId("sess-1".to_string())));
         assert_eq!(command.program, "claude");
         assert!(command.args.contains(&"--output-format".to_string()));
         assert!(command.args.contains(&"stream-json".to_string()));
-        assert!(command.args.contains(&"--include-partial-messages".to_string()));
+        assert!(
+            command
+                .args
+                .contains(&"--include-partial-messages".to_string())
+        );
         assert!(command.args.windows(2).any(|w| w == ["--resume", "sess-1"]));
-        assert!(command.args.windows(2).any(|w| w == ["--permission-mode", "plan"]));
-        assert!(command.args.windows(2).any(|w| w == ["--allowed-tools", "Read,Bash"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "plan"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--allowed-tools", "Read,Bash"])
+        );
         assert_eq!(command.args.last().unwrap(), "hello");
         // The product path never disables session persistence.
         assert!(!command.args.iter().any(|a| a == "--no-session-persistence"));
@@ -343,9 +357,11 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}}"#,
             r#"{"type":"result","subtype":"success","is_error":false,"result":"partial","session_id":"sess-z"}"#,
         ]);
-        assert!(events.contains(&AgentEvent::SessionDiscovered(AgentSessionId(
-            "sess-z".to_string()
-        ))));
+        assert!(
+            events.contains(&AgentEvent::SessionDiscovered(AgentSessionId(
+                "sess-z".to_string()
+            )))
+        );
         assert!(events.contains(&AgentEvent::MessageCompleted("partial".to_string())));
     }
 

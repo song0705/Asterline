@@ -9,10 +9,7 @@ pub fn risky_action_kind(body: &str) -> Option<&'static str> {
     let lower = body.to_ascii_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
 
-    if words.iter().any(|word| *word == "git")
-        || lower.starts_with("git ")
-        || lower.contains(" git ")
-    {
+    if words.contains(&"git") || lower.starts_with("git ") || lower.contains(" git ") {
         return Some("git");
     }
 

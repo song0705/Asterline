@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::event::{
-    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, LogEntry, MemberStatus, MemberSummary,
-    MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
+    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, LogEntry, MemberStatus,
+    MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
 };
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
@@ -162,7 +162,8 @@ impl TeamRuntime {
                 if let Some((target, body)) = self.last_user.clone() {
                     self.handle_user_message(target, body, &mut step);
                 } else {
-                    step.events.push(RuntimeEvent::Notice("nothing to retry".to_string()));
+                    step.events
+                        .push(RuntimeEvent::Notice("nothing to retry".to_string()));
                 }
             }
             UiCommand::Approve { id, decision } => self.handle_approval(id, decision, &mut step),
@@ -190,8 +191,9 @@ impl TeamRuntime {
                 .push(RuntimeEvent::Notice(format!("unknown member: {name}")));
         }
         if targets.is_empty() {
-            step.events
-                .push(RuntimeEvent::Notice("no matching member for message".to_string()));
+            step.events.push(RuntimeEvent::Notice(
+                "no matching member for message".to_string(),
+            ));
             return;
         }
 
@@ -292,9 +294,16 @@ impl TeamRuntime {
         }
     }
 
-    fn handle_approval(&mut self, id: ApprovalId, decision: ApprovalDecision, step: &mut RuntimeStep) {
+    fn handle_approval(
+        &mut self,
+        id: ApprovalId,
+        decision: ApprovalDecision,
+        step: &mut RuntimeStep,
+    ) {
         match self.store.resolve_approval(id, decision) {
-            Ok(true) => step.events.push(RuntimeEvent::ApprovalResolved { id, decision }),
+            Ok(true) => step
+                .events
+                .push(RuntimeEvent::ApprovalResolved { id, decision }),
             _ => {
                 step.events
                     .push(RuntimeEvent::Notice(format!("no pending approval {id}")));
@@ -392,7 +401,9 @@ impl TeamRuntime {
                     .and_then(|s| s.tools.remove(&id))
                     .unwrap_or_else(|| "tool".to_string());
                 if let Some(turn) = self.running_turn(member) {
-                    let _ = self.store.record_tool(turn, member, &name, &summary, Some(ok));
+                    let _ = self
+                        .store
+                        .record_tool(turn, member, &name, &summary, Some(ok));
                 }
                 step.events.push(RuntimeEvent::ToolCompleted {
                     member: member.clone(),
@@ -413,7 +424,9 @@ impl TeamRuntime {
             AgentEvent::Raw(line) => {
                 let _ = self.store.record_stream_event(member, &line);
             }
-            AgentEvent::Stderr(line) => self.log(member, LogEntry::warn(member.as_str(), line), &mut step),
+            AgentEvent::Stderr(line) => {
+                self.log(member, LogEntry::warn(member.as_str(), line), &mut step)
+            }
             AgentEvent::Log(message) => {
                 self.log(member, LogEntry::info(member.as_str(), message), &mut step)
             }
@@ -472,7 +485,11 @@ impl TeamRuntime {
 
         let parsed = parse_agent_output(&text);
         for warning in &parsed.warnings {
-            self.log(member, LogEntry::warn(member.as_str(), warning.clone()), step);
+            self.log(
+                member,
+                LogEntry::warn(member.as_str(), warning.clone()),
+                step,
+            );
         }
 
         if !parsed.visible_text.is_empty() {
@@ -532,7 +549,15 @@ impl TeamRuntime {
 
         let prompt = relay_prompt(&self.member_display(from), &tmsg.body);
         if self.relay_paused {
-            self.pause_route(turn, from, resolved.members, to_labels, tmsg.body, "relay paused by user", step);
+            self.pause_route(
+                turn,
+                from,
+                resolved.members,
+                to_labels,
+                tmsg.body,
+                "relay paused by user",
+                step,
+            );
             return;
         }
         match self.relay.record_auto_relay(turn, from) {
@@ -582,7 +607,13 @@ impl TeamRuntime {
         });
     }
 
-    fn finalize_run(&mut self, member: &MemberId, code: Option<i32>, ok: bool, step: &mut RuntimeStep) {
+    fn finalize_run(
+        &mut self,
+        member: &MemberId,
+        code: Option<i32>,
+        ok: bool,
+        step: &mut RuntimeStep,
+    ) {
         // Flush an unterminated streaming message.
         let pending_text = self.members.get(member).and_then(|s| {
             s.running
@@ -603,7 +634,8 @@ impl TeamRuntime {
             let message = format!(
                 "{} exited without success (code {})",
                 self.member_backend(member),
-                code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string())
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
             );
             let _ = self.store.record_error(Some(turn), Some(member), &message);
             step.events.push(RuntimeEvent::MemberError {
@@ -635,7 +667,13 @@ impl TeamRuntime {
 
     // === queueing / dispatch ============================================
 
-    fn enqueue_prompt(&mut self, member: &MemberId, turn: TurnId, prompt: String, step: &mut RuntimeStep) {
+    fn enqueue_prompt(
+        &mut self,
+        member: &MemberId,
+        turn: TurnId,
+        prompt: String,
+        step: &mut RuntimeStep,
+    ) {
         let busy = self
             .members
             .get(member)
@@ -655,7 +693,13 @@ impl TeamRuntime {
         }
     }
 
-    fn start_run(&mut self, member: &MemberId, turn: TurnId, prompt: String, step: &mut RuntimeStep) {
+    fn start_run(
+        &mut self,
+        member: &MemberId,
+        turn: TurnId,
+        prompt: String,
+        step: &mut RuntimeStep,
+    ) {
         let session = if self.member_uses_resume(member) {
             self.sessions.get(member)
         } else {
@@ -764,8 +808,18 @@ mod tests {
 
     fn team() -> TeamConfig {
         let mut config = TeamConfig::new("mixed", "/tmp/ws")
-            .with_member(TeamMember::new("builder", "Builder", BackendKind::Codex, "impl"))
-            .with_member(TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review"));
+            .with_member(TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+            ))
+            .with_member(TeamMember::new(
+                "reviewer",
+                "Reviewer",
+                BackendKind::Claude,
+                "review",
+            ));
         config.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
         config
     }
@@ -788,10 +842,17 @@ mod tests {
 
         assert_eq!(step.actions.len(), 1);
         assert_eq!(step.actions[0].member, MemberId::new("builder"));
-        assert!(step.events.iter().any(|e| matches!(e, RuntimeEvent::TurnStarted { .. })));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::TurnStarted { .. }))
+        );
         assert!(step.events.iter().any(|e| matches!(
             e,
-            RuntimeEvent::MemberStatus { status: MemberStatus::Running, .. }
+            RuntimeEvent::MemberStatus {
+                status: MemberStatus::Running,
+                ..
+            }
         )));
     }
 
@@ -807,8 +868,18 @@ mod tests {
             RuntimeEvent::MessageCompleted { text, .. } if text == "done"
         )));
 
-        let step = rt.on_agent_event(&builder, AgentEvent::Exited { code: Some(0), ok: true });
-        assert!(step.events.iter().any(|e| matches!(e, RuntimeEvent::TurnFinished { .. })));
+        let step = rt.on_agent_event(
+            &builder,
+            AgentEvent::Exited {
+                code: Some(0),
+                ok: true,
+            },
+        );
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::TurnFinished { .. }))
+        );
 
         let items = rt.store.replay_chat().unwrap();
         assert!(items.iter().any(|i| matches!(
@@ -835,7 +906,11 @@ mod tests {
             RuntimeEvent::Route { to, .. } if to == &vec!["reviewer".to_string()]
         )));
         // The relay is dispatched to the reviewer.
-        assert!(step.actions.iter().any(|a| a.member == MemberId::new("reviewer")));
+        assert!(
+            step.actions
+                .iter()
+                .any(|a| a.member == MemberId::new("reviewer"))
+        );
         assert!(step.actions[0].prompt.contains("please review"));
     }
 
@@ -872,13 +947,25 @@ mod tests {
         });
         assert!(step.events.iter().any(|e| matches!(
             e,
-            RuntimeEvent::MemberStatus { status: MemberStatus::Queued, .. }
+            RuntimeEvent::MemberStatus {
+                status: MemberStatus::Queued,
+                ..
+            }
         )));
-        assert!(step.actions.is_empty(), "busy member does not start a second run");
+        assert!(
+            step.actions.is_empty(),
+            "busy member does not start a second run"
+        );
 
         // Finishing the first run starts the queued prompt.
         rt.on_agent_event(&builder, AgentEvent::MessageCompleted("a".to_string()));
-        let step = rt.on_agent_event(&builder, AgentEvent::Exited { code: Some(0), ok: true });
+        let step = rt.on_agent_event(
+            &builder,
+            AgentEvent::Exited {
+                code: Some(0),
+                ok: true,
+            },
+        );
         assert!(step.actions.iter().any(|a| a.prompt == "second"));
     }
 
@@ -895,35 +982,61 @@ mod tests {
                 r#"@@team_message {"to":"reviewer","body":"check"}"#.to_string(),
             ),
         );
-        assert!(step.events.iter().any(|e| matches!(e, RuntimeEvent::RoutePaused { .. })));
-        assert!(!step.actions.iter().any(|a| a.member == MemberId::new("reviewer")));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::RoutePaused { .. }))
+        );
+        assert!(
+            !step
+                .actions
+                .iter()
+                .any(|a| a.member == MemberId::new("reviewer"))
+        );
 
         // Resolving with resume delivers it.
         let step = rt.on_ui_command(UiCommand::ResolvePausedRoute { resume: true });
-        assert!(step.actions.iter().any(|a| a.member == MemberId::new("reviewer")));
+        assert!(
+            step.actions
+                .iter()
+                .any(|a| a.member == MemberId::new("reviewer"))
+        );
     }
 
     #[test]
     fn relay_guard_pauses_after_limit() {
         let mut config = team();
         config.max_auto_relays = 1;
-        let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+        let mut rt =
+            TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
         rt.on_ui_command(user("go"));
         let builder = MemberId::new("builder");
 
         // First relay: delivered.
         let step = rt.on_agent_event(
             &builder,
-            AgentEvent::MessageCompleted(r#"@@team_message {"to":"reviewer","body":"1"}"#.to_string()),
+            AgentEvent::MessageCompleted(
+                r#"@@team_message {"to":"reviewer","body":"1"}"#.to_string(),
+            ),
         );
-        assert!(step.actions.iter().any(|a| a.member == MemberId::new("reviewer")));
+        assert!(
+            step.actions
+                .iter()
+                .any(|a| a.member == MemberId::new("reviewer"))
+        );
 
         // Second relay from the same member in the same turn: paused.
         let step = rt.on_agent_event(
             &builder,
-            AgentEvent::MessageCompleted(r#"@@team_message {"to":"reviewer","body":"2"}"#.to_string()),
+            AgentEvent::MessageCompleted(
+                r#"@@team_message {"to":"reviewer","body":"2"}"#.to_string(),
+            ),
         );
-        assert!(step.events.iter().any(|e| matches!(e, RuntimeEvent::RoutePaused { .. })));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::RoutePaused { .. }))
+        );
     }
 
     #[test]
@@ -936,7 +1049,11 @@ mod tests {
             &builder,
             AgentEvent::SessionDiscovered(AgentSessionId("thread-1".to_string())),
         );
-        assert!(step.events.iter().any(|e| matches!(e, RuntimeEvent::SessionUpdated { .. })));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::SessionUpdated { .. }))
+        );
         assert_eq!(
             rt.store.session_for(&builder).unwrap(),
             Some(AgentSessionId("thread-1".to_string()))
@@ -959,7 +1076,11 @@ mod tests {
             id,
             decision: ApprovalDecision::Approve,
         });
-        assert!(step.actions.iter().any(|a| a.member == MemberId::new("builder")));
+        assert!(
+            step.actions
+                .iter()
+                .any(|a| a.member == MemberId::new("builder"))
+        );
     }
 
     #[test]
@@ -970,9 +1091,16 @@ mod tests {
 
         rt.on_agent_event(&reviewer_unused, AgentEvent::MessageStarted);
         let step = rt.on_agent_event(&reviewer_unused, AgentEvent::TextDelta("Hel".to_string()));
-        assert!(step.events.iter().any(|e| matches!(e, RuntimeEvent::MessageDelta { .. })));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::MessageDelta { .. }))
+        );
         rt.on_agent_event(&reviewer_unused, AgentEvent::TextDelta("lo".to_string()));
-        let step = rt.on_agent_event(&reviewer_unused, AgentEvent::MessageCompleted("Hello".to_string()));
+        let step = rt.on_agent_event(
+            &reviewer_unused,
+            AgentEvent::MessageCompleted("Hello".to_string()),
+        );
         assert!(step.events.iter().any(|e| matches!(
             e,
             RuntimeEvent::MessageCompleted { text, .. } if text == "Hello"

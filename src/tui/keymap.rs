@@ -71,8 +71,14 @@ mod tests {
 
     #[test]
     fn core_bindings_resolve() {
-        assert_eq!(resolve(key(KeyCode::Enter, KeyModifiers::NONE)), Some(Action::Submit));
-        assert_eq!(resolve(key(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::CloseOverlay));
+        assert_eq!(
+            resolve(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Action::CloseOverlay)
+        );
         assert_eq!(
             resolve(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Action::Interrupt)
@@ -90,6 +96,9 @@ mod tests {
     #[test]
     fn control_letters_are_not_inserted_as_text() {
         // Ctrl+x is unbound, but must not be typed into the composer.
-        assert_eq!(resolve(key(KeyCode::Char('x'), KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            resolve(key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            None
+        );
     }
 }

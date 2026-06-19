@@ -112,7 +112,10 @@ impl CodexLineParser {
                 )]
             }
             Some("command_execution") => {
-                let summary = summarize(str_field(item, "command").unwrap_or_default(), TOOL_SUMMARY_MAX);
+                let summary = summarize(
+                    str_field(item, "command").unwrap_or_default(),
+                    TOOL_SUMMARY_MAX,
+                );
                 match phase {
                     Phase::Started => vec![AgentEvent::ToolStarted {
                         id,
@@ -120,7 +123,8 @@ impl CodexLineParser {
                         summary,
                     }],
                     Phase::Completed => {
-                        let exit_ok = item.get("exit_code").and_then(Value::as_i64).unwrap_or(0) == 0;
+                        let exit_ok =
+                            item.get("exit_code").and_then(Value::as_i64).unwrap_or(0) == 0;
                         vec![AgentEvent::ToolCompleted {
                             id,
                             ok: status == "completed" && exit_ok,
@@ -161,7 +165,10 @@ impl CodexLineParser {
                 }
             }
             Some("web_search") => {
-                let query = summarize(str_field(item, "query").unwrap_or_default(), TOOL_SUMMARY_MAX);
+                let query = summarize(
+                    str_field(item, "query").unwrap_or_default(),
+                    TOOL_SUMMARY_MAX,
+                );
                 match phase {
                     Phase::Started => vec![AgentEvent::ToolStarted {
                         id,
@@ -201,7 +208,9 @@ impl LineParser for CodexLineParser {
 
         match str_field(&value, "type") {
             Some("thread.started") => match str_field(&value, "thread_id") {
-                Some(id) => vec![AgentEvent::SessionDiscovered(AgentSessionId(id.to_string()))],
+                Some(id) => vec![AgentEvent::SessionDiscovered(AgentSessionId(
+                    id.to_string(),
+                ))],
                 None => Vec::new(),
             },
             Some("turn.started") | Some("turn.completed") => Vec::new(),
@@ -274,10 +283,12 @@ mod tests {
     fn resume_command_uses_resume_subcommand_with_session() {
         let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
         let adapter = CodexStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
-        let command =
-            adapter.build_command("again", Some(&AgentSessionId("thread-9".to_string())));
+        let command = adapter.build_command("again", Some(&AgentSessionId("thread-9".to_string())));
 
-        assert_eq!(&command.args[0..2], &["exec".to_string(), "resume".to_string()]);
+        assert_eq!(
+            &command.args[0..2],
+            &["exec".to_string(), "resume".to_string()]
+        );
         assert!(command.args.contains(&"thread-9".to_string()));
         assert_eq!(command.args.last().unwrap(), "again");
     }
@@ -303,7 +314,10 @@ mod tests {
         let completed = parse_all(&[
             r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Done."}}"#,
         ]);
-        assert_eq!(completed, vec![AgentEvent::MessageCompleted("Done.".to_string())]);
+        assert_eq!(
+            completed,
+            vec![AgentEvent::MessageCompleted("Done.".to_string())]
+        );
     }
 
     #[test]
@@ -342,9 +356,7 @@ mod tests {
 
     #[test]
     fn turn_failed_is_fatal() {
-        let events = parse_all(&[
-            r#"{"type":"turn.failed","error":{"message":"model error"}}"#,
-        ]);
+        let events = parse_all(&[r#"{"type":"turn.failed","error":{"message":"model error"}}"#]);
         assert_eq!(events, vec![AgentEvent::Fatal("model error".to_string())]);
     }
 

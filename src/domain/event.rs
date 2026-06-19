@@ -429,7 +429,10 @@ mod tests {
 
     #[test]
     fn route_to_display() {
-        assert_eq!(RouteTo::Member("reviewer".to_string()).to_string(), "reviewer");
+        assert_eq!(
+            RouteTo::Member("reviewer".to_string()).to_string(),
+            "reviewer"
+        );
         assert_eq!(RouteTo::All.to_string(), "all");
     }
 }

@@ -59,7 +59,9 @@ pub fn spawn(
         tx: input_tx.clone(),
     };
     let join = thread::spawn(move || {
-        run_loop(config, store, runners, events, approvals, input_tx, input_rx);
+        run_loop(
+            config, store, runners, events, approvals, input_tx, input_rx,
+        );
     });
     (handle, join)
 }

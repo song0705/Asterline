@@ -56,7 +56,10 @@ fn binary_in_dirs(dirs: &[PathBuf], name: &str) -> bool {
 /// Build a default in-memory roster from the detected backends:
 /// both -> mixed (codex builder + claude reviewer), one -> single-backend team,
 /// none -> `None` (the caller should show a setup/error state).
-pub fn default_team(workspace: impl Into<PathBuf>, detected: DetectedBackends) -> Option<TeamConfig> {
+pub fn default_team(
+    workspace: impl Into<PathBuf>,
+    detected: DetectedBackends,
+) -> Option<TeamConfig> {
     let workspace = workspace.into();
     match (detected.codex, detected.claude) {
         (true, true) => {
@@ -156,7 +159,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("asterline-cfg-load-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("team.json");
-        let config = default_team(&dir, DetectedBackends { codex: true, claude: true }).unwrap();
+        let config = default_team(
+            &dir,
+            DetectedBackends {
+                codex: true,
+                claude: true,
+            },
+        )
+        .unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
         let loaded = load_team_config(&path).expect("config loads");

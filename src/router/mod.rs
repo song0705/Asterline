@@ -83,22 +83,14 @@ mod tests {
 
     #[test]
     fn resolves_named_member() {
-        let resolved = resolve_targets(
-            &team(),
-            &[RouteTo::Member("reviewer".to_string())],
-            None,
-        );
+        let resolved = resolve_targets(&team(), &[RouteTo::Member("reviewer".to_string())], None);
         assert_eq!(resolved.members, vec![MemberId::new("reviewer")]);
         assert!(resolved.unknown.is_empty());
     }
 
     #[test]
     fn resolves_by_display_name() {
-        let resolved = resolve_targets(
-            &team(),
-            &[RouteTo::Member("Builder".to_string())],
-            None,
-        );
+        let resolved = resolve_targets(&team(), &[RouteTo::Member("Builder".to_string())], None);
         assert_eq!(resolved.members, vec![MemberId::new("builder")]);
     }
 
@@ -111,11 +103,7 @@ mod tests {
 
     #[test]
     fn unknown_target_is_reported() {
-        let resolved = resolve_targets(
-            &team(),
-            &[RouteTo::Member("ghost".to_string())],
-            None,
-        );
+        let resolved = resolve_targets(&team(), &[RouteTo::Member("ghost".to_string())], None);
         assert!(resolved.members.is_empty());
         assert_eq!(resolved.unknown, vec!["ghost".to_string()]);
     }

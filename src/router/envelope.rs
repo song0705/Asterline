@@ -116,8 +116,7 @@ mod tests {
 
     #[test]
     fn parses_single_string_target() {
-        let parsed =
-            parse_agent_output(r#"@@team_message {"to":"builder","body":"do the thing"}"#);
+        let parsed = parse_agent_output(r#"@@team_message {"to":"builder","body":"do the thing"}"#);
 
         assert_eq!(
             parsed.messages,
@@ -195,7 +194,10 @@ mod tests {
 
         assert!(parsed.messages.is_empty());
         assert!(parsed.warnings.is_empty());
-        assert_eq!(parsed.visible_text, "just some normal output\nwith two lines");
+        assert_eq!(
+            parsed.visible_text,
+            "just some normal output\nwith two lines"
+        );
     }
 
     #[test]

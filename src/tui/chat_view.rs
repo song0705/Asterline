@@ -38,10 +38,16 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = Line::from(vec![
         Span::styled(
             format!(" {} ", state.team()),
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(state.workspace().to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            state.workspace().to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
 
     let mut chips = Vec::new();
@@ -106,7 +112,9 @@ fn render_item(item: &ChatItem, width: usize, out: &mut Vec<Line<'static>>) {
         ChatItem::User { body } => {
             out.push(Line::from(Span::styled(
                 "You",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )));
             push_wrapped(body, width, "  ", Style::default(), out);
             out.push(Line::raw(""));
@@ -154,7 +162,9 @@ fn render_item(item: &ChatItem, width: usize, out: &mut Vec<Line<'static>>) {
         ChatItem::Route { from, to, body } => {
             out.push(Line::from(Span::styled(
                 format!("{from} → {}", to.join(", ")),
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             )));
             push_wrapped(body, width, "  ", Style::default().fg(Color::Magenta), out);
             out.push(Line::raw(""));
@@ -184,7 +194,13 @@ fn render_item(item: &ChatItem, width: usize, out: &mut Vec<Line<'static>>) {
     }
 }
 
-fn push_wrapped(text: &str, width: usize, indent: &str, style: Style, out: &mut Vec<Line<'static>>) {
+fn push_wrapped(
+    text: &str,
+    width: usize,
+    indent: &str,
+    style: Style,
+    out: &mut Vec<Line<'static>>,
+) {
     let wrap_width = width.saturating_sub(indent.len()).max(1);
     for line in wrap(text, wrap_width) {
         out.push(Line::from(Span::styled(format!("{indent}{line}"), style)));
@@ -215,7 +231,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut hints =
         "Enter send · Ctrl+L logs · Ctrl+R team · Ctrl+P commands · Ctrl+C cancel/quit".to_string();
     if state.paused_routes() > 0 {
-        hints.push_str(&format!("  ·  {} paused route(s): /retry", state.paused_routes()));
+        hints.push_str(&format!(
+            "  ·  {} paused route(s): /retry",
+            state.paused_routes()
+        ));
     }
     if !state.pending_approvals().is_empty() {
         hints.push_str(&format!(
@@ -224,7 +243,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(Color::DarkGray)))),
+        Paragraph::new(Line::from(Span::styled(
+            hints,
+            Style::default().fg(Color::DarkGray),
+        ))),
         area,
     );
 }
@@ -263,7 +285,10 @@ fn drawer_logs(state: &AppState) -> Vec<Line<'static>> {
                     format!("{:<5}", entry.level.as_str()),
                     Style::default().fg(log_color(entry.level)),
                 ),
-                Span::styled(format!(" {} ", entry.source), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {} ", entry.source),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(entry.message.clone()),
             ])
         })
@@ -446,6 +471,9 @@ mod tests {
 
     #[test]
     fn wrap_preserves_blank_lines() {
-        assert_eq!(wrap("a\n\nb", 10), vec!["a".to_string(), String::new(), "b".to_string()]);
+        assert_eq!(
+            wrap("a\n\nb", 10),
+            vec!["a".to_string(), String::new(), "b".to_string()]
+        );
     }
 }

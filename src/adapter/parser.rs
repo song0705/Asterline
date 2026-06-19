@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn summarize_collapses_and_truncates() {
-        assert_eq!(summarize("hello   world\n  again", 100), "hello world again");
+        assert_eq!(
+            summarize("hello   world\n  again", 100),
+            "hello world again"
+        );
         assert_eq!(summarize("abcdefghij", 5), "abcd…");
     }
 }

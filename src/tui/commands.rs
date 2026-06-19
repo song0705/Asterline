@@ -142,7 +142,10 @@ mod tests {
     fn drawer_and_control_commands() {
         assert_eq!(parse("/logs"), Submission::Drawer(Drawer::Logs));
         assert_eq!(parse("/team"), Submission::Drawer(Drawer::Team));
-        assert_eq!(parse("/abort"), Submission::Runtime(UiCommand::Cancel { member: None }));
+        assert_eq!(
+            parse("/abort"),
+            Submission::Runtime(UiCommand::Cancel { member: None })
+        );
         assert_eq!(parse("/retry"), Submission::Runtime(UiCommand::Retry));
         assert_eq!(
             parse("/approve"),

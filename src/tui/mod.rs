@@ -31,7 +31,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Run the TUI to completion. `events` delivers runtime events; `handle` sends
 /// commands back. On exit the runtime is asked to shut down.
-pub fn run(handle: RuntimeHandle, events: Receiver<RuntimeEvent>, mut state: AppState) -> io::Result<()> {
+pub fn run(
+    handle: RuntimeHandle,
+    events: Receiver<RuntimeEvent>,
+    mut state: AppState,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

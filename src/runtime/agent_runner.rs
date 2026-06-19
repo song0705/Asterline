@@ -1,8 +1,8 @@
 //! Transport: dispatch a member run on a worker thread and forward its
 //! [`AgentEvent`]s back to the runtime loop, tagged with the member.
 
-use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use crate::adapter::{MemberRunner, RunRequest};

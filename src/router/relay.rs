@@ -36,10 +36,7 @@ impl RelayGuard {
     /// Record one automatic relay initiated by `sender` during `turn`.
     /// Returns [`RelayDecision::Pause`] once the sender exceeds the limit.
     pub fn record_auto_relay(&mut self, turn: TurnId, sender: &MemberId) -> RelayDecision {
-        let count = self
-            .counts
-            .entry((turn, sender.clone()))
-            .or_insert(0);
+        let count = self.counts.entry((turn, sender.clone())).or_insert(0);
         *count = count.saturating_add(1);
 
         if *count > self.max_auto_relays {
