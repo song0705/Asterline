@@ -629,12 +629,17 @@ impl TeamRuntime {
             self.complete_message(member, text, step);
         }
 
-        let turn = match self.members.get_mut(member).and_then(|s| s.running.take()) {
-            Some(running) => running.turn,
+        let (turn, cancelled) = match self.members.get_mut(member).and_then(|s| s.running.take()) {
+            Some(running) => (running.turn, running.cancel.load(Ordering::Relaxed)),
             None => return,
         };
 
-        if !ok {
+        if cancelled {
+            // A user-requested cancel kills the process (no exit code); that is
+            // expected, not an error.
+            step.events
+                .push(RuntimeEvent::Notice(format!("{member} cancelled")));
+        } else if !ok {
             let message = format!(
                 "{} exited without success (code {})",
                 self.member_backend(member),
@@ -1108,6 +1113,31 @@ mod tests {
         assert!(step.events.iter().any(|e| matches!(
             e,
             RuntimeEvent::MessageCompleted { text, .. } if text == "Hello"
+        )));
+    }
+
+    #[test]
+    fn cancelled_run_is_not_reported_as_error() {
+        let mut rt = runtime();
+        rt.on_ui_command(user("build it"));
+        let builder = MemberId::new("builder");
+
+        rt.on_ui_command(UiCommand::Cancel {
+            member: Some(builder.clone()),
+        });
+        // The killed process exits unsuccessfully with no exit code.
+        let step = rt.on_agent_event(&builder, AgentEvent::Exited { code: None, ok: false });
+
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::MemberError { .. })),
+            "a cancelled run must not surface as an error"
+        );
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            RuntimeEvent::Notice(text) if text.contains("cancelled")
         )));
     }
 }
