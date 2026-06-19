@@ -1,159 +1,161 @@
 # Asterline
 
-Asterline is a TUI-first multi-agent coding console for coordinating a user,
-Codex, and Claude Code from one terminal UI. It keeps inter-agent messages
-visible, routed through the local runtime, and persisted to SQLite.
-
-The current implementation is a working prototype based on `PLAN.md`. Fake
-agents are the default so the UI, routing, persistence, relay guard, approvals,
-and terminal log flows can be tested without spending real Codex or Claude
-usage.
-
-## Current Capabilities
-
-- Rust + Ratatui terminal UI with a composer, event log, and agent status pane.
-- Route selection for:
-  - `You -> Team`
-  - `You -> Codex`
-  - `You -> Claude`
-  - `Codex -> Claude`
-  - `Claude -> Codex`
-- Fake Codex and fake Claude adapters for deterministic collaboration tests.
-- Structured inter-agent envelope parsing:
-
-  ```text
-  @@team_message {"to":"claude","kind":"question","body":"Should we write tests first?"}
-  ```
-
-- SQLite event log for messages, terminal output, inter-agent messages, and approvals.
-- Auto-relay guard that pauses a thread after too many agent-to-agent hops.
-- User-controlled relay pause, pending relay queue, replay, and rejection.
-- Approval queue for risky-looking requests involving shell/file/git actions.
-- Real non-interactive adapters:
-  - Codex: `codex exec --json ...`
-  - Claude Code: `claude -p --output-format json ...`
-- PTY adapter support for launching CLI programs, injecting input, draining raw output,
-  resizing the PTY, waiting for exit, and stopping a running session.
-- Runtime PTY session manager for starting, writing to, draining, polling, and
-  stopping per-agent PTY sessions.
-
-## Run
-
-From the repository root:
-
-```bash
-cargo run
-```
-
-After the TUI opens, type a task in the bottom Composer and press `Enter`.
-Use `Tab` to choose whether the message goes to Team, Codex, Claude, or an
-agent-to-agent route. Press `F1` inside the TUI for the built-in help view.
-
-By default this starts fake Codex and fake Claude and stores data in:
+Asterline is a chat-first, TUI multi-agent coding console. You talk to a team
+of coding agents from one terminal; each member is a backend (`codex` or
+`claude`) bound to a role. You see every agent's streaming output, tool calls,
+and the messages agents send each other — all in one conversation, persisted to
+SQLite.
 
 ```text
-.asterline/asterline.sqlite3
+┌ Asterline · /path/to/project · Builder·codex running  Reviewer·claude idle ┐
+│ You  build the parser, then have the reviewer check it                      │
+│ Builder · codex   I'll start by reading the project structure…              │
+│   ⚙ shell: cargo test   [running]                                           │
+│ Builder → reviewer   implementation done, please check edge cases           │
+│ Reviewer · claude   Two issues: the lexer drops a trailing newline…         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ > @reviewer focus on the error paths                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Use a custom database path:
+## Highlights
+
+- **Single-column chat.** Agent text, tool calls, agent-to-agent routes, and
+  errors are inline conversation blocks. Logs live in a drawer, not the main view.
+- **Generic team roster.** A member is `backend + role + name`. All-Codex,
+  all-Claude, and mixed teams are all valid; role is not tied to backend.
+- **Real streaming backends.** Claude via `claude -p --output-format stream-json
+  --include-partial-messages`; Codex via `codex exec --json`. Each member keeps a
+  resumable session — no `--ephemeral`, no `--no-session-persistence`.
+- **Visible agent-to-agent messaging.** Agents talk by emitting
+  `@@team_message {"to":"reviewer","body":"…"}`; the runtime routes it, shows it
+  in chat, and persists it. A relay guard pauses runaway loops.
+- **Persisted + replayable.** Chat, tool events, routes, raw backend JSON, logs,
+  approvals, and sessions are stored in SQLite and replayed on startup.
+- **No function keys.** All actions are plain keys and `Ctrl` chords.
+
+## Install
 
 ```bash
-cargo run -- --db /tmp/asterline.sqlite3
+cargo install --path .   # or: just install
 ```
 
-Show CLI help:
+This installs two binaries into `~/.cargo/bin`: `asterline` and the short alias
+`ast`. Launch with either:
 
 ```bash
-cargo run -- --help
+ast                       # auto-detect codex/claude in the current directory
+asterline --workspace ~/code/project
 ```
 
-## Backend Modes
-
-Fake agents are the default:
+During development you can also run without installing:
 
 ```bash
-cargo run
+cargo run            # or: just run
+cargo run -- --fake  # offline fake agents (no real CLI usage)
 ```
 
-Use real non-interactive Codex and Claude Code backends:
+## Usage
 
-```bash
-cargo run -- --real-agents
+With no `--team`, Asterline detects which backends are installed and builds a
+default roster:
+
+- both `codex` and `claude` → a mixed team (`builder`·codex + `reviewer`·claude)
+- only one → a single-member team
+- neither → it prints a setup hint and exits
+
+### Options
+
+| Flag | Meaning |
+| --- | --- |
+| `--team <PATH>` | Load a team config (JSON). |
+| `--workspace <PATH>` | Working directory for members (default: cwd). |
+| `--db <PATH>` | SQLite path (default: `<workspace>/.asterline/asterline.sqlite3`). |
+| `--no-restore` | Don't replay persisted chat on startup. |
+| `--debug` | Disable the approval gate (developer mode). |
+| `--fake` | Use offline fake agents instead of real CLIs. |
+| `-h`, `--help` | Show help. |
+
+### Team config
+
+```json
+{
+  "name": "my-team",
+  "workspace": "/path/to/project",
+  "default_target": { "member": "builder" },
+  "max_auto_relays": 6,
+  "members": [
+    {
+      "id": "builder",
+      "display_name": "Builder",
+      "backend": "codex",
+      "role": "implementation",
+      "sandbox": "workspace-write"
+    },
+    {
+      "id": "reviewer",
+      "display_name": "Reviewer",
+      "backend": "claude",
+      "role": "review",
+      "permission_mode": "plan"
+    }
+  ]
+}
 ```
 
-Use one real backend at a time:
+### Keys
 
-```bash
-cargo run -- --real-codex
-cargo run -- --real-claude
+- `Enter` — send the composer.
+- `Esc` — close the open drawer.
+- `Ctrl+L` — logs drawer · `Ctrl+R` — team drawer · `Ctrl+P` — command palette.
+- `Ctrl+C` — cancel running members, else clear the composer, else quit.
+- `Ctrl+U` — clear line · `Ctrl+W` — delete word · `Ctrl+A`/`Ctrl+E` — line start/end.
+- `↑`/`↓`/`PageUp`/`PageDown` — scroll the conversation.
+
+### Slash commands
+
+- `/ask <member> <message>` or `@<member> <message>` — send to one member.
+- `/all <message>` — send to everyone.
+- `/team`, `/sessions`, `/status` — open the team drawer.
+- `/logs` — open the logs drawer.
+- `/retry` — resume a paused route, or re-run the last turn.
+- `/abort` — cancel running members.
+- `/approve` · `/reject` — decide the first pending approval.
+- `/help` — show the command palette.
+
+### How agents talk to each other
+
+An agent sends a teammate a message by emitting a line:
+
+```text
+@@team_message {"to":"reviewer","body":"please review the parser"}
+@@team_message {"to":["builder","reviewer"],"body":"let's agree on the data model"}
+@@team_message {"to":"all","body":"status?"}
 ```
 
-Use PTY-backed CLI execution:
+Asterline parses it, shows `from → to` in the chat, persists it, and delivers it
+to the target members. Auto-relays are bounded per turn; when the limit is hit
+(or you pause relay), the route is queued and you continue it with `/retry`.
+
+## Develop
 
 ```bash
-cargo run -- --pty-agents
-cargo run -- --pty-codex
-cargo run -- --pty-claude
-```
-
-Real and PTY modes call local `codex` and/or `claude` binaries. They may require
-login and may consume real usage. The ignored smoke tests for those backends are
-kept opt-in for that reason.
-
-## TUI Shortcuts
-
-- `Tab`: cycle the current route target.
-- `Enter`: submit the composer text.
-- `Ctrl-A`: show the agent list view.
-- `Ctrl-L`: toggle persisted message log view.
-- `Ctrl-T`: show raw terminal output view.
-- `Ctrl-P`: show approval queue view.
-- `Ctrl-R`: pause or resume automatic agent-to-agent relay.
-- `Ctrl-E`: show pending relay queue view.
-- `Ctrl-Y`: approve the next approval, or replay the next relay in relay view.
-- `Ctrl-N`: reject the next approval, or reject the next relay in relay view.
-- `F1`: show built-in help.
-- `Esc`: return to the events view.
-- `Ctrl-C`: exit.
-
-## Test
-
-Run the standard checks:
-
-```bash
-cargo fmt --check
-cargo check
+just check     # cargo fmt --check + clippy -D warnings + tests
 cargo test
 ```
 
-The full test suite uses fake agents and local shell PTY tests by default. Real
-Codex and Claude Code smoke tests are marked `#[ignore]` because they can consume
-real service usage.
+The default test suite uses fake agents and local shell PTY tests. It never
+calls the real `codex`/`claude` CLIs.
 
-Opt-in real smoke tests only when you intend to call the installed CLIs:
-
-```bash
-ASTERLINE_RUN_CODEX_EXEC_SMOKE=1 cargo test real_codex_exec_smoke_test -- --ignored
-ASTERLINE_RUN_CLAUDE_PRINT_SMOKE=1 cargo test real_claude_print_smoke_test -- --ignored
-```
-
-## Project Layout
+## Layout
 
 ```text
 src/
-  adapter/   fake agents, Codex exec, Claude print, and PTY adapters
-  router/    team-message envelope parsing and relay guard
-  runtime/   workflow orchestration and runtime events
-  store/     SQLite persistence
-  tui/       Ratatui state, input handling, and widgets
-  types.rs   shared IDs, statuses, participants, and route targets
+  domain/    team roster + structured event vocabulary (no I/O)
+  router/    @@team_message parsing + relay guard + target resolution
+  adapter/   streaming claude/codex adapters, process runner, fake; cli_pty (debug)
+  runtime/   TeamRuntime orchestration core + transport, sessions, approvals
+  store/     event-source SQLite schema + chat replay
+  tui/       chat-first UI: state, rendering, composer, drawers, commands, keymap
+  app.rs     bootstrap: CLI args, default roster, runtime + TUI wiring
 ```
-
-## Current Limits
-
-- This is still a prototype, not a full replacement for Codex or Claude Code.
-- Fake agents remain the default for repeatable local development.
-- Real CLI integration is intentionally explicit to avoid accidental usage.
-- PTY backends now use runtime-managed per-agent sessions, but the TUI still
-  captures each submitted turn with a short synchronous output window rather
-  than a fully asynchronous live terminal stream.
