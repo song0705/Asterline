@@ -186,6 +186,9 @@ pub enum AgentEvent {
     },
     /// The backend session/thread id was discovered or updated.
     SessionDiscovered(AgentSessionId),
+    /// A raw, unparsed stdout line from the backend (persisted to `stream_events`
+    /// for later parser fixes; not shown in the chat).
+    Raw(String),
     /// A raw line from the backend's stderr.
     Stderr(String),
     /// A diagnostic line worth keeping in the logs drawer.
