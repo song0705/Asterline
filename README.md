@@ -114,6 +114,10 @@ default roster:
 
 ### Slash commands
 
+Start typing `/` to see the available commands, or `@` to see members — a
+popup filters as you type. `↑`/`↓` move the selection, `Tab`/`Enter` accept, and
+`Esc` dismisses it.
+
 - `/ask <member> <message>` or `@<member> <message>` — send to one member.
 - `/all <message>` — send to everyone.
 - `/team`, `/sessions`, `/status` — open the team drawer.
