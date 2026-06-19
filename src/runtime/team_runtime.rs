@@ -413,13 +413,17 @@ impl TeamRuntime {
                 });
             }
             AgentEvent::SessionDiscovered(session) => {
-                let backend = self.member_backend(member);
-                self.sessions.set(member.clone(), session.clone());
-                let _ = self.store.upsert_session(member, backend, &session);
-                step.events.push(RuntimeEvent::SessionUpdated {
-                    member: member.clone(),
-                    session,
-                });
+                // Backends may report the session id more than once per turn;
+                // only persist and surface it when it actually changes.
+                if self.sessions.get(member).as_ref() != Some(&session) {
+                    let backend = self.member_backend(member);
+                    self.sessions.set(member.clone(), session.clone());
+                    let _ = self.store.upsert_session(member, backend, &session);
+                    step.events.push(RuntimeEvent::SessionUpdated {
+                        member: member.clone(),
+                        session,
+                    });
+                }
             }
             AgentEvent::Raw(line) => {
                 let _ = self.store.record_stream_event(member, &line);

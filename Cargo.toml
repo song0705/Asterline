@@ -3,15 +3,6 @@ name = "asterline"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "asterline"
-path = "src/main.rs"
-
-# Short alias: launch with `ast` instead of `asterline`.
-[[bin]]
-name = "ast"
-path = "src/main.rs"
-
 [dependencies]
 crossterm = "0.29"
 portable-pty = "0.9"
