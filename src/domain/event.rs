@@ -154,6 +154,8 @@ pub enum UiCommand {
     ResolvePausedRoute { resume: bool },
     /// Set a member's reasoning effort.
     SetEffort { member: MemberId, effort: Effort },
+    /// Run a built-in coordinating workflow for a goal.
+    RunWorkflow { goal: String },
     /// Begin a graceful shutdown.
     Shutdown,
 }

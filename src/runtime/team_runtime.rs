@@ -204,6 +204,40 @@ impl TeamRuntime {
                         .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
                 }
             }
+            UiCommand::RunWorkflow { goal } => {
+                let coordinator = self
+                    .config
+                    .members
+                    .iter()
+                    .find(|m| m.role.to_lowercase().contains("plan"))
+                    .or_else(|| self.config.members.first())
+                    .map(|m| m.id.clone());
+                match coordinator {
+                    Some(id) => {
+                        let teammates: Vec<String> = self
+                            .config
+                            .members
+                            .iter()
+                            .filter(|m| m.id != id)
+                            .map(|m| format!("{} ({})", m.id, m.role))
+                            .collect();
+                        let prompt = format!(
+                            "Coordinate this goal as a team workflow.\n\nGoal: {goal}\n\n\
+                             Plan the work, then delegate to teammates by emitting lines like\n\
+                             @@team_message {{\"to\":\"<member>\",\"body\":\"...\"}}\n\
+                             (implementation to the builder, review to the reviewer). \
+                             Teammates: {}.",
+                            teammates.join(", ")
+                        );
+                        step.events
+                            .push(RuntimeEvent::Notice(format!("workflow started → {id}")));
+                        self.handle_user_message(MessageTarget::Member(id), prompt, &mut step);
+                    }
+                    None => step.events.push(RuntimeEvent::Notice(
+                        "no members for a workflow".to_string(),
+                    )),
+                }
+            }
             UiCommand::Shutdown => self.handle_cancel(None, &mut step),
         }
         step
@@ -1246,5 +1280,21 @@ mod tests {
 
         let step = rt.on_ui_command(user("go"));
         assert_eq!(step.actions[0].effort, Some(Effort::High));
+    }
+
+    #[test]
+    fn workflow_kicks_off_via_a_coordinator() {
+        let mut rt = runtime();
+        let step = rt.on_ui_command(UiCommand::RunWorkflow {
+            goal: "ship the parser".to_string(),
+        });
+
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            RuntimeEvent::Notice(text) if text.contains("workflow")
+        )));
+        assert_eq!(step.actions.len(), 1);
+        assert!(step.actions[0].prompt.contains("ship the parser"));
+        assert!(step.actions[0].prompt.contains("@@team_message"));
     }
 }

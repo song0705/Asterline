@@ -97,6 +97,23 @@ fn parse_slash(rest: &str) -> Submission {
                 _ => Submission::Help,
             }
         }
+        "workflow" => {
+            if arg.is_empty() {
+                Submission::Help
+            } else {
+                Submission::Runtime(UiCommand::RunWorkflow {
+                    goal: arg.to_string(),
+                })
+            }
+        }
+        "focus" => {
+            let (member, _) = split_first_word(arg);
+            if member.is_empty() {
+                Submission::Help
+            } else {
+                Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
+            }
+        }
         "help" => Submission::Help,
         _ => Submission::Help,
     }
@@ -202,5 +219,21 @@ mod tests {
         );
         assert_eq!(parse("/effort builder"), Submission::Help);
         assert_eq!(parse("/effort builder bogus"), Submission::Help);
+    }
+
+    #[test]
+    fn workflow_and_focus_commands() {
+        assert_eq!(
+            parse("/workflow build a parser"),
+            Submission::Runtime(UiCommand::RunWorkflow {
+                goal: "build a parser".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("/focus reviewer"),
+            Submission::Drawer(Drawer::MemberLogs(MemberId::new("reviewer")))
+        );
+        assert_eq!(parse("/workflow"), Submission::Help);
+        assert_eq!(parse("/focus"), Submission::Help);
     }
 }

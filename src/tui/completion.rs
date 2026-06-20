@@ -32,6 +32,8 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("abort", "cancel running members", false),
     ("approve", "approve first pending", false),
     ("reject", "reject first pending", false),
+    ("workflow", "coordinate a goal across the team", true),
+    ("focus", "view a member's logs", true),
     ("help", "show commands", false),
 ];
 
@@ -62,7 +64,7 @@ pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
             // Command chosen; only `/ask` completes its first argument (a member).
             Some(space) => {
                 let cmd: String = chars[1..space].iter().collect();
-                if cmd != "ask" && cmd != "effort" {
+                if cmd != "ask" && cmd != "effort" && cmd != "focus" {
                     return None;
                 }
                 let arg: Vec<char> = chars[space + 1..].to_vec();
