@@ -101,20 +101,25 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     let store = SqliteStore::open(&db_path).map_err(|err| io::Error::other(err.to_string()))?;
 
     let runners = build_runners(&team, config.fake);
-    let chat = if config.no_restore {
-        Vec::new()
+    let (chat, logs) = if config.no_restore {
+        (Vec::new(), Vec::new())
     } else {
         // A replay failure must be visible, not a silently-blank transcript:
         // surface it as the first chat item so a schema/store problem is
         // obvious in-app instead of looking like "history was lost".
-        match store.replay_chat() {
+        let chat = match store.replay_chat() {
             Ok(chat) => chat,
             Err(err) => vec![ChatItem::Notice {
                 text: format!("could not replay history: {err}"),
             }],
-        }
+        };
+        // Logs are persisted too; replay the recent tail so the logs drawer
+        // isn't empty after a restart.
+        let logs = store.recent_logs(4000).unwrap_or_default();
+        (chat, logs)
     };
-    let state = AppState::new(chat);
+    let mut state = AppState::new(chat);
+    state.seed_logs(logs);
 
     let (events_tx, events_rx) = mpsc::channel();
     let (handle, join) = runtime::spawn(team, store, runners, events_tx, !config.debug);

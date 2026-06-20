@@ -121,6 +121,15 @@ impl AppState {
 
     // --- applying runtime events ----------------------------------------
 
+    /// Seed the logs drawer with persisted entries replayed on startup, so logs
+    /// survive a restart the way the chat transcript does.
+    pub fn seed_logs(&mut self, mut logs: Vec<LogEntry>) {
+        if logs.len() > MAX_LOGS {
+            logs.drain(0..logs.len() - MAX_LOGS);
+        }
+        self.logs = logs;
+    }
+
     pub fn apply(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Ready {
@@ -842,6 +851,19 @@ mod tests {
         state.apply(RuntimeEvent::Log(LogEntry::warn("builder", "stderr noise")));
         assert!(state.chat().is_empty());
         assert_eq!(state.logs().len(), 1);
+    }
+
+    #[test]
+    fn seeded_logs_replay_into_the_drawer() {
+        let mut state = AppState::new(Vec::new());
+        state.seed_logs(vec![
+            LogEntry::info("builder", "started"),
+            LogEntry::warn("reviewer", "slow"),
+        ]);
+        assert_eq!(state.logs().len(), 2);
+        // Live logs still append after seeding.
+        state.apply(RuntimeEvent::Log(LogEntry::error("runtime", "boom")));
+        assert_eq!(state.logs().len(), 3);
     }
 
     #[test]
