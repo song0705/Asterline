@@ -144,16 +144,11 @@ impl CodexLineParser {
                 }
             }
             Some("file_change") => {
-                let summary = file_change_summary(item);
                 let ok = status == "completed";
-                vec![
-                    AgentEvent::ToolStarted {
-                        id: id.clone(),
-                        name: "apply_patch".to_string(),
-                        summary: summary.clone(),
-                    },
-                    AgentEvent::ToolCompleted { id, ok, summary },
-                ]
+                vec![AgentEvent::FileChange {
+                    files: file_change_files(item),
+                    ok,
+                }]
             }
             Some("mcp_tool_call") => {
                 let name = format!(
@@ -246,18 +241,21 @@ impl LineParser for CodexLineParser {
     }
 }
 
-fn file_change_summary(item: &Value) -> String {
-    let changes = item.get("changes").and_then(Value::as_array);
-    let count = changes.map(|c| c.len()).unwrap_or(0);
-    let paths = changes
-        .map(|c| {
-            c.iter()
-                .filter_map(|change| str_field(change, "path"))
-                .collect::<Vec<_>>()
-                .join(", ")
+fn file_change_files(item: &Value) -> Vec<(String, String)> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .map(|change| {
+                    (
+                        str_field(change, "path").unwrap_or_default().to_string(),
+                        str_field(change, "kind").unwrap_or("update").to_string(),
+                    )
+                })
+                .collect()
         })
-        .unwrap_or_default();
-    summarize(&format!("{count} file(s): {paths}"), TOOL_SUMMARY_MAX)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -394,5 +392,22 @@ mod tests {
     fn invalid_json_warns() {
         let events = parse_all(&[r#"not json"#]);
         assert!(matches!(events.as_slice(), [AgentEvent::ParseWarning(_)]));
+    }
+
+    #[test]
+    fn file_change_emits_a_diff_event() {
+        let events = parse_all(&[
+            r#"{"type":"item.completed","item":{"id":"f1","type":"file_change","status":"completed","changes":[{"path":"src/a.rs","kind":"update"},{"path":"src/b.rs","kind":"add"}]}}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![AgentEvent::FileChange {
+                files: vec![
+                    ("src/a.rs".to_string(), "update".to_string()),
+                    ("src/b.rs".to_string(), "add".to_string()),
+                ],
+                ok: true,
+            }]
+        );
     }
 }

@@ -488,6 +488,26 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
 
             out.push(Line::from(spans));
         }
+        ChatItem::Diff { files, .. } => {
+            out.push(Line::from(Span::styled(
+                "  ✎ file changes",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (path, kind) in files {
+                let (sign, color) = match kind.as_str() {
+                    "add" => ("+", Color::Green),
+                    "delete" => ("-", Color::Red),
+                    _ => ("~", Color::Yellow),
+                };
+                let shown = truncate(path, width.saturating_sub(6).max(10));
+                out.push(Line::from(vec![
+                    Span::styled(format!("    {sign} "), Style::default().fg(color)),
+                    Span::styled(shown, Style::default().fg(color)),
+                ]));
+            }
+        }
         ChatItem::Route { from, to, body } => {
             out.push(Line::from(Span::styled(
                 format!("{from} → {}", to.join(", ")),

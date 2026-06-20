@@ -228,6 +228,26 @@ impl SqliteStore {
         })
     }
 
+    pub fn record_diff(
+        &self,
+        turn: TurnId,
+        member: &MemberId,
+        files: &[(String, String)],
+    ) -> Result<MessageId> {
+        let encoded = files
+            .iter()
+            .map(|(path, kind)| format!("{kind}\t{path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.insert_message(MessageRow {
+            turn: Some(turn),
+            kind: "diff",
+            member: Some(member),
+            text: Some(&encoded),
+            ..MessageRow::default()
+        })
+    }
+
     pub fn record_notice(&self, turn: Option<TurnId>, text: &str) -> Result<MessageId> {
         self.insert_message(MessageRow {
             turn,
@@ -475,6 +495,19 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
             to: split_targets(targets),
             body: text.unwrap_or_default(),
         },
+        "diff" => ChatItem::Diff {
+            member: MemberId::new(member_id.unwrap_or_default()),
+            files: text
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(2, '\t');
+                    let kind = parts.next()?.to_string();
+                    let path = parts.next()?.to_string();
+                    Some((path, kind))
+                })
+                .collect(),
+        },
         "notice" => ChatItem::Notice {
             text: text.unwrap_or_default(),
         },
@@ -707,5 +740,24 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM team_members", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn diff_round_trips_through_replay() {
+        let store = store();
+        let turn = store.create_turn().unwrap();
+        let files = vec![
+            ("src/a.rs".to_string(), "update".to_string()),
+            ("src/b.rs".to_string(), "add".to_string()),
+        ];
+        store
+            .record_diff(turn, &MemberId::new("builder"), &files)
+            .unwrap();
+
+        let items = store.replay_chat().unwrap();
+        assert!(matches!(
+            &items[0],
+            ChatItem::Diff { files: f, .. } if *f == files
+        ));
     }
 }

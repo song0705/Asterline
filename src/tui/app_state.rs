@@ -203,6 +203,9 @@ impl AppState {
             RuntimeEvent::Route { from, to, body, .. } => {
                 self.push(ChatItem::Route { from, to, body });
             }
+            RuntimeEvent::FileChange { member, files } => {
+                self.push(ChatItem::Diff { member, files });
+            }
             RuntimeEvent::RouteError {
                 from,
                 target,

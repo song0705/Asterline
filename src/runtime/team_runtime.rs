@@ -447,6 +447,15 @@ impl TeamRuntime {
                     summary,
                 });
             }
+            AgentEvent::FileChange { files, ok: _ } => {
+                if let Some(turn) = self.running_turn(member) {
+                    let _ = self.store.record_diff(turn, member, &files);
+                }
+                step.events.push(RuntimeEvent::FileChange {
+                    member: member.clone(),
+                    files,
+                });
+            }
             AgentEvent::SessionDiscovered(session) => {
                 // Backends may report the session id more than once per turn;
                 // only persist and surface it when it actually changes.

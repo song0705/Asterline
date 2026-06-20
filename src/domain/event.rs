@@ -197,6 +197,11 @@ pub enum AgentEvent {
     Log(String),
     /// The backend emitted something the parser did not recognize.
     ParseWarning(String),
+    /// A set of file changes the agent made (apply_patch / edits).
+    FileChange {
+        files: Vec<(String, String)>,
+        ok: bool,
+    },
     /// The backend process exited.
     Exited { code: Option<i32>, ok: bool },
     /// An unrecoverable error running the backend.
@@ -334,6 +339,11 @@ pub enum RuntimeEvent {
         ok: bool,
         summary: String,
     },
+    /// A set of file changes the agent made (rendered as a diff card).
+    FileChange {
+        member: MemberId,
+        files: Vec<(String, String)>,
+    },
     /// An agent-to-agent message was routed (shown inline in the chat).
     Route {
         turn: TurnId,
@@ -398,6 +408,10 @@ pub enum ChatItem {
         name: String,
         summary: String,
         ok: Option<bool>,
+    },
+    Diff {
+        member: MemberId,
+        files: Vec<(String, String)>,
     },
     Route {
         from: MemberId,
