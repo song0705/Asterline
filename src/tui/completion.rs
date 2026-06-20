@@ -29,7 +29,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("diff", "show working-tree git diff", false),
     (
         "new",
-        "start a fresh session (optionally for one member)",
+        "start a fresh chat (new session, cleared transcript)",
         false,
     ),
     ("sessions", "session ids", false),

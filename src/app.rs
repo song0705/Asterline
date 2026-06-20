@@ -113,6 +113,10 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     let (chat, logs) = if config.no_restore {
         (Vec::new(), Vec::new())
     } else {
+        // Replay only the current conversation (the latest, or a fresh one).
+        if let Ok(conversation) = store.current_conversation() {
+            store.set_conversation(conversation);
+        }
         // A replay failure must be visible, not a silently-blank transcript:
         // surface it as the first chat item so a schema/store problem is
         // obvious in-app instead of looking like "history was lost".

@@ -99,6 +99,10 @@ pub struct TeamRuntime {
 impl TeamRuntime {
     pub fn new(config: TeamConfig, store: SqliteStore) -> Self {
         let _ = store.upsert_team(&config);
+        // Bind to the latest conversation so records and replay agree.
+        if let Ok(conversation) = store.current_conversation() {
+            store.set_conversation(conversation);
+        }
         let sessions = SessionRegistry::from_store(&store, &config.all_member_ids());
         let members = config
             .members
@@ -204,7 +208,7 @@ impl TeamRuntime {
                         .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
                 }
             }
-            UiCommand::NewSession { member } => self.handle_new_session(member, &mut step),
+            UiCommand::NewSession => self.handle_new_session(&mut step),
             UiCommand::ImportTranscript { member, items } => {
                 self.handle_import_transcript(member, items, &mut step)
             }
@@ -367,29 +371,23 @@ impl TeamRuntime {
         }
     }
 
-    fn handle_new_session(&mut self, member: Option<MemberId>, step: &mut RuntimeStep) {
-        let targets: Vec<MemberId> = match member {
-            Some(m) => match self.config.find(m.as_str()) {
-                Some(found) => vec![found.id.clone()],
-                None => {
-                    step.events
-                        .push(RuntimeEvent::Notice(format!("unknown member: {m}")));
-                    return;
-                }
-            },
-            None => self.config.all_member_ids(),
-        };
-        for id in &targets {
-            self.sessions.clear(id);
-            let _ = self.store.delete_session(id);
+    fn handle_new_session(&mut self, step: &mut RuntimeStep) {
+        // A fresh chat: a new conversation (so the transcript starts clean and
+        // restart shows only this chat) plus new backend sessions for everyone.
+        if let Ok(conversation) = self.store.create_conversation() {
+            self.store.set_conversation(conversation);
         }
-        let label = match targets.as_slice() {
-            [one] => one.to_string(),
-            _ => "all members".to_string(),
-        };
-        step.events.push(RuntimeEvent::Notice(format!(
-            "── new session for {label} — the next message starts a fresh thread ──"
-        )));
+        for id in self.config.all_member_ids() {
+            self.sessions.clear(&id);
+            let _ = self.store.delete_session(&id);
+        }
+        // Drop any in-flight turn state from the previous chat.
+        self.paused_routes.clear();
+        self.held_approvals.clear();
+        step.events.push(RuntimeEvent::SessionReset);
+        step.events.push(RuntimeEvent::Notice(
+            "started a new chat — fresh session for all members".to_string(),
+        ));
     }
 
     /// Persist and surface messages exchanged in a member's native session

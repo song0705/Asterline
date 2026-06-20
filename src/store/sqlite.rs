@@ -6,6 +6,7 @@
 //! backend session ids to `agent_sessions`. The runtime always writes here
 //! before emitting the corresponding UI event, so history survives a crash.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::{io, result};
 
@@ -21,7 +22,7 @@ pub type Result<T> = result::Result<T, rusqlite::Error>;
 
 /// Current event-source schema version. Bump this and add a migration arm in
 /// [`SqliteStore::migrate`] whenever the schema changes.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,12 +38,16 @@ pub struct StoredApproval {
 #[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
+    /// The conversation new rows are written to / replayed from. `/new` bumps it
+    /// to a fresh conversation so the transcript starts clean.
+    conversation: Cell<i64>,
 }
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let store = Self {
             conn: Connection::open(path)?,
+            conversation: Cell::new(0),
         };
         store.initialize()?;
         Ok(store)
@@ -51,6 +56,7 @@ impl SqliteStore {
     pub fn in_memory() -> Result<Self> {
         let store = Self {
             conn: Connection::open_in_memory()?,
+            conversation: Cell::new(0),
         };
         store.initialize()?;
         Ok(store)
@@ -89,7 +95,31 @@ impl SqliteStore {
                 "#,
             )?;
         }
-        self.create_schema()
+        self.create_schema()?;
+        // v1 -> v2: introduce conversations so `/new` can start a clean chat.
+        // Backfill existing messages into a single conversation.
+        if from == 1 {
+            if !self.has_column("messages", "conversation_id")? {
+                self.conn
+                    .execute_batch("ALTER TABLE messages ADD COLUMN conversation_id INTEGER;")?;
+            }
+            self.conn
+                .execute("INSERT INTO conversations DEFAULT VALUES", [])?;
+            let id = self.conn.last_insert_rowid();
+            self.conn.execute(
+                "UPDATE messages SET conversation_id = ?1 WHERE conversation_id IS NULL",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(columns.iter().any(|name| name == column))
     }
 
     /// True when the database holds the pre-v1 prototype schema, detected by a
@@ -145,19 +175,25 @@ impl SqliteStore {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS conversations (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                turn_id      INTEGER,
-                kind         TEXT NOT NULL,
-                member_id    TEXT,
-                display_name TEXT,
-                backend      TEXT,
-                text         TEXT,
-                name         TEXT,
-                summary      TEXT,
-                ok           INTEGER,
-                targets      TEXT,
-                created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER,
+                turn_id         INTEGER,
+                kind            TEXT NOT NULL,
+                member_id       TEXT,
+                display_name    TEXT,
+                backend         TEXT,
+                text            TEXT,
+                name            TEXT,
+                summary         TEXT,
+                ok              INTEGER,
+                targets         TEXT,
+                created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS stream_events (
@@ -335,9 +371,10 @@ impl SqliteStore {
     fn insert_message(&self, row: MessageRow<'_>) -> Result<MessageId> {
         self.conn.execute(
             "INSERT INTO messages
-                (turn_id, kind, member_id, display_name, backend, text, name, summary, ok, targets)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (conversation_id, turn_id, kind, member_id, display_name, backend, text, name, summary, ok, targets)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
+                self.conversation.get(),
                 row.turn.map(|t| t.0 as i64),
                 row.kind,
                 row.member.map(MemberId::as_str),
@@ -353,13 +390,13 @@ impl SqliteStore {
         Ok(MessageId(self.conn.last_insert_rowid() as u64))
     }
 
-    /// Rebuild the chat transcript in insertion order for TUI replay.
+    /// Rebuild the current conversation's transcript in insertion order.
     pub fn replay_chat(&self) -> Result<Vec<ChatItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
-             FROM messages ORDER BY id ASC",
+             FROM messages WHERE conversation_id = ?1 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map([], map_chat_item)?;
+        let rows = stmt.query_map(params![self.conversation.get()], map_chat_item)?;
         let mut items = Vec::new();
         for item in rows {
             if let Some(item) = item? {
@@ -367,6 +404,36 @@ impl SqliteStore {
             }
         }
         Ok(items)
+    }
+
+    // --- conversations ---------------------------------------------------
+
+    /// The active conversation (latest existing, creating one if none yet).
+    pub fn current_conversation(&self) -> Result<i64> {
+        let latest: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM conversations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match latest {
+            Some(id) => Ok(id),
+            None => self.create_conversation(),
+        }
+    }
+
+    /// Start a new conversation and return its id.
+    pub fn create_conversation(&self) -> Result<i64> {
+        self.conn
+            .execute("INSERT INTO conversations DEFAULT VALUES", [])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Set the conversation new rows are written to / replayed from.
+    pub fn set_conversation(&self, id: i64) {
+        self.conversation.set(id);
     }
 
     pub fn message_count(&self) -> Result<i64> {
@@ -828,6 +895,67 @@ mod tests {
             &items[0],
             ChatItem::Diff { files: f, .. } if *f == files
         ));
+    }
+
+    #[test]
+    fn migrates_v1_to_conversations_and_preserves_messages() {
+        let dir = std::env::temp_dir().join(format!("asterline-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        // A v1 database: event-source `messages` (has `kind`) but no
+        // conversation scoping, stamped user_version = 1.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE messages (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id      INTEGER,
+                    kind         TEXT NOT NULL,
+                    member_id    TEXT,
+                    display_name TEXT,
+                    backend      TEXT,
+                    text         TEXT,
+                    name         TEXT,
+                    summary      TEXT,
+                    ok           INTEGER,
+                    targets      TEXT,
+                    created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO messages (kind, text) VALUES ('user', 'older message');
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The pre-v2 message is backfilled into the (now current) conversation.
+        let conversation = store.current_conversation().unwrap();
+        store.set_conversation(conversation);
+        let items = store.replay_chat().unwrap();
+        assert_eq!(
+            items,
+            vec![ChatItem::User {
+                body: "older message".to_string()
+            }]
+        );
+
+        // A new chat starts an empty transcript; the old one is untouched.
+        let next = store.create_conversation().unwrap();
+        store.set_conversation(next);
+        assert!(store.replay_chat().unwrap().is_empty());
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

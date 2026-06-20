@@ -312,6 +312,17 @@ impl AppState {
             RuntimeEvent::Notice(text) => {
                 self.push(ChatItem::Notice { text });
             }
+            RuntimeEvent::SessionReset => {
+                // Begin a fresh chat: clear the transcript and in-flight cells,
+                // but keep members, logs, and prompt history.
+                self.chat.clear();
+                self.message_index.clear();
+                self.tool_index.clear();
+                self.active_reasoning.clear();
+                self.pending_user_messages.clear();
+                self.running_since.clear();
+                self.scroll = 0;
+            }
         }
     }
 

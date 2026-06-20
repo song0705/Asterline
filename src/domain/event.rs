@@ -162,9 +162,9 @@ pub enum UiCommand {
     ResolvePausedRoute { resume: bool },
     /// Set a member's reasoning effort.
     SetEffort { member: MemberId, effort: Effort },
-    /// Start a fresh session: forget resumable session ids so the next turns
-    /// begin new backend threads. `None` targets every member.
-    NewSession { member: Option<MemberId> },
+    /// Start a fresh chat: a new conversation and new backend sessions, with the
+    /// transcript cleared. (codex's `/new`.)
+    NewSession,
     /// Import messages exchanged in a member's native session (after attaching),
     /// so they appear in the Asterline transcript and persist.
     ImportTranscript {
@@ -407,6 +407,9 @@ pub enum RuntimeEvent {
     Log(LogEntry),
     /// A human-readable system notice shown inline in the chat.
     Notice(String),
+    /// Clear the transcript to begin a fresh chat (from `/new`). Members, logs,
+    /// and prompt history are kept.
+    SessionReset,
 }
 
 /// A rendered conversation block in the single-column chat. The TUI builds these
