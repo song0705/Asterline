@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
 use crate::domain::config::{default_team, detect_backends, load_team_config};
-use crate::domain::event::RuntimeEvent;
+use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
 use crate::runtime::{self, Runners, RuntimeHandle};
 use crate::store::sqlite::SqliteStore;
@@ -104,7 +104,15 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     let chat = if config.no_restore {
         Vec::new()
     } else {
-        store.replay_chat().unwrap_or_default()
+        // A replay failure must be visible, not a silently-blank transcript:
+        // surface it as the first chat item so a schema/store problem is
+        // obvious in-app instead of looking like "history was lost".
+        match store.replay_chat() {
+            Ok(chat) => chat,
+            Err(err) => vec![ChatItem::Notice {
+                text: format!("could not replay history: {err}"),
+            }],
+        }
     };
     let state = AppState::new(chat);
 

@@ -19,6 +19,10 @@ use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
 
+/// Current event-source schema version. Bump this and add a migration arm in
+/// [`SqliteStore::migrate`] whenever the schema changes.
+const SCHEMA_VERSION: i64 = 1;
+
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredApproval {
@@ -53,10 +57,66 @@ impl SqliteStore {
     }
 
     fn initialize(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < SCHEMA_VERSION {
+            self.migrate(version)?;
+            self.conn
+                .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        }
+        Ok(())
+    }
+
+    /// Bring a database at schema `from` up to [`SCHEMA_VERSION`].
+    ///
+    /// The pre-v1 prototype wrote an incompatible `messages`/`approvals` schema
+    /// plus a handful of tables the event-source design replaced. Its rows are
+    /// not convertible to the new model, so when that schema is detected the
+    /// legacy tables are dropped and rebuilt. A brand-new database has no such
+    /// tables, so the same path simply creates the current schema.
+    fn migrate(&self, from: i64) -> Result<()> {
+        if from == 0 && self.has_legacy_schema()? {
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS messages;
+                DROP TABLE IF EXISTS approvals;
+                DROP TABLE IF EXISTS agents;
+                DROP TABLE IF EXISTS sessions;
+                DROP TABLE IF EXISTS inter_agent_messages;
+                DROP TABLE IF EXISTS terminal_events;
+                "#,
+            )?;
+        }
+        self.create_schema()
+    }
+
+    /// True when the database holds the pre-v1 prototype schema, detected by a
+    /// `messages` table that predates the event-source `kind` column.
+    fn has_legacy_schema(&self) -> Result<bool> {
+        let messages_exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !messages_exists {
+            return Ok(false);
+        }
+        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(!columns.iter().any(|name| name == "kind"))
+    }
+
+    fn create_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
-            PRAGMA journal_mode = WAL;
-
             CREATE TABLE IF NOT EXISTS teams (
                 id         INTEGER PRIMARY KEY,
                 name       TEXT NOT NULL,
@@ -759,5 +819,76 @@ mod tests {
             &items[0],
             ChatItem::Diff { files: f, .. } if *f == files
         ));
+    }
+
+    #[test]
+    fn migrates_legacy_prototype_schema_then_persists() {
+        let dir = std::env::temp_dir().join(format!("asterline-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        // Simulate a pre-v1 prototype database: an incompatible `messages`
+        // schema (no `kind` column), a legacy `approvals` (`action_kind`), and
+        // dead prototype tables. `user_version` stays at the default 0.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE messages (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    route_from TEXT NOT NULL,
+                    route_to   TEXT NOT NULL,
+                    body       TEXT NOT NULL
+                );
+                CREATE TABLE approvals (id INTEGER PRIMARY KEY, action_kind TEXT NOT NULL);
+                CREATE TABLE agents (id INTEGER PRIMARY KEY);
+                CREATE TABLE sessions (id INTEGER PRIMARY KEY);
+                CREATE TABLE inter_agent_messages (id INTEGER PRIMARY KEY);
+                CREATE TABLE terminal_events (id INTEGER PRIMARY KEY);
+                INSERT INTO messages (route_from, route_to, body) VALUES ('a', 'b', 'old');
+                "#,
+            )
+            .unwrap();
+        }
+
+        // Opening through the store migrates the legacy schema in place. The
+        // unconvertible prototype rows are dropped (replay is empty, not an
+        // error) and the version is stamped.
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.replay_chat().unwrap().is_empty());
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // New writes round-trip through the rebuilt event-source schema — the
+        // exact path that was silently failing before the migration.
+        let turn = store.create_turn().unwrap();
+        let builder = MemberId::new("builder");
+        store
+            .record_user(turn, std::slice::from_ref(&builder), "hi")
+            .unwrap();
+        store
+            .record_agent(turn, &builder, "Builder", BackendKind::Codex, "on it")
+            .unwrap();
+        let items = store.replay_chat().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0],
+            ChatItem::User {
+                body: "hi".to_string()
+            }
+        );
+
+        // A second open is a clean no-op (already at SCHEMA_VERSION).
+        drop(store);
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.replay_chat().unwrap().len(), 2);
+
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
