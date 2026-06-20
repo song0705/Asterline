@@ -309,19 +309,26 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     .get(&member.id)
                     .map(|s| !s.is_empty())
                     .unwrap_or(false);
+                let elapsed = state
+                    .member_elapsed_secs(&member.id)
+                    .map(fmt_elapsed_compact)
+                    .unwrap_or_default();
                 let line_text = if has_reasoning {
                     let reasoning = &state.active_reasoning()[&member.id];
-                    format!("{spin_char} thinking: {reasoning}")
+                    format!("{spin_char} thinking {elapsed}: {reasoning}")
                 } else {
-                    let status_str = match member.status {
-                        MemberStatus::Running => "running...",
-                        MemberStatus::Queued => "queued...",
-                        MemberStatus::Waiting => "waiting...",
-                        MemberStatus::NeedsApproval => "waiting for approval...",
-                        MemberStatus::Failed => "failed",
-                        MemberStatus::Idle => "idle",
-                    };
-                    format!("{spin_char} {status_str}")
+                    match member.status {
+                        MemberStatus::Running => {
+                            format!("{spin_char} working {elapsed} · Ctrl+C to interrupt")
+                        }
+                        MemberStatus::Queued => format!("{spin_char} queued"),
+                        MemberStatus::Waiting => format!("{spin_char} waiting"),
+                        MemberStatus::NeedsApproval => {
+                            format!("{spin_char} waiting for approval")
+                        }
+                        MemberStatus::Failed => format!("{spin_char} failed"),
+                        MemberStatus::Idle => format!("{spin_char} idle"),
+                    }
                 };
 
                 for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
@@ -345,7 +352,11 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     .unwrap_or(false);
                 if has_reasoning {
                     let reasoning = &state.active_reasoning()[&member.id];
-                    let line_text = format!("{spin_char} thinking: {reasoning}");
+                    let elapsed = state
+                        .member_elapsed_secs(&member.id)
+                        .map(fmt_elapsed_compact)
+                        .unwrap_or_default();
+                    let line_text = format!("{spin_char} thinking {elapsed}: {reasoning}");
                     for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
                         lines.push(Line::from(vec![
                             Span::styled("  ", Style::default()),
@@ -672,7 +683,38 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ));
     }
 
+    let running = state.running_count();
+    if running > 0 {
+        if !parts.is_empty() {
+            parts.push(Span::raw("   "));
+        }
+        parts.push(Span::styled(
+            format!("⏳ {running} working · Ctrl+C to interrupt"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if parts.is_empty() {
+        // Idle: a faint, always-present key-hint line (codex-style).
+        parts.push(Span::styled(
+            "Enter send · ↑↓ history · @member · /help · Ctrl+R team · Ctrl+L logs",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(parts)), area);
+}
+
+/// Format elapsed seconds compactly: `8s`, `1m 4s`, `1h 2m 3s` (mirrors codex's
+/// `fmt_elapsed_compact`).
+fn fmt_elapsed_compact(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m {}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
 }
 
 fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &Drawer) {
@@ -954,6 +996,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fmt_elapsed_compact_scales_units() {
+        assert_eq!(fmt_elapsed_compact(8), "8s");
+        assert_eq!(fmt_elapsed_compact(64), "1m 4s");
+        assert_eq!(fmt_elapsed_compact(3723), "1h 2m 3s");
+    }
+
+    #[test]
     fn renders_a_clean_layout_snapshot() {
         use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
         use crate::domain::team::MemberId;
@@ -1003,6 +1052,9 @@ mod tests {
         assert!(view.contains("Asterline"));
         assert!(view.contains("Builder"));
         assert!(view.contains("builder → reviewer"));
+        // The running member surfaces a working indicator + interrupt hint.
+        assert!(view.contains("working"));
+        assert!(view.contains("interrupt"));
         // The conversation is not wrapped in a box; the only border is the
         // rounded composer at the bottom.
         assert!(view.contains('╭') && view.contains('╰'));

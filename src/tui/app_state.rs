@@ -3,6 +3,7 @@
 //! composer / drawer / scroll. No state is inferred from matching strings.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::domain::event::{
     ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
@@ -66,6 +67,9 @@ pub struct AppState {
     /// The live draft saved when history browsing begins, restored on the way
     /// back past the newest entry.
     history_draft: String,
+    /// When each currently-running member started, for the elapsed-time
+    /// "working" indicator. Set on entering Running, cleared otherwise.
+    running_since: HashMap<MemberId, Instant>,
 }
 
 impl AppState {
@@ -105,6 +109,7 @@ impl AppState {
             prompt_history,
             history_cursor: None,
             history_draft: String::new(),
+            running_since: HashMap::new(),
         }
     }
 
@@ -303,6 +308,16 @@ impl AppState {
     fn set_status(&mut self, member: &MemberId, status: MemberStatus) {
         if let Some(view) = self.members.iter_mut().find(|m| &m.id == member) {
             view.status = status;
+        }
+        // Track elapsed "working" time: start the clock when a member begins
+        // running (without resetting it on repeated Running events), stop it
+        // on any other status.
+        if status == MemberStatus::Running {
+            self.running_since
+                .entry(member.clone())
+                .or_insert_with(Instant::now);
+        } else {
+            self.running_since.remove(member);
         }
         if status == MemberStatus::Idle
             || status == MemberStatus::Failed
@@ -682,6 +697,13 @@ impl AppState {
 
     pub fn active_reasoning(&self) -> &HashMap<MemberId, String> {
         &self.active_reasoning
+    }
+
+    /// How long `member` has been running, for the "working" elapsed timer.
+    pub fn member_elapsed_secs(&self, member: &MemberId) -> Option<u64> {
+        self.running_since
+            .get(member)
+            .map(|t| t.elapsed().as_secs())
     }
 }
 
