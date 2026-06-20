@@ -12,7 +12,7 @@ pub mod drawers;
 pub mod keymap;
 pub mod markdown;
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -95,23 +95,38 @@ fn attach_to_member(
 ) -> io::Result<()> {
     let (program, args) = req.command();
 
+    // --- Suspend Asterline: hand the real terminal to the child CLI. ---
+    // Restore the cooked terminal, leave our alternate screen, and show the
+    // cursor, flushing so the child starts from a clean, owned main screen.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    println!(
+    let mut out = io::stdout();
+    execute!(out, LeaveAlternateScreen, crossterm::cursor::Show)?;
+    writeln!(
+        out,
         "\n── {} · {} {} ──  (exit the session to return to Asterline)\n",
         req.display_name,
         program,
         args.join(" ")
-    );
+    )?;
+    out.flush()?;
 
     let result = std::process::Command::new(&program)
         .args(&args)
         .current_dir(&req.cwd)
         .status();
 
+    // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen)?;
+    out.flush()?;
+    // Drop input the child or the terminal left buffered (e.g. the reply to the
+    // alternate-screen switch) so the first key after returning isn't a stray
+    // escape sequence.
+    while event::poll(Duration::from_secs(0))? {
+        let _ = event::read()?;
+    }
+    // Discard ratatui's cached screen contents so the next draw is a full
+    // repaint over whatever the child CLI left behind.
     terminal.clear()?;
 
     match result {
