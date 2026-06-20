@@ -603,18 +603,16 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             ),
         )
     } else if state.running_count() > 0 {
-        (Color::Yellow, " Processing turn (running...) ".to_string())
+        (Color::Yellow, " processing… ".to_string())
     } else {
-        (
-            Color::Cyan,
-            " Composer (Enter send · Alt/Shift+Enter newline · @member · /command) ".to_string(),
-        )
+        // Idle: a clean open composer (no title), like codex.
+        (Color::DarkGray, String::new())
     };
 
+    // Open composer: top and bottom rules only, no enclosing side bars.
     let block = Block::default()
         .title(title_text)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1145,9 +1143,9 @@ mod tests {
         // The running member surfaces a working indicator + interrupt hint.
         assert!(view.contains("working"));
         assert!(view.contains("interrupt"));
-        // The conversation is not wrapped in a box; the only border is the
-        // rounded composer at the bottom.
-        assert!(view.contains('╭') && view.contains('╰'));
+        // The composer is open (top/bottom rules only) — no enclosing box or
+        // rounded corners around the conversation or input.
+        assert!(!view.contains('╭'));
     }
 
     #[test]
