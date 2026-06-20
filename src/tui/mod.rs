@@ -177,6 +177,20 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state.scroll_down();
             }
         }
+        Action::HistoryPrev => {
+            if state.completion().is_some() {
+                state.popup_up();
+            } else {
+                state.history_prev();
+            }
+        }
+        Action::HistoryNext => {
+            if state.completion().is_some() {
+                state.popup_down();
+            } else {
+                state.history_next();
+            }
+        }
         Action::ToggleLogs => state.toggle_drawer(drawers::Drawer::Logs),
         Action::ToggleTeam => state.toggle_drawer(drawers::Drawer::Team),
         Action::TogglePalette => state.toggle_drawer(drawers::Drawer::Palette),
@@ -223,6 +237,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
 
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.take_composer();
+    // Record every non-blank submission for shell-style ↑/↓ recall.
+    state.record_submission(&text);
     match commands::parse(&text) {
         Submission::Runtime(command) => {
             if let UiCommand::UserMessage { target, body } = &command {

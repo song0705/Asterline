@@ -99,6 +99,13 @@ impl Composer {
         self.clear();
         text
     }
+
+    /// Replace the entire contents, leaving the cursor at the end. Used by
+    /// prompt-history recall to load a previous submission into the composer.
+    pub fn set_text(&mut self, text: &str) {
+        self.chars = text.chars().collect();
+        self.cursor = self.chars.len();
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +166,14 @@ mod tests {
         c.left();
         c.insert('b');
         assert_eq!(c.text(), "abc");
+    }
+
+    #[test]
+    fn set_text_replaces_and_moves_cursor_to_end() {
+        let mut c = typed("old");
+        c.home();
+        c.set_text("recalled");
+        assert_eq!(c.text(), "recalled");
+        assert_eq!(c.cursor(), 8);
     }
 }

@@ -122,7 +122,9 @@ default roster:
 - `←`/`→` — cycle member selection (when roster focus is active).
 - `Enter` (when a member is selected) — attach to that member's live backend
   session (exit the CLI to return).
-- `↑`/`↓`/`PageUp`/`PageDown` — scroll the conversation.
+- `↑`/`↓` — recall previous submissions (shell-style prompt history; preserves
+  your in-progress draft), or move the selection when a popup is open.
+- `PageUp`/`PageDown` — scroll the conversation.
 
 ### Slash commands
 

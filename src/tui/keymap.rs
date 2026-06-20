@@ -17,6 +17,8 @@ pub enum Action {
     End,
     ScrollUp,
     ScrollDown,
+    HistoryPrev,
+    HistoryNext,
     ToggleLogs,
     ToggleTeam,
     TogglePalette,
@@ -44,8 +46,12 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::Right => Some(Action::CursorRight),
         KeyCode::Home => Some(Action::Home),
         KeyCode::End => Some(Action::End),
-        KeyCode::Up | KeyCode::PageUp => Some(Action::ScrollUp),
-        KeyCode::Down | KeyCode::PageDown => Some(Action::ScrollDown),
+        // Arrows recall prompt history (or move the popup selection); page
+        // keys scroll the conversation. Mirrors shell / codex conventions.
+        KeyCode::Up => Some(Action::HistoryPrev),
+        KeyCode::Down => Some(Action::HistoryNext),
+        KeyCode::PageUp => Some(Action::ScrollUp),
+        KeyCode::PageDown => Some(Action::ScrollDown),
         KeyCode::Char('c') if ctrl => Some(Action::Interrupt),
         KeyCode::Char('g') if ctrl => Some(Action::ToggleExpand),
         KeyCode::Char('l') if ctrl => Some(Action::ToggleLogs),
@@ -100,6 +106,26 @@ mod tests {
         assert_eq!(
             resolve(key(KeyCode::Char('a'), KeyModifiers::NONE)),
             Some(Action::InsertChar('a'))
+        );
+    }
+
+    #[test]
+    fn arrows_recall_history_and_page_keys_scroll() {
+        assert_eq!(
+            resolve(key(KeyCode::Up, KeyModifiers::NONE)),
+            Some(Action::HistoryPrev)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(Action::HistoryNext)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(Action::ScrollUp)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(Action::ScrollDown)
         );
     }
 

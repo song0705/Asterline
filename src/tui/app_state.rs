@@ -57,11 +57,30 @@ pub struct AppState {
     pending_user_messages: Vec<String>,
     header_selected: Option<usize>,
     attach_request: Option<AttachRequest>,
+    /// Shell-style prompt history (oldest→newest): prior submissions recalled
+    /// with ↑/↓. Seeded from replayed user messages, appended as you submit.
+    prompt_history: Vec<String>,
+    /// Position in `prompt_history` while browsing, or `None` when editing the
+    /// live draft.
+    history_cursor: Option<usize>,
+    /// The live draft saved when history browsing begins, restored on the way
+    /// back past the newest entry.
+    history_draft: String,
 }
 
 impl AppState {
     /// Create with replayed chat history (empty for a fresh session).
     pub fn new(chat: Vec<ChatItem>) -> Self {
+        // Seed prompt history from prior user messages (cross-session recall),
+        // collapsing consecutive duplicates the way a shell history does.
+        let mut prompt_history: Vec<String> = Vec::new();
+        for item in &chat {
+            if let ChatItem::User { body } = item
+                && prompt_history.last() != Some(body)
+            {
+                prompt_history.push(body.clone());
+            }
+        }
         Self {
             team: "Asterline".to_string(),
             workspace: String::new(),
@@ -83,6 +102,9 @@ impl AppState {
             pending_user_messages: Vec::new(),
             header_selected: None,
             attach_request: None,
+            prompt_history,
+            history_cursor: None,
+            history_draft: String::new(),
         }
     }
 
@@ -458,21 +480,25 @@ impl AppState {
     pub fn insert_char(&mut self, ch: char) {
         self.header_selected = None;
         self.composer.insert(ch);
+        self.history_cursor = None;
         self.reset_popup();
     }
     pub fn backspace(&mut self) {
         self.header_selected = None;
         self.composer.backspace();
+        self.history_cursor = None;
         self.reset_popup();
     }
     pub fn delete_word(&mut self) {
         self.header_selected = None;
         self.composer.delete_word();
+        self.history_cursor = None;
         self.reset_popup();
     }
     pub fn clear_composer(&mut self) {
         self.header_selected = None;
         self.composer.clear();
+        self.history_cursor = None;
         self.reset_popup();
     }
     pub fn cursor_left(&mut self) {
@@ -493,6 +519,7 @@ impl AppState {
     }
     pub fn take_composer(&mut self) -> String {
         let text = self.composer.take();
+        self.history_cursor = None;
         self.reset_popup();
         text
     }
@@ -523,6 +550,66 @@ impl AppState {
         self.composer.replace_token(completion.token_start, &insert);
         self.reset_popup();
         self.composer.text() != before
+    }
+
+    // --- prompt history (shell-style ↑/↓ recall) ------------------------
+
+    /// Record a submitted line into prompt history (skipping blanks and
+    /// consecutive duplicates) and end any active browse.
+    pub fn record_submission(&mut self, text: &str) {
+        let text = text.trim();
+        if !text.is_empty() && self.prompt_history.last().map(String::as_str) != Some(text) {
+            self.prompt_history.push(text.to_string());
+        }
+        self.history_cursor = None;
+        self.history_draft.clear();
+    }
+
+    /// Recall an older entry (↑). The first step saves the live draft and jumps
+    /// to the newest entry; further steps walk backwards.
+    pub fn history_prev(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let target = match self.history_cursor {
+            None => {
+                self.history_draft = self.composer.text();
+                self.prompt_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(target);
+        let text = self.prompt_history[target].clone();
+        self.composer.set_text(&text);
+        // Suppress the completion popup while browsing recalled commands.
+        self.popup_dismissed = true;
+        self.popup_selected = 0;
+        self.header_selected = None;
+    }
+
+    /// Recall a newer entry (↓); stepping past the newest restores the draft.
+    pub fn history_next(&mut self) {
+        let Some(i) = self.history_cursor else {
+            return;
+        };
+        if i + 1 < self.prompt_history.len() {
+            self.history_cursor = Some(i + 1);
+            let text = self.prompt_history[i + 1].clone();
+            self.composer.set_text(&text);
+            self.popup_dismissed = true;
+        } else {
+            self.history_cursor = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.composer.set_text(&draft);
+        }
+        self.popup_selected = 0;
+        self.header_selected = None;
+    }
+
+    /// Whether the composer is currently showing a recalled history entry.
+    pub fn browsing_history(&self) -> bool {
+        self.history_cursor.is_some()
     }
 
     // --- UI actions -----------------------------------------------------
@@ -812,5 +899,67 @@ mod tests {
 
         state.insert_char('x');
         assert_eq!(state.header_selected(), None); // cleared on typing
+    }
+
+    #[test]
+    fn prompt_history_seeds_from_replayed_user_messages() {
+        let chat = vec![
+            ChatItem::User {
+                body: "first".to_string(),
+            },
+            ChatItem::Agent {
+                member: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                text: "ok".to_string(),
+            },
+            ChatItem::User {
+                body: "second".to_string(),
+            },
+        ];
+        let mut state = AppState::new(chat);
+
+        // ↑ recalls newest-first across sessions.
+        state.history_prev();
+        assert_eq!(state.composer().text(), "second");
+        state.history_prev();
+        assert_eq!(state.composer().text(), "first");
+        // Already at the oldest entry — further ↑ stays put.
+        state.history_prev();
+        assert_eq!(state.composer().text(), "first");
+        // ↓ walks back toward newest.
+        state.history_next();
+        assert_eq!(state.composer().text(), "second");
+    }
+
+    #[test]
+    fn history_preserves_and_restores_the_live_draft() {
+        let mut state = AppState::new(vec![ChatItem::User {
+            body: "prior".to_string(),
+        }]);
+        for ch in "draft".chars() {
+            state.insert_char(ch);
+        }
+        state.history_prev();
+        assert_eq!(state.composer().text(), "prior");
+        assert!(state.browsing_history());
+        // Stepping past the newest restores what was being typed.
+        state.history_next();
+        assert_eq!(state.composer().text(), "draft");
+        assert!(!state.browsing_history());
+    }
+
+    #[test]
+    fn submitting_records_history_and_skips_consecutive_dupes() {
+        let mut state = AppState::new(Vec::new());
+        state.record_submission("build it");
+        state.record_submission("build it"); // dup ignored
+        state.record_submission("   "); // blank ignored
+        state.record_submission("review it");
+
+        state.history_prev();
+        assert_eq!(state.composer().text(), "review it");
+        state.history_prev();
+        assert_eq!(state.composer().text(), "build it");
     }
 }
