@@ -22,25 +22,34 @@ SQLite.
 
 - **Single-column chat.** Agent text, tool calls, agent-to-agent routes, and
   errors are inline conversation blocks. Logs live in a drawer, not the main view.
-- **Generic team roster.** A member is `backend + role + name`. All-Codex,
-  all-Claude, and mixed teams are all valid; role is not tied to backend.
+- **Pick your team at startup.** With no `--team`, Asterline detects the
+  installed backend CLIs and lets you choose which to include (or falls back to a
+  default roster). A member is `backend + role + name`; mixed teams are valid.
 - **Three streaming backends.** Claude (`claude -p --output-format stream-json
   --include-partial-messages`), Codex (`codex exec --json`), and Gemini
-  (`gemini -p -o text`). Codex/Claude keep a resumable session — no `--ephemeral`,
-  no `--no-session-persistence`.
+  (`gemini -p -o text`). Codex/Claude keep a resumable session.
 - **Per-member reasoning effort.** `/effort <member> <level>` (low…max) maps to
   Claude's `--effort` and Codex's `model_reasoning_effort`, shown in the header.
 - **Attach to a live session.** Select a member and press `Enter` to hand the
   terminal to its real interactive CLI, resuming that member's session; exit to
-  return.
-- **Rich chat.** Agent output renders as Markdown; Codex file changes show as
-  diff cards; tool calls collapse to a single line.
+  return — and anything you said there is imported back into the transcript.
+- **Real composer.** Multi-line input (`Alt`/`Shift+Enter`), shell-style prompt
+  history (`↑`/`↓`), and reverse search (`Ctrl+R`).
+- **Rich chat.** Agent output renders as Markdown with syntax-highlighted code
+  (pulldown-cmark + syntect); `/diff` shows a syntax-highlighted working-tree
+  diff; tool calls collapse to a single line; a live "working" timer shows
+  elapsed time per member.
+- **New chat / sessions.** `/new` starts a fresh conversation (cleared
+  transcript, new backend sessions); transcripts are conversation-scoped, so a
+  restart resumes the current chat.
 - **Visible agent-to-agent messaging.** Agents talk by emitting
   `@@team_message {"to":"reviewer","body":"…"}`; the runtime routes it, shows it
   in chat, and persists it. A relay guard pauses runaway loops.
 - **Persisted + replayable.** Chat, tool events, routes, raw backend JSON, logs,
-  approvals, and sessions are stored in SQLite and replayed on startup.
-- **No function keys.** All actions are plain keys and `Ctrl` chords.
+  approvals, and sessions are stored in SQLite (versioned + migrated) and
+  replayed on startup.
+- **No function keys.** All actions are plain keys and `Ctrl` chords; the mouse
+  wheel scrolls the conversation.
 
 ## Install
 
@@ -65,12 +74,13 @@ cargo run -- --fake  # offline fake agents (no real CLI usage)
 
 ## Usage
 
-With no `--team`, Asterline detects which backends are installed and builds a
-default roster:
-
-- both `codex` and `claude` → a mixed team (`builder`·codex + `reviewer`·claude)
-- only one → a single-member team
-- neither → it prints a setup hint and exits
+With no `--team`, Asterline detects which backend CLIs are installed and opens an
+interactive team builder: toggle the backends you want with `Space`, then press
+`Enter` to start. Each chosen backend joins as a member with a default role
+(codex → builder, claude → reviewer, gemini → researcher). On a non-interactive
+stdout (or if you cancel) it falls back to a default roster; with no backend
+found at all it prints a setup hint and exits. Pass `--team <PATH>` to skip the
+builder and load a saved roster.
 
 ### Options
 
@@ -116,17 +126,19 @@ default roster:
 - `Enter` — send the composer.
 - `Alt+Enter` / `Shift+Enter` — insert a newline (the composer is multi-line and
   grows with its content).
+- `↑`/`↓` — recall previous submissions (shell-style prompt history; preserves
+  your in-progress draft), move between composer lines, or move the popup selection.
+- `Ctrl+R` — reverse-search prompt history (type to match, `Ctrl+R` for older,
+  `Enter` to accept, `Esc` to cancel).
+- `PageUp`/`PageDown` or the mouse wheel — scroll the conversation (or the open drawer).
 - `Esc` — close the open drawer or cancel roster selection.
-- `Ctrl+L` — logs drawer · `Ctrl+R` — team drawer · `Ctrl+P` — command palette.
+- `Ctrl+L` — logs drawer · `Ctrl+P` — command palette (team drawer via `/team`).
 - `Ctrl+C` — cancel running members, else clear the composer, else quit.
 - `Ctrl+U` — clear line · `Ctrl+W` — delete word · `Ctrl+A`/`Ctrl+E` — line start/end.
 - `Ctrl+N` / `Ctrl+B` — start cycling focus to next / previous member in the top roster.
 - `←`/`→` — cycle member selection (when roster focus is active).
 - `Enter` (when a member is selected) — attach to that member's live backend
-  session (exit the CLI to return).
-- `↑`/`↓` — recall previous submissions (shell-style prompt history; preserves
-  your in-progress draft), or move the selection when a popup is open.
-- `PageUp`/`PageDown` — scroll the conversation.
+  session; exit the CLI to return (messages you exchanged there are imported).
 
 ### Slash commands
 
@@ -136,13 +148,15 @@ popup filters as you type. `↑`/`↓` move the selection, `Tab`/`Enter` accept,
 
 - `/ask <member> <message>` or `@<member> <message>` — send to one member. Supports `all` as member to broadcast (e.g. `/ask all` or `@all`).
 - `/all <message>` — send to everyone.
+- `/new` — start a fresh chat: a new conversation (cleared transcript) and new
+  backend sessions for every member.
 - `/effort <member> <level>` — set reasoning effort (`low`…`max`).
 - `/workflow <goal>` — have a coordinator plan a goal and delegate to teammates.
 - `/focus <member>` — view a member's logs.
 - `/team`, `/sessions`, `/status` — open the team drawer.
 - `/logs` — open the logs drawer.
-- `/diff` — show the working-tree git diff (including untracked files) in a
-  scrollable overlay.
+- `/diff` — show the working-tree git diff (including untracked files), with
+  syntax-highlighted code, in a scrollable overlay.
 - `/retry` — resume a paused route, or re-run the last turn.
 - `/abort` — cancel running members.
 - `/approve` · `/reject` — decide the first pending approval.
