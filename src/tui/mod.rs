@@ -164,28 +164,36 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::Home => state.cursor_home(),
         Action::End => state.cursor_end(),
         Action::ScrollUp => {
-            if state.completion().is_some() {
+            if state.drawer().is_some() {
+                state.drawer_scroll_up();
+            } else if state.completion().is_some() {
                 state.popup_up();
             } else {
                 state.scroll_up();
             }
         }
         Action::ScrollDown => {
-            if state.completion().is_some() {
+            if state.drawer().is_some() {
+                state.drawer_scroll_down();
+            } else if state.completion().is_some() {
                 state.popup_down();
             } else {
                 state.scroll_down();
             }
         }
         Action::HistoryPrev => {
-            if state.completion().is_some() {
+            if state.drawer().is_some() {
+                state.drawer_scroll_up();
+            } else if state.completion().is_some() {
                 state.popup_up();
             } else {
                 state.history_prev();
             }
         }
         Action::HistoryNext => {
-            if state.completion().is_some() {
+            if state.drawer().is_some() {
+                state.drawer_scroll_down();
+            } else if state.completion().is_some() {
                 state.popup_down();
             } else {
                 state.history_next();
@@ -235,6 +243,39 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     }
 }
 
+/// Capture the workspace's working-tree git diff, including untracked files
+/// (mirrors codex's `/diff`). Returns a human-readable message on failure.
+fn compute_git_diff(workspace: &str) -> String {
+    let dir = if workspace.is_empty() { "." } else { workspace };
+    let run = |args: &[&str]| -> Option<String> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let mut out = match run(&["--no-pager", "diff"]) {
+        Some(diff) => diff,
+        None => return "not a git repository (or git is unavailable)".to_string(),
+    };
+    // Codex's /diff also surfaces untracked files; list them after the diff.
+    if let Some(untracked) = run(&["ls-files", "--others", "--exclude-standard"])
+        && !untracked.trim().is_empty()
+    {
+        out.push_str("\nUntracked files:\n");
+        for file in untracked.lines() {
+            out.push_str("  ");
+            out.push_str(file);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.take_composer();
     // Record every non-blank submission for shell-style ↑/↓ recall.
@@ -246,7 +287,14 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             }
             handle.send(command);
         }
-        Submission::Drawer(drawer) => state.toggle_drawer(drawer),
+        Submission::Drawer(drawer) => {
+            // `/diff` captures the live working-tree diff just before opening.
+            if drawer == drawers::Drawer::Diff && state.drawer() != Some(drawers::Drawer::Diff) {
+                let diff = compute_git_diff(state.workspace());
+                state.set_diff(diff);
+            }
+            state.toggle_drawer(drawer);
+        }
         Submission::ApproveFirst(decision) => match state.first_pending_approval() {
             Some(id) => {
                 handle.send(UiCommand::Approve { id, decision });

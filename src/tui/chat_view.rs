@@ -725,7 +725,7 @@ fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &D
         _ => drawer.title().to_string(),
     };
     let block = Block::default()
-        .title(format!(" {title} (Esc to close) "))
+        .title(format!(" {title} (↑↓ scroll · Esc to close) "))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -736,9 +736,59 @@ fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &D
         Drawer::Logs => drawer_logs(state),
         Drawer::Team => drawer_team(state),
         Drawer::Palette => drawer_palette(),
+        Drawer::Diff => drawer_diff(state),
         Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
     };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Clamp the scroll offset so content can't be pushed entirely off-screen.
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    let offset = state.drawer_scroll().min(max_scroll) as u16;
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0)),
+        inner,
+    );
+}
+
+/// Render the captured working-tree diff with +/- line coloring.
+fn drawer_diff(state: &AppState) -> Vec<Line<'static>> {
+    let Some(diff) = state.diff_text() else {
+        return vec![Line::styled(
+            "no diff captured — run /diff",
+            Style::default().fg(Color::DarkGray),
+        )];
+    };
+    if diff.trim().is_empty() {
+        return vec![Line::styled(
+            "working tree clean — no changes",
+            Style::default().fg(Color::Green),
+        )];
+    }
+    diff.lines()
+        .map(|line| {
+            let style = if line.starts_with("+++") || line.starts_with("---") {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if line.starts_with("@@") {
+                Style::default().fg(Color::Cyan)
+            } else if line.starts_with("diff ")
+                || line.starts_with("index ")
+                || line.starts_with("Untracked")
+            {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if line.starts_with('+') {
+                Style::default().fg(Color::Green)
+            } else if line.starts_with('-') {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(line.to_string(), style))
+        })
+        .collect()
 }
 
 fn drawer_logs(state: &AppState) -> Vec<Line<'static>> {
@@ -912,6 +962,7 @@ fn drawer_palette() -> Vec<Line<'static>> {
         ("/all <msg>", "Broadcast a message to all members"),
         ("/team", "Open team roster, active sessions, and approvals"),
         ("/logs", "Open raw log stream, stderr, and warnings"),
+        ("/diff", "Show the working-tree git diff"),
         ("/retry", "Resume paused routes or re-run the last turn"),
         ("/abort", "Cancel all running member executions"),
         (
@@ -1176,5 +1227,28 @@ mod tests {
         // The long command is truncated to a single line (ellipsis), not wrapped.
         assert!(view.contains('…'));
         assert!(view.contains("● shell"));
+    }
+
+    #[test]
+    fn renders_scrollable_diff_drawer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(Vec::new());
+        state.set_diff(
+            "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context"
+                .to_string(),
+        );
+        state.toggle_drawer(Drawer::Diff);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Working-tree diff"));
+        assert!(view.contains("scroll"));
+        assert!(view.contains("+new line"));
+        assert!(view.contains("-old line"));
     }
 }

@@ -8,6 +8,7 @@ pub enum Drawer {
     Logs,
     Team,
     Palette,
+    Diff,
     MemberLogs(MemberId),
 }
 
@@ -17,6 +18,7 @@ impl Drawer {
             Self::Logs => "Logs",
             Self::Team => "Team",
             Self::Palette => "Commands",
+            Self::Diff => "Working-tree diff",
             Self::MemberLogs(_) => "Member Logs",
         }
     }

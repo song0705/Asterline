@@ -70,6 +70,10 @@ pub struct AppState {
     /// When each currently-running member started, for the elapsed-time
     /// "working" indicator. Set on entering Running, cleared otherwise.
     running_since: HashMap<MemberId, Instant>,
+    /// Vertical scroll offset for the open drawer (logs / team / diff).
+    drawer_scroll: usize,
+    /// Captured working-tree diff text for the diff drawer (`/diff`).
+    diff_text: Option<String>,
 }
 
 impl AppState {
@@ -110,6 +114,8 @@ impl AppState {
             history_cursor: None,
             history_draft: String::new(),
             running_since: HashMap::new(),
+            drawer_scroll: 0,
+            diff_text: None,
         }
     }
 
@@ -635,10 +641,31 @@ impl AppState {
         } else {
             Some(drawer)
         };
+        self.drawer_scroll = 0;
     }
 
     pub fn close_drawer(&mut self) {
         self.drawer = None;
+        self.drawer_scroll = 0;
+    }
+
+    /// The drawer's vertical scroll offset (top line to show).
+    pub fn drawer_scroll(&self) -> usize {
+        self.drawer_scroll
+    }
+    pub fn drawer_scroll_up(&mut self) {
+        self.drawer_scroll = self.drawer_scroll.saturating_add(1);
+    }
+    pub fn drawer_scroll_down(&mut self) {
+        self.drawer_scroll = self.drawer_scroll.saturating_sub(1);
+    }
+
+    /// The captured working-tree diff shown in the diff drawer.
+    pub fn diff_text(&self) -> Option<&str> {
+        self.diff_text.as_deref()
+    }
+    pub fn set_diff(&mut self, diff: String) {
+        self.diff_text = Some(diff);
     }
 
     pub fn select_next_member(&mut self) {

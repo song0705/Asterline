@@ -26,6 +26,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("effort", "set reasoning effort (low…max)", true),
     ("team", "roster · sessions · approvals", false),
     ("logs", "raw logs · stderr · warnings", false),
+    ("diff", "show working-tree git diff", false),
     ("sessions", "session ids", false),
     ("status", "team status", false),
     ("retry", "resume paused route / re-run", false),

@@ -83,6 +83,7 @@ fn parse_slash(rest: &str) -> Submission {
         }
         "team" | "status" | "sessions" => Submission::Drawer(Drawer::Team),
         "logs" => Submission::Drawer(Drawer::Logs),
+        "diff" => Submission::Drawer(Drawer::Diff),
         "abort" => Submission::Runtime(UiCommand::Cancel { member: None }),
         "retry" => Submission::Runtime(UiCommand::Retry),
         "approve" => Submission::ApproveFirst(ApprovalDecision::Approve),
@@ -190,6 +191,7 @@ mod tests {
     fn drawer_and_control_commands() {
         assert_eq!(parse("/logs"), Submission::Drawer(Drawer::Logs));
         assert_eq!(parse("/team"), Submission::Drawer(Drawer::Team));
+        assert_eq!(parse("/diff"), Submission::Drawer(Drawer::Diff));
         assert_eq!(
             parse("/abort"),
             Submission::Runtime(UiCommand::Cancel { member: None })

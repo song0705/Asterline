@@ -139,6 +139,8 @@ popup filters as you type. `↑`/`↓` move the selection, `Tab`/`Enter` accept,
 - `/focus <member>` — view a member's logs.
 - `/team`, `/sessions`, `/status` — open the team drawer.
 - `/logs` — open the logs drawer.
+- `/diff` — show the working-tree git diff (including untracked files) in a
+  scrollable overlay.
 - `/retry` — resume a paused route, or re-run the last turn.
 - `/abort` — cancel running members.
 - `/approve` · `/reject` — decide the first pending approval.
