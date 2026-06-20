@@ -16,7 +16,9 @@ use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -41,14 +43,18 @@ pub fn run(
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_loop(&mut terminal, &mut state, &handle, &events);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     handle.send(UiCommand::Shutdown);
@@ -68,12 +74,16 @@ fn run_loop(
 
         terminal.draw(|frame| chat_view::render(frame, state))?;
 
-        if event::poll(POLL_INTERVAL)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && let Some(action) = keymap::resolve(key)
-        {
-            handle_action(action, state, handle);
+        if event::poll(POLL_INTERVAL)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let Some(action) = keymap::resolve(key) {
+                        handle_action(action, state, handle);
+                    }
+                }
+                Event::Mouse(mouse) => handle_mouse(mouse, state),
+                _ => {}
+            }
         }
 
         if let Some(req) = state.take_attach_request() {
@@ -82,6 +92,26 @@ fn run_loop(
 
         if state.should_quit() {
             return Ok(());
+        }
+    }
+}
+
+/// Mouse wheel scrolls the conversation (or the open drawer), a few lines per
+/// tick. Real mouse capture means the wheel no longer arrives as ↑/↓ arrow keys
+/// (which now recall prompt history).
+fn handle_mouse(mouse: MouseEvent, state: &mut AppState) {
+    const STEP: usize = 3;
+    let up = match mouse.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return,
+    };
+    for _ in 0..STEP {
+        match (state.drawer().is_some(), up) {
+            (true, true) => state.drawer_scroll_up(),
+            (true, false) => state.drawer_scroll_down(),
+            (false, true) => state.scroll_up(),
+            (false, false) => state.scroll_down(),
         }
     }
 }
@@ -100,7 +130,12 @@ fn attach_to_member(
     // cursor, flushing so the child starts from a clean, owned main screen.
     disable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, LeaveAlternateScreen, crossterm::cursor::Show)?;
+    execute!(
+        out,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
     writeln!(
         out,
         "\n── {} · {} {} ──  (exit the session to return to Asterline)\n",
@@ -117,7 +152,7 @@ fn attach_to_member(
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     out.flush()?;
     // Drop input the child or the terminal left buffered (e.g. the reply to the
     // alternate-screen switch) so the first key after returning isn't a stray
