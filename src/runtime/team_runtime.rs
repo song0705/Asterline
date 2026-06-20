@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::event::{
-    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, LogEntry, MemberStatus,
-    MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
+    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ImportedMessage, LogEntry,
+    MemberStatus, MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
 };
 use crate::domain::team::{BackendKind, Effort, MemberId, TeamConfig};
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
@@ -205,6 +205,9 @@ impl TeamRuntime {
                 }
             }
             UiCommand::NewSession { member } => self.handle_new_session(member, &mut step),
+            UiCommand::ImportTranscript { member, items } => {
+                self.handle_import_transcript(member, items, &mut step)
+            }
             UiCommand::RunWorkflow { goal } => {
                 let coordinator = self
                     .config
@@ -387,6 +390,66 @@ impl TeamRuntime {
         step.events.push(RuntimeEvent::Notice(format!(
             "── new session for {label} — the next message starts a fresh thread ──"
         )));
+    }
+
+    /// Persist and surface messages exchanged in a member's native session
+    /// (imported after an interactive attach), as one synthetic turn.
+    fn handle_import_transcript(
+        &mut self,
+        member: MemberId,
+        items: Vec<ImportedMessage>,
+        step: &mut RuntimeStep,
+    ) {
+        let Some(id) = self.config.find(member.as_str()).map(|m| m.id.clone()) else {
+            step.events
+                .push(RuntimeEvent::Notice(format!("unknown member: {member}")));
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        let turn = match self.store.create_turn() {
+            Ok(turn) => turn,
+            Err(err) => {
+                step.events
+                    .push(RuntimeEvent::Notice(format!("store error: {err}")));
+                return;
+            }
+        };
+        let display = self.member_display(&id);
+        let backend = self.member_backend(&id);
+        let count = items.len();
+        step.events.push(RuntimeEvent::TurnStarted { turn });
+        for item in items {
+            if item.from_user {
+                let _ = self
+                    .store
+                    .record_user(turn, std::slice::from_ref(&id), &item.text);
+                step.events.push(RuntimeEvent::UserMessage {
+                    turn,
+                    targets: vec![id.clone()],
+                    body: item.text,
+                });
+            } else {
+                let _ = self
+                    .store
+                    .record_agent(turn, &id, &display, backend, &item.text);
+                let msg = self.next_msg();
+                step.events.push(RuntimeEvent::MessageStarted {
+                    msg,
+                    turn,
+                    member: id.clone(),
+                });
+                step.events.push(RuntimeEvent::MessageCompleted {
+                    msg,
+                    text: item.text,
+                });
+            }
+        }
+        step.events.push(RuntimeEvent::Notice(format!(
+            "imported {count} message(s) from {id}'s attached session"
+        )));
+        step.events.push(RuntimeEvent::TurnFinished { turn });
     }
 
     fn handle_approval(

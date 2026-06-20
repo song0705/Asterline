@@ -6,10 +6,12 @@
 //! `codex` yourself — and returns to Asterline when that CLI exits.
 
 use crate::domain::team::BackendKind;
+use crate::domain::team::MemberId;
 
 /// A request to attach to a member's live backend session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachRequest {
+    pub member: MemberId,
     pub display_name: String,
     pub backend: BackendKind,
     pub session: Option<String>,
@@ -43,6 +45,7 @@ mod tests {
     #[test]
     fn codex_resumes_session_interactively() {
         let req = AttachRequest {
+            member: MemberId::new("builder"),
             display_name: "Builder".to_string(),
             backend: BackendKind::Codex,
             session: Some("thread-1".to_string()),
@@ -60,6 +63,7 @@ mod tests {
     #[test]
     fn fresh_member_launches_interactive_without_resume() {
         let req = AttachRequest {
+            member: MemberId::new("builder"),
             display_name: "Builder".to_string(),
             backend: BackendKind::Codex,
             session: None,
@@ -71,6 +75,7 @@ mod tests {
     #[test]
     fn claude_uses_resume_flag() {
         let req = AttachRequest {
+            member: MemberId::new("reviewer"),
             display_name: "Reviewer".to_string(),
             backend: BackendKind::Claude,
             session: Some("sess-9".to_string()),

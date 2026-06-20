@@ -134,6 +134,14 @@ pub enum MessageTarget {
     All,
 }
 
+/// One message imported from a member's native backend session transcript
+/// (e.g. the codex rollout) after attaching to it interactively.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedMessage {
+    pub from_user: bool,
+    pub text: String,
+}
+
 /// Commands sent from the TUI to the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiCommand {
@@ -157,6 +165,12 @@ pub enum UiCommand {
     /// Start a fresh session: forget resumable session ids so the next turns
     /// begin new backend threads. `None` targets every member.
     NewSession { member: Option<MemberId> },
+    /// Import messages exchanged in a member's native session (after attaching),
+    /// so they appear in the Asterline transcript and persist.
+    ImportTranscript {
+        member: MemberId,
+        items: Vec<ImportedMessage>,
+    },
     /// Run a built-in coordinating workflow for a goal.
     RunWorkflow { goal: String },
     /// Begin a graceful shutdown.

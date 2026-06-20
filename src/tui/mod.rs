@@ -11,6 +11,7 @@ pub mod composer;
 pub mod drawers;
 pub mod keymap;
 pub mod markdown;
+pub mod rollout_import;
 
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
@@ -27,6 +28,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::domain::event::{RuntimeEvent, UiCommand};
+use crate::domain::team::BackendKind;
 use crate::runtime::RuntimeHandle;
 use crate::tui::app_state::AppState;
 use crate::tui::commands::Submission;
@@ -87,7 +89,7 @@ fn run_loop(
         }
 
         if let Some(req) = state.take_attach_request() {
-            attach_to_member(terminal, state, &req)?;
+            attach_to_member(terminal, state, handle, &req)?;
         }
 
         if state.should_quit() {
@@ -121,9 +123,15 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState) {
 fn attach_to_member(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
+    handle: &RuntimeHandle,
     req: &attach::AttachRequest,
 ) -> io::Result<()> {
     let (program, args) = req.command();
+
+    // Snapshot the codex rollout so we can import whatever is typed during the
+    // attached session once it exits.
+    let snapshot = (req.backend == BackendKind::Codex)
+        .then(|| rollout_import::snapshot(req.session.as_deref()));
 
     // --- Suspend Asterline: hand the real terminal to the child CLI. ---
     // Restore the cooked terminal, leave our alternate screen, and show the
@@ -172,6 +180,19 @@ fn attach_to_member(
         Err(err) => state.apply(RuntimeEvent::Notice(format!(
             "could not launch {program}: {err}"
         ))),
+    }
+
+    // Import any messages exchanged in the attached session so they appear in
+    // (and persist to) the Asterline transcript. The runtime records them and
+    // emits the events the main loop renders.
+    if let Some(snapshot) = snapshot {
+        let imported = rollout_import::imported_since(snapshot);
+        if !imported.is_empty() {
+            handle.send(UiCommand::ImportTranscript {
+                member: req.member.clone(),
+                items: imported,
+            });
+        }
     }
     Ok(())
 }

@@ -472,6 +472,7 @@ impl AppState {
             return;
         }
         self.attach_request = Some(AttachRequest {
+            member: member.id.clone(),
             display_name: member.display_name.clone(),
             backend: member.backend,
             session: member.session.clone(),
