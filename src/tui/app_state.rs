@@ -37,6 +37,14 @@ pub struct PendingApproval {
     pub body: String,
 }
 
+/// Reverse incremental history search (Ctrl+R): a query and the index of the
+/// currently-matched prompt-history entry.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HistorySearch {
+    query: String,
+    match_idx: Option<usize>,
+}
+
 pub struct AppState {
     team: String,
     workspace: String,
@@ -70,6 +78,8 @@ pub struct AppState {
     /// When each currently-running member started, for the elapsed-time
     /// "working" indicator. Set on entering Running, cleared otherwise.
     running_since: HashMap<MemberId, Instant>,
+    /// Active reverse history search (Ctrl+R), if any.
+    history_search: Option<HistorySearch>,
     /// Vertical scroll offset for the open drawer (logs / team / diff).
     drawer_scroll: usize,
     /// Captured working-tree diff text for the diff drawer (`/diff`).
@@ -114,6 +124,7 @@ impl AppState {
             history_cursor: None,
             history_draft: String::new(),
             running_since: HashMap::new(),
+            history_search: None,
             drawer_scroll: 0,
             diff_text: None,
         }
@@ -670,6 +681,92 @@ impl AppState {
         self.history_cursor.is_some()
     }
 
+    // --- reverse history search (Ctrl+R) --------------------------------
+
+    pub fn in_history_search(&self) -> bool {
+        self.history_search.is_some()
+    }
+
+    /// The active search as `(query, matched entry)` for rendering.
+    pub fn history_search(&self) -> Option<(&str, Option<&str>)> {
+        self.history_search.as_ref().map(|s| {
+            (
+                s.query.as_str(),
+                s.match_idx.map(|i| self.prompt_history[i].as_str()),
+            )
+        })
+    }
+
+    pub fn start_history_search(&mut self) {
+        let match_idx = self.search_from("", None);
+        self.history_search = Some(HistorySearch {
+            query: String::new(),
+            match_idx,
+        });
+        self.header_selected = None;
+        self.popup_dismissed = true;
+    }
+
+    pub fn history_search_input(&mut self, ch: char) {
+        if let Some(mut search) = self.history_search.take() {
+            search.query.push(ch);
+            search.match_idx = self.search_from(&search.query, None);
+            self.history_search = Some(search);
+        }
+    }
+
+    pub fn history_search_backspace(&mut self) {
+        if let Some(mut search) = self.history_search.take() {
+            search.query.pop();
+            search.match_idx = self.search_from(&search.query, None);
+            self.history_search = Some(search);
+        }
+    }
+
+    /// Ctrl+R again: step to the next older match.
+    pub fn history_search_again(&mut self) {
+        if let Some(mut search) = self.history_search.take() {
+            let before = search.match_idx;
+            if let Some(idx) = self.search_from(&search.query, before) {
+                search.match_idx = Some(idx);
+            }
+            self.history_search = Some(search);
+        }
+    }
+
+    /// Accept the current match into the composer and leave search.
+    pub fn accept_history_search(&mut self) {
+        if let Some(search) = self.history_search.take()
+            && let Some(idx) = search.match_idx
+        {
+            let text = self.prompt_history[idx].clone();
+            self.composer.set_text(&text);
+        }
+        self.history_cursor = None;
+    }
+
+    pub fn cancel_history_search(&mut self) {
+        self.history_search = None;
+    }
+
+    /// Newest history entry containing `query` (case-insensitive) strictly older
+    /// than `before` (or the newest overall when `before` is `None`). An empty
+    /// query matches the newest available entry.
+    fn search_from(&self, query: &str, before: Option<usize>) -> Option<usize> {
+        if self.prompt_history.is_empty() {
+            return None;
+        }
+        let needle = query.to_lowercase();
+        let start = match before {
+            Some(0) => return None,
+            Some(i) => i - 1,
+            None => self.prompt_history.len() - 1,
+        };
+        (0..=start)
+            .rev()
+            .find(|&i| self.prompt_history[i].to_lowercase().contains(&needle))
+    }
+
     // --- UI actions -----------------------------------------------------
 
     pub fn toggle_drawer(&mut self, drawer: Drawer) {
@@ -1060,5 +1157,43 @@ mod tests {
         assert_eq!(state.composer().text(), "review it");
         state.history_prev();
         assert_eq!(state.composer().text(), "build it");
+    }
+
+    #[test]
+    fn reverse_history_search_finds_steps_and_accepts() {
+        let mut state = AppState::new(Vec::new());
+        state.record_submission("build the parser");
+        state.record_submission("review the parser");
+        state.record_submission("run tests");
+
+        state.start_history_search();
+        assert!(state.in_history_search());
+
+        for ch in "parser".chars() {
+            state.history_search_input(ch);
+        }
+        // Newest match first.
+        assert_eq!(state.history_search().unwrap().1, Some("review the parser"));
+        // Ctrl+R again → next older match.
+        state.history_search_again();
+        assert_eq!(state.history_search().unwrap().1, Some("build the parser"));
+
+        state.accept_history_search();
+        assert!(!state.in_history_search());
+        assert_eq!(state.composer().text(), "build the parser");
+    }
+
+    #[test]
+    fn reverse_history_search_cancel_keeps_composer() {
+        let mut state = AppState::new(Vec::new());
+        state.record_submission("hello world");
+        for ch in "draft".chars() {
+            state.insert_char(ch);
+        }
+        state.start_history_search();
+        state.history_search_input('h');
+        state.cancel_history_search();
+        assert!(!state.in_history_search());
+        assert_eq!(state.composer().text(), "draft");
     }
 }

@@ -693,6 +693,39 @@ fn clip_to_width(line: &str, avail: usize) -> String {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // Reverse history search (Ctrl+R) takes over the footer while active.
+    if let Some((query, matched)) = state.history_search() {
+        let mut spans = vec![
+            Span::styled(
+                "(reverse-search) ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("`{query}`"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" → ", Style::default().fg(Color::DarkGray)),
+        ];
+        match matched {
+            Some(text) => spans.push(Span::styled(
+                truncate(text, area.width as usize),
+                Style::default().fg(Color::Gray),
+            )),
+            None => spans.push(Span::styled(
+                "no match (Esc to cancel)",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let mut parts = Vec::new();
     if state.paused_routes() > 0 {
         parts.push(Span::styled(
@@ -734,7 +767,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else if parts.is_empty() {
         // Idle: a faint, always-present key-hint line (codex-style).
         parts.push(Span::styled(
-            "Enter send · Alt+Enter newline · ↑↓ history · @member · /help · Ctrl+R team",
+            "Enter send · Alt+Enter newline · ↑↓ history · Ctrl+R search · /help",
             Style::default().fg(Color::DarkGray),
         ));
     }

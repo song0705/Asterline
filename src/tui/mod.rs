@@ -199,6 +199,11 @@ fn attach_to_member(
 }
 
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
+    // Reverse history search (Ctrl+R) captures input until accepted/cancelled.
+    if state.in_history_search() {
+        handle_search_action(action, state);
+        return;
+    }
     match action {
         Action::InsertChar(ch) => state.insert_char(ch),
         Action::InsertNewline => state.insert_newline(),
@@ -260,8 +265,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Action::ToggleLogs => state.toggle_drawer(drawers::Drawer::Logs),
-        Action::ToggleTeam => state.toggle_drawer(drawers::Drawer::Team),
         Action::TogglePalette => state.toggle_drawer(drawers::Drawer::Palette),
+        Action::HistorySearch => state.start_history_search(),
         Action::ToggleExpand => state.toggle_tools_expansion(),
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
@@ -300,6 +305,21 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
             submit(state, handle);
         }
+    }
+}
+
+/// Handle keys while a reverse history search (Ctrl+R) is active.
+fn handle_search_action(action: Action, state: &mut AppState) {
+    match action {
+        Action::InsertChar(ch) => state.history_search_input(ch),
+        Action::Backspace => state.history_search_backspace(),
+        // Ctrl+R again steps to the next older match.
+        Action::HistorySearch => state.history_search_again(),
+        // Enter accepts the match into the composer.
+        Action::Submit => state.accept_history_search(),
+        // Esc / Ctrl+C leave search without changing the composer.
+        Action::CloseOverlay | Action::Interrupt => state.cancel_history_search(),
+        _ => {}
     }
 }
 
