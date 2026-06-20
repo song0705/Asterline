@@ -445,6 +445,15 @@ impl SqliteStore {
             .map(|opt| opt.map(AgentSessionId))
     }
 
+    /// Forget a member's resumable session so the next run starts fresh.
+    pub fn delete_session(&self, member: &MemberId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM agent_sessions WHERE member_id = ?1",
+            params![member.as_str()],
+        )?;
+        Ok(())
+    }
+
     // --- approvals -------------------------------------------------------
 
     pub fn insert_approval(

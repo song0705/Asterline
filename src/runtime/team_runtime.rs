@@ -204,6 +204,7 @@ impl TeamRuntime {
                         .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
                 }
             }
+            UiCommand::NewSession { member } => self.handle_new_session(member, &mut step),
             UiCommand::RunWorkflow { goal } => {
                 let coordinator = self
                     .config
@@ -361,6 +362,31 @@ impl TeamRuntime {
                 self.check_turn_complete(turn, step);
             }
         }
+    }
+
+    fn handle_new_session(&mut self, member: Option<MemberId>, step: &mut RuntimeStep) {
+        let targets: Vec<MemberId> = match member {
+            Some(m) => match self.config.find(m.as_str()) {
+                Some(found) => vec![found.id.clone()],
+                None => {
+                    step.events
+                        .push(RuntimeEvent::Notice(format!("unknown member: {m}")));
+                    return;
+                }
+            },
+            None => self.config.all_member_ids(),
+        };
+        for id in &targets {
+            self.sessions.clear(id);
+            let _ = self.store.delete_session(id);
+        }
+        let label = match targets.as_slice() {
+            [one] => one.to_string(),
+            _ => "all members".to_string(),
+        };
+        step.events.push(RuntimeEvent::Notice(format!(
+            "── new session for {label} — the next message starts a fresh thread ──"
+        )));
     }
 
     fn handle_approval(

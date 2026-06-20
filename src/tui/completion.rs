@@ -27,6 +27,11 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("team", "roster · sessions · approvals", false),
     ("logs", "raw logs · stderr · warnings", false),
     ("diff", "show working-tree git diff", false),
+    (
+        "new",
+        "start a fresh session (optionally for one member)",
+        false,
+    ),
     ("sessions", "session ids", false),
     ("status", "team status", false),
     ("retry", "resume paused route / re-run", false),

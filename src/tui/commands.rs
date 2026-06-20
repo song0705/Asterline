@@ -84,6 +84,11 @@ fn parse_slash(rest: &str) -> Submission {
         "team" | "status" | "sessions" => Submission::Drawer(Drawer::Team),
         "logs" => Submission::Drawer(Drawer::Logs),
         "diff" => Submission::Drawer(Drawer::Diff),
+        "new" => {
+            let (member, _) = split_first_word(arg);
+            let target = (!member.is_empty()).then(|| MemberId::new(member));
+            Submission::Runtime(UiCommand::NewSession { member: target })
+        }
         "abort" => Submission::Runtime(UiCommand::Cancel { member: None }),
         "retry" => Submission::Runtime(UiCommand::Retry),
         "approve" => Submission::ApproveFirst(ApprovalDecision::Approve),
@@ -237,5 +242,19 @@ mod tests {
         );
         assert_eq!(parse("/workflow"), Submission::Help);
         assert_eq!(parse("/focus"), Submission::Help);
+    }
+
+    #[test]
+    fn new_session_command() {
+        assert_eq!(
+            parse("/new"),
+            Submission::Runtime(UiCommand::NewSession { member: None })
+        );
+        assert_eq!(
+            parse("/new builder"),
+            Submission::Runtime(UiCommand::NewSession {
+                member: Some(MemberId::new("builder"))
+            })
+        );
     }
 }

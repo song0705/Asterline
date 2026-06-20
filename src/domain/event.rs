@@ -154,6 +154,9 @@ pub enum UiCommand {
     ResolvePausedRoute { resume: bool },
     /// Set a member's reasoning effort.
     SetEffort { member: MemberId, effort: Effort },
+    /// Start a fresh session: forget resumable session ids so the next turns
+    /// begin new backend threads. `None` targets every member.
+    NewSession { member: Option<MemberId> },
     /// Run a built-in coordinating workflow for a goal.
     RunWorkflow { goal: String },
     /// Begin a graceful shutdown.
