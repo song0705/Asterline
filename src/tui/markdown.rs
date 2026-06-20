@@ -420,6 +420,35 @@ fn syntect_color(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
+/// Map a syntect style (color + font flags) to a ratatui style.
+fn syntect_style(syn: syntect::highlighting::Style) -> Style {
+    let mut style = Style::default().fg(syntect_color(syn.foreground));
+    if syn.font_style.contains(FontStyle::BOLD) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if syn.font_style.contains(FontStyle::ITALIC) {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    style
+}
+
+/// Syntax-highlight a single line of code for a file `extension` (or language
+/// token), returning styled spans. Stateless per line — handy for diff views.
+pub(crate) fn highlight_code_line(line: &str, extension: &str) -> Vec<Span<'static>> {
+    let syntax = SYNTAXES
+        .find_syntax_by_extension(extension)
+        .or_else(|| SYNTAXES.find_syntax_by_token(extension))
+        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, &THEME);
+    match highlighter.highlight_line(line, &SYNTAXES) {
+        Ok(ranges) => ranges
+            .into_iter()
+            .map(|(syn, text)| Span::styled(text.to_string(), syntect_style(syn)))
+            .collect(),
+        Err(_) => vec![Span::raw(line.to_string())],
+    }
+}
+
 /// Render a parsed table with per-column width alignment and box-drawing rules.
 fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
     if table.rows.is_empty() {

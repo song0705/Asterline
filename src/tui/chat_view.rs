@@ -787,7 +787,8 @@ fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &D
     );
 }
 
-/// Render the captured working-tree diff with +/- line coloring.
+/// Render the captured working-tree diff: structural lines stay colored by role,
+/// while added/removed/context code is syntax-highlighted by the file's type.
 fn drawer_diff(state: &AppState) -> Vec<Line<'static>> {
     let Some(diff) = state.diff_text() else {
         return vec![Line::styled(
@@ -801,31 +802,76 @@ fn drawer_diff(state: &AppState) -> Vec<Line<'static>> {
             Style::default().fg(Color::Green),
         )];
     }
-    diff.lines()
-        .map(|line| {
-            let style = if line.starts_with("+++") || line.starts_with("---") {
+
+    let mut out = Vec::new();
+    let mut ext = String::new();
+    for line in diff.lines() {
+        // Track the current file so code lines highlight with the right syntax.
+        if let Some(path) = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("diff --git a/"))
+        {
+            ext = file_extension(path);
+        }
+
+        if line.starts_with("+++") || line.starts_with("---") {
+            out.push(Line::styled(
+                line.to_string(),
                 Style::default()
                     .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
-            } else if line.starts_with("@@") {
-                Style::default().fg(Color::Cyan)
-            } else if line.starts_with("diff ")
-                || line.starts_with("index ")
-                || line.starts_with("Untracked")
-            {
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if line.starts_with("@@") {
+            out.push(Line::styled(
+                line.to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("Untracked")
+        {
+            out.push(Line::styled(
+                line.to_string(),
                 Style::default()
                     .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else if line.starts_with('+') {
-                Style::default().fg(Color::Green)
-            } else if line.starts_with('-') {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Line::from(Span::styled(line.to_string(), style))
-        })
-        .collect()
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            out.push(diff_code_line('+', Color::Green, rest, &ext));
+        } else if let Some(rest) = line.strip_prefix('-') {
+            out.push(diff_code_line('-', Color::Red, rest, &ext));
+        } else {
+            let rest = line.strip_prefix(' ').unwrap_or(line);
+            out.push(diff_code_line(' ', Color::DarkGray, rest, &ext));
+        }
+    }
+    out
+}
+
+/// One diff content line: a colored +/-/space gutter plus syntax-highlighted code.
+fn diff_code_line(marker: char, gutter: Color, code: &str, ext: &str) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        marker.to_string(),
+        Style::default().fg(gutter),
+    )];
+    if code.is_empty() {
+        return Line::from(spans);
+    }
+    if ext.is_empty() {
+        spans.push(Span::styled(code.to_string(), Style::default().fg(gutter)));
+    } else {
+        spans.extend(markdown::highlight_code_line(code, ext));
+    }
+    Line::from(spans)
+}
+
+fn file_extension(path: &str) -> String {
+    let path = path.trim();
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn drawer_logs(state: &AppState) -> Vec<Line<'static>> {
