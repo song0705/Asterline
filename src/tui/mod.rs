@@ -12,6 +12,7 @@ pub mod drawers;
 pub mod keymap;
 pub mod markdown;
 pub mod rollout_import;
+pub mod team_builder;
 
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;

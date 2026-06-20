@@ -94,6 +94,42 @@ pub fn default_team(
     }
 }
 
+/// The canonical default member for a backend, used by the interactive team
+/// builder. Custom rosters (roles, sandboxes, prompts) come via a config file.
+pub fn default_member(backend: BackendKind) -> TeamMember {
+    match backend {
+        BackendKind::Codex => {
+            let mut m = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+            m.sandbox = SandboxPolicy::WorkspaceWrite;
+            m
+        }
+        BackendKind::Claude => {
+            let mut m = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+            m.permission_mode = Some(PermissionMode::Plan);
+            m
+        }
+        BackendKind::Gemini => {
+            TeamMember::new("researcher", "Researcher", BackendKind::Gemini, "research")
+        }
+    }
+}
+
+/// Build a team from an explicit list of backends chosen in the interactive
+/// builder. Returns `None` when no backend is selected.
+pub fn build_team(workspace: impl Into<PathBuf>, backends: &[BackendKind]) -> Option<TeamConfig> {
+    if backends.is_empty() {
+        return None;
+    }
+    let mut config = TeamConfig::new("custom", workspace);
+    for &backend in backends {
+        config = config.with_member(default_member(backend));
+    }
+    if let Some(first) = config.members.first().map(|m| m.id.clone()) {
+        config.default_target = Some(DefaultTarget::Member(first));
+    }
+    Some(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +210,29 @@ mod tests {
         assert!(!binary_in_dirs(&dirs, "nope-backend"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_team_from_selected_backends() {
+        assert!(build_team("/tmp/ws", &[]).is_none());
+
+        let config = build_team("/tmp/ws", &[BackendKind::Codex, BackendKind::Gemini]).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.members[0].backend, BackendKind::Codex);
+        assert_eq!(config.members[1].backend, BackendKind::Gemini);
+        // The first selected member is the default target.
+        assert_eq!(config.default_member_ids(), vec![MemberId::new("builder")]);
+    }
+
+    #[test]
+    fn default_member_maps_backend_to_role() {
+        assert_eq!(default_member(BackendKind::Codex).role, "implementation");
+        assert_eq!(default_member(BackendKind::Claude).role, "review");
+        assert_eq!(
+            default_member(BackendKind::Gemini).backend,
+            BackendKind::Gemini
+        );
     }
 
     #[test]

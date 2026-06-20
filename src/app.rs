@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
-use crate::domain::config::{default_team, detect_backends, load_team_config};
+use crate::domain::config::{detect_backends, load_team_config};
 use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
 use crate::runtime::{self, Runners, RuntimeHandle};
@@ -84,10 +84,19 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
 
     let mut team = match &config.team_path {
         Some(path) => load_team_config(path)?,
-        None => match default_team(&workspace, detect_backends()) {
-            Some(team) => team,
-            None => return Ok(None),
-        },
+        None => {
+            let detected = detect_backends();
+            if !detected.any() {
+                return Ok(None);
+            }
+            // Let the user choose the roster from the detected backends instead
+            // of silently applying a fixed default (falls back to the default
+            // roster when headless / on cancel).
+            match crate::tui::team_builder::run(detected, &workspace)? {
+                Some(team) => team,
+                None => return Ok(None),
+            }
+        }
     };
     inject_team_protocol(&mut team);
 
