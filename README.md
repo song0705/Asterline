@@ -79,14 +79,16 @@ interactive team builder: toggle the backends you want with `Space`, then press
 `Enter` to start. Each chosen backend joins as a member with a default role
 (codex → builder, claude → reviewer, gemini → researcher). On a non-interactive
 stdout (or if you cancel) it falls back to a default roster; with no backend
-found at all it prints a setup hint and exits. Pass `--team <PATH>` to skip the
-builder and load a saved roster.
+found at all it prints a setup hint and exits. Your choice is remembered in
+`<workspace>/.asterline/team.json` (re-run with `--pick-team` to change it), and
+`--team <PATH>` loads a saved roster directly.
 
 ### Options
 
 | Flag | Meaning |
 | --- | --- |
-| `--team <PATH>` | Load a team config (JSON). |
+| `--team <PATH>` | Load a team config (JSON); skips the builder. |
+| `--pick-team` | Re-open the team builder, ignoring the saved team. |
 | `--workspace <PATH>` | Working directory for members (default: cwd). |
 | `--db <PATH>` | SQLite path (default: `<workspace>/.asterline/asterline.sqlite3`). |
 | `--no-restore` | Don't replay persisted chat on startup. |

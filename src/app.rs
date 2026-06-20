@@ -82,8 +82,12 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         .clone()
         .unwrap_or_else(|| cwd.to_path_buf());
 
+    let saved_team = workspace.join(".asterline").join("team.json");
     let mut team = match &config.team_path {
         Some(path) => load_team_config(path)?,
+        // Reuse a previously-built roster so the builder doesn't nag every
+        // launch; `--pick-team` forces re-selection.
+        None if !config.pick_team && saved_team.is_file() => load_team_config(&saved_team)?,
         None => {
             let detected = detect_backends();
             if !detected.any() {
@@ -93,7 +97,16 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             // of silently applying a fixed default (falls back to the default
             // roster when headless / on cancel).
             match crate::tui::team_builder::run(detected, &workspace)? {
-                Some(team) => team,
+                Some(team) => {
+                    // Persist the choice for next time (before protocol injection).
+                    if let Some(parent) = saved_team.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(json) = serde_json::to_string_pretty(&team) {
+                        let _ = std::fs::write(&saved_team, json);
+                    }
+                    team
+                }
                 None => return Ok(None),
             }
         }
@@ -209,6 +222,7 @@ pub struct AppConfig {
     no_restore: bool,
     debug: bool,
     fake: bool,
+    pick_team: bool,
     show_help: bool,
 }
 
@@ -234,6 +248,7 @@ impl AppConfig {
                 "--no-restore" => config.no_restore = true,
                 "--debug" => config.debug = true,
                 "--fake" => config.fake = true,
+                "--pick-team" => config.pick_team = true,
                 "-h" | "--help" => config.show_help = true,
                 _ if arg.starts_with("--team=") => {
                     config.team_path = Some(arg["--team=".len()..].into())
@@ -270,7 +285,8 @@ impl AppConfig {
          Usage: asterline [OPTIONS]\n\
          \n\
          Options:\n\
-         \x20 --team <PATH>       Load a team config (JSON). Default: auto-detect codex/claude.\n\
+         \x20 --team <PATH>       Load a team config (JSON). Skips the team builder.\n\
+         \x20 --pick-team         Re-open the interactive team builder (ignore the saved team).\n\
          \x20 --workspace <PATH>  Working directory for members. Default: current directory.\n\
          \x20 --db <PATH>         SQLite path. Default: <workspace>/.asterline/asterline.sqlite3.\n\
          \x20 --no-restore        Do not replay persisted chat history on startup.\n\
@@ -278,8 +294,8 @@ impl AppConfig {
          \x20 --fake              Use offline fake agents instead of real CLIs.\n\
          \x20 -h, --help          Show this help.\n\
          \n\
-         With no --team, Asterline builds a default roster: both backends -> mixed\n\
-         (codex builder + claude reviewer); one backend -> a single-member team."
+         With no --team, Asterline opens a team builder from the detected backends\n\
+         and remembers your choice in <workspace>/.asterline/team.json."
     }
 }
 
