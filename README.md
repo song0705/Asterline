@@ -24,9 +24,17 @@ SQLite.
   errors are inline conversation blocks. Logs live in a drawer, not the main view.
 - **Generic team roster.** A member is `backend + role + name`. All-Codex,
   all-Claude, and mixed teams are all valid; role is not tied to backend.
-- **Real streaming backends.** Claude via `claude -p --output-format stream-json
-  --include-partial-messages`; Codex via `codex exec --json`. Each member keeps a
-  resumable session — no `--ephemeral`, no `--no-session-persistence`.
+- **Three streaming backends.** Claude (`claude -p --output-format stream-json
+  --include-partial-messages`), Codex (`codex exec --json`), and Gemini
+  (`gemini -p -o text`). Codex/Claude keep a resumable session — no `--ephemeral`,
+  no `--no-session-persistence`.
+- **Per-member reasoning effort.** `/effort <member> <level>` (low…max) maps to
+  Claude's `--effort` and Codex's `model_reasoning_effort`, shown in the header.
+- **Attach to a live session.** Select a member and press `Enter` to hand the
+  terminal to its real interactive CLI, resuming that member's session; exit to
+  return.
+- **Rich chat.** Agent output renders as Markdown; Codex file changes show as
+  diff cards; tool calls collapse to a single line.
 - **Visible agent-to-agent messaging.** Agents talk by emitting
   `@@team_message {"to":"reviewer","body":"…"}`; the runtime routes it, shows it
   in chat, and persists it. A relay guard pauses runaway loops.
@@ -112,7 +120,8 @@ default roster:
 - `Ctrl+U` — clear line · `Ctrl+W` — delete word · `Ctrl+A`/`Ctrl+E` — line start/end.
 - `Ctrl+N` / `Ctrl+B` — start cycling focus to next / previous member in the top roster.
 - `←`/`→` — cycle member selection (when roster focus is active).
-- `Enter` (when roster focus is active) — open the selected member's detailed log drawer.
+- `Enter` (when a member is selected) — attach to that member's live backend
+  session (exit the CLI to return).
 - `↑`/`↓`/`PageUp`/`PageDown` — scroll the conversation.
 
 ### Slash commands
@@ -123,6 +132,9 @@ popup filters as you type. `↑`/`↓` move the selection, `Tab`/`Enter` accept,
 
 - `/ask <member> <message>` or `@<member> <message>` — send to one member. Supports `all` as member to broadcast (e.g. `/ask all` or `@all`).
 - `/all <message>` — send to everyone.
+- `/effort <member> <level>` — set reasoning effort (`low`…`max`).
+- `/workflow <goal>` — have a coordinator plan a goal and delegate to teammates.
+- `/focus <member>` — view a member's logs.
 - `/team`, `/sessions`, `/status` — open the team drawer.
 - `/logs` — open the logs drawer.
 - `/retry` — resume a paused route, or re-run the last turn.
