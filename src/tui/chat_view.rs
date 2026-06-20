@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use crate::domain::event::{ChatItem, LogEntry, LogLevel, MemberStatus};
 use crate::domain::team::{BackendKind, MemberId};
@@ -16,12 +17,17 @@ use crate::tui::drawers::Drawer;
 use crate::tui::markdown;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
+    // The composer grows with its content up to a cap, like a real textarea.
+    const MAX_COMPOSER_ROWS: u16 = 8;
+    let composer_rows = (state.composer().line_count() as u16).clamp(1, MAX_COMPOSER_ROWS);
+    let composer_height = composer_rows + 2; // borders
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -601,7 +607,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else {
         (
             Color::Cyan,
-            " Composer (Enter to send, @member, /command) ".to_string(),
+            " Composer (Enter send · Alt/Shift+Enter newline · @member · /command) ".to_string(),
         )
     };
 
@@ -613,46 +619,79 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let chars: Vec<char> = state.composer().text().chars().collect();
-    let cursor = state.composer().cursor();
-    let prompt_cols = 2usize; // "> "
-    let avail = (inner.width as usize).saturating_sub(prompt_cols);
-    let (visible, cursor_in_view_width) = if avail == 0 {
-        (String::new(), 0)
+    let rows = inner.height as usize;
+    if rows == 0 {
+        return;
+    }
+    let avail = (inner.width as usize).saturating_sub(2); // "> " / "  " gutter
+    let text = state.composer().text();
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (cursor_row, cursor_col) = state.composer().cursor_row_col();
+
+    // Vertical scroll so the cursor's line stays visible in the capped area.
+    let top = if cursor_row >= rows {
+        cursor_row - rows + 1
     } else {
-        let start = cursor.saturating_sub(avail.saturating_sub(1));
-        let end = (start + avail).min(chars.len());
-        let visible_str: String = chars[start..end].iter().collect();
-        let cursor_relative_idx = cursor - start;
-        let width_before_cursor: usize = chars[start..(start + cursor_relative_idx)]
-            .iter()
-            .map(|&c| {
-                let val = c as u32;
-                if (0x3000..=0x9FFF).contains(&val)
-                    || (0xAC00..=0xD7AF).contains(&val)
-                    || (0xFF00..=0xFFEF).contains(&val)
-                {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum();
-        (visible_str, width_before_cursor)
+        0
     };
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().fg(border_color)),
-            Span::raw(visible),
-        ])),
-        inner,
-    );
-
-    if state.drawer().is_none() {
-        let col = inner.x + prompt_cols as u16 + cursor_in_view_width as u16;
-        frame.set_cursor_position((col, inner.y));
+    let mut out_lines: Vec<Line> = Vec::new();
+    let mut cursor_screen: Option<(u16, u16)> = None;
+    for (offset, row) in (top..top + rows).enumerate() {
+        let Some(line) = lines.get(row) else { break };
+        let prefix = if row == 0 { "> " } else { "  " };
+        let (shown, cursor_width) = if row == cursor_row {
+            composer_line_window(line, cursor_col, avail)
+        } else {
+            (clip_to_width(line, avail), 0)
+        };
+        out_lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(border_color)),
+            Span::raw(shown),
+        ]));
+        if row == cursor_row {
+            cursor_screen = Some((inner.x + 2 + cursor_width as u16, inner.y + offset as u16));
+        }
     }
+    frame.render_widget(Paragraph::new(out_lines), inner);
+
+    if state.drawer().is_none()
+        && let Some((col, row)) = cursor_screen
+    {
+        frame.set_cursor_position((col, row));
+    }
+}
+
+/// The visible slice of the cursor's composer line (horizontally scrolled to
+/// keep the cursor in view) plus the display width before the cursor.
+fn composer_line_window(line: &str, cursor_col: usize, avail: usize) -> (String, usize) {
+    if avail == 0 {
+        return (String::new(), 0);
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let start = cursor_col.saturating_sub(avail.saturating_sub(1));
+    let end = (start + avail).min(chars.len());
+    let shown: String = chars[start..end].iter().collect();
+    let cursor_width: usize = chars[start..cursor_col.min(end)]
+        .iter()
+        .map(|&c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    (shown, cursor_width)
+}
+
+/// Clip a line to roughly `avail` columns (used for non-cursor composer lines).
+fn clip_to_width(line: &str, avail: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in line.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > avail {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -697,7 +736,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else if parts.is_empty() {
         // Idle: a faint, always-present key-hint line (codex-style).
         parts.push(Span::styled(
-            "Enter send · ↑↓ history · @member · /help · Ctrl+R team · Ctrl+L logs",
+            "Enter send · Alt+Enter newline · ↑↓ history · @member · /help · Ctrl+R team",
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -1250,5 +1289,29 @@ mod tests {
         assert!(view.contains("scroll"));
         assert!(view.contains("+new line"));
         assert!(view.contains("-old line"));
+    }
+
+    #[test]
+    fn renders_multiline_composer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(Vec::new());
+        for ch in "line one".chars() {
+            state.insert_char(ch);
+        }
+        state.insert_newline();
+        for ch in "line two".chars() {
+            state.insert_char(ch);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        // Both composer lines are visible (first with the prompt gutter).
+        assert!(view.contains("> line one"));
+        assert!(view.contains("line two"));
     }
 }

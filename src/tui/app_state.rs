@@ -504,6 +504,22 @@ impl AppState {
         self.history_cursor = None;
         self.reset_popup();
     }
+    pub fn insert_newline(&mut self) {
+        self.header_selected = None;
+        self.composer.insert_newline();
+        self.history_cursor = None;
+        self.reset_popup();
+    }
+    /// Move the cursor up within a multi-line composer; returns false if it is
+    /// already on the first line (so the caller recalls history instead).
+    pub fn composer_up(&mut self) -> bool {
+        self.composer.up()
+    }
+    /// Move the cursor down within a multi-line composer; returns false if it is
+    /// already on the last line.
+    pub fn composer_down(&mut self) -> bool {
+        self.composer.down()
+    }
     pub fn backspace(&mut self) {
         self.header_selected = None;
         self.composer.backspace();

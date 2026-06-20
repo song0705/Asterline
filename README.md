@@ -114,6 +114,8 @@ default roster:
 ### Keys
 
 - `Enter` — send the composer.
+- `Alt+Enter` / `Shift+Enter` — insert a newline (the composer is multi-line and
+  grows with its content).
 - `Esc` — close the open drawer or cancel roster selection.
 - `Ctrl+L` — logs drawer · `Ctrl+R` — team drawer · `Ctrl+P` — command palette.
 - `Ctrl+C` — cancel running members, else clear the composer, else quit.

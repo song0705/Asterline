@@ -144,6 +144,7 @@ fn attach_to_member(
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     match action {
         Action::InsertChar(ch) => state.insert_char(ch),
+        Action::InsertNewline => state.insert_newline(),
         Action::Backspace => state.backspace(),
         Action::DeleteWord => state.delete_word(),
         Action::ClearLine => state.clear_composer(),
@@ -186,7 +187,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state.drawer_scroll_up();
             } else if state.completion().is_some() {
                 state.popup_up();
-            } else {
+            } else if !state.composer_up() {
+                // Already on the first composer line — recall older history.
                 state.history_prev();
             }
         }
@@ -195,7 +197,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state.drawer_scroll_down();
             } else if state.completion().is_some() {
                 state.popup_down();
-            } else {
+            } else if !state.composer_down() {
+                // Already on the last composer line — recall newer history.
                 state.history_next();
             }
         }

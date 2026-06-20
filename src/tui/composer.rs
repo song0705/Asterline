@@ -30,6 +30,11 @@ impl Composer {
         self.cursor += 1;
     }
 
+    /// Insert a hard line break at the cursor (multi-line composer).
+    pub fn insert_newline(&mut self) {
+        self.insert('\n');
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -67,11 +72,89 @@ impl Composer {
     }
 
     pub fn home(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.line_bounds().0;
     }
 
     pub fn end(&mut self) {
-        self.cursor = self.chars.len();
+        self.cursor = self.line_bounds().1;
+    }
+
+    /// Char index range `[start, end)` of the line containing the cursor.
+    fn line_bounds(&self) -> (usize, usize) {
+        let start = self.chars[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = self.chars[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.chars.len());
+        (start, end)
+    }
+
+    /// Char index of the start of each visual line.
+    fn line_starts(&self) -> Vec<usize> {
+        let mut starts = vec![0];
+        for (i, &c) in self.chars.iter().enumerate() {
+            if c == '\n' {
+                starts.push(i + 1);
+            }
+        }
+        starts
+    }
+
+    /// Number of visual lines (≥ 1).
+    pub fn line_count(&self) -> usize {
+        self.chars.iter().filter(|&&c| c == '\n').count() + 1
+    }
+
+    /// Cursor position as a (row, column) pair in characters.
+    pub fn cursor_row_col(&self) -> (usize, usize) {
+        let mut row = 0;
+        let mut col = 0;
+        for &c in &self.chars[..self.cursor] {
+            if c == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (row, col)
+    }
+
+    /// Move the cursor up one visual line, keeping the column. Returns false if
+    /// already on the first line (so the caller can fall back to history recall).
+    pub fn up(&mut self) -> bool {
+        let (row, col) = self.cursor_row_col();
+        if row == 0 {
+            return false;
+        }
+        let starts = self.line_starts();
+        let prev_start = starts[row - 1];
+        let prev_len = (starts[row] - 1).saturating_sub(prev_start);
+        self.cursor = prev_start + col.min(prev_len);
+        true
+    }
+
+    /// Move the cursor down one visual line, keeping the column. Returns false if
+    /// already on the last line.
+    pub fn down(&mut self) -> bool {
+        let (row, col) = self.cursor_row_col();
+        let starts = self.line_starts();
+        if row + 1 >= starts.len() {
+            return false;
+        }
+        let next_start = starts[row + 1];
+        let next_end = if row + 2 < starts.len() {
+            starts[row + 2] - 1
+        } else {
+            self.chars.len()
+        };
+        self.cursor = next_start + col.min(next_end - next_start);
+        true
     }
 
     /// The text before the cursor (used to compute completions).
@@ -175,5 +258,37 @@ mod tests {
         c.set_text("recalled");
         assert_eq!(c.text(), "recalled");
         assert_eq!(c.cursor(), 8);
+    }
+
+    #[test]
+    fn multiline_navigation_and_line_aware_home_end() {
+        let mut c = typed("ab\ncde");
+        assert_eq!(c.line_count(), 2);
+        assert_eq!(c.cursor_row_col(), (1, 3)); // end of "cde"
+
+        // Up keeps the column (clamped to the shorter first line).
+        assert!(c.up());
+        assert_eq!(c.cursor_row_col(), (0, 2)); // "ab" has length 2
+        // Already on the first line: up returns false (history fallback).
+        assert!(!c.up());
+
+        // Home/End act on the current line.
+        c.home();
+        assert_eq!(c.cursor(), 0);
+        c.end();
+        assert_eq!(c.cursor(), 2); // before the newline
+
+        assert!(c.down());
+        assert_eq!(c.cursor_row_col().0, 1);
+        assert!(!c.down());
+    }
+
+    #[test]
+    fn insert_newline_grows_lines() {
+        let mut c = typed("a");
+        c.insert_newline();
+        c.insert('b');
+        assert_eq!(c.text(), "a\nb");
+        assert_eq!(c.line_count(), 2);
     }
 }

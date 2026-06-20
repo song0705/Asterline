@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Action {
     Submit,
     InsertChar(char),
+    InsertNewline,
     Backspace,
     DeleteWord,
     ClearLine,
@@ -38,6 +39,10 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
 
     match key.code {
         KeyCode::F(_) => None,
+        // Alt+Enter / Shift+Enter insert a newline; plain Enter submits.
+        KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(Action::InsertNewline)
+        }
         KeyCode::Enter => Some(Action::Submit),
         KeyCode::Tab => Some(Action::Complete),
         KeyCode::Esc => Some(Action::CloseOverlay),
@@ -126,6 +131,22 @@ mod tests {
         assert_eq!(
             resolve(key(KeyCode::PageDown, KeyModifiers::NONE)),
             Some(Action::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn enter_submits_but_modified_enter_inserts_newline() {
+        assert_eq!(
+            resolve(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(Action::InsertNewline)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(Action::InsertNewline)
         );
     }
 

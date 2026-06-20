@@ -121,7 +121,10 @@ impl Renderer {
                 )));
             }
             // Raw HTML / footnotes / math: surface their text verbatim.
-            Event::Html(s) | Event::InlineHtml(s) | Event::InlineMath(s) | Event::DisplayMath(s) => {
+            Event::Html(s)
+            | Event::InlineHtml(s)
+            | Event::InlineMath(s)
+            | Event::DisplayMath(s) => {
                 self.push_units(&s, self.inline_style());
             }
             Event::TaskListMarker(done) => {
@@ -702,8 +705,12 @@ mod tests {
     fn inline_bold_and_code_split_into_spans() {
         let lines = render("a **bold** and `code` end", 80);
         let spans = &lines[0].spans;
-        assert!(spans.iter().any(|s| s.content.as_ref() == "bold"
-            && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.as_ref() == "bold"
+                    && s.style.add_modifier.contains(Modifier::BOLD))
+        );
         assert!(spans.iter().any(|s| s.content.as_ref() == "code"));
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "a bold and code end");
