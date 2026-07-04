@@ -33,7 +33,11 @@ impl AttachRequest {
                 vec!["--resume".to_string(), session.clone()],
             ),
             (BackendKind::Claude, None) => ("claude".to_string(), Vec::new()),
-            (BackendKind::Gemini, _) => ("gemini".to_string(), Vec::new()),
+            (BackendKind::Agy, Some(session)) => (
+                "agy".to_string(),
+                vec!["--conversation".to_string(), session.clone()],
+            ),
+            (BackendKind::Agy, None) => ("agy".to_string(), Vec::new()),
         }
     }
 }
@@ -86,6 +90,24 @@ mod tests {
             (
                 "claude".to_string(),
                 vec!["--resume".to_string(), "sess-9".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn agy_uses_conversation_flag() {
+        let req = AttachRequest {
+            member: MemberId::new("researcher"),
+            display_name: "Researcher".to_string(),
+            backend: BackendKind::Agy,
+            session: Some("sess-9".to_string()),
+            cwd: "/tmp/ws".to_string(),
+        };
+        assert_eq!(
+            req.command(),
+            (
+                "agy".to_string(),
+                vec!["--conversation".to_string(), "sess-9".to_string()]
             )
         );
     }

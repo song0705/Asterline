@@ -39,7 +39,8 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
 
     match key.code {
         KeyCode::F(_) => None,
-        // Alt+Enter / Shift+Enter insert a newline; plain Enter submits.
+        // Shift+Enter inserts a newline; Alt+Enter is kept as a fallback for
+        // terminals that cannot report Shift+Enter distinctly.
         KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(Action::InsertNewline)
         }

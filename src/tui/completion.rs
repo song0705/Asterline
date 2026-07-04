@@ -24,7 +24,8 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("ask", "send to one member", true),
     ("all", "send to everyone", true),
     ("effort", "set reasoning effort (low…max)", true),
-    ("team", "roster · sessions · approvals", false),
+    ("team", "edit roster · sessions · approvals", false),
+    ("runs", "workflow status · next action", false),
     ("logs", "raw logs · stderr · warnings", false),
     ("diff", "show working-tree git diff", false),
     (
@@ -38,7 +39,13 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("abort", "cancel running members", false),
     ("approve", "approve first pending", false),
     ("reject", "reject first pending", false),
+    ("plan", "start a tracked team workflow", true),
     ("workflow", "coordinate a goal across the team", true),
+    ("continue", "resume latest or selected workflow", true),
+    ("note", "record a workflow checkpoint", true),
+    ("block", "mark a workflow blocked", true),
+    ("step", "manage workflow checklist", true),
+    ("verify", "verify latest or selected workflow", true),
     ("focus", "view a member's logs", true),
     ("help", "show commands", false),
 ];
@@ -173,11 +180,21 @@ mod tests {
         assert_eq!(c.token_start, 0);
         assert!(c.items.iter().any(|i| i.insert == "/ask "));
         assert!(c.items.iter().any(|i| i.insert == "/team"));
+        assert!(c.items.iter().any(|i| i.insert == "/plan "));
+        assert!(c.items.iter().any(|i| i.insert == "/continue "));
+        assert!(c.items.iter().any(|i| i.insert == "/note "));
+        assert!(c.items.iter().any(|i| i.insert == "/block "));
+        assert!(c.items.iter().any(|i| i.insert == "/step "));
     }
 
     #[test]
     fn slash_prefix_filters() {
         assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
+        assert_eq!(inserts("/pl"), vec!["/plan ".to_string()]);
+        assert_eq!(inserts("/con"), vec!["/continue ".to_string()]);
+        assert_eq!(inserts("/no"), vec!["/note ".to_string()]);
+        assert_eq!(inserts("/blo"), vec!["/block ".to_string()]);
+        assert_eq!(inserts("/ste"), vec!["/step ".to_string()]);
         let a = inserts("/a");
         assert!(a.contains(&"/ask ".to_string()) && a.contains(&"/all ".to_string()));
     }

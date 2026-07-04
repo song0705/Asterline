@@ -1,47 +1,58 @@
-//! Renders the chat-first UI: a header with team + member status, the single
-//! scrolling conversation column, the bottom composer, a footer hint line, and
-//! an optional drawer overlay (logs / team / command palette).
+//! Renders the chat-first UI: the header block, the single scrolling
+//! conversation column, the bottom composer, a footer hint line, and an
+//! optional drawer overlay. Chat-block rendering lives here; the header,
+//! drawers, and workflow presentation live in sibling modules.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use crate::domain::event::{ChatItem, LogEntry, LogLevel, MemberStatus};
-use crate::domain::team::{BackendKind, MemberId};
+use crate::domain::event::{ChatItem, MemberStatus};
+use crate::domain::team::DefaultTarget;
 use crate::tui::app_state::AppState;
 use crate::tui::completion::Completion;
-use crate::tui::drawers::Drawer;
+use crate::tui::drawer_view::render_drawer;
+use crate::tui::header::{render_footer, render_header};
 use crate::tui::markdown;
+use crate::tui::status_indicator;
+use crate::tui::theme;
+use crate::tui::theme::truncate_width;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     // The composer grows with its content up to a cap, like a real textarea.
     const MAX_COMPOSER_ROWS: u16 = 8;
     let composer_rows = (state.composer().line_count() as u16).clamp(1, MAX_COMPOSER_ROWS);
     let composer_height = composer_rows + 2; // borders
+    let completion = if state.drawer().is_none() {
+        state.completion()
+    } else {
+        None
+    };
+    let bottom_height = completion
+        .as_ref()
+        .map(completion_popup_height)
+        .unwrap_or(1);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(composer_height),
-            Constraint::Length(1),
+            Constraint::Length(bottom_height),
         ])
         .split(frame.area());
 
     render_header(frame, chunks[0], state);
     render_chat(frame, chunks[1], state);
     render_composer(frame, chunks[2], state);
-    render_footer(frame, chunks[3], state);
-
-    // The completion popup floats just above the composer (hidden behind a drawer).
-    if state.drawer().is_none()
-        && let Some(completion) = state.completion()
-    {
-        render_popup(frame, chunks[2], &completion, state.popup_selected());
+    if let Some(completion) = completion {
+        render_popup(frame, chunks[3], &completion, state.popup_selected());
+    } else {
+        render_footer(frame, chunks[3], state);
     }
 
     if let Some(drawer) = state.drawer() {
@@ -49,38 +60,31 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     }
 }
 
-fn render_popup(
-    frame: &mut Frame<'_>,
-    composer_area: Rect,
-    completion: &Completion,
-    selected: usize,
-) {
-    const MAX_ROWS: usize = 6;
-    let count = completion.items.len();
-    let shown = count.min(MAX_ROWS);
-    let height = shown as u16 + 2;
-    let width = composer_area.width.min(60);
-    let area = Rect {
-        x: composer_area.x,
-        y: composer_area.y.saturating_sub(height),
-        width,
-        height,
-    };
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(format!(" {} ", completion.title))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+const MAX_COMPLETION_ROWS: usize = 6;
 
+fn completion_popup_height(completion: &Completion) -> u16 {
+    completion.items.len().min(MAX_COMPLETION_ROWS) as u16
+}
+
+fn render_popup(frame: &mut Frame<'_>, area: Rect, completion: &Completion, selected: usize) {
+    let count = completion.items.len();
+    let shown = count.min(MAX_COMPLETION_ROWS);
     let selected = selected.min(count.saturating_sub(1));
     let start = if selected >= shown {
         selected + 1 - shown
     } else {
         0
     };
+    let name_width = completion
+        .items
+        .iter()
+        .filter_map(|item| {
+            let (name, description) = completion_parts(&item.label);
+            description.map(|_| name.chars().count())
+        })
+        .max()
+        .unwrap_or(0)
+        .min(18);
     let lines: Vec<Line> = completion
         .items
         .iter()
@@ -88,108 +92,59 @@ fn render_popup(
         .skip(start)
         .take(shown)
         .map(|(i, item)| {
-            let style = if i == selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+            let (name, description) = completion_parts(&item.label);
+            let is_selected = i == selected;
+            let selected_name_style = theme::selection();
+            let selected_text_style = Style::default().fg(Color::Black).bg(theme::ACCENT);
+            let name_style = if is_selected {
+                selected_name_style
+            } else {
+                theme::accent()
+            };
+            let marker_style = if is_selected {
+                selected_name_style
             } else {
                 Style::default()
             };
-            Line::from(Span::styled(format!(" {} ", item.label), style))
+            let marker = if is_selected { "› " } else { "  " };
+            let mut used_width = marker.chars().count() + name.chars().count();
+            let mut spans = vec![
+                Span::styled(marker, marker_style),
+                Span::styled(name.to_string(), name_style),
+            ];
+            if let Some(description) = description {
+                let padding = name_width.saturating_sub(name.chars().count()) + 2;
+                used_width += padding + description.chars().count();
+                let padding_style = if is_selected {
+                    selected_text_style
+                } else {
+                    Style::default()
+                };
+                let description_style = if is_selected {
+                    selected_text_style
+                } else {
+                    theme::muted()
+                };
+                spans.push(Span::styled(" ".repeat(padding), padding_style));
+                spans.push(Span::styled(description.to_string(), description_style));
+            }
+            if is_selected {
+                spans.push(Span::styled(
+                    " ".repeat((area.width as usize).saturating_sub(used_width)),
+                    selected_text_style,
+                ));
+            }
+            Line::from(spans)
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let width = area.width as usize;
-    let project_name = format!(" Asterline · {} ", state.team());
-    let workspace_info = if state.workspace().is_empty() {
-        String::new()
-    } else {
-        format!(" {} ", state.workspace())
-    };
-    let remaining_dashes = width
-        .saturating_sub(project_name.chars().count())
-        .saturating_sub(workspace_info.chars().count())
-        .saturating_sub(2);
-    let dashes = "─".repeat(remaining_dashes);
-
-    let header_line = Line::from(vec![
-        Span::styled("┌", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            project_name,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(dashes, Style::default().fg(Color::DarkGray)),
-        Span::styled(workspace_info, Style::default().fg(Color::DarkGray)),
-        Span::styled("┐", Style::default().fg(Color::DarkGray)),
-    ]);
-
-    let mut chips = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
-    for (i, member) in state.members().iter().enumerate() {
-        if i > 0 {
-            chips.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
-        }
-        let color = backend_color(member.backend);
-        let dot = match member.status {
-            MemberStatus::Running => {
-                let ms = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                let idx = ((ms / 80) % spinner.len() as u128) as usize;
-                spinner[idx]
-            }
-            MemberStatus::NeedsApproval => "⚠",
-            MemberStatus::Failed => "✘",
-            _ => "○",
-        };
-        let is_selected = state.header_selected() == Some(i);
-        let (name_style, status_style) = if is_selected {
-            (
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(color)
-                    .add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::Black).bg(color),
-            )
-        } else {
-            (
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-                Style::default().fg(status_color(member.status)),
-            )
-        };
-        chips.push(Span::styled(format!("{dot} "), status_style));
-        chips.push(Span::styled(member.display_name.clone(), name_style));
-        chips.push(Span::styled(
-            format!(" ({})", status_glyph(member.status)),
-            status_style,
-        ));
-        if let Some(effort) = member.effort {
-            chips.push(Span::styled(
-                format!(" ·{}", effort.as_str()),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
+fn completion_parts(label: &str) -> (&str, Option<&str>) {
+    match label.split_once(" — ") {
+        Some((name, description)) => (name, Some(description)),
+        None => (label, None),
     }
-    if state.members().is_empty() {
-        chips.push(Span::styled(
-            "starting…",
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    let chips_len: usize = chips.iter().map(|s| s.content.chars().count()).sum();
-    let right_padding = width.saturating_sub(chips_len).saturating_sub(1);
-    chips.push(Span::raw(" ".repeat(right_padding)));
-    chips.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-
-    frame.render_widget(Paragraph::new(vec![header_line, Line::from(chips)]), area);
 }
 
 fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -202,180 +157,50 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     if state.chat().is_empty() {
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "      _       _             _ _",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "     / \\   __| |_ ___  _ __| (_)_ __   ___",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "    / _ \\ / _` \\ __/ _ \\| '__| | | '_ \\ / _ \\",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "   / ___ \\ (_| | ||  __/| |  | | | | | |  __/",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  /_/   \\_\\__,_|\\__\\___||_|  |_|_|_| |_|\\___|",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "Welcome to Asterline — A chat-first multi-agent console.",
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" to submit, ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "@member",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " to target a member, ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                "/help",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" for commands.", Style::default().fg(Color::DarkGray)),
-        ]));
+        lines.extend(quick_start_lines(state));
         lines.push(Line::raw(""));
     }
 
-    for item in state.chat() {
-        render_item(item, width, state, &mut lines);
-    }
+    render_chat_history(state, width, &mut lines);
 
-    // Append active member status lines
+    // Append live activity lines for members that are currently busy.
     let active_members: Vec<_> = state
         .members()
         .iter()
         .filter(|m| m.status != MemberStatus::Idle)
         .collect();
 
-    if !active_members.is_empty() {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let idx = ((ms / 80) % spinner.len() as u128) as usize;
-        let spin_char = spinner[idx];
-
-        for member in active_members {
-            // Draw placeholder header if the member hasn't started their message yet
-            if !state.has_active_message(&member.id) {
-                let color = backend_color(member.backend);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "• ",
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        member.display_name.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" · {}", member.backend.as_str()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-
-                let has_reasoning = state
-                    .active_reasoning()
-                    .get(&member.id)
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-                let elapsed = state
-                    .member_elapsed_secs(&member.id)
-                    .map(fmt_elapsed_compact)
-                    .unwrap_or_default();
-                let line_text = if has_reasoning {
-                    let reasoning = &state.active_reasoning()[&member.id];
-                    format!("{spin_char} thinking {elapsed}: {reasoning}")
-                } else {
-                    match member.status {
-                        MemberStatus::Running => {
-                            format!("{spin_char} working {elapsed} · Ctrl+C to interrupt")
-                        }
-                        MemberStatus::Queued => format!("{spin_char} queued"),
-                        MemberStatus::Waiting => format!("{spin_char} waiting"),
-                        MemberStatus::NeedsApproval => {
-                            format!("{spin_char} waiting for approval")
-                        }
-                        MemberStatus::Failed => format!("{spin_char} failed"),
-                        MemberStatus::Idle => format!("{spin_char} idle"),
-                    }
-                };
-
-                for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
-                    lines.push(Line::from(vec![
-                        Span::styled("  ", Style::default()),
-                        Span::styled(
-                            wrapped,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                    ]));
-                }
-                lines.push(Line::raw(""));
-            } else {
-                // Member has started their message; only show reasoning if present
-                let has_reasoning = state
-                    .active_reasoning()
-                    .get(&member.id)
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-                if has_reasoning {
-                    let reasoning = &state.active_reasoning()[&member.id];
-                    let elapsed = state
-                        .member_elapsed_secs(&member.id)
-                        .map(fmt_elapsed_compact)
-                        .unwrap_or_default();
-                    let line_text = format!("{spin_char} thinking {elapsed}: {reasoning}");
-                    for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(
-                                wrapped,
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                        ]));
-                    }
-                }
-            }
+    let spin_char = status_indicator::spinner();
+    for member in active_members {
+        // A member that hasn't started its message yet gets a placeholder
+        // header; one that has only surfaces its live reasoning.
+        let show_placeholder = !state.has_active_message(&member.id);
+        let reasoning = state
+            .active_reasoning()
+            .get(&member.id)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty());
+        if !show_placeholder && reasoning.is_none() {
+            continue;
+        }
+        if show_placeholder {
+            lines.push(agent_header_line(&member.display_name, member.backend));
+        }
+        let line_text = status_indicator::member_activity_text(
+            member.status,
+            reasoning,
+            state.member_elapsed_secs(&member.id),
+            spin_char,
+            Some(&member_runtime_profile(member)),
+        );
+        for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped, theme::muted_italic()),
+            ]));
+        }
+        if show_placeholder {
+            lines.push(Line::raw(""));
         }
     }
 
@@ -388,6 +213,135 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'static>>) {
+    let items = state.chat();
+    let mut saw_work_activity = false;
+    for (i, item) in items.iter().enumerate() {
+        if matches!(item, ChatItem::User { .. }) && saw_work_activity {
+            render_turn_separator(width, out);
+            saw_work_activity = false;
+        }
+        if is_work_activity(item) {
+            saw_work_activity = true;
+        }
+        let before = out.len();
+        render_item(item, width, state, out);
+        // Central spacing policy: one blank line between blocks, except
+        // between consecutive compact one-liners (tools, notices, …), which
+        // stay grouped.
+        if out.len() > before {
+            let next = items.get(i + 1);
+            let grouped = is_compact(item) && next.is_some_and(is_compact);
+            if !grouped {
+                out.push(Line::raw(""));
+            }
+        }
+    }
+    if saw_work_activity && state.running_count() == 0 {
+        render_turn_separator(width, out);
+    }
+}
+
+fn is_work_activity(item: &ChatItem) -> bool {
+    matches!(
+        item,
+        ChatItem::Tool { ok: Some(_), .. } | ChatItem::Diff { .. } | ChatItem::Route { .. }
+    )
+}
+
+/// Compact items render as one or two lines and cluster without blank lines.
+fn is_compact(item: &ChatItem) -> bool {
+    matches!(
+        item,
+        ChatItem::Tool { .. } | ChatItem::Diff { .. } | ChatItem::Notice { .. }
+    )
+}
+
+/// A light, inset rule between finished work turns — enough to scan by,
+/// without cutting the conversation into full-width slabs.
+fn render_turn_separator(width: usize, out: &mut Vec<Line<'static>>) {
+    while out.last().is_some_and(line_is_blank) {
+        out.pop();
+    }
+    let rule_width = (width / 3).clamp(8, width.max(8));
+    out.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(rule_width)),
+        theme::muted(),
+    )));
+    out.push(Line::raw(""));
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
+fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" Asterline", theme::accent_bold()),
+        Span::styled(" · Multi-Agent Coding Console", theme::muted()),
+    ]));
+
+    if state.members().is_empty() {
+        lines.push(Line::styled(" Team is loading...", theme::muted()));
+        return lines;
+    }
+
+    let members = state
+        .members()
+        .iter()
+        .map(|member| {
+            format!(
+                "{} ({}, {})",
+                member.id,
+                member.backend.as_str(),
+                member.role
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    lines.push(Line::from(vec![
+        Span::styled(" Members: ", theme::muted()),
+        Span::styled(members, theme::text()),
+    ]));
+    lines.push(Line::raw(""));
+
+    let example_member = state
+        .members()
+        .iter()
+        .find(|member| match state.default_target() {
+            Some(DefaultTarget::Member(id)) => &member.id == id,
+            _ => false,
+        })
+        .or_else(|| state.members().first())
+        .map(|member| member.id.to_string())
+        .unwrap_or_else(|| "member".to_string());
+    let examples = [
+        (format!("@{example_member} <message>"), "message one member"),
+        ("/plan <goal>".to_string(), "run a tracked team workflow"),
+        ("/help".to_string(), "all commands"),
+    ];
+    for (i, (cmd, desc)) in examples.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(if i == 0 { " Try:  " } else { "       " }, theme::muted()),
+            Span::styled(format!("{cmd:<24}"), theme::accent_bold()),
+            Span::styled(desc.to_string(), theme::muted()),
+        ]));
+    }
+    lines
+}
+
+fn agent_header_line(
+    display_name: &str,
+    backend: crate::domain::team::BackendKind,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("• ", theme::backend_bold(backend)),
+        Span::styled(display_name.to_string(), theme::backend_bold(backend)),
+        Span::styled(format!(" · {}", backend.as_str()), theme::muted()),
+    ])
+}
+
 fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Line<'static>>) {
     match item {
         ChatItem::User { body } => {
@@ -395,21 +349,12 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
             for line in markdown::wrap(body, width.saturating_sub(2).max(1)) {
                 let prefix = if first {
                     first = false;
-                    Span::styled(
-                        "› ",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    Span::styled("› ", theme::bold(theme::USER))
                 } else {
-                    Span::styled("  ", Style::default())
+                    Span::raw("  ")
                 };
-                out.push(Line::from(vec![
-                    prefix,
-                    Span::styled(line, Style::default().fg(Color::Gray)),
-                ]));
+                out.push(Line::from(vec![prefix, Span::styled(line, theme::text())]));
             }
-            out.push(Line::raw(""));
         }
         ChatItem::Agent {
             member,
@@ -421,104 +366,52 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
             if text.is_empty() && !state.has_active_message(member) {
                 return;
             }
-            let color = backend_color(*backend);
-            out.push(Line::from(vec![
-                Span::styled(
-                    "• ",
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    display_name.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" · {}", backend.as_str()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+            out.push(agent_header_line(display_name, *backend));
             for line in markdown::render(text, width.saturating_sub(2).max(1)) {
-                let mut spans = vec![Span::styled("  ", Style::default())];
+                let mut spans = vec![Span::raw("  ")];
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
             }
-            out.push(Line::raw(""));
         }
         ChatItem::Tool {
             name, summary, ok, ..
         } => {
-            let (dot, dot_color) = match ok {
-                None => {
-                    let ms = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                    let idx = ((ms / 80) % spinner.len() as u128) as usize;
-                    (spinner[idx], Color::Yellow)
+            let (marker, marker_color, text_style) = match ok {
+                None => (status_indicator::spinner(), theme::WARNING, theme::text()),
+                Some(true) => ("✓", theme::SUCCESS, theme::text()),
+                Some(false) => ("✕", theme::ERROR, theme::error()),
+            };
+            let command = tool_display_text(name, summary);
+            let command_width = width.saturating_sub(6).max(12);
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{marker} "), theme::bold(marker_color)),
+                Span::styled(truncate_width(&command, command_width), text_style),
+            ]));
+            if state.tools_expanded() && summary.chars().count() > command_width {
+                for line in markdown::wrap(summary, width.saturating_sub(6).max(1))
+                    .into_iter()
+                    .take(3)
+                {
+                    out.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(line, theme::muted()),
+                    ]));
                 }
-                Some(true) => ("●", Color::Green),
-                Some(false) => ("●", Color::Red),
-            };
-
-            let name_color = match ok {
-                None => Color::Yellow,
-                Some(_) => Color::DarkGray,
-            };
-            let name_modifier = match ok {
-                None => Modifier::BOLD,
-                Some(_) => Modifier::empty(),
-            };
-
-            let mut spans = vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(format!("{dot} "), Style::default().fg(dot_color)),
-                Span::styled(
-                    name.clone(),
-                    Style::default().fg(name_color).add_modifier(name_modifier),
-                ),
-            ];
-
-            if state.tools_expanded() {
-                let avail = width.saturating_sub(name.chars().count() + 28);
-                let display_summary = truncate(summary, avail.max(10));
-                spans.push(Span::styled(": ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(
-                    display_summary,
-                    Style::default().fg(Color::Gray),
-                ));
-                spans.push(Span::styled(" ", Style::default()));
-                spans.push(Span::styled(
-                    "(ctrl+g/t to collapse)",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ));
-            } else {
-                spans.push(Span::styled(" ", Style::default()));
-                spans.push(Span::styled(
-                    "(ctrl+g/t to expand)",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ));
             }
-
-            out.push(Line::from(spans));
         }
         ChatItem::Diff { files, .. } => {
             out.push(Line::from(Span::styled(
                 "  ✎ file changes",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                theme::accent_bold(),
             )));
             for (path, kind) in files {
                 let (sign, color) = match kind.as_str() {
-                    "add" => ("+", Color::Green),
-                    "delete" => ("-", Color::Red),
-                    _ => ("~", Color::Yellow),
+                    "add" => ("+", theme::SUCCESS),
+                    "delete" => ("-", theme::ERROR),
+                    _ => ("~", theme::WARNING),
                 };
-                let shown = truncate(path, width.saturating_sub(6).max(10));
+                let shown = truncate_width(path, width.saturating_sub(6).max(10));
                 out.push(Line::from(vec![
                     Span::styled(format!("    {sign} "), Style::default().fg(color)),
                     Span::styled(shown, Style::default().fg(color)),
@@ -526,34 +419,34 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
             }
         }
         ChatItem::Route { from, to, body } => {
-            out.push(Line::from(Span::styled(
-                format!("{from} → {}", to.join(", ")),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            push_wrapped(body, width, "  ", Style::default().fg(Color::Magenta), out);
-            out.push(Line::raw(""));
+            let from_backend = state
+                .members()
+                .iter()
+                .find(|member| &member.id == from)
+                .map(|member| theme::backend_color(member.backend))
+                .unwrap_or(theme::MUTED);
+            out.push(Line::from(vec![
+                Span::styled("  ↳ ", theme::muted()),
+                Span::styled(
+                    format!("{from} → {}", to.join(", ")),
+                    theme::bold(from_backend),
+                ),
+            ]));
+            push_wrapped(body, width, "    ", theme::text(), out);
         }
         ChatItem::Notice { text } => {
-            push_wrapped(
-                &format!("• {text}"),
-                width,
-                "",
-                Style::default().fg(Color::DarkGray),
-                out,
-            );
+            push_wrapped(&format!("  • {text}"), width, "", theme::muted(), out);
         }
         ChatItem::Error { member, message } => {
             let prefix = member
                 .as_ref()
-                .map(|m| format!("✗ {m}: "))
-                .unwrap_or_else(|| "✗ ".to_string());
+                .map(|m| format!("  ✗ {m}: "))
+                .unwrap_or_else(|| "  ✗ ".to_string());
             push_wrapped(
                 &format!("{prefix}{message}"),
                 width,
                 "",
-                Style::default().fg(Color::Red),
+                theme::error(),
                 out,
             );
         }
@@ -573,40 +466,34 @@ fn push_wrapped(
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    let max = max.max(1);
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= max {
-        collapsed
+fn tool_display_text(name: &str, summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() || summary == name {
+        name.to_string()
     } else {
-        let mut out: String = collapsed.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
+        format!("{name}  {summary}")
     }
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let (border_color, title_text) = if !state.pending_approvals().is_empty() {
         (
-            Color::Magenta,
+            theme::WARNING,
             format!(
-                " Action Required ({} pending approvals: /approve) ",
+                " {} pending approval(s) · /approve ",
                 state.pending_approvals().len()
             ),
         )
     } else if state.paused_routes() > 0 {
         (
-            Color::Yellow,
-            format!(
-                " Delivery Paused ({} routes paused: /retry) ",
-                state.paused_routes()
-            ),
+            theme::WARNING,
+            format!(" {} route(s) paused · /retry ", state.paused_routes()),
         )
     } else if state.running_count() > 0 {
-        (Color::Yellow, " processing… ".to_string())
+        (theme::WARNING, " processing… ".to_string())
     } else {
         // Idle: a clean open composer (no title), like codex.
-        (Color::DarkGray, String::new())
+        (theme::MUTED, String::new())
     };
 
     // Open composer: top and bottom rules only, no enclosing side bars.
@@ -692,515 +579,130 @@ fn clip_to_width(line: &str, avail: usize) -> String {
     out
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // Reverse history search (Ctrl+R) takes over the footer while active.
-    if let Some((query, matched)) = state.history_search() {
-        let mut spans = vec![
-            Span::styled(
-                "(reverse-search) ",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("`{query}`"),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" → ", Style::default().fg(Color::DarkGray)),
-        ];
-        match matched {
-            Some(text) => spans.push(Span::styled(
-                truncate(text, area.width as usize),
-                Style::default().fg(Color::Gray),
-            )),
-            None => spans.push(Span::styled(
-                "no match (Esc to cancel)",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-        return;
-    }
-
-    let mut parts = Vec::new();
-    if state.paused_routes() > 0 {
-        parts.push(Span::styled(
-            format!(
-                "● {} paused route(s) (type /retry to resume)",
-                state.paused_routes()
-            ),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if !state.pending_approvals().is_empty() {
-        if !parts.is_empty() {
-            parts.push(Span::raw("   "));
-        }
-        parts.push(Span::styled(
-            format!(
-                "● {} pending approval(s) (type /approve to decide)",
-                state.pending_approvals().len()
-            ),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    let running = state.running_count();
-    if running > 0 {
-        if !parts.is_empty() {
-            parts.push(Span::raw("   "));
-        }
-        parts.push(Span::styled(
-            format!("⏳ {running} working · Ctrl+C to interrupt"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if parts.is_empty() {
-        // Idle: a faint, always-present key-hint line (codex-style).
-        parts.push(Span::styled(
-            "Enter send · Alt+Enter newline · ↑↓ history · Ctrl+R search · /help",
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(parts)), area);
-}
-
-/// Format elapsed seconds compactly: `8s`, `1m 4s`, `1h 2m 3s` (mirrors codex's
-/// `fmt_elapsed_compact`).
-fn fmt_elapsed_compact(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m {}s", secs / 3600, (secs % 3600) / 60, secs % 60)
-    }
-}
-
-fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &Drawer) {
-    let popup = centered_rect(area, 80, 70);
-    frame.render_widget(Clear, popup);
-    let title = match drawer {
-        Drawer::MemberLogs(member) => format!("Logs: {member}"),
-        _ => drawer.title().to_string(),
-    };
-    let block = Block::default()
-        .title(format!(" {title} (↑↓ scroll · Esc to close) "))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let lines = match drawer {
-        Drawer::Logs => drawer_logs(state),
-        Drawer::Team => drawer_team(state),
-        Drawer::Palette => drawer_palette(),
-        Drawer::Diff => drawer_diff(state),
-        Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
-    };
-    // Clamp the scroll offset so content can't be pushed entirely off-screen.
-    let max_scroll = lines.len().saturating_sub(inner.height as usize);
-    let offset = state.drawer_scroll().min(max_scroll) as u16;
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        inner,
-    );
-}
-
-/// Render the captured working-tree diff: structural lines stay colored by role,
-/// while added/removed/context code is syntax-highlighted by the file's type.
-fn drawer_diff(state: &AppState) -> Vec<Line<'static>> {
-    let Some(diff) = state.diff_text() else {
-        return vec![Line::styled(
-            "no diff captured — run /diff",
-            Style::default().fg(Color::DarkGray),
-        )];
-    };
-    if diff.trim().is_empty() {
-        return vec![Line::styled(
-            "working tree clean — no changes",
-            Style::default().fg(Color::Green),
-        )];
-    }
-
-    let mut out = Vec::new();
-    let mut ext = String::new();
-    for line in diff.lines() {
-        // Track the current file so code lines highlight with the right syntax.
-        if let Some(path) = line
-            .strip_prefix("+++ b/")
-            .or_else(|| line.strip_prefix("diff --git a/"))
-        {
-            ext = file_extension(path);
-        }
-
-        if line.starts_with("+++") || line.starts_with("---") {
-            out.push(Line::styled(
-                line.to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else if line.starts_with("@@") {
-            out.push(Line::styled(
-                line.to_string(),
-                Style::default().fg(Color::Cyan),
-            ));
-        } else if line.starts_with("diff ")
-            || line.starts_with("index ")
-            || line.starts_with("Untracked")
-        {
-            out.push(Line::styled(
-                line.to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else if let Some(rest) = line.strip_prefix('+') {
-            out.push(diff_code_line('+', Color::Green, rest, &ext));
-        } else if let Some(rest) = line.strip_prefix('-') {
-            out.push(diff_code_line('-', Color::Red, rest, &ext));
-        } else {
-            let rest = line.strip_prefix(' ').unwrap_or(line);
-            out.push(diff_code_line(' ', Color::DarkGray, rest, &ext));
-        }
-    }
-    out
-}
-
-/// One diff content line: a colored +/-/space gutter plus syntax-highlighted code.
-fn diff_code_line(marker: char, gutter: Color, code: &str, ext: &str) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        marker.to_string(),
-        Style::default().fg(gutter),
-    )];
-    if code.is_empty() {
-        return Line::from(spans);
-    }
-    if ext.is_empty() {
-        spans.push(Span::styled(code.to_string(), Style::default().fg(gutter)));
-    } else {
-        spans.extend(markdown::highlight_code_line(code, ext));
-    }
-    Line::from(spans)
-}
-
-fn file_extension(path: &str) -> String {
-    let path = path.trim();
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn drawer_logs(state: &AppState) -> Vec<Line<'static>> {
-    let logs = state.logs();
-    if logs.is_empty() {
-        return vec![Line::styled(
-            "no logs yet",
-            Style::default().fg(Color::DarkGray),
-        )];
-    }
-    logs.iter()
-        .rev()
-        .take(200)
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {:<5} ", entry.level.as_str()),
-                    Style::default()
-                        .fg(log_color(entry.level))
-                        .bg(Color::Rgb(30, 30, 30)),
-                ),
-                Span::styled(
-                    format!(" {} ", entry.source),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(entry.message.clone(), Style::default().fg(Color::Gray)),
-            ])
-        })
-        .collect()
-}
-
-fn drawer_member_logs(state: &AppState, member_id: &MemberId) -> Vec<Line<'static>> {
-    let logs = state.logs();
-    let member_str = member_id.as_str();
-    let filtered: Vec<&LogEntry> = logs
-        .iter()
-        .filter(|entry| entry.source == member_str)
-        .collect();
-
-    if filtered.is_empty() {
-        return vec![Line::styled(
-            format!("no logs yet for {member_id}"),
-            Style::default().fg(Color::DarkGray),
-        )];
-    }
-
-    filtered
-        .into_iter()
-        .rev()
-        .take(200)
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {:<5} ", entry.level.as_str()),
-                    Style::default()
-                        .fg(log_color(entry.level))
-                        .bg(Color::Rgb(30, 30, 30)),
-                ),
-                Span::styled(
-                    format!(" {} ", entry.source),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(entry.message.clone(), Style::default().fg(Color::Gray)),
-            ])
-        })
-        .collect()
-}
-
-fn drawer_team(state: &AppState) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            " {:<12} │ {:<8} │ {:<18} │ {:<10} ",
-            "Member", "Backend", "Role", "Status"
-        ),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "──────────────┼──────────┼────────────────────┼────────────",
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    for member in state.members() {
-        let color = backend_color(member.backend);
-        let status_color = status_color(member.status);
-        let status_str = status_glyph(member.status);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {:<12} ", member.display_name),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:<8} ", member.backend.as_str()),
-                Style::default().fg(color),
-            ),
-            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{:<18} ", member.role), Style::default()),
-            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:<10} ", status_str),
-                Style::default().fg(status_color),
-            ),
-        ]));
-        let session = member
-            .session
-            .clone()
-            .unwrap_or_else(|| "no session yet".to_string());
-        lines.push(Line::styled(
-            format!("   └─ session: {session}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    if !state.pending_approvals().is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " Pending approvals:",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-        for approval in state.pending_approvals() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  [{}] ", approval.id),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{} (", approval.action),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    approval.body.clone(),
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-                Span::styled(")", Style::default().fg(Color::Yellow)),
-            ]));
-        }
-    }
-    lines
-}
-
-fn drawer_palette() -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        " Command Palette",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "─────────────────",
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    let items = [
-        ("/ask <member> <msg>", "Send a message to a specific member"),
-        ("@<member> <msg>", "Shortcut to message a specific member"),
-        ("/all <msg>", "Broadcast a message to all members"),
-        ("/team", "Open team roster, active sessions, and approvals"),
-        ("/logs", "Open raw log stream, stderr, and warnings"),
-        ("/diff", "Show the working-tree git diff"),
-        ("/retry", "Resume paused routes or re-run the last turn"),
-        ("/abort", "Cancel all running member executions"),
-        (
-            "/approve / /reject",
-            "Approve or reject the first pending approval",
-        ),
-        ("/help", "Show this palette help drawer"),
-    ];
-
-    for (cmd, desc) in items {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<24} ", cmd),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" {desc}",), Style::default().fg(Color::Gray)),
-        ]));
-    }
-    lines
-}
-
-fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
-fn backend_color(backend: BackendKind) -> Color {
-    match backend {
-        BackendKind::Claude => Color::Magenta,
-        BackendKind::Codex => Color::Cyan,
-        BackendKind::Gemini => Color::Blue,
-    }
-}
-
-fn status_glyph(status: MemberStatus) -> &'static str {
-    match status {
-        MemberStatus::Idle => "idle",
-        MemberStatus::Queued => "queued",
-        MemberStatus::Running => "running",
-        MemberStatus::Waiting => "waiting",
-        MemberStatus::NeedsApproval => "approval",
-        MemberStatus::Failed => "failed",
-    }
-}
-
-fn status_color(status: MemberStatus) -> Color {
-    match status {
-        MemberStatus::Running => Color::Yellow,
-        MemberStatus::Failed => Color::Red,
-        MemberStatus::NeedsApproval => Color::Magenta,
-        _ => Color::DarkGray,
-    }
-}
-
-fn log_color(level: LogLevel) -> Color {
-    match level {
-        LogLevel::Error => Color::Red,
-        LogLevel::Warn => Color::Yellow,
-        LogLevel::Info => Color::Gray,
-        LogLevel::Debug => Color::DarkGray,
-    }
+fn member_runtime_profile(member: &crate::tui::app_state::MemberView) -> String {
+    format!(
+        "model: {} • effort: {}",
+        member.model.as_deref().unwrap_or("default"),
+        member
+            .effort
+            .map(|effort| effort.as_str())
+            .unwrap_or("default")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::event::{
+        MemberStatus, RuntimeEvent, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
+        WorkflowRunSummary, WorkflowStepStatus, WorkflowStepSummary, WorkflowVerification,
+    };
+    use crate::domain::team::{
+        BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
+    };
+    use crate::tui::drawers::Drawer;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-    #[test]
-    fn fmt_elapsed_compact_scales_units() {
-        assert_eq!(fmt_elapsed_compact(8), "8s");
-        assert_eq!(fmt_elapsed_compact(64), "1m 4s");
-        assert_eq!(fmt_elapsed_compact(3723), "1h 2m 3s");
+    fn member_summary(
+        id: &str,
+        display_name: &str,
+        backend: BackendKind,
+        role: &str,
+        status: MemberStatus,
+    ) -> crate::domain::event::MemberSummary {
+        crate::domain::event::MemberSummary {
+            id: MemberId::new(id),
+            display_name: display_name.to_string(),
+            backend,
+            role: role.to_string(),
+            status,
+            session: None,
+            cwd: String::new(),
+            model: None,
+            effort: None,
+            sandbox: SandboxPolicy::ReadOnly,
+            permission_mode: Some(PermissionMode::Default),
+            session_policy: SessionPolicy::Resume,
+        }
+    }
+
+    fn plain_text(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn is_separator_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '─')
     }
 
     #[test]
-    fn renders_a_clean_layout_snapshot() {
-        use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
-        use crate::domain::team::MemberId;
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
+    fn fmt_elapsed_compact_scales_units() {
+        assert_eq!(status_indicator::fmt_elapsed_compact(8), "8s");
+        assert_eq!(status_indicator::fmt_elapsed_compact(64), "1m 04s");
+        assert_eq!(status_indicator::fmt_elapsed_compact(3723), "1h 02m 03s");
+    }
 
+    #[test]
+    fn renders_empty_state_quick_start() {
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
             team: "default-mixed".to_string(),
             workspace: "/Users/me/proj".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "implementation",
+                MemberStatus::Idle,
+            )],
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(96, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Members:"));
+        assert!(view.contains("builder (codex, implementation)"));
+        assert!(view.contains("@builder <message>"));
+        assert!(view.contains("/plan <goal>"));
+        assert!(view.contains("/help"));
+    }
+
+    #[test]
+    fn renders_a_clean_layout_snapshot() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "default-mixed".to_string(),
+            workspace: "/Users/me/proj".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
             members: vec![
-                MemberSummary {
-                    id: MemberId::new("builder"),
-                    display_name: "Builder".to_string(),
-                    backend: BackendKind::Codex,
-                    role: "implementation".to_string(),
-                    status: MemberStatus::Running,
-                    session: None,
-                    cwd: String::new(),
-                    effort: None,
-                },
-                MemberSummary {
-                    id: MemberId::new("reviewer"),
-                    display_name: "Reviewer".to_string(),
-                    backend: BackendKind::Claude,
-                    role: "review".to_string(),
-                    status: MemberStatus::Idle,
-                    session: None,
-                    cwd: String::new(),
-                    effort: None,
-                },
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "implementation",
+                    MemberStatus::Running,
+                ),
+                member_summary(
+                    "reviewer",
+                    "Reviewer",
+                    BackendKind::Claude,
+                    "review",
+                    MemberStatus::Idle,
+                ),
             ],
         });
         state.apply(RuntimeEvent::Notice("welcome to Asterline".to_string()));
@@ -1220,7 +722,7 @@ mod tests {
         assert!(view.contains("Builder"));
         assert!(view.contains("builder → reviewer"));
         // The running member surfaces a working indicator + interrupt hint.
-        assert!(view.contains("working"));
+        assert!(view.contains("Working"));
         assert!(view.contains("interrupt"));
         // The composer is open (top/bottom rules only) — no enclosing box or
         // rounded corners around the conversation or input.
@@ -1228,26 +730,47 @@ mod tests {
     }
 
     #[test]
-    fn renders_completion_popup() {
-        use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
-        use crate::domain::team::MemberId;
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
+    fn header_clips_workspace_by_display_width() {
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
             team: "t".to_string(),
-            workspace: String::new(),
-            members: vec![MemberSummary {
-                id: MemberId::new("builder"),
-                display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
-                role: "impl".to_string(),
-                status: MemberStatus::Idle,
-                session: None,
-                cwd: String::new(),
-                effort: None,
-            }],
+            workspace: "/Users/我/很长的项目路径名称超级超级长/子目录".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+                MemberStatus::Idle,
+            )],
+        });
+
+        // Narrow terminal: the CJK path must clip by display width, not chars.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Asterline · t"));
+        assert!(view.contains('…'));
+    }
+
+    #[test]
+    fn renders_completion_popup() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: ".".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+                MemberStatus::Idle,
+            )],
         });
         for ch in "/a".chars() {
             state.insert_char(ch);
@@ -1258,18 +781,168 @@ mod tests {
         let view = format!("{}", terminal.backend());
         eprintln!("\n{view}");
 
-        assert!(view.contains("commands"));
         assert!(view.contains("/ask"));
         assert!(view.contains("/all"));
+        assert!(!view.contains("╭"));
+        assert!(!view.contains("@member to send"));
+        assert!(view.contains("› /ask      send to one member"));
+    }
+
+    #[test]
+    fn running_status_shows_model_and_effort() {
+        let mut builder = member_summary(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "impl",
+            MemberStatus::Running,
+        );
+        builder.model = Some("gpt-5-codex".to_string());
+        builder.effort = Some(Effort::High);
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![builder],
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        // The activity line spells the profile out; the header chip abbreviates.
+        assert!(view.contains("model: gpt-5-codex"));
+        assert!(view.contains("effort: high"));
+        assert!(view.contains("·gpt-5-codex/high"));
+    }
+
+    #[test]
+    fn pure_conversation_does_not_show_work_separator() {
+        let state = AppState::new(vec![
+            ChatItem::User {
+                body: "explain this function".to_string(),
+            },
+            ChatItem::Agent {
+                member: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                text: "It parses the request.".to_string(),
+            },
+        ]);
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 40, &mut lines);
+
+        let text = plain_text(&lines);
+        assert!(!text.iter().any(|line| is_separator_text(line)));
+    }
+
+    #[test]
+    fn completed_work_turn_gets_separator_before_next_user_message() {
+        use crate::domain::event::TurnId;
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+                MemberStatus::Idle,
+            )],
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "run tests".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("builder"),
+            tool_id: "t1".to_string(),
+            name: "shell".to_string(),
+            summary: "cargo test".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolCompleted {
+            member: MemberId::new("builder"),
+            tool_id: "t1".to_string(),
+            ok: true,
+            summary: "cargo test".to_string(),
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(2),
+            targets: vec![MemberId::new("builder")],
+            body: "now summarize".to_string(),
+        });
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 40, &mut lines);
+
+        let text = plain_text(&lines);
+        let separators: Vec<_> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| is_separator_text(line))
+            .collect();
+        assert_eq!(separators.len(), 1);
+        let separator_index = separators[0].0;
+        assert!(
+            text[..separator_index]
+                .iter()
+                .any(|line| line.contains("shell"))
+        );
+        assert!(
+            text[separator_index + 1..]
+                .iter()
+                .any(|line| line.contains("now summarize"))
+        );
+    }
+
+    #[test]
+    fn consecutive_tool_lines_stay_grouped() {
+        use crate::domain::event::TurnId;
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "go".to_string(),
+        });
+        for (id, cmd) in [("t1", "cargo build"), ("t2", "cargo test")] {
+            state.apply(RuntimeEvent::ToolStarted {
+                member: MemberId::new("builder"),
+                tool_id: id.to_string(),
+                name: "shell".to_string(),
+                summary: cmd.to_string(),
+            });
+            state.apply(RuntimeEvent::ToolCompleted {
+                member: MemberId::new("builder"),
+                tool_id: id.to_string(),
+                ok: true,
+                summary: cmd.to_string(),
+            });
+        }
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 60, &mut lines);
+
+        let text = plain_text(&lines);
+        let build_idx = text
+            .iter()
+            .position(|line| line.contains("cargo build"))
+            .unwrap();
+        // The two tool lines are adjacent — no blank line in between.
+        assert!(text[build_idx + 1].contains("cargo test"));
     }
 
     #[test]
     fn renders_markdown_agent_message() {
-        use crate::domain::event::ChatItem;
-        use crate::domain::team::MemberId;
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
         let chat = vec![ChatItem::Agent {
             member: MemberId::new("reviewer"),
             display_name: "Reviewer".to_string(),
@@ -1293,25 +966,21 @@ mod tests {
 
     #[test]
     fn renders_user_band_and_compact_tool() {
-        use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent, TurnId};
-        use crate::domain::team::MemberId;
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
+        use crate::domain::event::TurnId;
 
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
             team: "t".to_string(),
             workspace: String::new(),
-            members: vec![MemberSummary {
-                id: MemberId::new("builder"),
-                display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
-                role: "impl".to_string(),
-                status: MemberStatus::Idle,
-                session: None,
-                cwd: String::new(),
-                effort: None,
-            }],
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+                MemberStatus::Idle,
+            )],
         });
         state.apply(RuntimeEvent::UserMessage {
             turn: TurnId(1),
@@ -1331,8 +1000,6 @@ mod tests {
             ok: true,
             summary: long.to_string(),
         });
-        state.toggle_tools_expansion();
-
         let mut terminal = Terminal::new(TestBackend::new(72, 12)).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let view = format!("{}", terminal.backend());
@@ -1342,14 +1009,11 @@ mod tests {
         assert!(view.contains("run the tests"));
         // The long command is truncated to a single line (ellipsis), not wrapped.
         assert!(view.contains('…'));
-        assert!(view.contains("● shell"));
+        assert!(view.contains("✓ shell"));
     }
 
     #[test]
     fn renders_scrollable_diff_drawer() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
         let mut state = AppState::new(Vec::new());
         state.set_diff(
             "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context"
@@ -1368,11 +1032,294 @@ mod tests {
         assert!(view.contains("-old line"));
     }
 
+    fn ready_with_run(run: WorkflowRunSummary) -> AppState {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: vec![run],
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+                MemberStatus::Idle,
+            )],
+        });
+        state
+    }
+
+    #[test]
+    fn renders_workflow_footer_next_step() {
+        let state = ready_with_run(WorkflowRunSummary {
+            id: WorkflowRunId(7),
+            goal: "ship parser".to_string(),
+            status: WorkflowRunStatus::Done,
+            coordinator: Some(MemberId::new("builder")),
+            verification: None,
+            created_at: "2026-06-28 10:00:00".to_string(),
+            updated_at: "2026-06-28 10:00:00".to_string(),
+            attempt: 1,
+            events: Vec::new(),
+            steps: Vec::new(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("run-7 done"));
+        assert!(view.contains("/verify to check"));
+        assert!(view.contains("/runs details"));
+    }
+
+    #[test]
+    fn renders_workflow_footer_step_progress() {
+        let state = ready_with_run(WorkflowRunSummary {
+            id: WorkflowRunId(7),
+            goal: "ship parser".to_string(),
+            status: WorkflowRunStatus::Running,
+            coordinator: Some(MemberId::new("builder")),
+            verification: None,
+            created_at: "2026-06-28 10:00:00".to_string(),
+            updated_at: "2026-06-28 10:00:00".to_string(),
+            attempt: 1,
+            events: Vec::new(),
+            steps: vec![
+                WorkflowStepSummary {
+                    number: 1,
+                    status: WorkflowStepStatus::Done,
+                    owner: None,
+                    title: "Map parser states".to_string(),
+                    note: None,
+                    updated_at: "2026-06-28 10:05:00".to_string(),
+                },
+                WorkflowStepSummary {
+                    number: 2,
+                    status: WorkflowStepStatus::Doing,
+                    owner: None,
+                    title: "Wire checklist UI".to_string(),
+                    note: None,
+                    updated_at: "2026-06-28 10:10:00".to_string(),
+                },
+            ],
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("run-7 running"));
+        assert!(view.contains("1/2 done"));
+        assert!(view.contains("1 doing"));
+        assert!(view.contains("/runs details"));
+    }
+
+    #[test]
+    fn renders_workflow_runs_drawer() {
+        let mut state = ready_with_run(WorkflowRunSummary {
+            id: WorkflowRunId(1),
+            goal: "ship parser".to_string(),
+            status: WorkflowRunStatus::Done,
+            coordinator: Some(MemberId::new("builder")),
+            verification: Some(WorkflowVerification {
+                command: "cargo test".to_string(),
+                ok: true,
+                summary: "ok".to_string(),
+            }),
+            created_at: "2026-06-28 10:00:00".to_string(),
+            updated_at: "2026-06-28 10:15:00".to_string(),
+            attempt: 1,
+            events: vec![
+                WorkflowRunEventSummary {
+                    kind: "note".to_string(),
+                    title: "User note".to_string(),
+                    detail: Some("checkpoint saved".to_string()),
+                    created_at: "2026-06-28 10:10:00".to_string(),
+                    attempt: 1,
+                },
+                WorkflowRunEventSummary {
+                    kind: "verification_passed".to_string(),
+                    title: "Verification passed".to_string(),
+                    detail: Some("cargo test\nok".to_string()),
+                    created_at: "2026-06-28 10:15:00".to_string(),
+                    attempt: 1,
+                },
+            ],
+            steps: vec![
+                WorkflowStepSummary {
+                    number: 1,
+                    status: WorkflowStepStatus::Done,
+                    owner: Some(MemberId::new("builder")),
+                    title: "Map parser states".to_string(),
+                    note: None,
+                    updated_at: "2026-06-28 10:05:00".to_string(),
+                },
+                WorkflowStepSummary {
+                    number: 2,
+                    status: WorkflowStepStatus::Blocked,
+                    owner: None,
+                    title: "Document edge cases".to_string(),
+                    note: Some("waiting for reviewer".to_string()),
+                    updated_at: "2026-06-28 10:12:00".to_string(),
+                },
+            ],
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 34)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Workflow Runs"));
+        assert!(view.contains("Enter status"));
+        assert!(view.contains("Tab dispatch"));
+        assert!(view.contains("x details"));
+        assert!(view.contains("←→ run"));
+        assert!(view.contains("View: compact"));
+        assert!(view.contains("Selected: run-1"));
+        assert!(view.contains("Goal: ship parser"));
+        assert!(view.contains("Progress:"));
+        assert!(view.contains("Action: /plan"));
+        assert!(view.contains("Steps:"));
+        // Compact mode hides the deep-dive fields.
+        assert!(!view.contains("Owners:"));
+        assert!(!view.contains("Next:"));
+        assert!(!view.contains("Outcome:"));
+        assert!(!view.contains("Stages:"));
+        assert!(!view.contains("Timeline:"));
+        assert!(!view.contains("checkpoint saved"));
+
+        assert!(state.toggle_workflow_runs_detail());
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("x compact"));
+        assert!(view.contains("History: 1 run"));
+        assert!(view.contains("View: details"));
+        assert!(view.contains("1 verified"));
+        assert!(view.contains("Selected: run-1"));
+        assert!(view.contains("Goal: ship parser"));
+        assert!(view.contains("Owner: builder"));
+        assert!(view.contains("Attempt: #1"));
+        assert!(view.contains("Time: created 06-28 10:00"));
+        assert!(view.contains("updated 06-28 10:15"));
+        assert!(view.contains("Progress:"));
+        assert!(view.contains("1/2 done"));
+        assert!(view.contains("1 blocked"));
+        assert!(view.contains("Owners:"));
+        assert!(view.contains("@builder 0/1 done"));
+        assert!(view.contains("unassigned 1/1 1 blocked"));
+        assert!(view.contains("Outcome: verified by cargo test"));
+        assert!(view.contains("Next: verified"));
+        assert!(view.contains("Action: /plan"));
+        assert!(view.contains("Stages:"));
+        assert!(view.contains("Steps:"));
+        assert!(view.contains("@builder"));
+        assert!(view.contains("Map parser states"));
+        assert!(view.contains("Document edge cases"));
+        assert!(view.contains("waiting for reviewer"));
+        assert!(view.contains("Timeline:"));
+        assert!(view.contains("User note"));
+        assert!(view.contains("checkpoint saved"));
+        assert!(view.contains("Verification passed"));
+        assert!(view.contains("plan done"));
+        assert!(view.contains("work done"));
+        assert!(view.contains("verify done"));
+        assert!(view.contains("run-1"));
+        assert!(view.contains("Try"));
+        assert!(view.contains("Steps"));
+        assert!(view.contains("#1"));
+        assert!(view.contains("Updated"));
+        assert!(view.contains("06-28 10:15"));
+        assert!(view.contains("ship parser"));
+        assert!(view.contains("cargo test"));
+        assert!(view.contains("ok"));
+    }
+
+    #[test]
+    fn renders_selected_workflow_step_action() {
+        let mut state = ready_with_run(WorkflowRunSummary {
+            id: WorkflowRunId(1),
+            goal: "ship parser".to_string(),
+            status: WorkflowRunStatus::Running,
+            coordinator: Some(MemberId::new("builder")),
+            verification: None,
+            created_at: "2026-06-28 10:00:00".to_string(),
+            updated_at: "2026-06-28 10:15:00".to_string(),
+            attempt: 1,
+            events: Vec::new(),
+            steps: vec![WorkflowStepSummary {
+                number: 1,
+                status: WorkflowStepStatus::Doing,
+                owner: Some(MemberId::new("builder")),
+                title: "Wire checklist UI".to_string(),
+                note: None,
+                updated_at: "2026-06-28 10:05:00".to_string(),
+            }],
+        });
+        state.toggle_drawer(Drawer::Runs);
+        state.select_next_workflow_step();
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Action: /step done run-1 1"));
+        assert!(view.contains("Dispatch: @builder Continue run-1 step #1"));
+        assert!(view.contains("@builder"));
+        assert!(view.contains("› 1."));
+        assert!(view.contains("Wire checklist UI"));
+    }
+
+    #[test]
+    fn renders_failed_workflow_continue_action() {
+        let mut state = ready_with_run(WorkflowRunSummary {
+            id: WorkflowRunId(1),
+            goal: "ship parser".to_string(),
+            status: WorkflowRunStatus::Failed,
+            coordinator: Some(MemberId::new("builder")),
+            verification: Some(WorkflowVerification {
+                command: "cargo test".to_string(),
+                ok: false,
+                summary: "tests failed".to_string(),
+            }),
+            created_at: "2026-06-28 10:00:00".to_string(),
+            updated_at: "2026-06-28 10:15:00".to_string(),
+            attempt: 2,
+            events: vec![WorkflowRunEventSummary {
+                kind: "verification_failed".to_string(),
+                title: "Verification failed".to_string(),
+                detail: Some("cargo test\ntests failed".to_string()),
+                created_at: "2026-06-28 10:15:00".to_string(),
+                attempt: 2,
+            }],
+            steps: Vec::new(),
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let view = format!("{}", terminal.backend());
+        eprintln!("\n{view}");
+
+        assert!(view.contains("Outcome: verification failed: cargo test"));
+        assert!(view.contains("Timeline:"));
+        assert!(view.contains("Verification failed"));
+        assert!(view.contains("Attempt: #2"));
+        assert!(view.contains("Next: run the Action command to continue fixes"));
+        assert!(view.contains("Action: /continue run-1 fix failing verification"));
+        assert!(view.contains("#2"));
+    }
+
     #[test]
     fn renders_multiline_composer() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
         let mut state = AppState::new(Vec::new());
         for ch in "line one".chars() {
             state.insert_char(ch);

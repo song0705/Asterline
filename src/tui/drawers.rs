@@ -7,6 +7,7 @@ use crate::domain::team::MemberId;
 pub enum Drawer {
     Logs,
     Team,
+    Runs,
     Palette,
     Diff,
     MemberLogs(MemberId),
@@ -17,6 +18,7 @@ impl Drawer {
         match self {
             Self::Logs => "Logs",
             Self::Team => "Team",
+            Self::Runs => "Workflow Runs",
             Self::Palette => "Commands",
             Self::Diff => "Working-tree diff",
             Self::MemberLogs(_) => "Member Logs",

@@ -3,16 +3,25 @@
 //! composer / drawer / scroll. No state is inferred from matching strings.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::domain::event::{
     ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
+    WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepStatus,
 };
-use crate::domain::team::{BackendKind, Effort, MemberId};
+use crate::domain::team::{
+    BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
+    TeamMember,
+};
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
+use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
+use crate::workflow::suggested_verify_command;
 
 const MAX_LOGS: usize = 4000;
 
@@ -26,7 +35,11 @@ pub struct MemberView {
     pub status: MemberStatus,
     pub session: Option<String>,
     pub cwd: String,
+    pub model: Option<String>,
     pub effort: Option<Effort>,
+    pub sandbox: SandboxPolicy,
+    pub permission_mode: Option<PermissionMode>,
+    pub session_policy: SessionPolicy,
 }
 
 /// A pending approval awaiting a decision.
@@ -48,11 +61,16 @@ struct HistorySearch {
 pub struct AppState {
     team: String,
     workspace: String,
+    default_target: Option<DefaultTarget>,
     members: Vec<MemberView>,
     chat: Vec<ChatItem>,
     message_index: HashMap<MessageId, usize>,
     tool_index: HashMap<String, usize>,
     logs: Vec<LogEntry>,
+    workflow_runs: Vec<WorkflowRunSummary>,
+    selected_workflow_run: Option<WorkflowRunId>,
+    selected_workflow_step: Option<u32>,
+    workflow_runs_detail: bool,
     pending_approvals: Vec<PendingApproval>,
     paused_routes: usize,
     composer: Composer,
@@ -61,6 +79,7 @@ pub struct AppState {
     popup_selected: usize,
     popup_dismissed: bool,
     should_quit: bool,
+    quit_armed: bool,
     tools_expanded: bool,
     active_reasoning: HashMap<MemberId, String>,
     pending_user_messages: Vec<String>,
@@ -84,6 +103,8 @@ pub struct AppState {
     drawer_scroll: usize,
     /// Captured working-tree diff text for the diff drawer (`/diff`).
     diff_text: Option<String>,
+    /// Editable draft shown by the `/team` drawer.
+    team_editor: Option<TeamEditor>,
 }
 
 impl AppState {
@@ -102,11 +123,16 @@ impl AppState {
         Self {
             team: "Asterline".to_string(),
             workspace: String::new(),
+            default_target: None,
             members: Vec::new(),
             chat,
             message_index: HashMap::new(),
             tool_index: HashMap::new(),
             logs: Vec::new(),
+            workflow_runs: Vec::new(),
+            selected_workflow_run: None,
+            selected_workflow_step: None,
+            workflow_runs_detail: false,
             pending_approvals: Vec::new(),
             paused_routes: 0,
             composer: Composer::new(),
@@ -115,6 +141,7 @@ impl AppState {
             popup_selected: 0,
             popup_dismissed: false,
             should_quit: false,
+            quit_armed: false,
             tools_expanded: false,
             active_reasoning: HashMap::new(),
             pending_user_messages: Vec::new(),
@@ -127,6 +154,7 @@ impl AppState {
             history_search: None,
             drawer_scroll: 0,
             diff_text: None,
+            team_editor: None,
         }
     }
 
@@ -146,10 +174,16 @@ impl AppState {
             RuntimeEvent::Ready {
                 team,
                 workspace,
+                default_target,
                 members,
+                workflow_runs,
             } => {
                 self.team = team;
                 self.workspace = workspace;
+                self.default_target = default_target;
+                self.workflow_runs = workflow_runs;
+                self.ensure_selected_workflow_run();
+                self.ensure_selected_workflow_step();
                 self.members = members
                     .into_iter()
                     .map(|m| MemberView {
@@ -160,9 +194,34 @@ impl AppState {
                         status: m.status,
                         session: m.session,
                         cwd: m.cwd,
+                        model: m.model,
                         effort: m.effort,
+                        sandbox: m.sandbox,
+                        permission_mode: m.permission_mode,
+                        session_policy: m.session_policy,
                     })
                     .collect();
+                let member_ids: std::collections::HashSet<MemberId> =
+                    self.members.iter().map(|m| m.id.clone()).collect();
+                self.running_since
+                    .retain(|member, _| member_ids.contains(member));
+                for member in &self.members {
+                    if member.status == MemberStatus::Running {
+                        self.running_since
+                            .entry(member.id.clone())
+                            .or_insert_with(Instant::now);
+                    } else {
+                        self.running_since.remove(&member.id);
+                    }
+                }
+                if let Some(idx) = self.header_selected
+                    && idx >= self.members.len()
+                {
+                    self.header_selected = self.members.len().checked_sub(1);
+                }
+                if self.drawer == Some(Drawer::Team) {
+                    self.open_team_editor();
+                }
             }
             RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {
                 self.active_reasoning.clear();
@@ -314,6 +373,15 @@ impl AppState {
                     message,
                 });
             }
+            RuntimeEvent::WorkflowRunUpdated { run } => {
+                if let Some(existing) = self.workflow_runs.iter_mut().find(|r| r.id == run.id) {
+                    *existing = run;
+                } else {
+                    self.workflow_runs.push(run);
+                }
+                self.ensure_selected_workflow_run();
+                self.ensure_selected_workflow_step();
+            }
             RuntimeEvent::Log(entry) => {
                 self.logs.push(entry);
                 if self.logs.len() > MAX_LOGS {
@@ -401,11 +469,25 @@ impl AppState {
 
     pub fn resolve_local_targets(&self, target: &MessageTarget) -> Vec<MemberId> {
         match target {
-            MessageTarget::Default => self
-                .members
-                .first()
-                .map(|m| vec![m.id.clone()])
-                .unwrap_or_default(),
+            MessageTarget::Default => match &self.default_target {
+                Some(DefaultTarget::All) => self.members.iter().map(|m| m.id.clone()).collect(),
+                Some(DefaultTarget::Member(id)) => {
+                    let resolved = self.resolve_local_named(std::slice::from_ref(id));
+                    if resolved.is_empty() {
+                        self.members
+                            .first()
+                            .map(|m| vec![m.id.clone()])
+                            .unwrap_or_default()
+                    } else {
+                        resolved
+                    }
+                }
+                None => self
+                    .members
+                    .first()
+                    .map(|m| vec![m.id.clone()])
+                    .unwrap_or_default(),
+            },
             MessageTarget::All => self.members.iter().map(|m| m.id.clone()).collect(),
             MessageTarget::Member(id) => self.resolve_local_named(std::slice::from_ref(id)),
             MessageTarget::Members(ids) => self.resolve_local_named(ids),
@@ -435,6 +517,9 @@ impl AppState {
     pub fn workspace(&self) -> &str {
         &self.workspace
     }
+    pub fn default_target(&self) -> Option<&DefaultTarget> {
+        self.default_target.as_ref()
+    }
     pub fn members(&self) -> &[MemberView] {
         &self.members
     }
@@ -443,6 +528,44 @@ impl AppState {
     }
     pub fn logs(&self) -> &[LogEntry] {
         &self.logs
+    }
+    pub fn workflow_runs(&self) -> &[WorkflowRunSummary] {
+        &self.workflow_runs
+    }
+    pub fn latest_workflow_run(&self) -> Option<&WorkflowRunSummary> {
+        self.workflow_runs.last()
+    }
+    pub fn latest_workflow_action_command(&self) -> Option<String> {
+        self.latest_workflow_run()
+            .map(|run| workflow_action_command(run, &self.workspace, false))
+    }
+    pub fn selected_workflow_run(&self) -> Option<&WorkflowRunSummary> {
+        self.selected_workflow_run
+            .and_then(|id| self.workflow_runs.iter().find(|run| run.id == id))
+            .or_else(|| self.latest_workflow_run())
+    }
+    pub fn selected_workflow_step(&self) -> Option<u32> {
+        let run = self.selected_workflow_run()?;
+        self.selected_workflow_step
+            .filter(|step| run.steps.iter().any(|candidate| candidate.number == *step))
+    }
+    pub fn selected_workflow_action_command(&self) -> Option<String> {
+        self.selected_workflow_run()
+            .map(|run| workflow_action_command(run, &self.workspace, true))
+    }
+    pub fn selected_workflow_stage_command(&self) -> Option<String> {
+        let run = self.selected_workflow_run()?;
+        self.selected_workflow_step()
+            .and_then(|step| workflow_step_action_command(run, step))
+            .or_else(|| Some(workflow_action_command(run, &self.workspace, true)))
+    }
+    pub fn selected_workflow_dispatch_command(&self) -> Option<String> {
+        let run = self.selected_workflow_run()?;
+        let step = self.selected_workflow_step()?;
+        workflow_step_dispatch_command(run, step)
+    }
+    pub fn workflow_runs_detail(&self) -> bool {
+        self.workflow_runs_detail
     }
     pub fn pending_approvals(&self) -> &[PendingApproval] {
         &self.pending_approvals
@@ -481,6 +604,7 @@ impl AppState {
     /// (with a notice) while that member is running, to avoid two processes on
     /// one session.
     pub fn request_attach(&mut self, idx: usize) {
+        self.disarm_quit();
         let Some(member) = self.members.get(idx) else {
             self.header_selected = None;
             return;
@@ -530,13 +654,19 @@ impl AppState {
         self.popup_dismissed = false;
     }
 
+    pub(crate) fn disarm_quit(&mut self) {
+        self.quit_armed = false;
+    }
+
     pub fn insert_char(&mut self, ch: char) {
+        self.disarm_quit();
         self.header_selected = None;
         self.composer.insert(ch);
         self.history_cursor = None;
         self.reset_popup();
     }
     pub fn insert_newline(&mut self) {
+        self.disarm_quit();
         self.header_selected = None;
         self.composer.insert_newline();
         self.history_cursor = None;
@@ -545,48 +675,58 @@ impl AppState {
     /// Move the cursor up within a multi-line composer; returns false if it is
     /// already on the first line (so the caller recalls history instead).
     pub fn composer_up(&mut self) -> bool {
+        self.disarm_quit();
         self.composer.up()
     }
     /// Move the cursor down within a multi-line composer; returns false if it is
     /// already on the last line.
     pub fn composer_down(&mut self) -> bool {
+        self.disarm_quit();
         self.composer.down()
     }
     pub fn backspace(&mut self) {
+        self.disarm_quit();
         self.header_selected = None;
         self.composer.backspace();
         self.history_cursor = None;
         self.reset_popup();
     }
     pub fn delete_word(&mut self) {
+        self.disarm_quit();
         self.header_selected = None;
         self.composer.delete_word();
         self.history_cursor = None;
         self.reset_popup();
     }
     pub fn clear_composer(&mut self) {
+        self.disarm_quit();
         self.header_selected = None;
         self.composer.clear();
         self.history_cursor = None;
         self.reset_popup();
     }
     pub fn cursor_left(&mut self) {
+        self.disarm_quit();
         self.composer.left();
         self.reset_popup();
     }
     pub fn cursor_right(&mut self) {
+        self.disarm_quit();
         self.composer.right();
         self.reset_popup();
     }
     pub fn cursor_home(&mut self) {
+        self.disarm_quit();
         self.composer.home();
         self.reset_popup();
     }
     pub fn cursor_end(&mut self) {
+        self.disarm_quit();
         self.composer.end();
         self.reset_popup();
     }
     pub fn take_composer(&mut self) -> String {
+        self.disarm_quit();
         let text = self.composer.take();
         self.history_cursor = None;
         self.reset_popup();
@@ -594,9 +734,11 @@ impl AppState {
     }
 
     pub fn popup_up(&mut self) {
+        self.disarm_quit();
         self.popup_selected = self.popup_selected.saturating_sub(1);
     }
     pub fn popup_down(&mut self) {
+        self.disarm_quit();
         if let Some(completion) = self.completion()
             && self.popup_selected + 1 < completion.items.len()
         {
@@ -604,6 +746,7 @@ impl AppState {
         }
     }
     pub fn dismiss_popup(&mut self) {
+        self.disarm_quit();
         self.popup_dismissed = true;
     }
 
@@ -613,6 +756,7 @@ impl AppState {
         let Some(completion) = self.completion() else {
             return false;
         };
+        self.disarm_quit();
         let index = self.popup_selected.min(completion.items.len() - 1);
         let insert = completion.items[index].insert.clone();
         let before = self.composer.text();
@@ -626,6 +770,7 @@ impl AppState {
     /// Record a submitted line into prompt history (skipping blanks and
     /// consecutive duplicates) and end any active browse.
     pub fn record_submission(&mut self, text: &str) {
+        self.disarm_quit();
         let text = text.trim();
         if !text.is_empty() && self.prompt_history.last().map(String::as_str) != Some(text) {
             self.prompt_history.push(text.to_string());
@@ -637,6 +782,7 @@ impl AppState {
     /// Recall an older entry (↑). The first step saves the live draft and jumps
     /// to the newest entry; further steps walk backwards.
     pub fn history_prev(&mut self) {
+        self.disarm_quit();
         if self.prompt_history.is_empty() {
             return;
         }
@@ -659,6 +805,7 @@ impl AppState {
 
     /// Recall a newer entry (↓); stepping past the newest restores the draft.
     pub fn history_next(&mut self) {
+        self.disarm_quit();
         let Some(i) = self.history_cursor else {
             return;
         };
@@ -698,6 +845,7 @@ impl AppState {
     }
 
     pub fn start_history_search(&mut self) {
+        self.disarm_quit();
         let match_idx = self.search_from("", None);
         self.history_search = Some(HistorySearch {
             query: String::new(),
@@ -708,6 +856,7 @@ impl AppState {
     }
 
     pub fn history_search_input(&mut self, ch: char) {
+        self.disarm_quit();
         if let Some(mut search) = self.history_search.take() {
             search.query.push(ch);
             search.match_idx = self.search_from(&search.query, None);
@@ -716,6 +865,7 @@ impl AppState {
     }
 
     pub fn history_search_backspace(&mut self) {
+        self.disarm_quit();
         if let Some(mut search) = self.history_search.take() {
             search.query.pop();
             search.match_idx = self.search_from(&search.query, None);
@@ -725,6 +875,7 @@ impl AppState {
 
     /// Ctrl+R again: step to the next older match.
     pub fn history_search_again(&mut self) {
+        self.disarm_quit();
         if let Some(mut search) = self.history_search.take() {
             let before = search.match_idx;
             if let Some(idx) = self.search_from(&search.query, before) {
@@ -736,6 +887,7 @@ impl AppState {
 
     /// Accept the current match into the composer and leave search.
     pub fn accept_history_search(&mut self) {
+        self.disarm_quit();
         if let Some(search) = self.history_search.take()
             && let Some(idx) = search.match_idx
         {
@@ -746,6 +898,7 @@ impl AppState {
     }
 
     pub fn cancel_history_search(&mut self) {
+        self.disarm_quit();
         self.history_search = None;
     }
 
@@ -770,17 +923,190 @@ impl AppState {
     // --- UI actions -----------------------------------------------------
 
     pub fn toggle_drawer(&mut self, drawer: Drawer) {
+        self.disarm_quit();
         self.drawer = if self.drawer.as_ref() == Some(&drawer) {
+            self.team_editor = None;
             None
         } else {
+            match drawer {
+                Drawer::Team => self.open_team_editor(),
+                Drawer::Runs => {
+                    self.team_editor = None;
+                    self.ensure_selected_workflow_run();
+                }
+                _ => {
+                    self.team_editor = None;
+                }
+            }
             Some(drawer)
         };
         self.drawer_scroll = 0;
     }
 
     pub fn close_drawer(&mut self) {
+        self.disarm_quit();
         self.drawer = None;
         self.drawer_scroll = 0;
+        self.team_editor = None;
+    }
+
+    pub fn stage_selected_workflow_action(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Runs) || !self.composer.is_empty() {
+            return false;
+        }
+        let Some(command) = self.selected_workflow_stage_command() else {
+            return false;
+        };
+        self.disarm_quit();
+        self.header_selected = None;
+        self.composer.set_text(&command);
+        self.history_cursor = None;
+        self.reset_popup();
+        self.close_drawer();
+        true
+    }
+
+    pub fn stage_selected_workflow_dispatch(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Runs) || !self.composer.is_empty() {
+            return false;
+        }
+        let Some(command) = self.selected_workflow_dispatch_command() else {
+            return false;
+        };
+        self.disarm_quit();
+        self.header_selected = None;
+        self.composer.set_text(&command);
+        self.history_cursor = None;
+        self.reset_popup();
+        self.close_drawer();
+        true
+    }
+
+    pub fn toggle_workflow_runs_detail(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Runs) || !self.composer.is_empty() {
+            return false;
+        }
+        self.disarm_quit();
+        self.workflow_runs_detail = !self.workflow_runs_detail;
+        self.drawer_scroll = 0;
+        true
+    }
+
+    pub fn select_newer_workflow_run(&mut self) {
+        if self.drawer != Some(Drawer::Runs) {
+            return;
+        }
+        self.disarm_quit();
+        self.selected_workflow_step = None;
+        self.ensure_selected_workflow_run();
+        let Some(id) = self.selected_workflow_run else {
+            return;
+        };
+        let Some(index) = self.workflow_run_index(id) else {
+            return;
+        };
+        if index + 1 < self.workflow_runs.len() {
+            self.selected_workflow_run = Some(self.workflow_runs[index + 1].id);
+        }
+    }
+
+    pub fn select_older_workflow_run(&mut self) {
+        if self.drawer != Some(Drawer::Runs) {
+            return;
+        }
+        self.disarm_quit();
+        self.selected_workflow_step = None;
+        self.ensure_selected_workflow_run();
+        let Some(id) = self.selected_workflow_run else {
+            return;
+        };
+        let Some(index) = self.workflow_run_index(id) else {
+            return;
+        };
+        if index > 0 {
+            self.selected_workflow_run = Some(self.workflow_runs[index - 1].id);
+        }
+    }
+
+    pub fn select_previous_workflow_step(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Runs) {
+            return false;
+        }
+        self.disarm_quit();
+        let Some(run) = self.selected_workflow_run() else {
+            self.selected_workflow_step = None;
+            return false;
+        };
+        if run.steps.is_empty() {
+            self.selected_workflow_step = None;
+            return false;
+        }
+        let next = match self.selected_workflow_step() {
+            None => run.steps.last().map(|step| step.number),
+            Some(number) => run
+                .steps
+                .iter()
+                .position(|step| step.number == number)
+                .and_then(|idx| idx.checked_sub(1))
+                .and_then(|idx| run.steps.get(idx))
+                .map(|step| step.number),
+        }
+        .or_else(|| run.steps.first().map(|step| step.number));
+        self.selected_workflow_step = next;
+        true
+    }
+
+    pub fn select_next_workflow_step(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Runs) {
+            return false;
+        }
+        self.disarm_quit();
+        let Some(run) = self.selected_workflow_run() else {
+            self.selected_workflow_step = None;
+            return false;
+        };
+        if run.steps.is_empty() {
+            self.selected_workflow_step = None;
+            return false;
+        }
+        let next = match self.selected_workflow_step() {
+            None => run.steps.first().map(|step| step.number),
+            Some(number) => run
+                .steps
+                .iter()
+                .position(|step| step.number == number)
+                .and_then(|idx| run.steps.get(idx + 1))
+                .map(|step| step.number),
+        }
+        .or_else(|| run.steps.last().map(|step| step.number));
+        self.selected_workflow_step = next;
+        true
+    }
+
+    fn ensure_selected_workflow_run(&mut self) {
+        let selected_is_valid = self
+            .selected_workflow_run
+            .is_some_and(|id| self.workflow_runs.iter().any(|run| run.id == id));
+        if !selected_is_valid {
+            self.selected_workflow_run = self.workflow_runs.last().map(|run| run.id);
+            self.selected_workflow_step = None;
+        }
+    }
+
+    fn ensure_selected_workflow_step(&mut self) {
+        let Some(step) = self.selected_workflow_step else {
+            return;
+        };
+        let step_is_valid = self
+            .selected_workflow_run()
+            .is_some_and(|run| run.steps.iter().any(|candidate| candidate.number == step));
+        if !step_is_valid {
+            self.selected_workflow_step = None;
+        }
+    }
+
+    fn workflow_run_index(&self, id: WorkflowRunId) -> Option<usize> {
+        self.workflow_runs.iter().position(|run| run.id == id)
     }
 
     /// The drawer's vertical scroll offset (top line to show).
@@ -788,10 +1114,12 @@ impl AppState {
         self.drawer_scroll
     }
     pub fn drawer_scroll_up(&mut self) {
-        self.drawer_scroll = self.drawer_scroll.saturating_add(1);
+        self.disarm_quit();
+        self.drawer_scroll = self.drawer_scroll.saturating_sub(1);
     }
     pub fn drawer_scroll_down(&mut self) {
-        self.drawer_scroll = self.drawer_scroll.saturating_sub(1);
+        self.disarm_quit();
+        self.drawer_scroll = self.drawer_scroll.saturating_add(1);
     }
 
     /// The captured working-tree diff shown in the diff drawer.
@@ -802,7 +1130,60 @@ impl AppState {
         self.diff_text = Some(diff);
     }
 
+    pub(crate) fn team_editor(&self) -> Option<&TeamEditor> {
+        self.team_editor.as_ref()
+    }
+
+    pub(crate) fn handle_team_editor_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> TeamEditorOutcome {
+        if self.drawer != Some(Drawer::Team) {
+            return TeamEditorOutcome::Ignored;
+        }
+        let Some(editor) = self.team_editor.as_mut() else {
+            return TeamEditorOutcome::Ignored;
+        };
+        editor.handle_key(code, modifiers)
+    }
+
+    fn open_team_editor(&mut self) {
+        let members = self
+            .members
+            .iter()
+            .map(|view| self.view_to_member(view))
+            .collect();
+        self.team_editor = Some(TeamEditor::new(
+            self.team.clone(),
+            PathBuf::from(self.workspace.clone()),
+            self.default_target.clone(),
+            members,
+        ));
+    }
+
+    fn view_to_member(&self, view: &MemberView) -> TeamMember {
+        let mut member = TeamMember::new(
+            view.id.clone(),
+            view.display_name.clone(),
+            view.backend,
+            view.role.clone(),
+        );
+        member.cwd = if view.cwd.is_empty() || view.cwd == self.workspace {
+            None
+        } else {
+            Some(PathBuf::from(&view.cwd))
+        };
+        member.model = view.model.clone();
+        member.sandbox = view.sandbox;
+        member.permission_mode = view.permission_mode;
+        member.session_policy = view.session_policy;
+        member.effort = view.effort;
+        member
+    }
+
     pub fn select_next_member(&mut self) {
+        self.disarm_quit();
         let len = self.members.len();
         if len == 0 {
             return;
@@ -816,6 +1197,7 @@ impl AppState {
     }
 
     pub fn select_prev_member(&mut self) {
+        self.disarm_quit();
         let len = self.members.len();
         if len == 0 {
             return;
@@ -829,23 +1211,39 @@ impl AppState {
     }
 
     pub fn clear_header_selection(&mut self) {
+        self.disarm_quit();
         self.header_selected = None;
     }
 
     pub fn scroll_up(&mut self) {
+        self.disarm_quit();
         self.scroll = self.scroll.saturating_add(1);
     }
 
     pub fn scroll_down(&mut self) {
+        self.disarm_quit();
         self.scroll = self.scroll.saturating_sub(1);
     }
 
     pub fn reset_scroll(&mut self) {
+        self.disarm_quit();
         self.scroll = 0;
     }
 
     pub fn quit(&mut self) {
+        self.quit_armed = false;
         self.should_quit = true;
+    }
+
+    pub fn request_quit(&mut self) {
+        if self.quit_armed {
+            self.quit();
+        } else {
+            self.quit_armed = true;
+            self.push(ChatItem::Notice {
+                text: "press Ctrl+C again to quit".to_string(),
+            });
+        }
     }
 
     pub fn tools_expanded(&self) -> bool {
@@ -853,6 +1251,7 @@ impl AppState {
     }
 
     pub fn toggle_tools_expansion(&mut self) {
+        self.disarm_quit();
         self.tools_expanded = !self.tools_expanded;
     }
 
@@ -868,15 +1267,112 @@ impl AppState {
     }
 }
 
+pub(crate) fn workflow_action_command(
+    run: &WorkflowRunSummary,
+    workspace: &str,
+    include_run_id: bool,
+) -> String {
+    match run.status {
+        WorkflowRunStatus::Running | WorkflowRunStatus::Verifying => "/abort".to_string(),
+        WorkflowRunStatus::Done if run.verification.is_none() => {
+            let workspace = if workspace.is_empty() {
+                Path::new(".")
+            } else {
+                Path::new(workspace)
+            };
+            let mut command = verify_command_prefix(run, include_run_id);
+            if let Some(check) = suggested_verify_command(workspace) {
+                command.push(' ');
+                command.push_str(check);
+            }
+            command
+        }
+        WorkflowRunStatus::Done => "/plan ".to_string(),
+        WorkflowRunStatus::Failed if run.verification.is_some() => {
+            let mut command = continue_command_prefix(run, include_run_id);
+            command.push_str(" fix failing verification");
+            command
+        }
+        WorkflowRunStatus::Failed => continue_command_prefix(run, include_run_id),
+        WorkflowRunStatus::Blocked => {
+            let mut command = continue_command_prefix(run, include_run_id);
+            command.push_str(" blocker resolved");
+            command
+        }
+        WorkflowRunStatus::Planned => "/retry".to_string(),
+    }
+}
+
+fn verify_command_prefix(run: &WorkflowRunSummary, include_run_id: bool) -> String {
+    if include_run_id {
+        format!("/verify {}", run.id)
+    } else {
+        "/verify".to_string()
+    }
+}
+
+fn continue_command_prefix(run: &WorkflowRunSummary, include_run_id: bool) -> String {
+    if include_run_id {
+        format!("/continue {}", run.id)
+    } else {
+        "/continue".to_string()
+    }
+}
+
+fn workflow_step_action_command(run: &WorkflowRunSummary, step: u32) -> Option<String> {
+    let step = run
+        .steps
+        .iter()
+        .find(|candidate| candidate.number == step)?;
+    let (action, note) = match step.status {
+        WorkflowStepStatus::Todo => ("doing", None),
+        WorkflowStepStatus::Doing => ("done", None),
+        WorkflowStepStatus::Blocked => ("doing", Some("blocker resolved")),
+        WorkflowStepStatus::Done => ("todo", Some("reopen")),
+    };
+    let mut command = format!("/step {action} {} {}", run.id, step.number);
+    if let Some(note) = note {
+        command.push(' ');
+        command.push_str(note);
+    }
+    Some(command)
+}
+
+fn workflow_step_dispatch_command(run: &WorkflowRunSummary, step: u32) -> Option<String> {
+    let step = run
+        .steps
+        .iter()
+        .find(|candidate| candidate.number == step)?;
+    let Some(owner) = &step.owner else {
+        return Some(format!("/step assign {} {} ", run.id, step.number));
+    };
+
+    let instruction = match step.status {
+        WorkflowStepStatus::Todo => "Start",
+        WorkflowStepStatus::Doing => "Continue",
+        WorkflowStepStatus::Blocked => "Revisit blocked",
+        WorkflowStepStatus::Done => "Review completed",
+    };
+    Some(format!(
+        "@{owner} {instruction} {} step #{}: {}. Update the checklist with @@workflow_step as you progress.",
+        run.id, step.number, step.title
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::event::{AgentSessionId, ApprovalDecision, MemberSummary, TurnId};
+    use crate::domain::event::{
+        AgentSessionId, ApprovalDecision, MemberSummary, TurnId, WorkflowRunId, WorkflowRunStatus,
+        WorkflowRunSummary, WorkflowStepSummary, WorkflowVerification,
+    };
 
     fn ready() -> RuntimeEvent {
         RuntimeEvent::Ready {
             team: "mixed".to_string(),
             workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
             members: vec![MemberSummary {
                 id: MemberId::new("builder"),
                 display_name: "Builder".to_string(),
@@ -885,7 +1381,11 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                model: None,
                 effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
             }],
         }
     }
@@ -896,6 +1396,332 @@ mod tests {
         state.apply(ready());
         assert_eq!(state.team(), "mixed");
         assert_eq!(state.members().len(), 1);
+    }
+
+    #[test]
+    fn workflow_run_updates_insert_then_replace() {
+        let mut state = AppState::new(Vec::new());
+        let run = WorkflowRunSummary {
+            id: WorkflowRunId(1),
+            goal: "ship parser".to_string(),
+            status: WorkflowRunStatus::Running,
+            coordinator: Some(MemberId::new("builder")),
+            verification: None,
+            created_at: "2026-06-28 10:00:00".to_string(),
+            updated_at: "2026-06-28 10:00:00".to_string(),
+            attempt: 1,
+            events: Vec::new(),
+            steps: Vec::new(),
+        };
+
+        state.apply(RuntimeEvent::WorkflowRunUpdated { run: run.clone() });
+        assert_eq!(state.workflow_runs(), std::slice::from_ref(&run));
+        assert_eq!(state.latest_workflow_run(), Some(&run));
+
+        let updated = WorkflowRunSummary {
+            status: WorkflowRunStatus::Done,
+            verification: Some(WorkflowVerification {
+                command: "cargo test".to_string(),
+                ok: true,
+                summary: "ok".to_string(),
+            }),
+            ..run
+        };
+        state.apply(RuntimeEvent::WorkflowRunUpdated {
+            run: updated.clone(),
+        });
+
+        assert_eq!(state.workflow_runs(), std::slice::from_ref(&updated));
+        assert_eq!(state.latest_workflow_run(), Some(&updated));
+    }
+
+    #[test]
+    fn runs_drawer_stages_selected_workflow_action_without_overwriting_draft() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        state.apply(RuntimeEvent::WorkflowRunUpdated {
+            run: WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship parser".to_string(),
+                status: WorkflowRunStatus::Done,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: Vec::new(),
+            },
+        });
+
+        state.toggle_drawer(Drawer::Runs);
+        assert!(state.stage_selected_workflow_action());
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.composer().text(), "/verify run-1");
+
+        state.clear_composer();
+        state.insert_char('x');
+        state.toggle_drawer(Drawer::Runs);
+        assert!(!state.stage_selected_workflow_action());
+        assert_eq!(state.drawer(), Some(Drawer::Runs));
+        assert_eq!(state.composer().text(), "x");
+    }
+
+    #[test]
+    fn runs_drawer_can_select_an_older_workflow_run() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: vec![
+                WorkflowRunSummary {
+                    id: WorkflowRunId(1),
+                    goal: "ship parser".to_string(),
+                    status: WorkflowRunStatus::Done,
+                    coordinator: Some(MemberId::new("builder")),
+                    verification: None,
+                    created_at: "2026-06-28 10:00:00".to_string(),
+                    updated_at: "2026-06-28 10:05:00".to_string(),
+                    attempt: 1,
+                    events: Vec::new(),
+                    steps: Vec::new(),
+                },
+                WorkflowRunSummary {
+                    id: WorkflowRunId(2),
+                    goal: "refactor ui".to_string(),
+                    status: WorkflowRunStatus::Running,
+                    coordinator: Some(MemberId::new("builder")),
+                    verification: None,
+                    created_at: "2026-06-28 10:10:00".to_string(),
+                    updated_at: "2026-06-28 10:12:00".to_string(),
+                    attempt: 1,
+                    events: Vec::new(),
+                    steps: Vec::new(),
+                },
+            ],
+            members: Vec::new(),
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        assert_eq!(
+            state.selected_workflow_run().map(|run| run.id),
+            Some(WorkflowRunId(2))
+        );
+        state.select_older_workflow_run();
+        assert_eq!(
+            state.selected_workflow_run().map(|run| run.id),
+            Some(WorkflowRunId(1))
+        );
+        assert_eq!(
+            state.selected_workflow_action_command().as_deref(),
+            Some("/verify run-1")
+        );
+        assert!(state.stage_selected_workflow_action());
+        assert_eq!(state.composer().text(), "/verify run-1");
+    }
+
+    #[test]
+    fn runs_drawer_can_select_steps_and_stage_step_actions() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        state.apply(RuntimeEvent::WorkflowRunUpdated {
+            run: WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship checklist".to_string(),
+                status: WorkflowRunStatus::Running,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: vec![
+                    WorkflowStepSummary {
+                        number: 1,
+                        status: WorkflowStepStatus::Todo,
+                        owner: Some(MemberId::new("builder")),
+                        title: "Write parser tests".to_string(),
+                        note: None,
+                        updated_at: "2026-06-28 10:01:00".to_string(),
+                    },
+                    WorkflowStepSummary {
+                        number: 2,
+                        status: WorkflowStepStatus::Doing,
+                        owner: None,
+                        title: "Wire checklist UI".to_string(),
+                        note: None,
+                        updated_at: "2026-06-28 10:02:00".to_string(),
+                    },
+                    WorkflowStepSummary {
+                        number: 3,
+                        status: WorkflowStepStatus::Blocked,
+                        owner: None,
+                        title: "Wait for credentials".to_string(),
+                        note: None,
+                        updated_at: "2026-06-28 10:03:00".to_string(),
+                    },
+                    WorkflowStepSummary {
+                        number: 4,
+                        status: WorkflowStepStatus::Done,
+                        owner: None,
+                        title: "Document result".to_string(),
+                        note: None,
+                        updated_at: "2026-06-28 10:04:00".to_string(),
+                    },
+                ],
+            },
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        assert_eq!(state.selected_workflow_step(), None);
+        assert_eq!(
+            state.selected_workflow_stage_command().as_deref(),
+            Some("/abort")
+        );
+
+        assert!(state.select_next_workflow_step());
+        assert_eq!(state.selected_workflow_step(), Some(1));
+        assert_eq!(
+            state.selected_workflow_stage_command().as_deref(),
+            Some("/step doing run-1 1")
+        );
+        assert_eq!(
+            state.selected_workflow_dispatch_command().as_deref(),
+            Some(
+                "@builder Start run-1 step #1: Write parser tests. Update the checklist with @@workflow_step as you progress."
+            )
+        );
+
+        state.select_newer_workflow_run();
+        assert_eq!(state.selected_workflow_step(), None);
+        assert_eq!(
+            state.selected_workflow_stage_command().as_deref(),
+            Some("/abort")
+        );
+
+        assert!(state.select_next_workflow_step());
+
+        assert!(state.select_next_workflow_step());
+        assert_eq!(
+            state.selected_workflow_stage_command().as_deref(),
+            Some("/step done run-1 2")
+        );
+        assert_eq!(
+            state.selected_workflow_dispatch_command().as_deref(),
+            Some("/step assign run-1 2 ")
+        );
+
+        assert!(state.select_next_workflow_step());
+        assert_eq!(
+            state.selected_workflow_stage_command().as_deref(),
+            Some("/step doing run-1 3 blocker resolved")
+        );
+
+        assert!(state.select_next_workflow_step());
+        assert_eq!(
+            state.selected_workflow_stage_command().as_deref(),
+            Some("/step todo run-1 4 reopen")
+        );
+
+        assert!(state.stage_selected_workflow_action());
+        assert_eq!(state.composer().text(), "/step todo run-1 4 reopen");
+    }
+
+    #[test]
+    fn workflow_action_previews_detected_verify_command() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-action-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: dir.display().to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: Vec::new(),
+        });
+        state.apply(RuntimeEvent::WorkflowRunUpdated {
+            run: WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship parser".to_string(),
+                status: WorkflowRunStatus::Done,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: Vec::new(),
+            },
+        });
+
+        assert_eq!(
+            state.latest_workflow_action_command().as_deref(),
+            Some("/verify cargo test")
+        );
+        state.toggle_drawer(Drawer::Runs);
+        assert!(state.stage_selected_workflow_action());
+        assert_eq!(state.composer().text(), "/verify run-1 cargo test");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workflow_action_continues_failed_and_blocked_runs() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        state.apply(RuntimeEvent::WorkflowRunUpdated {
+            run: WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship parser".to_string(),
+                status: WorkflowRunStatus::Failed,
+                coordinator: Some(MemberId::new("builder")),
+                verification: Some(WorkflowVerification {
+                    command: "cargo test".to_string(),
+                    ok: false,
+                    summary: "failed".to_string(),
+                }),
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 2,
+                events: Vec::new(),
+                steps: Vec::new(),
+            },
+        });
+
+        assert_eq!(
+            state.latest_workflow_action_command().as_deref(),
+            Some("/continue fix failing verification")
+        );
+        state.toggle_drawer(Drawer::Runs);
+        assert!(state.stage_selected_workflow_action());
+        assert_eq!(
+            state.composer().text(),
+            "/continue run-1 fix failing verification"
+        );
+
+        state.apply(RuntimeEvent::WorkflowRunUpdated {
+            run: WorkflowRunSummary {
+                id: WorkflowRunId(2),
+                goal: "unblock release".to_string(),
+                status: WorkflowRunStatus::Blocked,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 2,
+                events: Vec::new(),
+                steps: Vec::new(),
+            },
+        });
+
+        assert_eq!(
+            state.latest_workflow_action_command().as_deref(),
+            Some("/continue blocker resolved")
+        );
     }
 
     #[test]
@@ -1010,6 +1836,51 @@ mod tests {
     }
 
     #[test]
+    fn default_target_all_marks_every_member_running_optimistically() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::All),
+            workflow_runs: Vec::new(),
+            members: vec![
+                MemberSummary {
+                    id: MemberId::new("builder"),
+                    display_name: "Builder".to_string(),
+                    backend: BackendKind::Codex,
+                    role: "impl".to_string(),
+                    status: MemberStatus::Idle,
+                    session: None,
+                    cwd: String::new(),
+                    model: None,
+                    effort: None,
+                    sandbox: SandboxPolicy::ReadOnly,
+                    permission_mode: Some(PermissionMode::Default),
+                    session_policy: SessionPolicy::Resume,
+                },
+                MemberSummary {
+                    id: MemberId::new("reviewer"),
+                    display_name: "Reviewer".to_string(),
+                    backend: BackendKind::Claude,
+                    role: "review".to_string(),
+                    status: MemberStatus::Idle,
+                    session: None,
+                    cwd: String::new(),
+                    model: None,
+                    effort: None,
+                    sandbox: SandboxPolicy::ReadOnly,
+                    permission_mode: Some(PermissionMode::Default),
+                    session_policy: SessionPolicy::Resume,
+                },
+            ],
+        });
+
+        state.handle_user_message_submitted(&MessageTarget::Default, "go".to_string());
+
+        assert_eq!(state.running_count(), 2);
+    }
+
+    #[test]
     fn drawer_toggles() {
         let mut state = AppState::new(Vec::new());
         state.toggle_drawer(Drawer::Logs);
@@ -1017,6 +1888,68 @@ mod tests {
         state.toggle_drawer(Drawer::Logs);
         assert_eq!(state.drawer(), None);
         let _ = AgentSessionId("x".to_string());
+    }
+
+    #[test]
+    fn drawer_scroll_down_increases_render_offset() {
+        let mut state = AppState::new(Vec::new());
+        state.toggle_drawer(Drawer::Logs);
+
+        state.drawer_scroll_up();
+        assert_eq!(state.drawer_scroll(), 0);
+
+        state.drawer_scroll_down();
+        assert_eq!(state.drawer_scroll(), 1);
+
+        state.drawer_scroll_up();
+        assert_eq!(state.drawer_scroll(), 0);
+    }
+
+    #[test]
+    fn quit_requires_two_consecutive_requests() {
+        let mut state = AppState::new(Vec::new());
+
+        state.request_quit();
+        assert!(!state.should_quit());
+        assert!(state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::Notice { text } if text.contains("Ctrl+C again")
+        )));
+
+        state.request_quit();
+        assert!(state.should_quit());
+    }
+
+    #[test]
+    fn quit_confirmation_is_disarmed_by_input() {
+        let mut state = AppState::new(Vec::new());
+
+        state.request_quit();
+        state.insert_char('x');
+        state.clear_composer();
+        state.request_quit();
+
+        assert!(!state.should_quit());
+    }
+
+    #[test]
+    fn team_drawer_editor_can_add_and_apply_member() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        state.toggle_drawer(Drawer::Team);
+
+        let add = state.handle_team_editor_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(add, TeamEditorOutcome::Consumed(None));
+
+        let apply = state.handle_team_editor_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        let TeamEditorOutcome::Consumed(Some(crate::domain::event::UiCommand::ReplaceTeam {
+            members,
+            ..
+        })) = apply
+        else {
+            panic!("expected replace team command");
+        };
+        assert_eq!(members.len(), 2);
     }
 
     #[test]
@@ -1069,7 +2002,11 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                model: None,
                 effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
             },
             MemberView {
                 id: MemberId::new("reviewer"),
@@ -1079,7 +2016,11 @@ mod tests {
                 status: MemberStatus::Idle,
                 session: None,
                 cwd: String::new(),
+                model: None,
                 effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
             },
         ];
         assert_eq!(state.header_selected(), None);

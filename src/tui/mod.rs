@@ -8,22 +8,31 @@ pub mod chat_view;
 pub mod commands;
 pub mod completion;
 pub mod composer;
+pub mod drawer_view;
 pub mod drawers;
+pub mod header;
 pub mod keymap;
 pub mod markdown;
 pub mod rollout_import;
+pub mod status_indicator;
 pub mod team_builder;
+pub mod team_editor;
+pub mod theme;
+pub mod workflow_view;
 
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -34,6 +43,7 @@ use crate::runtime::RuntimeHandle;
 use crate::tui::app_state::AppState;
 use crate::tui::commands::Submission;
 use crate::tui::keymap::Action;
+use crate::tui::team_editor::TeamEditorOutcome;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -46,13 +56,21 @@ pub fn run(
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    let keyboard_enhancement = enable_keyboard_enhancement(&mut stdout)?;
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut state, &handle, &events);
+    let result = run_loop(
+        &mut terminal,
+        &mut state,
+        &handle,
+        &events,
+        keyboard_enhancement,
+    );
 
     disable_raw_mode()?;
+    disable_keyboard_enhancement(terminal.backend_mut(), keyboard_enhancement)?;
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
@@ -64,11 +82,36 @@ pub fn run(
     result
 }
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
+fn enable_keyboard_enhancement(out: &mut impl Write) -> io::Result<bool> {
+    if supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        )?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn disable_keyboard_enhancement(out: &mut impl Write, enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(out, PopKeyboardEnhancementFlags)?;
+    }
+    Ok(())
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
     handle: &RuntimeHandle,
     events: &Receiver<RuntimeEvent>,
+    keyboard_enhancement: bool,
 ) -> io::Result<()> {
     loop {
         while let Ok(event) = events.try_recv() {
@@ -80,6 +123,9 @@ fn run_loop(
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if handle_team_editor_key(key, state, handle) {
+                        continue;
+                    }
                     if let Some(action) = keymap::resolve(key) {
                         handle_action(action, state, handle);
                     }
@@ -90,11 +136,27 @@ fn run_loop(
         }
 
         if let Some(req) = state.take_attach_request() {
-            attach_to_member(terminal, state, handle, &req)?;
+            attach_to_member(terminal, state, handle, &req, keyboard_enhancement)?;
         }
 
         if state.should_quit() {
             return Ok(());
+        }
+    }
+}
+
+fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeHandle) -> bool {
+    match state.handle_team_editor_key(key.code, key.modifiers) {
+        TeamEditorOutcome::Ignored => false,
+        TeamEditorOutcome::Consumed(command) => {
+            if let Some(command) = command {
+                handle.send(command);
+            }
+            true
+        }
+        TeamEditorOutcome::Close => {
+            state.close_drawer();
+            true
         }
     }
 }
@@ -126,6 +188,7 @@ fn attach_to_member(
     state: &mut AppState,
     handle: &RuntimeHandle,
     req: &attach::AttachRequest,
+    keyboard_enhancement: bool,
 ) -> io::Result<()> {
     let (program, args) = req.command();
 
@@ -139,6 +202,7 @@ fn attach_to_member(
     // cursor, flushing so the child starts from a clean, owned main screen.
     disable_raw_mode()?;
     let mut out = io::stdout();
+    disable_keyboard_enhancement(&mut out, keyboard_enhancement)?;
     execute!(
         out,
         DisableMouseCapture,
@@ -161,6 +225,12 @@ fn attach_to_member(
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
+    if keyboard_enhancement {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        )?;
+    }
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     out.flush()?;
     // Drop input the child or the terminal left buffered (e.g. the reply to the
@@ -199,9 +269,15 @@ fn attach_to_member(
 }
 
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
+    if action != Action::Interrupt {
+        state.disarm_quit();
+    }
     // Reverse history search (Ctrl+R) captures input until accepted/cancelled.
     if state.in_history_search() {
         handle_search_action(action, state);
+        return;
+    }
+    if action == Action::InsertChar('x') && state.toggle_workflow_runs_detail() {
         return;
     }
     match action {
@@ -211,14 +287,18 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::DeleteWord => state.delete_word(),
         Action::ClearLine => state.clear_composer(),
         Action::CursorLeft => {
-            if state.header_selected().is_some() {
+            if state.drawer() == Some(drawers::Drawer::Runs) {
+                state.select_older_workflow_run();
+            } else if state.header_selected().is_some() {
                 state.select_prev_member();
             } else {
                 state.cursor_left();
             }
         }
         Action::CursorRight => {
-            if state.header_selected().is_some() {
+            if state.drawer() == Some(drawers::Drawer::Runs) {
+                state.select_newer_workflow_run();
+            } else if state.header_selected().is_some() {
                 state.select_next_member();
             } else {
                 state.cursor_right();
@@ -245,7 +325,11 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Action::HistoryPrev => {
-            if state.drawer().is_some() {
+            if state.drawer() == Some(drawers::Drawer::Runs) {
+                if !state.select_previous_workflow_step() {
+                    state.select_newer_workflow_run();
+                }
+            } else if state.drawer().is_some() {
                 state.drawer_scroll_up();
             } else if state.completion().is_some() {
                 state.popup_up();
@@ -255,7 +339,11 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Action::HistoryNext => {
-            if state.drawer().is_some() {
+            if state.drawer() == Some(drawers::Drawer::Runs) {
+                if !state.select_next_workflow_step() {
+                    state.select_older_workflow_run();
+                }
+            } else if state.drawer().is_some() {
                 state.drawer_scroll_down();
             } else if state.completion().is_some() {
                 state.popup_down();
@@ -271,6 +359,11 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
         Action::Complete => {
+            if state.drawer() == Some(drawers::Drawer::Runs)
+                && state.stage_selected_workflow_dispatch()
+            {
+                return;
+            }
             state.accept_completion();
         }
         Action::CloseOverlay => {
@@ -284,14 +377,20 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         }
         Action::Interrupt => {
             if state.running_count() > 0 {
+                state.disarm_quit();
                 handle.send(UiCommand::Cancel { member: None });
             } else if !state.composer().is_empty() {
                 state.clear_composer();
             } else {
-                state.quit();
+                state.request_quit();
             }
         }
         Action::Submit => {
+            if state.drawer() == Some(drawers::Drawer::Runs)
+                && state.stage_selected_workflow_action()
+            {
+                return;
+            }
             // With the popup open, Enter accepts the highlighted item; if the
             // token is already complete (no change), fall through to submit.
             if state.completion().is_some() && state.accept_completion() {
@@ -357,17 +456,19 @@ fn compute_git_diff(workspace: &str) -> String {
 }
 
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
-    let text = state.take_composer();
-    // Record every non-blank submission for shell-style ↑/↓ recall.
-    state.record_submission(&text);
+    let text = state.composer().text();
     match commands::parse(&text) {
         Submission::Runtime(command) => {
+            state.record_submission(&text);
+            state.take_composer();
             if let UiCommand::UserMessage { target, body } = &command {
                 state.handle_user_message_submitted(target, body.clone());
             }
             handle.send(command);
         }
         Submission::Drawer(drawer) => {
+            state.record_submission(&text);
+            state.take_composer();
             // `/diff` captures the live working-tree diff just before opening.
             if drawer == drawers::Drawer::Diff && state.drawer() != Some(drawers::Drawer::Diff) {
                 let diff = compute_git_diff(state.workspace());
@@ -377,12 +478,247 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
         }
         Submission::ApproveFirst(decision) => match state.first_pending_approval() {
             Some(id) => {
+                state.record_submission(&text);
+                state.take_composer();
                 handle.send(UiCommand::Approve { id, decision });
             }
             None => state.apply(RuntimeEvent::Notice("no pending approval".to_string())),
         },
-        Submission::Help => state.toggle_drawer(drawers::Drawer::Palette),
-        Submission::Empty => {}
+        Submission::Help => {
+            state.record_submission(&text);
+            state.take_composer();
+            state.toggle_drawer(drawers::Drawer::Palette);
+        }
+        Submission::NeedsTarget => state.apply(RuntimeEvent::Notice(
+            "message needs a target prefix: @member, @all, /ask, or /all (draft kept)".to_string(),
+        )),
+        Submission::Empty => {
+            state.take_composer();
+        }
     }
     state.reset_scroll();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::event::{
+        ChatItem, WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepStatus,
+        WorkflowStepSummary,
+    };
+    use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
+    use crate::runtime::{self, Runners};
+    use crate::store::sqlite::SqliteStore;
+    use crate::tui::drawers::Drawer;
+    use std::sync::mpsc;
+
+    #[test]
+    fn untargeted_text_keeps_the_draft() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        for ch in "build the parser".chars() {
+            state.insert_char(ch);
+        }
+
+        submit(&mut state, &handle);
+
+        assert_eq!(state.composer().text(), "build the parser");
+        assert!(state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::Notice { text } if text.contains("draft kept")
+        )));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn enter_in_runs_drawer_stages_next_action() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: vec![WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship parser".to_string(),
+                status: WorkflowRunStatus::Done,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: Vec::new(),
+            }],
+            members: Vec::new(),
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        handle_action(Action::Submit, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.composer().text(), "/verify run-1");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn runs_drawer_arrow_selects_step_before_staging_action() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: vec![WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship parser".to_string(),
+                status: WorkflowRunStatus::Running,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: vec![WorkflowStepSummary {
+                    number: 1,
+                    status: WorkflowStepStatus::Doing,
+                    owner: None,
+                    title: "Wire checklist UI".to_string(),
+                    note: None,
+                    updated_at: "2026-06-28 10:05:00".to_string(),
+                }],
+            }],
+            members: Vec::new(),
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        handle_action(Action::HistoryNext, &mut state, &handle);
+        handle_action(Action::Submit, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.composer().text(), "/step done run-1 1");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn runs_drawer_tab_dispatches_selected_step_to_owner() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: vec![WorkflowRunSummary {
+                id: WorkflowRunId(1),
+                goal: "ship parser".to_string(),
+                status: WorkflowRunStatus::Running,
+                coordinator: Some(MemberId::new("builder")),
+                verification: None,
+                created_at: "2026-06-28 10:00:00".to_string(),
+                updated_at: "2026-06-28 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: vec![WorkflowStepSummary {
+                    number: 1,
+                    status: WorkflowStepStatus::Todo,
+                    owner: Some(MemberId::new("builder")),
+                    title: "Wire checklist UI".to_string(),
+                    note: None,
+                    updated_at: "2026-06-28 10:05:00".to_string(),
+                }],
+            }],
+            members: Vec::new(),
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        handle_action(Action::HistoryNext, &mut state, &handle);
+        handle_action(Action::Complete, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        assert_eq!(
+            state.composer().text(),
+            "@builder Start run-1 step #1: Wire checklist UI. Update the checklist with @@workflow_step as you progress."
+        );
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn runs_drawer_x_toggles_detail_without_typing() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: Vec::new(),
+        });
+        state.toggle_drawer(Drawer::Runs);
+
+        assert!(!state.workflow_runs_detail());
+        handle_action(Action::InsertChar('x'), &mut state, &handle);
+        assert!(state.workflow_runs_detail());
+        assert!(state.composer().is_empty());
+
+        state.insert_char('a');
+        handle_action(Action::InsertChar('x'), &mut state, &handle);
+        assert!(state.workflow_runs_detail());
+        assert_eq!(state.composer().text(), "ax");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
 }
