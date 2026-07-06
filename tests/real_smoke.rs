@@ -1,4 +1,4 @@
-//! Opt-in smoke tests against the real `codex` / `claude` CLIs. They exercise
+//! Opt-in smoke tests against the real `codex` / `claude` / `agy` CLIs. They exercise
 //! the full adapter -> process -> parser path (no TUI) with one trivial turn.
 //!
 //! These are `#[ignore]`d because they call local CLIs and may consume usage.
@@ -7,9 +7,10 @@
 //! ```bash
 //! ASTERLINE_SMOKE_CODEX=1  cargo test --test real_smoke real_codex_smoke  -- --ignored --nocapture
 //! ASTERLINE_SMOKE_CLAUDE=1 cargo test --test real_smoke real_claude_smoke -- --ignored --nocapture
+//! ASTERLINE_SMOKE_AGY=1    cargo test --test real_smoke real_agy_smoke    -- --ignored --nocapture
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -74,6 +75,26 @@ fn assert_healthy_turn(label: &str, events: &[AgentEvent]) {
     );
 }
 
+fn assert_completed_contains(label: &str, events: &[AgentEvent], needle: &str) {
+    assert!(
+        events.iter().any(|event| {
+            matches!(event, AgentEvent::MessageCompleted(text) if text.contains(needle))
+        }),
+        "{label}: expected completed message to contain {needle:?}"
+    );
+}
+
+fn agy_member(test_name: &str) -> TeamMember {
+    let cwd: PathBuf = std::env::temp_dir().join(format!(
+        "asterline-agy-smoke-{test_name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut member = TeamMember::new("agy", "Agy", BackendKind::Agy, "smoke");
+    member.cwd = Some(cwd);
+    member
+}
+
 #[test]
 #[ignore = "calls the real codex CLI; opt in with ASTERLINE_SMOKE_CODEX=1"]
 fn real_codex_smoke() {
@@ -131,26 +152,53 @@ fn real_claude_smoke() {
 }
 
 #[test]
-#[ignore = "calls the real gemini CLI; opt in with ASTERLINE_SMOKE_GEMINI=1"]
-fn real_gemini_smoke() {
-    if std::env::var("ASTERLINE_SMOKE_GEMINI").as_deref() != Ok("1") {
+#[ignore = "calls the real agy CLI; opt in with ASTERLINE_SMOKE_AGY=1"]
+fn real_agy_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_AGY").as_deref() != Ok("1") {
         return;
     }
-    let member = TeamMember::new("gemini", "Gemini", BackendKind::Gemini, "smoke");
-    let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
-    // Gemini v1 is stateless (text output, no session), so only require a
-    // non-empty completed message and a clean exit.
-    report("gemini", &events);
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::MessageCompleted(t) if !t.trim().is_empty())),
-        "gemini: expected a non-empty completed message"
+    let member = agy_member("fresh");
+    let events = run_once(
+        &member,
+        "Do not inspect files or use tools. Reply with exactly: ASTERLINE_OK",
     );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Exited { ok: true, .. })),
-        "gemini: expected a clean exit"
+    assert_healthy_turn("agy", &events);
+    assert_completed_contains("agy", &events, "ASTERLINE_OK");
+}
+
+#[test]
+#[ignore = "calls the real agy CLI twice (fresh + resume); opt in with ASTERLINE_SMOKE_AGY=1"]
+fn real_agy_resume_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_AGY").as_deref() != Ok("1") {
+        return;
+    }
+    let member = agy_member("resume");
+    let first = run_once(
+        &member,
+        "Do not inspect files or use tools. Remember the word ORANGE. Reply with: READY",
     );
+    assert_healthy_turn("agy-fresh", &first);
+    assert_completed_contains("agy-fresh", &first, "READY");
+    let session = first
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionDiscovered(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a session id to resume");
+
+    let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
+    let (tx, rx) = mpsc::channel();
+    runner.run(
+        RunRequest {
+            prompt: "Reply with the word you were asked to remember.".to_string(),
+            session: Some(session),
+            cancel: Arc::new(AtomicBool::new(false)),
+            effort: None,
+        },
+        tx,
+    );
+    let resumed: Vec<AgentEvent> = rx.iter().collect();
+    assert_healthy_turn("agy-resume", &resumed);
+    assert_completed_contains("agy-resume", &resumed, "ORANGE");
 }

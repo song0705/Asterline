@@ -8,7 +8,9 @@ pub mod team;
 pub use event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel,
     MemberStatus, MemberSummary, MessageId, MessageTarget, RouteTo, RuntimeEvent, TeamMessage,
-    TurnId, UiCommand,
+    TurnId, UiCommand, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
+    WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus, WorkflowStepSummary,
+    WorkflowVerification,
 };
 pub use team::{
     BackendKind, DEFAULT_MAX_AUTO_RELAYS, DefaultTarget, MemberId, PermissionMode, SandboxPolicy,

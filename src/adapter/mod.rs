@@ -2,15 +2,15 @@
 //!
 //! The product path runs each member through a [`MemberRunner`] that streams
 //! [`AgentEvent`]s. Real members use [`ProcessRunner`] over a [`StreamAdapter`]
-//! (`claude_stream` / `codex_stream`); tests and offline mode use
+//! (`claude_stream` / `codex_stream` / `agy_stream`); tests and offline mode use
 //! [`fake::FakeRunner`]. `cli_pty` is retained as a raw-terminal/debug
 //! capability and is not part of the product path.
 
+pub mod agy_stream;
 pub mod claude_stream;
 pub mod cli_pty;
 pub mod codex_stream;
 pub mod fake;
-pub mod gemini_stream;
 pub mod parser;
 pub mod process;
 
@@ -22,10 +22,10 @@ use std::sync::mpsc::Sender;
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, TeamMember};
 
+pub use agy_stream::AgyStreamAdapter;
 pub use claude_stream::ClaudeStreamAdapter;
 pub use codex_stream::CodexStreamAdapter;
 pub use fake::FakeRunner;
-pub use gemini_stream::GeminiStreamAdapter;
 pub use process::{AdapterCommand, LineParser, ProcessRunner, StreamAdapter, run_streaming};
 
 /// Inputs for one member turn.
@@ -55,7 +55,7 @@ pub fn runner_for(member: &TeamMember, workspace: &Path) -> Box<dyn MemberRunner
         BackendKind::Codex => Box::new(ProcessRunner::new(CodexStreamAdapter::from_member(
             member, workspace,
         ))),
-        BackendKind::Gemini => Box::new(ProcessRunner::new(GeminiStreamAdapter::from_member(
+        BackendKind::Agy => Box::new(ProcessRunner::new(AgyStreamAdapter::from_member(
             member, workspace,
         ))),
     }

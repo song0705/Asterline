@@ -1,13 +1,15 @@
 //! Team roster domain types.
 //!
 //! A team is a generic roster of members. Each member binds a backend
-//! (`claude` or `codex`) to a free-form role and a stable id. Roles are not
+//! (`claude`, `codex`, or `agy`) to a free-form role and a stable id. Roles are not
 //! tied to a backend, so all-codex, all-claude, and mixed teams are all valid.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::de;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The default ceiling on consecutive automatic agent-to-agent relays within a
 /// single turn before the runtime pauses and asks the user to continue.
@@ -19,7 +21,7 @@ pub const DEFAULT_MAX_AUTO_RELAYS: u32 = 6;
 pub enum BackendKind {
     Claude,
     Codex,
-    Gemini,
+    Agy,
 }
 
 impl BackendKind {
@@ -27,7 +29,7 @@ impl BackendKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
+            Self::Agy => "agy",
         }
     }
 }
@@ -45,7 +47,7 @@ impl TryFrom<&str> for BackendKind {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            "gemini" => Ok(Self::Gemini),
+            "agy" => Ok(Self::Agy),
             other => Err(format!("unknown backend: {other}")),
         }
     }
@@ -82,6 +84,30 @@ impl From<String> for MemberId {
     fn from(value: String) -> Self {
         Self(value)
     }
+}
+
+/// Convert a user-facing name into the stable handle used in `@member`,
+/// default targets, and routing. Explicit ids in config files are left intact;
+/// this is only used when Asterline derives the handle from a display name.
+pub fn normalize_member_id(value: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch.is_whitespace() {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out
+    }
+}
+
+pub fn derived_member_id(display_name: &str, fallback: &str) -> MemberId {
+    MemberId::new(normalize_member_id(display_name, fallback))
 }
 
 /// Codex sandbox policy. Serialized values match the `codex --sandbox` argument.
@@ -210,28 +236,140 @@ impl Effort {
 }
 
 /// A single team member: a backend bound to a role and a stable id.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeamMember {
     pub id: MemberId,
     pub display_name: String,
     pub backend: BackendKind,
     pub role: String,
-    #[serde(default)]
     pub cwd: Option<PathBuf>,
-    #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
     pub system_prompt: Option<String>,
-    #[serde(default)]
     pub sandbox: SandboxPolicy,
-    #[serde(default)]
     pub permission_mode: Option<PermissionMode>,
-    #[serde(default)]
     pub allowed_tools: Vec<String>,
-    #[serde(default)]
     pub session_policy: SessionPolicy,
-    #[serde(default)]
     pub effort: Option<Effort>,
+}
+
+impl Serialize for TeamMember {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let derived_id = derived_member_id(&self.display_name, self.backend.as_str());
+        let include_id = self.id != derived_id;
+        let include_cwd = self.cwd.is_some();
+        let include_model = self.model.is_some();
+        let include_system_prompt = self.system_prompt.is_some();
+        let include_sandbox = self.sandbox != SandboxPolicy::default();
+        let include_permission = self.permission_mode.is_some();
+        let include_allowed_tools = !self.allowed_tools.is_empty();
+        let include_session = self.session_policy != SessionPolicy::default();
+        let include_effort = self.effort.is_some();
+
+        let field_count = 3
+            + usize::from(include_id)
+            + usize::from(include_cwd)
+            + usize::from(include_model)
+            + usize::from(include_system_prompt)
+            + usize::from(include_sandbox)
+            + usize::from(include_permission)
+            + usize::from(include_allowed_tools)
+            + usize::from(include_session)
+            + usize::from(include_effort);
+        let mut state = serializer.serialize_struct("TeamMember", field_count)?;
+        if include_id {
+            state.serialize_field("id", &self.id)?;
+        }
+        state.serialize_field("display_name", &self.display_name)?;
+        state.serialize_field("backend", &self.backend)?;
+        state.serialize_field("role", &self.role)?;
+        if include_cwd {
+            state.serialize_field("cwd", &self.cwd)?;
+        }
+        if include_model {
+            state.serialize_field("model", &self.model)?;
+        }
+        if include_system_prompt {
+            state.serialize_field("system_prompt", &self.system_prompt)?;
+        }
+        if include_sandbox {
+            state.serialize_field("sandbox", &self.sandbox)?;
+        }
+        if include_permission {
+            state.serialize_field("permission_mode", &self.permission_mode)?;
+        }
+        if include_allowed_tools {
+            state.serialize_field("allowed_tools", &self.allowed_tools)?;
+        }
+        if include_session {
+            state.serialize_field("session_policy", &self.session_policy)?;
+        }
+        if include_effort {
+            state.serialize_field("effort", &self.effort)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TeamMember {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TeamMemberInput {
+            #[serde(default)]
+            id: Option<MemberId>,
+            #[serde(default)]
+            display_name: Option<String>,
+            backend: BackendKind,
+            role: String,
+            #[serde(default)]
+            cwd: Option<PathBuf>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            system_prompt: Option<String>,
+            #[serde(default)]
+            sandbox: SandboxPolicy,
+            #[serde(default)]
+            permission_mode: Option<PermissionMode>,
+            #[serde(default)]
+            allowed_tools: Vec<String>,
+            #[serde(default)]
+            session_policy: SessionPolicy,
+            #[serde(default)]
+            effort: Option<Effort>,
+        }
+
+        let input = TeamMemberInput::deserialize(deserializer)?;
+        let display_name = input
+            .display_name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .or_else(|| input.id.as_ref().map(|id| id.as_str().to_string()))
+            .ok_or_else(|| de::Error::custom("team member needs id or display_name"))?;
+        let id = input
+            .id
+            .unwrap_or_else(|| derived_member_id(&display_name, input.backend.as_str()));
+
+        Ok(Self {
+            id,
+            display_name,
+            backend: input.backend,
+            role: input.role,
+            cwd: input.cwd,
+            model: input.model,
+            system_prompt: input.system_prompt,
+            sandbox: input.sandbox,
+            permission_mode: input.permission_mode,
+            allowed_tools: input.allowed_tools,
+            session_policy: input.session_policy,
+            effort: input.effort,
+        })
+    }
 }
 
 impl TeamMember {
@@ -395,6 +533,43 @@ mod tests {
 
     fn claude(id: &str, role: &str) -> TeamMember {
         TeamMember::new(id, id, BackendKind::Claude, role)
+    }
+
+    #[test]
+    fn member_id_can_be_derived_from_display_name() {
+        let member: TeamMember = serde_json::from_str(
+            r#"{
+                "display_name": " Lead Engineer ",
+                "backend": "codex",
+                "role": "implementation"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(member.id, MemberId::new("lead-engineer"));
+        assert_eq!(member.display_name, "Lead Engineer");
+    }
+
+    #[test]
+    fn member_serialization_omits_derived_id() {
+        let derived = TeamMember::new(
+            "lead-engineer",
+            "Lead Engineer",
+            BackendKind::Codex,
+            "implementation",
+        );
+        let json = serde_json::to_string(&derived).unwrap();
+        assert!(!json.contains("\"id\""));
+        assert!(json.contains("\"display_name\""));
+
+        let custom = TeamMember::new(
+            "lead",
+            "Lead Engineer",
+            BackendKind::Codex,
+            "implementation",
+        );
+        let json = serde_json::to_string(&custom).unwrap();
+        assert!(json.contains("\"id\""));
     }
 
     #[test]

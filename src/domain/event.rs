@@ -4,7 +4,10 @@
 
 use std::fmt;
 
-use crate::domain::team::{BackendKind, Effort, MemberId};
+use crate::domain::team::{
+    BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
+    TeamMember,
+};
 
 /// A turn groups everything that happens after one user submission.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -17,6 +20,10 @@ pub struct MessageId(pub u64);
 /// A pending approval request awaiting a user decision.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ApprovalId(pub u64);
+
+/// A persisted workflow run started from `/plan` (`/workflow` remains an alias).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WorkflowRunId(pub u64);
 
 macro_rules! impl_id_display {
     ($($ty:ty => $prefix:literal),* $(,)?) => {
@@ -32,6 +39,7 @@ impl_id_display! {
     TurnId => "turn-",
     MessageId => "msg-",
     ApprovalId => "approval-",
+    WorkflowRunId => "run-",
 }
 
 /// A backend session/thread id used to resume a member's conversation.
@@ -93,6 +101,82 @@ impl ApprovalDecision {
             Self::Approve => "approved",
             Self::Reject => "rejected",
         }
+    }
+}
+
+/// High-level lifecycle for a user-visible workflow run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowRunStatus {
+    Planned,
+    Running,
+    Verifying,
+    Done,
+    Failed,
+    Blocked,
+}
+
+impl WorkflowRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Running => "running",
+            Self::Verifying => "verifying",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "running" => Self::Running,
+            "verifying" => Self::Verifying,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "blocked" => Self::Blocked,
+            _ => Self::Planned,
+        }
+    }
+}
+
+impl fmt::Display for WorkflowRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-run checklist item state shown in `/runs`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowStepStatus {
+    Todo,
+    Doing,
+    Done,
+    Blocked,
+}
+
+impl WorkflowStepStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Doing => "doing",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "doing" => Self::Doing,
+            "done" => Self::Done,
+            "blocked" => Self::Blocked,
+            _ => Self::Todo,
+        }
+    }
+}
+
+impl fmt::Display for WorkflowStepStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -162,6 +246,11 @@ pub enum UiCommand {
     ResolvePausedRoute { resume: bool },
     /// Set a member's reasoning effort.
     SetEffort { member: MemberId, effort: Effort },
+    /// Replace the editable team roster while the TUI is running.
+    ReplaceTeam {
+        members: Vec<TeamMember>,
+        default_target: Option<DefaultTarget>,
+    },
     /// Start a fresh chat: a new conversation and new backend sessions, with the
     /// transcript cleared. (codex's `/new`.)
     NewSession,
@@ -173,6 +262,60 @@ pub enum UiCommand {
     },
     /// Run a built-in coordinating workflow for a goal.
     RunWorkflow { goal: String },
+    /// Continue an existing workflow run, usually after a blocker or failed
+    /// verification. Without a run id, the runtime targets the latest run.
+    ContinueWorkflow {
+        run_id: Option<WorkflowRunId>,
+        note: Option<String>,
+    },
+    /// Append a human checkpoint note to a workflow run without changing its
+    /// lifecycle status. Without a run id, the runtime targets the latest run.
+    NoteWorkflow {
+        run_id: Option<WorkflowRunId>,
+        note: String,
+    },
+    /// Mark a workflow run as blocked and record the reason in its timeline.
+    /// Without a run id, the runtime targets the latest run.
+    BlockWorkflow {
+        run_id: Option<WorkflowRunId>,
+        reason: String,
+    },
+    /// Run verification for the latest workflow run, or a specific run when
+    /// launched from `/runs`.
+    VerifyWorkflow {
+        run_id: Option<WorkflowRunId>,
+        command: Option<String>,
+    },
+    /// Add one checklist step to the latest or specified workflow run.
+    AddWorkflowStep {
+        run_id: Option<WorkflowRunId>,
+        owner: Option<MemberId>,
+        title: String,
+    },
+    /// Update a checklist step by its 1-based number in `/runs`.
+    UpdateWorkflowStep {
+        run_id: Option<WorkflowRunId>,
+        step: u32,
+        status: WorkflowStepStatus,
+        note: Option<String>,
+    },
+    /// Rename a checklist step by its 1-based number in `/runs`.
+    RenameWorkflowStep {
+        run_id: Option<WorkflowRunId>,
+        step: u32,
+        title: String,
+    },
+    /// Remove a checklist step by its 1-based number in `/runs`.
+    RemoveWorkflowStep {
+        run_id: Option<WorkflowRunId>,
+        step: u32,
+    },
+    /// Assign or clear a checklist step owner by its 1-based number in `/runs`.
+    AssignWorkflowStep {
+        run_id: Option<WorkflowRunId>,
+        step: u32,
+        owner: Option<MemberId>,
+    },
     /// Begin a graceful shutdown.
     Shutdown,
 }
@@ -293,7 +436,75 @@ pub struct MemberSummary {
     pub status: MemberStatus,
     pub session: Option<String>,
     pub cwd: String,
+    pub model: Option<String>,
     pub effort: Option<Effort>,
+    pub sandbox: SandboxPolicy,
+    pub permission_mode: Option<PermissionMode>,
+    pub session_policy: SessionPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowVerification {
+    pub command: String,
+    pub ok: bool,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowRunEventSummary {
+    pub kind: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub attempt: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowStepSummary {
+    pub number: u32,
+    pub status: WorkflowStepStatus,
+    pub owner: Option<MemberId>,
+    pub title: String,
+    pub note: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkflowStepRequest {
+    Add {
+        owner: Option<MemberId>,
+        title: String,
+    },
+    Update {
+        step: u32,
+        status: WorkflowStepStatus,
+        note: Option<String>,
+    },
+    Rename {
+        step: u32,
+        title: String,
+    },
+    Remove {
+        step: u32,
+    },
+    Assign {
+        step: u32,
+        owner: Option<MemberId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowRunSummary {
+    pub id: WorkflowRunId,
+    pub goal: String,
+    pub status: WorkflowRunStatus,
+    pub coordinator: Option<MemberId>,
+    pub verification: Option<WorkflowVerification>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub attempt: u32,
+    pub events: Vec<WorkflowRunEventSummary>,
+    pub steps: Vec<WorkflowStepSummary>,
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth
@@ -304,7 +515,9 @@ pub enum RuntimeEvent {
     Ready {
         team: String,
         workspace: String,
+        default_target: Option<DefaultTarget>,
         members: Vec<MemberSummary>,
+        workflow_runs: Vec<WorkflowRunSummary>,
     },
     TurnStarted {
         turn: TurnId,
@@ -403,6 +616,9 @@ pub enum RuntimeEvent {
         member: MemberId,
         message: String,
     },
+    WorkflowRunUpdated {
+        run: WorkflowRunSummary,
+    },
     /// A diagnostic for the logs drawer only.
     Log(LogEntry),
     /// A human-readable system notice shown inline in the chat.
@@ -458,6 +674,7 @@ mod tests {
         assert_eq!(TurnId(3).to_string(), "turn-3");
         assert_eq!(MessageId(7).to_string(), "msg-7");
         assert_eq!(ApprovalId(1).to_string(), "approval-1");
+        assert_eq!(WorkflowRunId(2).to_string(), "run-2");
     }
 
     #[test]

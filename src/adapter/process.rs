@@ -49,6 +49,10 @@ pub trait LineParser: Send {
     fn finish(&mut self) -> Vec<AgentEvent> {
         Vec::new()
     }
+    /// Emit any events that require the process to have fully exited.
+    fn finish_after_exit(&mut self, _ok: bool) -> Vec<AgentEvent> {
+        Vec::new()
+    }
 }
 
 /// A [`MemberRunner`] that drives a real CLI through a [`StreamAdapter`].
@@ -171,6 +175,11 @@ pub fn run_streaming(
         let _ = stderr_thread.join();
     }
     let _ = watcher.join();
+
+    let ok = status.as_ref().is_some_and(|status| status.success());
+    for event in parser.finish_after_exit(ok) {
+        let _ = events.send(event);
+    }
 
     match status {
         Some(status) => {

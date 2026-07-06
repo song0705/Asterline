@@ -8,19 +8,91 @@ use crate::domain::team::{
     BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, TeamConfig, TeamMember,
 };
 
+const TEAM_PROTOCOL_BEGIN: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_BEGIN -->";
+const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
+pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
+pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL.md";
+const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
+
+pub fn ensure_team_skill(workspace: &Path) -> io::Result<()> {
+    let path = workspace.join(ASTERLINE_TEAM_SKILL_PATH);
+    if path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, ASTERLINE_TEAM_SKILL)
+}
+
+pub fn team_skill_hint() -> String {
+    format!(
+        "Use ${ASTERLINE_TEAM_SKILL_NAME} for Asterline teammate messaging and roster changes. If skills are unavailable, read {ASTERLINE_TEAM_SKILL_PATH}."
+    )
+}
+
 /// Read and validate a team config from a JSON file.
 pub fn load_team_config(path: &Path) -> io::Result<TeamConfig> {
     let text = fs::read_to_string(path)?;
-    let config: TeamConfig = serde_json::from_str(&text).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid team config {}: {err}", path.display()),
-        )
-    })?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| invalid_config(path, err.to_string(), &text))?;
+    let migrated = migrate_legacy_backends(&mut value);
+    let config: TeamConfig = serde_json::from_value(value)
+        .map_err(|err| invalid_config(path, err.to_string(), &text))?;
     config
         .validate()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if migrated && should_rewrite_migrated_config(path) {
+        let _ = fs::write(
+            path,
+            serde_json::to_string_pretty(&config).unwrap_or_default(),
+        );
+    }
     Ok(config)
+}
+
+fn invalid_config(path: &Path, err: String, text: &str) -> io::Error {
+    let migration_hint = if text.contains("\"gemini\"") {
+        " Legacy Gemini backend configs should be migrated to backend \"agy\"; re-run with --pick-team if automatic migration fails."
+    } else {
+        ""
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "invalid team config {}: {err}.{migration_hint}",
+            path.display()
+        ),
+    )
+}
+
+fn migrate_legacy_backends(value: &mut serde_json::Value) -> bool {
+    let mut migrated = false;
+    let Some(members) = value
+        .get_mut("members")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    for member in members {
+        let Some(backend) = member.get_mut("backend") else {
+            continue;
+        };
+        if backend.as_str() == Some("gemini") {
+            *backend = serde_json::Value::String("agy".to_string());
+            migrated = true;
+        }
+    }
+    migrated
+}
+
+fn should_rewrite_migrated_config(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("team.json")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(".asterline")
 }
 
 /// Which backend CLIs are available on the current `PATH`.
@@ -28,16 +100,16 @@ pub fn load_team_config(path: &Path) -> io::Result<TeamConfig> {
 pub struct DetectedBackends {
     pub codex: bool,
     pub claude: bool,
-    pub gemini: bool,
+    pub agy: bool,
 }
 
 impl DetectedBackends {
     pub fn any(self) -> bool {
-        self.codex || self.claude || self.gemini
+        self.codex || self.claude || self.agy
     }
 }
 
-/// Detect `codex` and `claude` on the current `PATH`.
+/// Detect supported backend CLIs on the current `PATH`.
 pub fn detect_backends() -> DetectedBackends {
     let paths = env::var_os("PATH");
     let dirs: Vec<PathBuf> = paths
@@ -47,7 +119,7 @@ pub fn detect_backends() -> DetectedBackends {
     DetectedBackends {
         codex: binary_in_dirs(&dirs, "codex"),
         claude: binary_in_dirs(&dirs, "claude"),
-        gemini: binary_in_dirs(&dirs, "gemini"),
+        agy: binary_in_dirs(&dirs, "agy"),
     }
 }
 
@@ -86,9 +158,9 @@ pub fn default_team(
             let claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "general");
             Some(TeamConfig::new("default-claude", workspace).with_member(claude))
         }
-        (false, false) if detected.gemini => {
-            let gemini = TeamMember::new("gemini", "Gemini", BackendKind::Gemini, "general");
-            Some(TeamConfig::new("default-gemini", workspace).with_member(gemini))
+        (false, false) if detected.agy => {
+            let agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "general");
+            Some(TeamConfig::new("default-agy", workspace).with_member(agy))
         }
         (false, false) => None,
     }
@@ -108,8 +180,8 @@ pub fn default_member(backend: BackendKind) -> TeamMember {
             m.permission_mode = Some(PermissionMode::Plan);
             m
         }
-        BackendKind::Gemini => {
-            TeamMember::new("researcher", "Researcher", BackendKind::Gemini, "research")
+        BackendKind::Agy => {
+            TeamMember::new("researcher", "Researcher", BackendKind::Agy, "research")
         }
     }
 }
@@ -130,6 +202,88 @@ pub fn build_team(workspace: impl Into<PathBuf>, backends: &[BackendKind]) -> Op
     Some(config)
 }
 
+/// Prepend a compact Asterline team hint to each member's system prompt.
+/// Detailed protocol lives in the repo skill at `.agents/skills`.
+pub fn inject_team_protocol(team: &mut TeamConfig) {
+    let protocols: Vec<String> = team
+        .members
+        .iter()
+        .map(|me| {
+            let teammates: Vec<String> = team
+                .members
+                .iter()
+                .filter(|other| other.id != me.id)
+                .map(|other| format!("{} [{}]", other.id, other.role))
+                .collect();
+            build_protocol(me.id.as_str(), &teammates)
+        })
+        .collect();
+
+    for (member, protocol) in team.members.iter_mut().zip(protocols) {
+        let wrapped = format!("{TEAM_PROTOCOL_BEGIN}\n{protocol}\n{TEAM_PROTOCOL_END}");
+        let existing = member.system_prompt.take().map(|prompt| {
+            let stripped = strip_team_protocol(&prompt);
+            stripped.trim().to_string()
+        });
+        member.system_prompt = match existing.filter(|prompt| !prompt.is_empty()) {
+            Some(existing) => Some(format!("{wrapped}\n\n{existing}")),
+            None => Some(wrapped),
+        };
+    }
+}
+
+/// Remove Asterline's injected protocol from system prompts before persisting a
+/// user-editable team config.
+pub fn strip_team_protocols(mut team: TeamConfig) -> TeamConfig {
+    for member in &mut team.members {
+        if let Some(prompt) = member.system_prompt.take() {
+            let stripped = strip_team_protocol(&prompt);
+            member.system_prompt = if stripped.trim().is_empty() {
+                None
+            } else {
+                Some(stripped.trim().to_string())
+            };
+        }
+    }
+    team
+}
+
+pub fn strip_team_protocol(prompt: &str) -> String {
+    let Some(begin) = prompt.find(TEAM_PROTOCOL_BEGIN) else {
+        return prompt.to_string();
+    };
+    let after_begin = begin + TEAM_PROTOCOL_BEGIN.len();
+    let Some(relative_end) = prompt[after_begin..].find(TEAM_PROTOCOL_END) else {
+        return prompt.to_string();
+    };
+    let end = after_begin + relative_end + TEAM_PROTOCOL_END.len();
+    let mut out = String::new();
+    out.push_str(prompt[..begin].trim_end());
+    if !out.is_empty() && !prompt[end..].trim_start().is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(prompt[end..].trim_start());
+    out
+}
+
+fn build_protocol(me: &str, teammates: &[String]) -> String {
+    let mut protocol = format!(
+        "You are \"{me}\", a member of an Asterline multi-agent team.\n\
+         {}\n",
+        team_skill_hint()
+    );
+    if teammates.is_empty() {
+        protocol.push_str("You are the only member; there are no teammates to message.\n");
+    } else {
+        protocol.push_str(&format!(
+            "Teammates you can message: {}.\n",
+            teammates.join(", ")
+        ));
+    }
+    protocol.push_str("All other text you write is shown to the user.");
+    protocol
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,7 +293,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: true,
             claude: true,
-            gemini: false,
+            agy: false,
         };
         let config = default_team("/tmp/ws", detected).expect("mixed team");
 
@@ -155,7 +309,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: true,
             claude: false,
-            gemini: false,
+            agy: false,
         };
         let config = default_team("/tmp/ws", detected).expect("codex team");
 
@@ -168,7 +322,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: true,
-            gemini: false,
+            agy: false,
         };
         let config = default_team("/tmp/ws", detected).expect("claude team");
 
@@ -181,21 +335,21 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: false,
-            gemini: false,
+            agy: false,
         };
         assert!(default_team("/tmp/ws", detected).is_none());
     }
 
     #[test]
-    fn gemini_only_default_team_is_single_gemini() {
+    fn agy_only_default_team_is_single_agy() {
         let detected = DetectedBackends {
             codex: false,
             claude: false,
-            gemini: true,
+            agy: true,
         };
-        let config = default_team("/tmp/ws", detected).expect("gemini team");
+        let config = default_team("/tmp/ws", detected).expect("agy team");
         assert_eq!(config.members.len(), 1);
-        assert_eq!(config.members[0].backend, BackendKind::Gemini);
+        assert_eq!(config.members[0].backend, BackendKind::Agy);
     }
 
     #[test]
@@ -216,11 +370,11 @@ mod tests {
     fn build_team_from_selected_backends() {
         assert!(build_team("/tmp/ws", &[]).is_none());
 
-        let config = build_team("/tmp/ws", &[BackendKind::Codex, BackendKind::Gemini]).unwrap();
+        let config = build_team("/tmp/ws", &[BackendKind::Codex, BackendKind::Agy]).unwrap();
         assert!(config.validate().is_ok());
         assert_eq!(config.members.len(), 2);
         assert_eq!(config.members[0].backend, BackendKind::Codex);
-        assert_eq!(config.members[1].backend, BackendKind::Gemini);
+        assert_eq!(config.members[1].backend, BackendKind::Agy);
         // The first selected member is the default target.
         assert_eq!(config.default_member_ids(), vec![MemberId::new("builder")]);
     }
@@ -229,10 +383,51 @@ mod tests {
     fn default_member_maps_backend_to_role() {
         assert_eq!(default_member(BackendKind::Codex).role, "implementation");
         assert_eq!(default_member(BackendKind::Claude).role, "review");
+        assert_eq!(default_member(BackendKind::Agy).backend, BackendKind::Agy);
+    }
+
+    #[test]
+    fn team_protocol_is_injected_and_stripped_for_persistence() {
+        let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+        member.system_prompt = Some("custom prompt".to_string());
+        let mut config = TeamConfig::new("t", "/tmp/ws")
+            .with_member(member)
+            .with_member(TeamMember::new(
+                "reviewer",
+                "Reviewer",
+                BackendKind::Claude,
+                "review",
+            ));
+
+        inject_team_protocol(&mut config);
+        let prompt = config.members[0].system_prompt.as_ref().unwrap();
+        assert!(prompt.contains("$asterline-team"));
+        assert!(prompt.contains(ASTERLINE_TEAM_SKILL_PATH));
+        assert!(!prompt.contains("@@team_message"));
+        assert!(!prompt.contains("@@team_member"));
+        assert!(prompt.contains("reviewer"));
+        assert!(prompt.contains("custom prompt"));
+
+        let stripped = strip_team_protocols(config);
         assert_eq!(
-            default_member(BackendKind::Gemini).backend,
-            BackendKind::Gemini
+            stripped.members[0].system_prompt.as_deref(),
+            Some("custom prompt")
         );
+        assert_eq!(stripped.members[1].system_prompt, None);
+    }
+
+    #[test]
+    fn ensure_team_skill_writes_repo_skill_when_missing() {
+        let dir = std::env::temp_dir().join(format!("asterline-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_team_skill(&dir).unwrap();
+
+        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("name: asterline-team"));
+        assert!(text.contains("@@team_message"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -245,7 +440,7 @@ mod tests {
             DetectedBackends {
                 codex: true,
                 claude: true,
-                gemini: false,
+                agy: false,
             },
         )
         .unwrap();
@@ -253,6 +448,67 @@ mod tests {
 
         let loaded = load_team_config(&path).expect("config loads");
         assert_eq!(loaded, config);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_team_config_derives_missing_member_ids() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-cfg-derived-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("team.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "name": "manual",
+              "workspace": "/tmp/ws",
+              "default_target": { "member": "lead-engineer" },
+              "members": [{
+                "display_name": "Lead Engineer",
+                "backend": "codex",
+                "role": "implementation"
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_team_config(&path).expect("config derives id from display_name");
+        assert_eq!(config.members[0].id, MemberId::new("lead-engineer"));
+        assert_eq!(
+            config.default_member_ids(),
+            vec![MemberId::new("lead-engineer")]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_team_config_migrates_old_gemini_backend() {
+        let dir = std::env::temp_dir().join(format!("asterline-cfg-gemini-{}", std::process::id()));
+        let config_dir = dir.join(".asterline");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("team.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "name": "old",
+              "workspace": "/tmp/ws",
+              "members": [{
+                "id": "researcher",
+                "display_name": "Researcher",
+                "backend": "gemini",
+                "role": "research"
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_team_config(&path).expect("old gemini backend is migrated");
+        assert_eq!(config.members[0].backend, BackendKind::Agy);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("\"backend\": \"agy\""));
+        assert!(!rewritten.contains("\"gemini\""));
 
         std::fs::remove_dir_all(&dir).ok();
     }

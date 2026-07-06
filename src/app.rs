@@ -10,7 +10,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
-use crate::domain::config::{detect_backends, load_team_config};
+use crate::domain::config::{
+    detect_backends, ensure_team_skill, inject_team_protocol, load_team_config,
+};
 use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
 use crate::runtime::{self, Runners, RuntimeHandle};
@@ -38,7 +40,7 @@ where
         Some(prepared) => prepared,
         None => {
             eprintln!(
-                "Asterline: no team config and neither `codex` nor `claude` was found on PATH.\n\
+                "Asterline: no team config and no supported backend CLI was found on PATH.\n\
                  Install a backend CLI, or pass --team <config.json>."
             );
             return Ok(());
@@ -52,18 +54,17 @@ where
         state,
     } = prepared;
 
-    println!(
-        "\x1b[1;36m      _       _             _ _\n\
-     / \\   __| |_ ___  _ __| (_)_ __   ___\n\
-    / _ \\ / _` \\ __/ _ \\| '__| | | '_ \\ / _ \\\n\
-   / ___ \\ (_| | ||  __/| |  | | | | | |  __/\n\
-  /_/   \\_\\__,_|\\__\\___||_|  |_|_|_| |_|\\___|\x1b[0m\n\
-  Multi-Agent Coding Console\n"
-    );
+    if config.banner {
+        print_startup_banner();
+    }
 
     tui::run(handle, events, state)?;
     let _ = join.join();
     Ok(())
+}
+
+fn print_startup_banner() {
+    println!("\x1b[1;36mAsterline\x1b[0m · Multi-Agent Coding Console");
 }
 
 /// Everything needed to run the TUI, wired but not yet started.
@@ -111,6 +112,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             }
         }
     };
+    ensure_team_skill(&team.workspace)?;
     inject_team_protocol(&mut team);
 
     let db_path = config
@@ -148,7 +150,16 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     state.seed_logs(logs);
 
     let (events_tx, events_rx) = mpsc::channel();
-    let (handle, join) = runtime::spawn(team, store, runners, events_tx, !config.debug);
+    let team_save_path = config.team_path.clone().unwrap_or(saved_team);
+    let (handle, join) = runtime::spawn(
+        team,
+        store,
+        runners,
+        events_tx,
+        !config.debug,
+        config.fake,
+        Some(team_save_path),
+    );
 
     Ok(Some(Prepared {
         handle,
@@ -171,49 +182,6 @@ fn build_runners(team: &TeamConfig, fake: bool) -> Runners {
     runners
 }
 
-/// Prepend the Asterline team protocol to each member's system prompt so agents
-/// know how to message teammates with `@@team_message`.
-fn inject_team_protocol(team: &mut TeamConfig) {
-    let protocols: Vec<String> = team
-        .members
-        .iter()
-        .map(|me| {
-            let teammates: Vec<String> = team
-                .members
-                .iter()
-                .filter(|other| other.id != me.id)
-                .map(|other| format!("{} [{}]", other.id, other.role))
-                .collect();
-            build_protocol(me.id.as_str(), &teammates)
-        })
-        .collect();
-
-    for (member, protocol) in team.members.iter_mut().zip(protocols) {
-        member.system_prompt = Some(match member.system_prompt.take() {
-            Some(existing) => format!("{protocol}\n\n{existing}"),
-            None => protocol,
-        });
-    }
-}
-
-fn build_protocol(me: &str, teammates: &[String]) -> String {
-    let mut protocol = format!(
-        "You are \"{me}\", a member of an Asterline multi-agent team.\n\
-         To send a message to a teammate, output a line by itself:\n\
-         @@team_message {{\"to\":\"<member-id or all>\",\"body\":\"<your message>\"}}\n"
-    );
-    if teammates.is_empty() {
-        protocol.push_str("You are the only member; there are no teammates to message.\n");
-    } else {
-        protocol.push_str(&format!(
-            "Teammates you can message: {}.\n",
-            teammates.join(", ")
-        ));
-    }
-    protocol.push_str("All other text you write is shown to the user.");
-    protocol
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AppConfig {
     team_path: Option<PathBuf>,
@@ -223,6 +191,7 @@ pub struct AppConfig {
     debug: bool,
     fake: bool,
     pick_team: bool,
+    banner: bool,
     show_help: bool,
 }
 
@@ -249,6 +218,7 @@ impl AppConfig {
                 "--debug" => config.debug = true,
                 "--fake" => config.fake = true,
                 "--pick-team" => config.pick_team = true,
+                "--banner" => config.banner = true,
                 "-h" | "--help" => config.show_help = true,
                 _ if arg.starts_with("--team=") => {
                     config.team_path = Some(arg["--team=".len()..].into())
@@ -292,6 +262,7 @@ impl AppConfig {
          \x20 --no-restore        Do not replay persisted chat history on startup.\n\
          \x20 --debug             Disable the approval gate (developer mode).\n\
          \x20 --fake              Use offline fake agents instead of real CLIs.\n\
+         \x20 --banner            Print a compact startup banner before the TUI.\n\
          \x20 -h, --help          Show this help.\n\
          \n\
          With no --team, Asterline opens a team builder from the detected backends\n\
@@ -314,12 +285,14 @@ mod tests {
             "/tmp/ws",
             "--no-restore",
             "--fake",
+            "--banner",
         ])
         .unwrap();
         assert_eq!(config.team_path, Some(PathBuf::from("/tmp/t.json")));
         assert_eq!(config.workspace, Some(PathBuf::from("/tmp/ws")));
         assert!(config.no_restore);
         assert!(config.fake);
+        assert!(config.banner);
     }
 
     #[test]
@@ -327,6 +300,13 @@ mod tests {
         let config = AppConfig::parse(["--db=/tmp/x.sqlite3", "--help"]).unwrap();
         assert_eq!(config.db_path, Some(PathBuf::from("/tmp/x.sqlite3")));
         assert!(config.show_help);
+        assert!(!config.banner);
+    }
+
+    #[test]
+    fn help_mentions_compact_banner_flag() {
+        assert!(AppConfig::help().contains("--banner"));
+        assert!(AppConfig::help().contains("compact startup banner"));
     }
 
     #[test]
@@ -346,7 +326,7 @@ mod tests {
             crate::domain::config::DetectedBackends {
                 codex: true,
                 claude: true,
-                gemini: false,
+                agy: false,
             },
         )
         .unwrap();
@@ -355,7 +335,7 @@ mod tests {
             .member(&crate::domain::team::MemberId::new("builder"))
             .unwrap();
         let prompt = builder.system_prompt.as_ref().unwrap();
-        assert!(prompt.contains("@@team_message"));
+        assert!(prompt.contains("$asterline-team"));
         assert!(prompt.contains("reviewer"));
     }
 
@@ -370,7 +350,7 @@ mod tests {
             crate::domain::config::DetectedBackends {
                 codex: true,
                 claude: false,
-                gemini: false,
+                agy: false,
             },
         )
         .unwrap();
@@ -387,6 +367,10 @@ mod tests {
         .unwrap();
 
         let prepared = prepare(&config, &dir).unwrap().expect("prepared");
+        assert!(
+            dir.join(crate::domain::config::ASTERLINE_TEAM_SKILL_PATH)
+                .is_file()
+        );
         let Prepared {
             handle,
             join,

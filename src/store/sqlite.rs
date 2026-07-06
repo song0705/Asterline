@@ -15,6 +15,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::domain::event::{
     AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel, MessageId, TurnId,
+    WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary,
+    WorkflowStepStatus, WorkflowStepSummary, WorkflowVerification,
 };
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
@@ -22,7 +24,7 @@ pub type Result<T> = result::Result<T, rusqlite::Error>;
 
 /// Current event-source schema version. Bump this and add a migration arm in
 /// [`SqliteStore::migrate`] whenever the schema changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 8;
 
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +112,62 @@ impl SqliteStore {
                 "UPDATE messages SET conversation_id = ?1 WHERE conversation_id IS NULL",
                 params![id],
             )?;
+        }
+        // v2 -> v3: Gemini CLI was replaced by Agy. Keep old transcripts,
+        // roster snapshots, and session rows readable under the new backend.
+        self.conn.execute_batch(
+            r#"
+            UPDATE messages SET backend = 'agy' WHERE backend = 'gemini';
+            UPDATE team_members SET backend = 'agy' WHERE backend = 'gemini';
+            UPDATE agent_sessions SET backend = 'agy' WHERE backend = 'gemini';
+            "#,
+        )?;
+        if !self.has_column("workflow_runs", "attempt")? {
+            self.conn.execute_batch(
+                "ALTER TABLE workflow_runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+        if from < 6 {
+            self.conn.execute_batch(
+                r#"
+                INSERT INTO workflow_run_events (run_id, attempt, kind, title, detail, created_at)
+                SELECT id,
+                       attempt,
+                       'imported',
+                       'Imported existing run',
+                       status,
+                       updated_at
+                  FROM workflow_runs
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM workflow_run_events
+                        WHERE workflow_run_events.run_id = workflow_runs.id
+                 );
+                "#,
+            )?;
+        }
+        if from < 7 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workflow_run_steps (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id     INTEGER NOT NULL,
+                    position   INTEGER NOT NULL,
+                    status     TEXT NOT NULL,
+                    owner      TEXT,
+                    title      TEXT NOT NULL,
+                    note       TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS workflow_run_steps_run_idx
+                    ON workflow_run_steps (run_id, position);
+                "#,
+            )?;
+        }
+        if from < 8 && !self.has_column("workflow_run_steps", "owner")? {
+            self.conn
+                .execute_batch("ALTER TABLE workflow_run_steps ADD COLUMN owner TEXT;")?;
         }
         Ok(())
     }
@@ -220,6 +278,47 @@ impl SqliteStore {
                 message    TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS workflow_runs (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                goal                 TEXT NOT NULL,
+                status               TEXT NOT NULL,
+                coordinator          TEXT,
+                verification_command TEXT,
+                verification_ok      INTEGER,
+                verification_summary TEXT,
+                created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                attempt              INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_run_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id     INTEGER NOT NULL,
+                attempt    INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                title      TEXT NOT NULL,
+                detail     TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS workflow_run_events_run_idx
+                ON workflow_run_events (run_id, id);
+
+            CREATE TABLE IF NOT EXISTS workflow_run_steps (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id     INTEGER NOT NULL,
+                position   INTEGER NOT NULL,
+                status     TEXT NOT NULL,
+                owner      TEXT,
+                title      TEXT NOT NULL,
+                note       TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS workflow_run_steps_run_idx
+                ON workflow_run_steps (run_id, position);
             "#,
         )
     }
@@ -559,6 +658,409 @@ impl SqliteStore {
         )?;
         Ok(updated == 1)
     }
+
+    // --- workflow runs ---------------------------------------------------
+
+    pub fn create_workflow_run(
+        &self,
+        goal: &str,
+        coordinator: Option<&MemberId>,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "INSERT INTO workflow_runs (goal, status, coordinator)
+             VALUES (?1, ?2, ?3)",
+            params![
+                goal,
+                WorkflowRunStatus::Running.as_str(),
+                coordinator.map(MemberId::as_str)
+            ],
+        )?;
+        let id = WorkflowRunId(self.conn.last_insert_rowid() as u64);
+        self.record_workflow_event(id, "started", "Started workflow", Some(goal))?;
+        self.workflow_run(id)
+    }
+
+    pub fn update_workflow_status(
+        &self,
+        id: WorkflowRunId,
+        status: WorkflowRunStatus,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "UPDATE workflow_runs SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![status.as_str(), id.0 as i64],
+        )?;
+        let (kind, title) = workflow_status_event(status);
+        self.record_workflow_event(id, kind, title, None)?;
+        self.workflow_run(id)
+    }
+
+    pub fn set_workflow_verification(
+        &self,
+        id: WorkflowRunId,
+        command: &str,
+        ok: bool,
+        summary: &str,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "UPDATE workflow_runs
+             SET status = ?1,
+                 verification_command = ?2,
+                 verification_ok = ?3,
+                 verification_summary = ?4,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?5",
+            params![
+                if ok {
+                    WorkflowRunStatus::Done.as_str()
+                } else {
+                    WorkflowRunStatus::Failed.as_str()
+                },
+                command,
+                ok as i64,
+                summary,
+                id.0 as i64
+            ],
+        )?;
+        self.record_workflow_event(
+            id,
+            if ok {
+                "verification_passed"
+            } else {
+                "verification_failed"
+            },
+            if ok {
+                "Verification passed"
+            } else {
+                "Verification failed"
+            },
+            Some(&format!("{command}\n{summary}")),
+        )?;
+        self.workflow_run(id)
+    }
+
+    pub fn continue_workflow_run(
+        &self,
+        id: WorkflowRunId,
+        note: Option<&str>,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "UPDATE workflow_runs
+             SET status = ?1,
+                 attempt = attempt + 1,
+                 verification_command = NULL,
+                 verification_ok = NULL,
+                 verification_summary = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2",
+            params![WorkflowRunStatus::Running.as_str(), id.0 as i64],
+        )?;
+        self.record_workflow_event(id, "continued", "Continued workflow", note)?;
+        self.workflow_run(id)
+    }
+
+    pub fn add_workflow_note(&self, id: WorkflowRunId, note: &str) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id.0 as i64],
+        )?;
+        self.record_workflow_event(id, "note", "User note", Some(note))?;
+        self.workflow_run(id)
+    }
+
+    pub fn block_workflow_run(
+        &self,
+        id: WorkflowRunId,
+        reason: &str,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "UPDATE workflow_runs
+             SET status = ?1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2",
+            params![WorkflowRunStatus::Blocked.as_str(), id.0 as i64],
+        )?;
+        self.record_workflow_event(id, "blocked", "Workflow blocked", Some(reason))?;
+        self.workflow_run(id)
+    }
+
+    pub fn add_workflow_step(
+        &self,
+        id: WorkflowRunId,
+        owner: Option<&MemberId>,
+        title: &str,
+    ) -> Result<WorkflowRunSummary> {
+        let inserted = self.conn.execute(
+            "INSERT INTO workflow_run_steps (run_id, position, status, owner, title)
+             SELECT id,
+                    (
+                        SELECT COALESCE(MAX(position), 0) + 1
+                          FROM workflow_run_steps
+                         WHERE run_id = ?1
+                    ),
+                    ?2,
+                    ?3,
+                    ?4
+              FROM workflow_runs
+             WHERE id = ?1",
+            params![
+                id.0 as i64,
+                WorkflowStepStatus::Todo.as_str(),
+                owner.map(MemberId::as_str),
+                title
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        self.conn.execute(
+            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id.0 as i64],
+        )?;
+        let detail = match owner {
+            Some(owner) => format!("@{owner}: {title}"),
+            None => title.to_string(),
+        };
+        self.record_workflow_event(id, "step_added", "Step added", Some(&detail))?;
+        self.workflow_run(id)
+    }
+
+    pub fn update_workflow_step(
+        &self,
+        id: WorkflowRunId,
+        number: u32,
+        status: WorkflowStepStatus,
+        note: Option<&str>,
+    ) -> Result<WorkflowRunSummary> {
+        let title: String = self.conn.query_row(
+            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            params![id.0 as i64, number as i64],
+            |row| row.get(0),
+        )?;
+        let note_value = note.filter(|note| !note.trim().is_empty());
+        self.conn.execute(
+            "UPDATE workflow_run_steps
+             SET status = ?1,
+                 note = ?2,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE run_id = ?3 AND position = ?4",
+            params![status.as_str(), note_value, id.0 as i64, number as i64],
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id.0 as i64],
+        )?;
+        let detail = match note_value {
+            Some(note) => format!("#{number} {}: {title}\n{note}", status.as_str()),
+            None => format!("#{number} {}: {title}", status.as_str()),
+        };
+        self.record_workflow_event(id, "step_updated", "Step updated", Some(&detail))?;
+        self.workflow_run(id)
+    }
+
+    pub fn rename_workflow_step(
+        &self,
+        id: WorkflowRunId,
+        number: u32,
+        title: &str,
+    ) -> Result<WorkflowRunSummary> {
+        let old_title: String = self.conn.query_row(
+            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            params![id.0 as i64, number as i64],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_run_steps
+             SET title = ?1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE run_id = ?2 AND position = ?3",
+            params![title, id.0 as i64, number as i64],
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id.0 as i64],
+        )?;
+        self.record_workflow_event(
+            id,
+            "step_renamed",
+            "Step renamed",
+            Some(&format!("#{number}: {old_title}\n{title}")),
+        )?;
+        self.workflow_run(id)
+    }
+
+    pub fn remove_workflow_step(
+        &self,
+        id: WorkflowRunId,
+        number: u32,
+    ) -> Result<WorkflowRunSummary> {
+        let title: String = self.conn.query_row(
+            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            params![id.0 as i64, number as i64],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "DELETE FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            params![id.0 as i64, number as i64],
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_run_steps
+             SET position = position - 1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE run_id = ?1 AND position > ?2",
+            params![id.0 as i64, number as i64],
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id.0 as i64],
+        )?;
+        self.record_workflow_event(
+            id,
+            "step_removed",
+            "Step removed",
+            Some(&format!("#{number}: {title}")),
+        )?;
+        self.workflow_run(id)
+    }
+
+    pub fn assign_workflow_step(
+        &self,
+        id: WorkflowRunId,
+        number: u32,
+        owner: Option<&MemberId>,
+    ) -> Result<WorkflowRunSummary> {
+        let title: String = self.conn.query_row(
+            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            params![id.0 as i64, number as i64],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_run_steps
+             SET owner = ?1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE run_id = ?2 AND position = ?3",
+            params![owner.map(MemberId::as_str), id.0 as i64, number as i64],
+        )?;
+        self.conn.execute(
+            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id.0 as i64],
+        )?;
+        let detail = match owner {
+            Some(owner) => format!("#{number} @{owner}: {title}"),
+            None => format!("#{number} unassigned: {title}"),
+        };
+        self.record_workflow_event(id, "step_assigned", "Step assigned", Some(&detail))?;
+        self.workflow_run(id)
+    }
+
+    pub fn latest_workflow_run(&self) -> Result<Option<WorkflowRunSummary>> {
+        let run = self
+            .conn
+            .query_row(
+                "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt
+                 FROM workflow_runs ORDER BY id DESC LIMIT 1",
+                [],
+                map_workflow_run,
+            )
+            .optional()?;
+        run.map(|run| self.with_workflow_events(run)).transpose()
+    }
+
+    pub fn recent_workflow_runs(&self, limit: usize) -> Result<Vec<WorkflowRunSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt
+             FROM workflow_runs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], map_workflow_run)?;
+        let mut runs = rows.collect::<Result<Vec<_>>>()?;
+        runs.reverse();
+        runs.into_iter()
+            .map(|run| self.with_workflow_events(run))
+            .collect()
+    }
+
+    pub fn workflow_run(&self, id: WorkflowRunId) -> Result<WorkflowRunSummary> {
+        let run = self.conn.query_row(
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt
+             FROM workflow_runs WHERE id = ?1",
+            params![id.0 as i64],
+            map_workflow_run,
+        )?;
+        self.with_workflow_events(run)
+    }
+
+    fn record_workflow_event(
+        &self,
+        id: WorkflowRunId,
+        kind: &str,
+        title: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workflow_run_events (run_id, attempt, kind, title, detail)
+             SELECT id, attempt, ?2, ?3, ?4 FROM workflow_runs WHERE id = ?1",
+            params![id.0 as i64, kind, title, detail],
+        )?;
+        Ok(())
+    }
+
+    fn with_workflow_events(&self, mut run: WorkflowRunSummary) -> Result<WorkflowRunSummary> {
+        run.events = self.workflow_run_events(run.id, 8)?;
+        run.steps = self.workflow_run_steps(run.id, 12)?;
+        Ok(run)
+    }
+
+    fn workflow_run_events(
+        &self,
+        id: WorkflowRunId,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRunEventSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, title, detail, created_at, attempt
+             FROM (
+                 SELECT id, kind, title, detail, created_at, attempt
+                   FROM workflow_run_events
+                  WHERE run_id = ?1
+                  ORDER BY id DESC
+                  LIMIT ?2
+             )
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![id.0 as i64, limit as i64], |row| {
+            Ok(WorkflowRunEventSummary {
+                kind: row.get(0)?,
+                title: row.get(1)?,
+                detail: row.get(2)?,
+                created_at: row.get(3)?,
+                attempt: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn workflow_run_steps(
+        &self,
+        id: WorkflowRunId,
+        limit: usize,
+    ) -> Result<Vec<WorkflowStepSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT position, status, owner, title, note, updated_at
+               FROM workflow_run_steps
+              WHERE run_id = ?1
+              ORDER BY position ASC
+              LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![id.0 as i64, limit as i64], |row| {
+            Ok(WorkflowStepSummary {
+                number: row.get::<_, i64>(0)? as u32,
+                status: WorkflowStepStatus::parse(&row.get::<_, String>(1)?),
+                owner: row.get::<_, Option<String>>(2)?.map(MemberId::new),
+                title: row.get(3)?,
+                note: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
 }
 
 /// Builder for a `messages` row; unused fields stay `None`.
@@ -667,8 +1169,47 @@ fn map_approval(row: &Row<'_>) -> rusqlite::Result<StoredApproval> {
     })
 }
 
+fn map_workflow_run(row: &Row<'_>) -> rusqlite::Result<WorkflowRunSummary> {
+    let command: Option<String> = row.get(4)?;
+    let ok: Option<i64> = row.get(5)?;
+    let summary: Option<String> = row.get(6)?;
+    Ok(WorkflowRunSummary {
+        id: WorkflowRunId(row.get::<_, i64>(0)? as u64),
+        goal: row.get(1)?,
+        status: WorkflowRunStatus::parse(&row.get::<_, String>(2)?),
+        coordinator: row.get::<_, Option<String>>(3)?.map(MemberId::new),
+        verification: match (command, ok, summary) {
+            (Some(command), Some(ok), Some(summary)) => Some(WorkflowVerification {
+                command,
+                ok: ok != 0,
+                summary,
+            }),
+            _ => None,
+        },
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        attempt: row.get::<_, i64>(9)? as u32,
+        events: Vec::new(),
+        steps: Vec::new(),
+    })
+}
+
+fn workflow_status_event(status: WorkflowRunStatus) -> (&'static str, &'static str) {
+    match status {
+        WorkflowRunStatus::Planned => ("planned", "Workflow planned"),
+        WorkflowRunStatus::Running => ("running", "Workflow running"),
+        WorkflowRunStatus::Verifying => ("verifying", "Started verification"),
+        WorkflowRunStatus::Done => ("done", "Work finished"),
+        WorkflowRunStatus::Failed => ("failed", "Workflow failed"),
+        WorkflowRunStatus::Blocked => ("blocked", "Workflow blocked"),
+    }
+}
+
 fn read_backend(value: Option<&str>) -> rusqlite::Result<BackendKind> {
     let value = value.unwrap_or("");
+    if value == "gemini" {
+        return Ok(BackendKind::Agy);
+    }
     BackendKind::try_from(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
             3,
@@ -832,6 +1373,142 @@ mod tests {
     }
 
     #[test]
+    fn workflow_runs_record_status_and_verification() {
+        let store = store();
+        let builder = MemberId::new("builder");
+
+        let run = store
+            .create_workflow_run("ship the parser", Some(&builder))
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Running);
+        assert_eq!(run.coordinator, Some(builder));
+        assert_eq!(run.attempt, 1);
+        assert_eq!(run.events.len(), 1);
+        assert_eq!(run.events[0].kind, "started");
+
+        let run = store
+            .update_workflow_status(run.id, WorkflowRunStatus::Verifying)
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Verifying);
+        assert_eq!(run.events.last().unwrap().kind, "verifying");
+
+        let run = store
+            .set_workflow_verification(run.id, "cargo test", true, "ok")
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Done);
+        let verification = run.verification.expect("verification saved");
+        assert_eq!(verification.command, "cargo test");
+        assert!(verification.ok);
+        assert_eq!(verification.summary, "ok");
+        assert_eq!(run.events.last().unwrap().kind, "verification_passed");
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("cargo test\nok")
+        );
+
+        let run = store
+            .continue_workflow_run(run.id, Some("fix follow-up"))
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Running);
+        assert_eq!(run.attempt, 2);
+        assert_eq!(run.verification, None);
+        assert_eq!(run.events.last().unwrap().kind, "continued");
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("fix follow-up")
+        );
+        assert_eq!(run.events.last().unwrap().attempt, 2);
+
+        let run = store
+            .add_workflow_note(run.id, "waiting for design input")
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Running);
+        assert_eq!(run.events.last().unwrap().kind, "note");
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("waiting for design input")
+        );
+
+        let run = store
+            .add_workflow_step(run.id, None, "parse config")
+            .unwrap();
+        assert_eq!(run.steps.len(), 1);
+        assert_eq!(run.steps[0].number, 1);
+        assert_eq!(run.steps[0].status, WorkflowStepStatus::Todo);
+        assert_eq!(run.steps[0].owner, None);
+        assert_eq!(run.steps[0].title, "parse config");
+        assert_eq!(run.events.last().unwrap().kind, "step_added");
+
+        let reviewer = MemberId::new("reviewer");
+        let run = store
+            .assign_workflow_step(run.id, 1, Some(&reviewer))
+            .unwrap();
+        assert_eq!(run.steps[0].owner, Some(reviewer.clone()));
+        assert_eq!(run.events.last().unwrap().kind, "step_assigned");
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("#1 @reviewer: parse config")
+        );
+
+        let run = store
+            .update_workflow_step(
+                run.id,
+                1,
+                WorkflowStepStatus::Done,
+                Some("covered by config tests"),
+            )
+            .unwrap();
+        assert_eq!(run.steps[0].status, WorkflowStepStatus::Done);
+        assert_eq!(
+            run.steps[0].note.as_deref(),
+            Some("covered by config tests")
+        );
+        assert_eq!(run.events.last().unwrap().kind, "step_updated");
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("#1 done: parse config\ncovered by config tests")
+        );
+
+        let run = store
+            .add_workflow_step(run.id, Some(&reviewer), "obsolete duplicate")
+            .unwrap();
+        assert_eq!(run.steps.len(), 2);
+        assert_eq!(run.steps[1].owner, Some(reviewer));
+
+        let run = store
+            .rename_workflow_step(run.id, 2, "document config")
+            .unwrap();
+        assert_eq!(run.steps[1].title, "document config");
+        assert_eq!(run.events.last().unwrap().kind, "step_renamed");
+
+        let run = store.remove_workflow_step(run.id, 1).unwrap();
+        assert_eq!(run.steps.len(), 1);
+        assert_eq!(run.steps[0].number, 1);
+        assert_eq!(run.steps[0].title, "document config");
+        assert_eq!(run.events.last().unwrap().kind, "step_removed");
+
+        let run = store.assign_workflow_step(run.id, 1, None).unwrap();
+        assert_eq!(run.steps[0].owner, None);
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("#1 unassigned: document config")
+        );
+
+        let run = store
+            .block_workflow_run(run.id, "missing API token")
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Blocked);
+        assert_eq!(run.events.last().unwrap().kind, "blocked");
+        assert_eq!(
+            run.events.last().unwrap().detail.as_deref(),
+            Some("missing API token")
+        );
+
+        assert_eq!(store.latest_workflow_run().unwrap().unwrap().id, run.id);
+        assert_eq!(store.recent_workflow_runs(10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn stream_events_and_logs_are_recorded() {
         let store = store();
         store
@@ -953,6 +1630,353 @@ mod tests {
         let next = store.create_conversation().unwrap();
         store.set_conversation(next);
         assert!(store.replay_chat().unwrap().is_empty());
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v2_gemini_backend_rows_to_agy() {
+        let dir = std::env::temp_dir().join(format!("asterline-v3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v2.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE conversations (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE messages (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER,
+                    turn_id         INTEGER,
+                    kind            TEXT NOT NULL,
+                    member_id       TEXT,
+                    display_name    TEXT,
+                    backend         TEXT,
+                    text            TEXT,
+                    name            TEXT,
+                    summary         TEXT,
+                    ok              INTEGER,
+                    targets         TEXT,
+                    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO conversations DEFAULT VALUES;
+                INSERT INTO messages (conversation_id, kind, member_id, display_name, backend, text)
+                    VALUES (1, 'agent', 'researcher', 'Researcher', 'gemini', 'old reply');
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let conversation = store.current_conversation().unwrap();
+        store.set_conversation(conversation);
+        let items = store.replay_chat().unwrap();
+        assert!(matches!(
+            &items[0],
+            ChatItem::Agent {
+                backend: BackendKind::Agy,
+                text,
+                ..
+            } if text == "old reply"
+        ));
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v3_to_workflow_runs_schema() {
+        let dir = std::env::temp_dir().join(format!("asterline-v4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v3.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE conversations (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE messages (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER,
+                    turn_id         INTEGER,
+                    kind            TEXT NOT NULL,
+                    member_id       TEXT,
+                    display_name    TEXT,
+                    backend         TEXT,
+                    text            TEXT,
+                    name            TEXT,
+                    summary         TEXT,
+                    ok              INTEGER,
+                    targets         TEXT,
+                    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO conversations DEFAULT VALUES;
+                INSERT INTO messages (conversation_id, kind, text)
+                    VALUES (1, 'user', 'older v3 message');
+                PRAGMA user_version = 3;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let run = store
+            .create_workflow_run("verify migration", Some(&MemberId::new("builder")))
+            .unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Running);
+
+        let conversation = store.current_conversation().unwrap();
+        store.set_conversation(conversation);
+        assert_eq!(
+            store.replay_chat().unwrap(),
+            vec![ChatItem::User {
+                body: "older v3 message".to_string()
+            }]
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v4_to_workflow_attempts_and_events() {
+        let dir = std::env::temp_dir().join(format!("asterline-v6-v4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v4.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE workflow_runs (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal                 TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    coordinator          TEXT,
+                    verification_command TEXT,
+                    verification_ok      INTEGER,
+                    verification_summary TEXT,
+                    created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO workflow_runs (goal, status, coordinator)
+                    VALUES ('ship parser', 'done', 'builder');
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let run = store.latest_workflow_run().unwrap().unwrap();
+        assert_eq!(run.attempt, 1);
+        assert_eq!(run.events.len(), 1);
+        assert_eq!(run.events[0].kind, "imported");
+        assert_eq!(run.events[0].detail.as_deref(), Some("done"));
+        assert!(run.steps.is_empty());
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v5_to_workflow_events() {
+        let dir = std::env::temp_dir().join(format!("asterline-v6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v5.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE workflow_runs (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal                 TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    coordinator          TEXT,
+                    verification_command TEXT,
+                    verification_ok      INTEGER,
+                    verification_summary TEXT,
+                    created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    attempt              INTEGER NOT NULL DEFAULT 1
+                );
+                INSERT INTO workflow_runs (goal, status, coordinator, attempt)
+                    VALUES ('ship parser', 'failed', 'builder', 3);
+                PRAGMA user_version = 5;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let run = store.latest_workflow_run().unwrap().unwrap();
+        assert_eq!(run.attempt, 3);
+        assert_eq!(run.events.len(), 1);
+        assert_eq!(run.events[0].kind, "imported");
+        assert_eq!(run.events[0].attempt, 3);
+        assert_eq!(run.events[0].detail.as_deref(), Some("failed"));
+        assert!(run.steps.is_empty());
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v6_to_workflow_steps() {
+        let dir = std::env::temp_dir().join(format!("asterline-v7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v6.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE workflow_runs (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal                 TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    coordinator          TEXT,
+                    verification_command TEXT,
+                    verification_ok      INTEGER,
+                    verification_summary TEXT,
+                    created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    attempt              INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE workflow_run_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id     INTEGER NOT NULL,
+                    attempt    INTEGER NOT NULL,
+                    kind       TEXT NOT NULL,
+                    title      TEXT NOT NULL,
+                    detail     TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO workflow_runs (goal, status, coordinator, attempt)
+                    VALUES ('ship parser', 'running', 'builder', 1);
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let run = store
+            .add_workflow_step(WorkflowRunId(1), None, "write parser tests")
+            .unwrap();
+        assert_eq!(run.steps.len(), 1);
+        assert_eq!(run.steps[0].title, "write parser tests");
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v7_to_workflow_step_owner() {
+        let dir = std::env::temp_dir().join(format!("asterline-v8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v7.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE workflow_runs (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal                 TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    coordinator          TEXT,
+                    verification_command TEXT,
+                    verification_ok      INTEGER,
+                    verification_summary TEXT,
+                    created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    attempt              INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE workflow_run_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id     INTEGER NOT NULL,
+                    attempt    INTEGER NOT NULL,
+                    kind       TEXT NOT NULL,
+                    title      TEXT NOT NULL,
+                    detail     TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE workflow_run_steps (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id     INTEGER NOT NULL,
+                    position   INTEGER NOT NULL,
+                    status     TEXT NOT NULL,
+                    title      TEXT NOT NULL,
+                    note       TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO workflow_runs (goal, status, coordinator, attempt)
+                    VALUES ('ship parser', 'running', 'builder', 1);
+                INSERT INTO workflow_run_steps (run_id, position, status, title)
+                    VALUES (1, 1, 'todo', 'write parser tests');
+                PRAGMA user_version = 7;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(store.has_column("workflow_run_steps", "owner").unwrap());
+
+        let owner = MemberId::new("builder");
+        let run = store
+            .assign_workflow_step(WorkflowRunId(1), 1, Some(&owner))
+            .unwrap();
+        assert_eq!(run.steps[0].owner, Some(owner));
 
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
