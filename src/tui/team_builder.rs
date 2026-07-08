@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
@@ -25,6 +25,7 @@ use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamConfig, TeamMember, normalize_member_id as normalize_domain_member_id,
 };
+use crate::tui::theme;
 
 /// Pick a team interactively from the detected backends. Returns `None` if the
 /// user cancels or nothing is available.
@@ -370,77 +371,106 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
         .title(" Asterline · build your team ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(theme::accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let avail = inner.width as usize;
 
     let mut lines = vec![
         Line::from(Span::styled(
             "Customize members, backend CLIs, model, and reasoning effort:",
-            Style::default().fg(Color::Gray),
+            theme::muted(),
         )),
         Line::raw(""),
-        Line::from(Span::styled(
-            " Members",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(" Members", theme::accent_bold())),
     ];
+
+    // Distribute available width across columns dynamically.
+    // Layout: " › name @handle backend role=… model=… effort=…"
+    let name_w = avail.clamp(8, 18);
+    let handle_w = avail.clamp(6, 14);
+    let backend_w = 7;
+    let rest = avail.saturating_sub(name_w + handle_w + backend_w + 6);
+    let role_w = rest.clamp(6, 16);
+    let model_w = rest.saturating_sub(role_w).clamp(6, 16);
 
     for (i, member) in state.members.iter().enumerate() {
         let pointer = if i == state.selected { "›" } else { " " };
         let style = if i == state.selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            theme::selection()
         } else {
-            Style::default().fg(Color::White)
+            theme::emphasis()
         };
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {pointer} {:<18} @{:<14} {:<7} role={:<14} model={:<14} effort={}",
-                truncate(&member.display_name, 14),
-                member.id,
-                member.backend.as_str(),
-                truncate(&member.role, 14),
-                truncate(member.model.as_deref().unwrap_or("default"), 14),
-                member
-                    .effort
-                    .map(|effort| effort.as_str())
-                    .unwrap_or("default")
+        let muted_style = if i == state.selected {
+            theme::selection()
+        } else {
+            theme::muted()
+        };
+        let backend_color = theme::backend_color(member.backend);
+        let backend_style = if i == state.selected {
+            theme::selection()
+        } else {
+            Style::default().fg(backend_color)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {pointer} "), style),
+            Span::styled(
+                theme::pad_width(&truncate(&member.display_name, name_w), name_w),
+                style,
             ),
-            style,
-        )));
+            Span::styled(" ", style),
+            Span::styled(
+                theme::pad_width(&format!("@{}", member.id), handle_w),
+                muted_style,
+            ),
+            Span::styled(" ", style),
+            Span::styled(
+                theme::pad_width(member.backend.as_str(), backend_w),
+                backend_style,
+            ),
+            Span::styled(" ", style),
+            Span::styled(
+                format!("role={} ", theme::clip_width(&member.role, role_w)),
+                muted_style,
+            ),
+            Span::styled(
+                format!(
+                    "model={} ",
+                    theme::clip_width(member.model.as_deref().unwrap_or("default"), model_w)
+                ),
+                muted_style,
+            ),
+            Span::styled(
+                format!(
+                    "effort={}",
+                    member
+                        .effort
+                        .map(|effort| effort.as_str())
+                        .unwrap_or("default")
+                ),
+                muted_style,
+            ),
+        ]));
     }
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         " Selected member fields",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        theme::accent_bold(),
     )));
 
     let selected = state.selected_member();
     lines.push(Line::from(vec![
-        Span::styled("     handle: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("@{}", selected.id),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(" (auto)", Style::default().fg(Color::DarkGray)),
+        Span::styled("     handle: ", theme::muted()),
+        Span::styled(format!("@{}", selected.id), theme::accent()),
+        Span::styled(" (auto)", theme::muted()),
     ]));
     for (idx, field) in Field::ALL.iter().enumerate() {
         let selected_field = idx == state.field;
         let style = if selected_field {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            theme::selection_cell()
         } else {
-            Style::default().fg(Color::Gray)
+            theme::text()
         };
         lines.push(Line::from(Span::styled(
             format!(" {:>10}: {}", field.label(), field_value(selected, *field)),
@@ -453,24 +483,18 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" editing {}: ", edit.field.label()),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                theme::warning_bold(),
             ),
-            Span::styled(edit.buffer.clone(), Style::default().fg(Color::White)),
+            Span::styled(edit.buffer.clone(), theme::emphasis()),
         ]));
         lines.push(Line::from(Span::styled(
             "Enter commit · Esc cancel · Ctrl+U clear",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            theme::muted_italic(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "↑/↓ member · ←/→ field · Enter edit/cycle · a add · d delete · s start · Esc quit",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            theme::muted_italic(),
         )));
     }
 

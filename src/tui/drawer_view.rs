@@ -50,13 +50,27 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
     let lines = match drawer {
         Drawer::Logs => drawer_logs(state),
         Drawer::Team => drawer_team(state),
-        Drawer::Runs => drawer_runs(state),
+        Drawer::Runs => drawer_runs(state, content.width as usize),
         Drawer::Palette => drawer_palette(),
         Drawer::Diff => drawer_diff(state),
         Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
     };
     // Clamp the scroll offset so content can't be pushed entirely off-screen.
-    let max_scroll = lines.len().saturating_sub(content.height as usize);
+    // Account for line wrapping: the Paragraph widget wraps long lines, so the
+    // visual line count can exceed `lines.len()`.
+    let content_width = content.width.max(1) as usize;
+    let visual_count: usize = lines
+        .iter()
+        .map(|line| {
+            let w = line_width(line);
+            if w == 0 {
+                1
+            } else {
+                w.div_ceil(content_width).max(1)
+            }
+        })
+        .sum();
+    let max_scroll = visual_count.saturating_sub(content.height as usize);
     let offset = state.drawer_scroll().min(max_scroll) as u16;
     frame.render_widget(
         Paragraph::new(lines)
@@ -80,6 +94,14 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             hint_row,
         );
     }
+}
+
+/// Display width of all spans in a line (for scroll clamping with wrapping).
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| theme::display_width(span.content.as_ref()))
+        .sum()
 }
 
 fn log_lines<'a>(entries: impl Iterator<Item = &'a LogEntry>) -> Vec<Line<'static>> {
@@ -140,67 +162,64 @@ fn table_header(cells: &[&str], widths: &[usize], tail: &str) -> (Line<'static>,
     )
 }
 
-const TEAM_COLUMNS: [usize; 3] = [13, 9, 19];
-
 fn drawer_team(state: &AppState) -> Vec<Line<'static>> {
     if let Some(editor) = state.team_editor() {
         return drawer_team_editor(state, editor);
     }
 
     let mut lines = Vec::new();
-    let (header, rule) = table_header(&["Member", "Backend", "Role"], &TEAM_COLUMNS, "Status");
-    lines.push(header);
-    lines.push(rule);
+    lines.push(Line::from(vec![
+        Span::styled(" Team", theme::accent_bold()),
+        Span::styled(
+            format!("  {} member(s)", state.members().len()),
+            theme::muted(),
+        ),
+    ]));
+    lines.push(Line::raw(""));
 
     for member in state.members() {
         let color = theme::backend_color(member.backend);
-        let sep = Span::styled("│ ", theme::muted());
+        let status_label = theme::status_label(member.status);
+        // Header line: ● Name  backend · role  ·  status
         lines.push(Line::from(vec![
+            Span::styled("● ", theme::bold(color)),
+            Span::styled(member.display_name.clone(), theme::bold(color)),
             Span::styled(
-                format!(" {}", pad_width(&member.display_name, TEAM_COLUMNS[0])),
-                theme::bold(color),
+                format!("   {} · {}", member.backend.as_str(), member.role),
+                theme::muted(),
             ),
-            sep.clone(),
-            Span::styled(
-                pad_width(member.backend.as_str(), TEAM_COLUMNS[1]),
-                Style::default().fg(color),
-            ),
-            sep.clone(),
-            Span::styled(pad_width(&member.role, TEAM_COLUMNS[2]), theme::text()),
-            sep,
-            Span::styled(
-                theme::status_label(member.status).to_string(),
-                Style::default().fg(theme::status_color(member.status)),
-            ),
+            Span::styled(format!("   {status_label}"), {
+                Style::default().fg(theme::status_color(member.status))
+            }),
         ]));
-        let session = member
-            .session
-            .clone()
-            .unwrap_or_else(|| "no session yet".to_string());
+        // Detail line 1: session · model · effort
+        let session = member.session.clone().unwrap_or_else(|| "—".to_string());
         let model = member.model.as_deref().unwrap_or("default");
         let effort = member
             .effort
             .map(|effort| effort.as_str().to_string())
             .unwrap_or_else(|| "default".to_string());
-        lines.push(Line::styled(
-            format!("   └─ session: {session}"),
-            theme::muted(),
-        ));
-        lines.push(Line::styled(
-            format!(
-                "      model: {model} · effort: {effort} · cwd: {}",
-                member.cwd
-            ),
-            theme::muted(),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled("  session ", theme::muted()),
+            Span::styled(session, theme::text()),
+            Span::styled("  ·  model ", theme::muted()),
+            Span::styled(model.to_string(), theme::text()),
+            Span::styled("  ·  effort ", theme::muted()),
+            Span::styled(effort, theme::text()),
+        ]));
+        // Detail line 2: cwd
+        lines.push(Line::from(vec![
+            Span::styled("  cwd ", theme::muted()),
+            Span::styled(member.cwd.clone(), theme::text()),
+        ]));
+        lines.push(Line::raw(""));
     }
 
     if !state.pending_approvals().is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(" Pending approvals:", theme::warning_bold()));
+        lines.push(Line::styled(" Pending approvals", theme::warning_bold()));
         for approval in state.pending_approvals() {
             lines.push(Line::from(vec![
-                Span::styled(format!("  [{}] ", approval.id), theme::warning_bold()),
+                Span::styled(format!("  {} ", approval.id), theme::warning_bold()),
                 Span::styled(format!("{} (", approval.action), theme::warning()),
                 Span::styled(
                     approval.body.clone(),

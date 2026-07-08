@@ -59,7 +59,7 @@ pub(crate) fn workflow_footer_hint(state: &AppState) -> Option<(String, Color)> 
 /// The `/runs` drawer body. Compact mode shows what you act on (selected run,
 /// goal, progress, action, steps, history table); `x` expands the rest
 /// (owner, times, owners workload, outcome, stages, timeline).
-pub(crate) fn drawer_runs(state: &AppState) -> Vec<Line<'static>> {
+pub(crate) fn drawer_runs(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let runs = state.workflow_runs();
     let detail = state.workflow_runs_detail();
     if runs.is_empty() {
@@ -160,7 +160,10 @@ pub(crate) fn drawer_runs(state: &AppState) -> Vec<Line<'static>> {
         if let Some(dispatch) = state.selected_workflow_dispatch_command() {
             lines.push(Line::from(vec![
                 Span::styled(" Dispatch: ", theme::muted()),
-                Span::styled(truncate_width(&dispatch, 54), theme::accent_bold()),
+                Span::styled(
+                    truncate_width(&dispatch, width.saturating_sub(12).max(20)),
+                    theme::accent_bold(),
+                ),
             ]));
         }
         if detail {
@@ -169,6 +172,7 @@ pub(crate) fn drawer_runs(state: &AppState) -> Vec<Line<'static>> {
         lines.extend(workflow_step_lines(
             selected,
             state.selected_workflow_step(),
+            width,
         ));
         if detail || surfaced {
             lines.extend(workflow_timeline_lines(selected));
@@ -181,7 +185,7 @@ pub(crate) fn drawer_runs(state: &AppState) -> Vec<Line<'static>> {
 
     let selected_id = state.selected_workflow_run().map(|run| run.id);
     for run in runs.iter().rev().take(50) {
-        lines.extend(drawer_run(run, selected_id == Some(run.id), detail));
+        lines.extend(drawer_run(run, selected_id == Some(run.id), detail, width));
     }
     lines
 }
@@ -211,7 +215,12 @@ fn runs_table_rule() -> Line<'static> {
     Line::from(Span::styled(text, theme::muted()))
 }
 
-fn drawer_run(run: &WorkflowRunSummary, selected: bool, detail: bool) -> Vec<Line<'static>> {
+fn drawer_run(
+    run: &WorkflowRunSummary,
+    selected: bool,
+    detail: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let owner = run
         .coordinator
@@ -263,7 +272,7 @@ fn drawer_run(run: &WorkflowRunSummary, selected: bool, detail: bool) -> Vec<Lin
         cell(&owner, RUNS_COLUMNS[5], theme::TEXT),
         sep,
         Span::styled(
-            truncate_width(&run.goal, 14),
+            truncate_width(&run.goal, width.saturating_sub(67).max(10)),
             row_style.fg(if selected {
                 Color::Black
             } else {
@@ -291,7 +300,11 @@ fn drawer_run(run: &WorkflowRunSummary, selected: bool, detail: bool) -> Vec<Lin
     lines
 }
 
-fn workflow_step_lines(run: &WorkflowRunSummary, selected_step: Option<u32>) -> Vec<Line<'static>> {
+fn workflow_step_lines(
+    run: &WorkflowRunSummary,
+    selected_step: Option<u32>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if run.steps.is_empty() {
         lines.push(Line::from(vec![
@@ -306,12 +319,19 @@ fn workflow_step_lines(run: &WorkflowRunSummary, selected_step: Option<u32>) -> 
 
     lines.push(Line::from(vec![Span::styled(" Steps:", theme::muted())]));
     for step in run.steps.iter().take(8) {
-        lines.push(workflow_step_line(step, selected_step == Some(step.number)));
+        lines.push(workflow_step_line(
+            step,
+            selected_step == Some(step.number),
+            width,
+        ));
         if let Some(note) = &step.note
             && !note.trim().is_empty()
         {
             lines.push(Line::styled(
-                format!("     {}", truncate_width(note.trim(), 64)),
+                format!(
+                    "     {}",
+                    truncate_width(note.trim(), width.saturating_sub(5).max(20))
+                ),
                 theme::muted(),
             ));
         }
@@ -319,7 +339,7 @@ fn workflow_step_lines(run: &WorkflowRunSummary, selected_step: Option<u32>) -> 
     lines
 }
 
-fn workflow_step_line(step: &WorkflowStepSummary, selected: bool) -> Line<'static> {
+fn workflow_step_line(step: &WorkflowStepSummary, selected: bool, width: usize) -> Line<'static> {
     let (marker, color) = workflow_step_marker(step.status);
     let row_style = if selected {
         theme::selection()
@@ -346,7 +366,10 @@ fn workflow_step_line(step: &WorkflowStepSummary, selected: bool) -> Line<'stati
     if let Some(owner) = &step.owner {
         spans.push(Span::styled(format!("@{owner} "), row_style));
     }
-    spans.push(Span::styled(truncate_width(&step.title, 58), row_style));
+    spans.push(Span::styled(
+        truncate_width(&step.title, width.saturating_sub(10).max(20)),
+        row_style,
+    ));
     Line::from(spans)
 }
 

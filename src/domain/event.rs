@@ -589,6 +589,7 @@ pub enum RuntimeEvent {
         from: MemberId,
         target: String,
         reason: String,
+        body: String,
     },
     /// Automatic relay was paused (limit hit or user paused); the route is queued.
     RoutePaused {

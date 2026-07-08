@@ -1,6 +1,8 @@
 //! The bottom composer: a single logical input line with a movable cursor and
 //! word/line editing. Stores characters so cursor math is Unicode-safe.
 
+use unicode_width::UnicodeWidthChar;
+
 #[derive(Debug, Default)]
 pub struct Composer {
     chars: Vec<char>,
@@ -189,6 +191,49 @@ impl Composer {
         self.chars = text.chars().collect();
         self.cursor = self.chars.len();
     }
+
+    /// Wrap the composer text to `width` display columns and return every
+    /// visual line plus the cursor's visual (row, column) position. Each
+    /// logical line (`\n`) starts a new visual line; long lines wrap at the
+    /// exact column boundary (character-level, like a plain textarea) so the
+    /// cursor maps directly to a screen cell.
+    pub fn visual_lines_with_cursor(&self, width: usize) -> (Vec<String>, usize, usize) {
+        let width = width.max(1);
+        let mut lines: Vec<String> = vec![String::new()];
+        let mut cur_col = 0usize;
+        let mut cursor_row = 0usize;
+        let mut cursor_col = 0usize;
+
+        for (i, &ch) in self.chars.iter().enumerate() {
+            if i == self.cursor {
+                cursor_row = lines.len() - 1;
+                cursor_col = cur_col;
+            }
+            if ch == '\n' {
+                lines.push(String::new());
+                cur_col = 0;
+            } else {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cur_col > 0 && cur_col + w > width {
+                    lines.push(String::new());
+                    cur_col = 0;
+                }
+                lines.last_mut().unwrap().push(ch);
+                cur_col += w;
+            }
+        }
+        // Cursor at the very end of the text.
+        if self.cursor == self.chars.len() {
+            cursor_row = lines.len() - 1;
+            cursor_col = cur_col;
+        }
+        (lines, cursor_row, cursor_col)
+    }
+
+    /// Number of visual lines after wrapping to `width` (≥ 1).
+    pub fn visual_line_count(&self, width: usize) -> usize {
+        self.visual_lines_with_cursor(width).0.len()
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +335,35 @@ mod tests {
         c.insert('b');
         assert_eq!(c.text(), "a\nb");
         assert_eq!(c.line_count(), 2);
+    }
+
+    #[test]
+    fn visual_lines_wrap_long_line() {
+        let c = typed("abcdefghij"); // 10 chars
+        let (lines, row, col) = c.visual_lines_with_cursor(4);
+        // 10 chars wrapped at width 4 → 3 lines: "abcd" "efgh" "ij"
+        assert_eq!(lines, vec!["abcd", "efgh", "ij"]);
+        // Cursor at end → last line, col 2.
+        assert_eq!(row, 2);
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn visual_lines_respect_newlines_and_cursor() {
+        let mut c = typed("hello world");
+        c.left(); // cursor after "hello worl"
+        c.left();
+        let (lines, row, col) = c.visual_lines_with_cursor(5);
+        // "hello world" wrapped at 5 → "hello" " worl" "d"
+        assert_eq!(lines, vec!["hello", " worl", "d"]);
+        // Cursor is after "hello wor" (9 chars) → line 1 (" worl"), col 4.
+        assert_eq!(row, 1);
+        assert_eq!(col, 4);
+    }
+
+    #[test]
+    fn visual_line_count_empty_is_one() {
+        let c = Composer::new();
+        assert_eq!(c.visual_line_count(10), 1);
     }
 }

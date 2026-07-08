@@ -69,13 +69,15 @@ pub fn run(
         keyboard_enhancement,
     );
 
-    disable_raw_mode()?;
+    // Pop keyboard enhancement before leaving raw mode so the terminal still
+    // processes the escape sequence while in raw mode.
     disable_keyboard_enhancement(terminal.backend_mut(), keyboard_enhancement)?;
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
+    disable_raw_mode()?;
     terminal.show_cursor()?;
 
     handle.send(UiCommand::Shutdown);
@@ -181,6 +183,13 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState) {
     }
 }
 
+/// Check whether `name` is an executable on the current `PATH`.
+fn binary_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
 /// Hand the whole terminal to the member's real interactive CLI (resuming its
 /// session), then restore Asterline when that CLI exits.
 fn attach_to_member(
@@ -191,6 +200,20 @@ fn attach_to_member(
     keyboard_enhancement: bool,
 ) -> io::Result<()> {
     let (program, args) = req.command();
+    let exit_hint = match req.backend {
+        BackendKind::Codex => "type /exit or press Ctrl+D",
+        BackendKind::Claude => "type /exit or press Ctrl+D",
+        BackendKind::Agy => "type /exit or press Ctrl+D",
+    };
+
+    // Bail out before suspending the terminal if the backend CLI is missing,
+    // so the user never sees a blank screen + confusing error.
+    if !binary_on_path(&program) {
+        state.apply(RuntimeEvent::Notice(format!(
+            "could not attach: {program} is not on PATH"
+        )));
+        return Ok(());
+    }
 
     // Snapshot the codex rollout so we can import whatever is typed during the
     // attached session once it exits.
@@ -211,7 +234,7 @@ fn attach_to_member(
     )?;
     writeln!(
         out,
-        "\n── {} · {} {} ──  (exit the session to return to Asterline)\n",
+        "\n── {} · {} {} ──\n  Asterline suspended. To return: {exit_hint}\n  (Ctrl+C is sent to the CLI and may not exit it.)\n",
         req.display_name,
         program,
         args.join(" ")

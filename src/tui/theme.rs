@@ -23,7 +23,7 @@ pub const MUTED: Color = Color::DarkGray;
 pub const TEXT: Color = Color::Gray;
 pub const EMPHASIS: Color = Color::White;
 /// Marker for user-authored input (the `›` gutter).
-pub const USER: Color = Color::Green;
+pub const USER: Color = Color::LightGreen;
 
 pub fn text() -> Style {
     Style::default().fg(TEXT)
@@ -35,6 +35,10 @@ pub fn muted() -> Style {
 
 pub fn muted_italic() -> Style {
     muted().add_modifier(Modifier::ITALIC)
+}
+
+pub fn notice() -> Style {
+    Style::default().fg(ACCENT)
 }
 
 pub fn emphasis() -> Style {
@@ -96,9 +100,9 @@ pub fn selection_cell() -> Style {
 
 pub fn backend_color(backend: BackendKind) -> Color {
     match backend {
-        BackendKind::Claude => Color::Magenta,
-        BackendKind::Codex => Color::Cyan,
-        BackendKind::Agy => Color::Blue,
+        BackendKind::Claude => Color::LightMagenta,
+        BackendKind::Codex => Color::LightCyan,
+        BackendKind::Agy => Color::LightBlue,
     }
 }
 

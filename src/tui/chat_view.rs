@@ -8,7 +8,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use unicode_width::UnicodeWidthChar;
 
 use crate::domain::event::{ChatItem, MemberStatus};
 use crate::domain::team::DefaultTarget;
@@ -24,7 +23,9 @@ use crate::tui::theme::truncate_width;
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     // The composer grows with its content up to a cap, like a real textarea.
     const MAX_COMPOSER_ROWS: u16 = 8;
-    let composer_rows = (state.composer().line_count() as u16).clamp(1, MAX_COMPOSER_ROWS);
+    let composer_avail = frame.area().width.saturating_sub(2) as usize;
+    let composer_rows =
+        (state.composer().visual_line_count(composer_avail) as u16).clamp(1, MAX_COMPOSER_ROWS);
     let composer_height = composer_rows + 2; // borders
     let completion = if state.drawer().is_none() {
         state.completion()
@@ -80,7 +81,7 @@ fn render_popup(frame: &mut Frame<'_>, area: Rect, completion: &Completion, sele
         .iter()
         .filter_map(|item| {
             let (name, description) = completion_parts(&item.label);
-            description.map(|_| name.chars().count())
+            description.map(|_| theme::display_width(name))
         })
         .max()
         .unwrap_or(0)
@@ -107,14 +108,14 @@ fn render_popup(frame: &mut Frame<'_>, area: Rect, completion: &Completion, sele
                 Style::default()
             };
             let marker = if is_selected { "› " } else { "  " };
-            let mut used_width = marker.chars().count() + name.chars().count();
+            let mut used_width = theme::display_width(marker) + theme::display_width(name);
             let mut spans = vec![
                 Span::styled(marker, marker_style),
                 Span::styled(name.to_string(), name_style),
             ];
             if let Some(description) = description {
-                let padding = name_width.saturating_sub(name.chars().count()) + 2;
-                used_width += padding + description.chars().count();
+                let padding = name_width.saturating_sub(theme::display_width(name)) + 2;
+                used_width += padding + theme::display_width(description);
                 let padding_style = if is_selected {
                     selected_text_style
                 } else {
@@ -257,15 +258,14 @@ fn is_compact(item: &ChatItem) -> bool {
     )
 }
 
-/// A light, inset rule between finished work turns — enough to scan by,
-/// without cutting the conversation into full-width slabs.
+/// A full-width rule between finished work turns.
 fn render_turn_separator(width: usize, out: &mut Vec<Line<'static>>) {
     while out.last().is_some_and(line_is_blank) {
         out.pop();
     }
-    let rule_width = (width / 3).clamp(8, width.max(8));
+    let rule_width = width.max(1);
     out.push(Line::from(Span::styled(
-        format!("  {}", "─".repeat(rule_width)),
+        "─".repeat(rule_width),
         theme::muted(),
     )));
     out.push(Line::raw(""));
@@ -336,9 +336,9 @@ fn agent_header_line(
     backend: crate::domain::team::BackendKind,
 ) -> Line<'static> {
     Line::from(vec![
-        Span::styled("• ", theme::backend_bold(backend)),
+        Span::styled("▸ ", theme::backend_bold(backend)),
         Span::styled(display_name.to_string(), theme::backend_bold(backend)),
-        Span::styled(format!(" · {}", backend.as_str()), theme::muted()),
+        Span::styled(format!("  {}", backend.as_str()), theme::muted()),
     ])
 }
 
@@ -353,7 +353,10 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
                 } else {
                     Span::raw("  ")
                 };
-                out.push(Line::from(vec![prefix, Span::styled(line, theme::text())]));
+                out.push(Line::from(vec![
+                    prefix,
+                    Span::styled(line, theme::emphasis()),
+                ]));
             }
         }
         ChatItem::Agent {
@@ -377,7 +380,11 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
             name, summary, ok, ..
         } => {
             let (marker, marker_color, text_style) = match ok {
-                None => (status_indicator::spinner(), theme::WARNING, theme::text()),
+                None => (
+                    status_indicator::spinner(),
+                    theme::WARNING,
+                    theme::emphasis(),
+                ),
                 Some(true) => ("✓", theme::SUCCESS, theme::text()),
                 Some(false) => ("✕", theme::ERROR, theme::error()),
             };
@@ -426,16 +433,16 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
                 .map(|member| theme::backend_color(member.backend))
                 .unwrap_or(theme::MUTED);
             out.push(Line::from(vec![
-                Span::styled("  ↳ ", theme::muted()),
+                Span::styled("  ↳ ", theme::accent()),
                 Span::styled(
                     format!("{from} → {}", to.join(", ")),
                     theme::bold(from_backend),
                 ),
             ]));
-            push_wrapped(body, width, "    ", theme::text(), out);
+            push_wrapped(body, width, "    ", theme::muted(), out);
         }
         ChatItem::Notice { text } => {
-            push_wrapped(&format!("  • {text}"), width, "", theme::muted(), out);
+            push_wrapped(&format!("  • {text}"), width, "", theme::notice(), out);
         }
         ChatItem::Error { member, message } => {
             let prefix = member
@@ -490,7 +497,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             format!(" {} route(s) paused · /retry ", state.paused_routes()),
         )
     } else if state.running_count() > 0 {
-        (theme::WARNING, " processing… ".to_string())
+        (theme::MUTED, " processing… ".to_string())
     } else {
         // Idle: a clean open composer (no title), like codex.
         (theme::MUTED, String::new())
@@ -509,11 +516,12 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         return;
     }
     let avail = (inner.width as usize).saturating_sub(2); // "> " / "  " gutter
-    let text = state.composer().text();
-    let lines: Vec<&str> = text.split('\n').collect();
-    let (cursor_row, cursor_col) = state.composer().cursor_row_col();
 
-    // Vertical scroll so the cursor's line stays visible in the capped area.
+    // Visual lines with wrapping so long input is fully visible (no horizontal
+    // clipping). The cursor maps directly to a screen cell.
+    let (visual_lines, cursor_row, cursor_col) = state.composer().visual_lines_with_cursor(avail);
+
+    // Vertical scroll so the cursor's visual line stays visible.
     let top = if cursor_row >= rows {
         cursor_row - rows + 1
     } else {
@@ -523,12 +531,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut out_lines: Vec<Line> = Vec::new();
     let mut cursor_screen: Option<(u16, u16)> = None;
     for (offset, row) in (top..top + rows).enumerate() {
-        let Some(line) = lines.get(row) else { break };
+        let Some(line) = visual_lines.get(row) else {
+            break;
+        };
         let prefix = if row == 0 { "> " } else { "  " };
         let (shown, cursor_width) = if row == cursor_row {
-            composer_line_window(line, cursor_col, avail)
+            (line.clone(), cursor_col)
         } else {
-            (clip_to_width(line, avail), 0)
+            (line.clone(), 0)
         };
         out_lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(border_color)),
@@ -545,38 +555,6 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     {
         frame.set_cursor_position((col, row));
     }
-}
-
-/// The visible slice of the cursor's composer line (horizontally scrolled to
-/// keep the cursor in view) plus the display width before the cursor.
-fn composer_line_window(line: &str, cursor_col: usize, avail: usize) -> (String, usize) {
-    if avail == 0 {
-        return (String::new(), 0);
-    }
-    let chars: Vec<char> = line.chars().collect();
-    let start = cursor_col.saturating_sub(avail.saturating_sub(1));
-    let end = (start + avail).min(chars.len());
-    let shown: String = chars[start..end].iter().collect();
-    let cursor_width: usize = chars[start..cursor_col.min(end)]
-        .iter()
-        .map(|&c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum();
-    (shown, cursor_width)
-}
-
-/// Clip a line to roughly `avail` columns (used for non-cursor composer lines).
-fn clip_to_width(line: &str, avail: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in line.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > avail {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out
 }
 
 fn member_runtime_profile(member: &crate::tui::app_state::MemberView) -> String {
