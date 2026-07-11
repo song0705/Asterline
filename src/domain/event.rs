@@ -320,8 +320,8 @@ pub enum UiCommand {
     Shutdown,
 }
 
-/// Unified event emitted by a backend adapter while a member runs. Both the
-/// Claude and Codex stream adapters translate their backend output into this
+/// Unified event emitted by a backend adapter while a member runs. The
+/// backend stream adapters translate their output into this
 /// single vocabulary; unknown backend output becomes [`AgentEvent::Log`] or
 /// [`AgentEvent::ParseWarning`] so the TUI never crashes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -565,11 +565,16 @@ pub enum RuntimeEvent {
         name: String,
         summary: String,
     },
+    ToolProgress {
+        member: MemberId,
+        tool_id: String,
+        delta: String,
+    },
     ToolCompleted {
         member: MemberId,
         tool_id: String,
         ok: bool,
-        summary: String,
+        output: String,
     },
     /// A set of file changes the agent made (rendered as a diff card).
     FileChange {
@@ -646,6 +651,7 @@ pub enum ChatItem {
         member: MemberId,
         name: String,
         summary: String,
+        detail: String,
         ok: Option<bool>,
     },
     Diff {

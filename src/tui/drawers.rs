@@ -10,6 +10,7 @@ pub enum Drawer {
     Runs,
     Palette,
     Diff,
+    Skills,
     MemberLogs(MemberId),
 }
 
@@ -21,6 +22,7 @@ impl Drawer {
             Self::Runs => "Workflow Runs",
             Self::Palette => "Commands",
             Self::Diff => "Working-tree diff",
+            Self::Skills => "Skills · next prompt",
             Self::MemberLogs(_) => "Member Logs",
         }
     }

@@ -326,6 +326,7 @@ mod tests {
             crate::domain::config::DetectedBackends {
                 codex: true,
                 claude: true,
+                grok: false,
                 agy: false,
             },
         )
@@ -350,6 +351,7 @@ mod tests {
             crate::domain::config::DetectedBackends {
                 codex: true,
                 claude: false,
+                grok: false,
                 agy: false,
             },
         )

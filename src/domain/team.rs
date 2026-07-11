@@ -1,7 +1,7 @@
 //! Team roster domain types.
 //!
 //! A team is a generic roster of members. Each member binds a backend
-//! (`claude`, `codex`, or `agy`) to a free-form role and a stable id. Roles are not
+//! (`claude`, `codex`, `grok`, or `agy`) to a free-form role and a stable id. Roles are not
 //! tied to a backend, so all-codex, all-claude, and mixed teams are all valid.
 
 use std::fmt;
@@ -21,6 +21,7 @@ pub const DEFAULT_MAX_AUTO_RELAYS: u32 = 6;
 pub enum BackendKind {
     Claude,
     Codex,
+    Grok,
     Agy,
 }
 
@@ -29,6 +30,7 @@ impl BackendKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
             Self::Agy => "agy",
         }
     }
@@ -47,6 +49,7 @@ impl TryFrom<&str> for BackendKind {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "grok" => Ok(Self::Grok),
             "agy" => Ok(Self::Agy),
             other => Err(format!("unknown backend: {other}")),
         }
@@ -110,7 +113,8 @@ pub fn derived_member_id(display_name: &str, fallback: &str) -> MemberId {
     MemberId::new(normalize_member_id(display_name, fallback))
 }
 
-/// Codex sandbox policy. Serialized values match the `codex --sandbox` argument.
+/// Backend sandbox policy. Serialized values use the established Codex names;
+/// adapters map them to backend-specific profiles.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxPolicy {
@@ -129,10 +133,19 @@ impl SandboxPolicy {
             Self::DangerFullAccess => "danger-full-access",
         }
     }
+
+    /// The corresponding Grok sandbox profile.
+    pub fn grok_arg(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace",
+            Self::DangerFullAccess => "off",
+        }
+    }
 }
 
-/// Claude permission mode. Serialized values match the `claude --permission-mode`
-/// argument.
+/// Claude/Grok permission mode. Serialized values match their
+/// `--permission-mode` arguments.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PermissionMode {
     #[default]
@@ -161,6 +174,10 @@ impl PermissionMode {
             Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
         }
+    }
+
+    pub fn grok_arg(self) -> &'static str {
+        self.claude_arg()
     }
 }
 
@@ -536,6 +553,30 @@ mod tests {
     }
 
     #[test]
+    fn grok_backend_round_trips_in_team_config() {
+        let config: TeamConfig = serde_json::from_str(
+            r#"{
+                "name":"grok-team",
+                "workspace":"/tmp/ws",
+                "members":[{
+                    "display_name":"Grok",
+                    "backend":"grok",
+                    "role":"implementation"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.members[0].id, MemberId::new("grok"));
+        assert_eq!(config.members[0].backend, BackendKind::Grok);
+        assert!(
+            serde_json::to_string(&config)
+                .unwrap()
+                .contains("\"backend\":\"grok\"")
+        );
+    }
+
+    #[test]
     fn member_id_can_be_derived_from_display_name() {
         let member: TeamMember = serde_json::from_str(
             r#"{
@@ -688,10 +729,14 @@ mod tests {
             SandboxPolicy::DangerFullAccess.codex_arg(),
             "danger-full-access"
         );
+        assert_eq!(SandboxPolicy::ReadOnly.grok_arg(), "read-only");
+        assert_eq!(SandboxPolicy::WorkspaceWrite.grok_arg(), "workspace");
+        assert_eq!(SandboxPolicy::DangerFullAccess.grok_arg(), "off");
         assert_eq!(PermissionMode::AcceptEdits.claude_arg(), "acceptEdits");
         assert_eq!(
             PermissionMode::BypassPermissions.claude_arg(),
             "bypassPermissions"
         );
+        assert_eq!(PermissionMode::Auto.grok_arg(), "auto");
     }
 }

@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::domain::event::{ChatItem, MemberStatus};
-use crate::domain::team::DefaultTarget;
+use crate::domain::team::{DefaultTarget, MemberId};
 use crate::tui::app_state::AppState;
 use crate::tui::completion::Completion;
 use crate::tui::drawer_view::render_drawer;
@@ -19,6 +19,33 @@ use crate::tui::markdown;
 use crate::tui::status_indicator;
 use crate::tui::theme;
 use crate::tui::theme::truncate_width;
+
+// Paint the rail as a terminal-cell background instead of a font glyph. This
+// fills the complete cell rectangle regardless of font ascent, descent, or
+// line-height metrics, so adjacent rows meet without visible seams.
+fn chat_rail(color: Color) -> Span<'static> {
+    Span::styled(" ", Style::default().bg(color))
+}
+
+fn member_rail_color(state: &AppState, member: &MemberId) -> Color {
+    state
+        .members()
+        .iter()
+        .find(|candidate| &candidate.id == member)
+        .map(|candidate| candidate.backend)
+        .or_else(|| {
+            state.chat().iter().rev().find_map(|item| match item {
+                ChatItem::Agent {
+                    member: candidate,
+                    backend,
+                    ..
+                } if candidate == member => Some(*backend),
+                _ => None,
+            })
+        })
+        .map(theme::backend_color)
+        .unwrap_or_else(theme::muted_color)
+}
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     // The composer grows with its content up to a cap, like a real textarea.
@@ -96,7 +123,7 @@ fn render_popup(frame: &mut Frame<'_>, area: Rect, completion: &Completion, sele
             let (name, description) = completion_parts(&item.label);
             let is_selected = i == selected;
             let selected_name_style = theme::selection();
-            let selected_text_style = Style::default().fg(Color::Black).bg(theme::ACCENT);
+            let selected_text_style = theme::selection();
             let name_style = if is_selected {
                 selected_name_style
             } else {
@@ -196,7 +223,8 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         );
         for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                chat_rail(theme::backend_color(member.backend)),
+                Span::raw(" "),
                 Span::styled(wrapped, theme::muted_italic()),
             ]));
         }
@@ -226,13 +254,21 @@ fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'stati
             saw_work_activity = true;
         }
         let before = out.len();
-        render_item(item, width, state, out);
-        // Central spacing policy: one blank line between blocks, except
-        // between consecutive compact one-liners (tools, notices, …), which
-        // stay grouped.
+        let previous_sender = if i == 0 {
+            None
+        } else {
+            items.get(i - 1).and_then(item_sender)
+        };
+        let show_sender_header = item_sender(item) != previous_sender;
+        render_item(item, width, state, out, show_sender_header);
+        // Keep one member's answer, tools, routes, diffs, and errors on the
+        // same uninterrupted visual rail. Separate unrelated blocks.
         if out.len() > before {
             let next = items.get(i + 1);
-            let grouped = is_compact(item) && next.is_some_and(is_compact);
+            let grouped = (is_compact(item) && next.is_some_and(is_compact))
+                || item_sender(item)
+                    .is_some_and(|sender| next.and_then(item_sender).as_ref() == Some(&sender))
+                || next.is_some_and(|next| same_member_thread(item, next));
             if !grouped {
                 out.push(Line::raw(""));
             }
@@ -256,6 +292,21 @@ fn is_compact(item: &ChatItem) -> bool {
         item,
         ChatItem::Tool { .. } | ChatItem::Diff { .. } | ChatItem::Notice { .. }
     )
+}
+
+fn same_member_thread(current: &ChatItem, next: &ChatItem) -> bool {
+    item_member(current).is_some_and(|member| item_member(next) == Some(member))
+}
+
+fn item_member(item: &ChatItem) -> Option<&MemberId> {
+    match item {
+        ChatItem::Agent { member, .. }
+        | ChatItem::Tool { member, .. }
+        | ChatItem::Diff { member, .. } => Some(member),
+        ChatItem::Route { from, .. } => Some(from),
+        ChatItem::Error { member, .. } => member.as_ref(),
+        ChatItem::User { .. } | ChatItem::Notice { .. } => None,
+    }
 }
 
 /// A full-width rule between finished work turns.
@@ -336,25 +387,53 @@ fn agent_header_line(
     backend: crate::domain::team::BackendKind,
 ) -> Line<'static> {
     Line::from(vec![
-        Span::styled("▸ ", theme::backend_bold(backend)),
+        Span::styled("◆ ", theme::backend_bold(backend)),
         Span::styled(display_name.to_string(), theme::backend_bold(backend)),
-        Span::styled(format!("  {}", backend.as_str()), theme::muted()),
+        Span::styled(format!("  · {}", backend.as_str()), theme::muted()),
     ])
 }
 
-fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Line<'static>>) {
+fn user_header_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("◆ ", theme::bold(theme::user_color())),
+        Span::styled("You", theme::bold(theme::user_color())),
+    ])
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ChatSender {
+    User,
+    Agent(MemberId),
+}
+
+fn item_sender(item: &ChatItem) -> Option<ChatSender> {
+    match item {
+        ChatItem::User { .. } => Some(ChatSender::User),
+        ChatItem::Agent { member, .. } => Some(ChatSender::Agent(member.clone())),
+        ChatItem::Tool { .. }
+        | ChatItem::Diff { .. }
+        | ChatItem::Route { .. }
+        | ChatItem::Notice { .. }
+        | ChatItem::Error { .. } => None,
+    }
+}
+
+fn render_item(
+    item: &ChatItem,
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+    show_sender_header: bool,
+) {
     match item {
         ChatItem::User { body } => {
-            let mut first = true;
+            if show_sender_header {
+                out.push(user_header_line());
+            }
             for line in markdown::wrap(body, width.saturating_sub(2).max(1)) {
-                let prefix = if first {
-                    first = false;
-                    Span::styled("› ", theme::bold(theme::USER))
-                } else {
-                    Span::raw("  ")
-                };
                 out.push(Line::from(vec![
-                    prefix,
+                    chat_rail(theme::user_color()),
+                    Span::raw(" "),
                     Span::styled(line, theme::emphasis()),
                 ]));
             }
@@ -369,93 +448,121 @@ fn render_item(item: &ChatItem, width: usize, state: &AppState, out: &mut Vec<Li
             if text.is_empty() && !state.has_active_message(member) {
                 return;
             }
-            out.push(agent_header_line(display_name, *backend));
+            if show_sender_header {
+                out.push(agent_header_line(display_name, *backend));
+            }
             for line in markdown::render(text, width.saturating_sub(2).max(1)) {
-                let mut spans = vec![Span::raw("  ")];
+                let mut spans = vec![chat_rail(theme::backend_color(*backend)), Span::raw(" ")];
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
             }
         }
         ChatItem::Tool {
-            name, summary, ok, ..
+            member,
+            name,
+            summary,
+            detail,
+            ok,
         } => {
             let (marker, marker_color, text_style) = match ok {
                 None => (
                     status_indicator::spinner(),
-                    theme::WARNING,
+                    theme::warning_color(),
                     theme::emphasis(),
                 ),
-                Some(true) => ("✓", theme::SUCCESS, theme::text()),
-                Some(false) => ("✕", theme::ERROR, theme::error()),
+                Some(true) => ("✓", theme::success_color(), theme::text()),
+                Some(false) => ("✕", theme::error_color(), theme::error()),
             };
             let command = tool_display_text(name, summary);
             let command_width = width.saturating_sub(6).max(12);
+            let rail_color = member_rail_color(state, member);
             out.push(Line::from(vec![
-                Span::raw("  "),
+                chat_rail(rail_color),
+                Span::raw("   "),
                 Span::styled(format!("{marker} "), theme::bold(marker_color)),
                 Span::styled(truncate_width(&command, command_width), text_style),
             ]));
-            if state.tools_expanded() && summary.chars().count() > command_width {
-                for line in markdown::wrap(summary, width.saturating_sub(6).max(1))
-                    .into_iter()
-                    .take(3)
-                {
+            if !detail.trim().is_empty() {
+                let detail_style = if *ok == Some(false) {
+                    theme::error()
+                } else {
+                    theme::muted()
+                };
+                let max_lines = if state.tools_expanded() || *ok == Some(false) {
+                    20
+                } else {
+                    1
+                };
+                let wrapped = markdown::wrap(detail.trim(), width.saturating_sub(8).max(1));
+                let clipped = wrapped.len() > max_lines;
+                for (idx, line) in wrapped.into_iter().take(max_lines).enumerate() {
                     out.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(line, theme::muted()),
+                        chat_rail(rail_color),
+                        Span::raw(if idx == 0 { "     ↳ " } else { "       " }),
+                        Span::styled(line, detail_style),
+                    ]));
+                }
+                if clipped && !state.tools_expanded() && *ok != Some(false) {
+                    out.push(Line::from(vec![
+                        chat_rail(rail_color),
+                        Span::styled("       … Ctrl+O expand tool output", theme::muted_italic()),
                     ]));
                 }
             }
         }
-        ChatItem::Diff { files, .. } => {
-            out.push(Line::from(Span::styled(
-                "  ✎ file changes",
-                theme::accent_bold(),
-            )));
+        ChatItem::Diff { member, files } => {
+            let rail_color = member_rail_color(state, member);
+            out.push(Line::from(vec![
+                chat_rail(rail_color),
+                Span::styled("   ✎ file changes", theme::accent_bold()),
+            ]));
             for (path, kind) in files {
                 let (sign, color) = match kind.as_str() {
-                    "add" => ("+", theme::SUCCESS),
-                    "delete" => ("-", theme::ERROR),
-                    _ => ("~", theme::WARNING),
+                    "add" => ("+", theme::success_color()),
+                    "delete" => ("-", theme::error_color()),
+                    _ => ("~", theme::warning_color()),
                 };
-                let shown = truncate_width(path, width.saturating_sub(6).max(10));
+                let shown = truncate_width(path, width.saturating_sub(8).max(10));
                 out.push(Line::from(vec![
-                    Span::styled(format!("    {sign} "), Style::default().fg(color)),
+                    chat_rail(rail_color),
+                    Span::styled(format!("     {sign} "), Style::default().fg(color)),
                     Span::styled(shown, Style::default().fg(color)),
                 ]));
             }
         }
         ChatItem::Route { from, to, body } => {
-            let from_backend = state
-                .members()
-                .iter()
-                .find(|member| &member.id == from)
-                .map(|member| theme::backend_color(member.backend))
-                .unwrap_or(theme::MUTED);
+            let from_backend = member_rail_color(state, from);
             out.push(Line::from(vec![
-                Span::styled("  ↳ ", theme::accent()),
+                chat_rail(from_backend),
+                Span::styled("   ↳ ", theme::accent()),
                 Span::styled(
                     format!("{from} → {}", to.join(", ")),
                     theme::bold(from_backend),
                 ),
             ]));
-            push_wrapped(body, width, "    ", theme::muted(), out);
+            for line in markdown::wrap(body, width.saturating_sub(6).max(1)) {
+                out.push(Line::from(vec![
+                    chat_rail(from_backend),
+                    Span::styled(format!("     {line}"), theme::muted()),
+                ]));
+            }
         }
         ChatItem::Notice { text } => {
             push_wrapped(&format!("  • {text}"), width, "", theme::notice(), out);
         }
         ChatItem::Error { member, message } => {
-            let prefix = member
-                .as_ref()
-                .map(|m| format!("  ✗ {m}: "))
-                .unwrap_or_else(|| "  ✗ ".to_string());
-            push_wrapped(
-                &format!("{prefix}{message}"),
-                width,
-                "",
-                theme::error(),
-                out,
-            );
+            if let Some(member) = member {
+                let rail_color = member_rail_color(state, member);
+                let text = format!("✕ {member}: {message}");
+                for line in markdown::wrap(&text, width.saturating_sub(4).max(1)) {
+                    out.push(Line::from(vec![
+                        chat_rail(rail_color),
+                        Span::styled(format!("   {line}"), theme::error()),
+                    ]));
+                }
+            } else {
+                push_wrapped(&format!("  ✕ {message}"), width, "", theme::error(), out);
+            }
         }
     }
 }
@@ -485,7 +592,7 @@ fn tool_display_text(name: &str, summary: &str) -> String {
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let (border_color, title_text) = if !state.pending_approvals().is_empty() {
         (
-            theme::WARNING,
+            theme::warning_color(),
             format!(
                 " {} pending approval(s) · /approve ",
                 state.pending_approvals().len()
@@ -493,14 +600,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         )
     } else if state.paused_routes() > 0 {
         (
-            theme::WARNING,
+            theme::warning_color(),
             format!(" {} route(s) paused · /retry ", state.paused_routes()),
         )
     } else if state.running_count() > 0 {
-        (theme::MUTED, " processing… ".to_string())
+        (theme::muted_color(), " processing… ".to_string())
     } else {
         // Idle: a clean open composer (no title), like codex.
-        (theme::MUTED, String::new())
+        (theme::muted_color(), String::new())
     };
 
     // Open composer: top and bottom rules only, no enclosing side bars.
@@ -816,6 +923,122 @@ mod tests {
 
         let text = plain_text(&lines);
         assert!(!text.iter().any(|line| is_separator_text(line)));
+        assert!(text.iter().any(|line| line == "◆ You"));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("explain this function"))
+        );
+    }
+
+    #[test]
+    fn consecutive_agent_messages_suppress_repeated_header() {
+        let state = AppState::new(vec![
+            ChatItem::Agent {
+                member: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                text: "first reply".to_string(),
+            },
+            ChatItem::Agent {
+                member: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                text: "second reply".to_string(),
+            },
+            ChatItem::Agent {
+                member: MemberId::new("reviewer"),
+                display_name: "Reviewer".to_string(),
+                backend: BackendKind::Claude,
+                text: "review reply".to_string(),
+            },
+        ]);
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 60, &mut lines);
+
+        let text = plain_text(&lines);
+        let builder_headers = text
+            .iter()
+            .filter(|line| line.contains("Builder") && line.contains("codex"))
+            .count();
+        let reviewer_headers = text
+            .iter()
+            .filter(|line| line.contains("Reviewer") && line.contains("claude"))
+            .count();
+        assert_eq!(builder_headers, 1);
+        assert_eq!(reviewer_headers, 1);
+        assert!(text.iter().any(|line| line.contains("first reply")));
+        assert!(text.iter().any(|line| line.contains("second reply")));
+        let first = text
+            .iter()
+            .position(|line| line.contains("first reply"))
+            .unwrap();
+        assert!(text[first + 1].contains("second reply"));
+    }
+
+    #[test]
+    fn member_activity_uses_one_full_height_unbroken_rail() {
+        let member = MemberId::new("builder");
+        let state = AppState::new(vec![
+            ChatItem::Agent {
+                member: member.clone(),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                text: "checking now".to_string(),
+            },
+            ChatItem::Tool {
+                member: member.clone(),
+                name: "shell".to_string(),
+                summary: "cargo test".to_string(),
+                detail: "test result: ok".to_string(),
+                ok: Some(true),
+            },
+            ChatItem::Diff {
+                member: member.clone(),
+                files: vec![("src/lib.rs".to_string(), "modify".to_string())],
+            },
+            ChatItem::Error {
+                member: Some(member),
+                message: "follow-up failed".to_string(),
+            },
+        ]);
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 70, &mut lines);
+
+        let text = plain_text(&lines);
+        let start = text
+            .iter()
+            .position(|line| line.contains("checking now"))
+            .unwrap();
+        let end = text
+            .iter()
+            .position(|line| line.contains("follow-up failed"))
+            .unwrap();
+        assert!(text[start..=end].iter().all(|line| !line.trim().is_empty()));
+        assert!(lines[start..=end].iter().all(|line| {
+            line.spans.first().is_some_and(|span| {
+                span.content.as_ref() == " "
+                    && span.style.bg == Some(theme::backend_color(BackendKind::Codex))
+            })
+        }));
+
+        let rail_lines = lines[start..=end].to_vec();
+        let height = u16::try_from(rail_lines.len()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(rail_lines.clone()), frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            assert_eq!(
+                buffer.cell((0, y)).unwrap().bg,
+                theme::backend_color(BackendKind::Codex),
+                "rail cell at row {y} must have a full-cell background"
+            );
+        }
     }
 
     #[test]
@@ -851,7 +1074,7 @@ mod tests {
             member: MemberId::new("builder"),
             tool_id: "t1".to_string(),
             ok: true,
-            summary: "cargo test".to_string(),
+            output: "test result: ok".to_string(),
         });
         state.apply(RuntimeEvent::UserMessage {
             turn: TurnId(2),
@@ -903,7 +1126,7 @@ mod tests {
                 member: MemberId::new("builder"),
                 tool_id: id.to_string(),
                 ok: true,
-                summary: cmd.to_string(),
+                output: "ok".to_string(),
             });
         }
         let mut lines = Vec::new();
@@ -915,8 +1138,17 @@ mod tests {
             .iter()
             .position(|line| line.contains("cargo build"))
             .unwrap();
-        // The two tool lines are adjacent — no blank line in between.
-        assert!(text[build_idx + 1].contains("cargo test"));
+        let test_idx = text
+            .iter()
+            .position(|line| line.contains("cargo test"))
+            .unwrap();
+        // Tool blocks (including their output lines) stay adjacent.
+        assert!(test_idx > build_idx);
+        assert!(
+            text[build_idx + 1..test_idx]
+                .iter()
+                .all(|line| !line.trim().is_empty())
+        );
     }
 
     #[test]
@@ -976,18 +1208,39 @@ mod tests {
             member: MemberId::new("builder"),
             tool_id: "t1".to_string(),
             ok: true,
-            summary: long.to_string(),
+            output: "matches found".to_string(),
         });
-        let mut terminal = Terminal::new(TestBackend::new(72, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(72, 14)).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let view = format!("{}", terminal.backend());
         eprintln!("\n{view}");
 
-        assert!(view.contains("› "));
+        assert!(view.contains("◆ You"));
         assert!(view.contains("run the tests"));
         // The long command is truncated to a single line (ellipsis), not wrapped.
         assert!(view.contains('…'));
         assert!(view.contains("✓ shell"));
+        assert!(view.contains("matches found"));
+    }
+
+    #[test]
+    fn failed_tool_shows_error_output_without_expanding() {
+        let state = AppState::new(vec![ChatItem::Tool {
+            member: MemberId::new("builder"),
+            name: "shell".to_string(),
+            summary: "cargo test".to_string(),
+            detail: "error: test parser failed\nexpected true, got false".to_string(),
+            ok: Some(false),
+        }]);
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 70, &mut lines);
+
+        let text = plain_text(&lines).join("\n");
+        assert!(text.contains("✕ shell"));
+        assert!(text.contains("cargo test"));
+        assert!(text.contains("error: test parser failed"));
+        assert!(text.contains("expected true, got false"));
     }
 
     #[test]

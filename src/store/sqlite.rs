@@ -393,6 +393,7 @@ impl SqliteStore {
         member: &MemberId,
         name: &str,
         summary: &str,
+        detail: &str,
         ok: Option<bool>,
     ) -> Result<MessageId> {
         self.insert_message(MessageRow {
@@ -401,6 +402,7 @@ impl SqliteStore {
             member: Some(member),
             name: Some(name),
             summary: Some(summary),
+            text: Some(detail),
             ok,
             ..MessageRow::default()
         })
@@ -1126,6 +1128,7 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
             member: MemberId::new(member_id.unwrap_or_default()),
             name: name.unwrap_or_default(),
             summary: summary.unwrap_or_default(),
+            detail: text.unwrap_or_default(),
             ok: ok.map(|v| v != 0),
         },
         "route" => ChatItem::Route {

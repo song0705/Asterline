@@ -20,6 +20,7 @@ use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
+use crate::tui::skills::SkillInfo;
 use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
 use crate::workflow::suggested_verify_command;
 
@@ -83,6 +84,7 @@ pub struct AppState {
     tools_expanded: bool,
     active_reasoning: HashMap<MemberId, String>,
     pending_user_messages: Vec<String>,
+    last_message_target: Option<MessageTarget>,
     header_selected: Option<usize>,
     attach_request: Option<AttachRequest>,
     /// Shell-style prompt history (oldest→newest): prior submissions recalled
@@ -105,6 +107,8 @@ pub struct AppState {
     diff_text: Option<String>,
     /// Editable draft shown by the `/team` drawer.
     team_editor: Option<TeamEditor>,
+    skills: Vec<SkillInfo>,
+    selected_skill: usize,
 }
 
 impl AppState {
@@ -145,6 +149,7 @@ impl AppState {
             tools_expanded: false,
             active_reasoning: HashMap::new(),
             pending_user_messages: Vec::new(),
+            last_message_target: None,
             header_selected: None,
             attach_request: None,
             prompt_history,
@@ -155,6 +160,8 @@ impl AppState {
             drawer_scroll: 0,
             diff_text: None,
             team_editor: None,
+            skills: Vec::new(),
+            selected_skill: 0,
         }
     }
 
@@ -282,32 +289,41 @@ impl AppState {
                     member,
                     name,
                     summary,
+                    detail: String::new(),
                     ok: None,
                 });
                 self.tool_index.insert(tool_id, idx);
+            }
+            RuntimeEvent::ToolProgress { tool_id, delta, .. } => {
+                if let Some(idx) = self.tool_index.get(&tool_id).copied()
+                    && let Some(ChatItem::Tool { detail, .. }) = self.chat.get_mut(idx)
+                {
+                    detail.push_str(&delta);
+                }
             }
             RuntimeEvent::ToolCompleted {
                 member,
                 tool_id,
                 ok,
-                summary,
+                output,
             } => {
                 if let Some(idx) = self.tool_index.remove(&tool_id)
                     && let Some(ChatItem::Tool {
                         ok: cell_ok,
-                        summary: cell_summary,
+                        detail,
                         ..
                     }) = self.chat.get_mut(idx)
                 {
                     *cell_ok = Some(ok);
-                    if !summary.is_empty() {
-                        *cell_summary = summary;
+                    if !output.is_empty() {
+                        *detail = output;
                     }
                 } else {
                     self.push(ChatItem::Tool {
                         member,
                         name: "tool".to_string(),
-                        summary,
+                        summary: String::new(),
+                        detail: output,
                         ok: Some(ok),
                     });
                 }
@@ -400,6 +416,7 @@ impl AppState {
                 self.tool_index.clear();
                 self.active_reasoning.clear();
                 self.pending_user_messages.clear();
+                self.last_message_target = None;
                 self.running_since.clear();
                 self.scroll = 0;
             }
@@ -468,11 +485,37 @@ impl AppState {
     }
 
     pub fn handle_user_message_submitted(&mut self, target: &MessageTarget, body: String) {
+        self.remember_message_target(target);
         self.pending_user_messages.push(body.clone());
         self.push(ChatItem::User { body });
         let targets = self.resolve_local_targets(target);
         for member_id in targets {
             self.set_status(&member_id, MemberStatus::Running);
+        }
+    }
+
+    pub fn inherited_user_message(&self, text: &str) -> Option<(MessageTarget, String)> {
+        let target = self.last_message_target.clone()?;
+        if self.resolve_local_targets(&target).is_empty() {
+            return None;
+        }
+        let body = text.trim();
+        if body.is_empty() {
+            return None;
+        }
+        Some((target.clone(), format_inherited_user_body(&target, body)))
+    }
+
+    pub fn clear_last_message_target(&mut self) {
+        self.last_message_target = None;
+    }
+
+    fn remember_message_target(&mut self, target: &MessageTarget) {
+        match target {
+            MessageTarget::All | MessageTarget::Member(_) => {
+                self.last_message_target = Some(target.clone());
+            }
+            MessageTarget::Default | MessageTarget::Members(_) => {}
         }
     }
 
@@ -952,6 +995,51 @@ impl AppState {
         self.drawer_scroll = 0;
     }
 
+    pub fn set_skills(&mut self, skills: Vec<SkillInfo>) {
+        self.skills = skills;
+        self.selected_skill = 0;
+    }
+
+    pub fn skills(&self) -> &[SkillInfo] {
+        &self.skills
+    }
+
+    pub fn selected_skill(&self) -> usize {
+        self.selected_skill
+    }
+
+    pub fn select_previous_skill(&mut self) {
+        self.selected_skill = self.selected_skill.saturating_sub(1);
+    }
+
+    pub fn select_next_skill(&mut self) {
+        if self.selected_skill + 1 < self.skills.len() {
+            self.selected_skill += 1;
+        }
+    }
+
+    pub fn stage_selected_skill(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Skills) {
+            return false;
+        }
+        let Some(skill) = self.skills.get(self.selected_skill).cloned() else {
+            return false;
+        };
+        let member = match self.default_target.as_ref() {
+            Some(DefaultTarget::Member(id)) => self.members.iter().find(|member| &member.id == id),
+            _ => self.members.first(),
+        };
+        let Some(member) = member else {
+            return false;
+        };
+        let invocation = skill_invocation(member.backend, &skill);
+        self.composer
+            .set_text(&format!("@{} {invocation} ", member.id));
+        self.history_cursor = None;
+        self.close_drawer();
+        true
+    }
+
     pub fn close_drawer(&mut self) {
         self.disarm_quit();
         self.drawer = None;
@@ -1276,6 +1364,18 @@ impl AppState {
     }
 }
 
+fn skill_invocation(backend: BackendKind, skill: &SkillInfo) -> String {
+    match backend {
+        BackendKind::Codex => format!("${}", skill.name),
+        BackendKind::Claude => format!("/{}", skill.name),
+        BackendKind::Grok | BackendKind::Agy => format!(
+            "Use the skill `{}` from `{}` for this request.",
+            skill.name,
+            skill.path.display()
+        ),
+    }
+}
+
 pub(crate) fn workflow_action_command(
     run: &WorkflowRunSummary,
     workspace: &str,
@@ -1368,6 +1468,14 @@ fn workflow_step_dispatch_command(run: &WorkflowRunSummary, step: u32) -> Option
     ))
 }
 
+fn format_inherited_user_body(target: &MessageTarget, body: &str) -> String {
+    match target {
+        MessageTarget::All => format!("@all {body}"),
+        MessageTarget::Member(member) => format!("@{member} {body}"),
+        MessageTarget::Default | MessageTarget::Members(_) => body.to_string(),
+    }
+}
+
 /// Rough estimate of how many visual lines a [`ChatItem`] will occupy, used
 /// only to keep the scroll position stable when new items arrive while the
 /// user is browsing history. The exact count depends on the render width and
@@ -1382,7 +1490,7 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
                 text.lines().count().max(1) + 1 // +1 for header
             }
         }
-        ChatItem::Tool { .. } => 1,
+        ChatItem::Tool { detail, .. } => 1 + usize::from(!detail.is_empty()),
         ChatItem::Diff { files, .. } => 1 + files.len(),
         ChatItem::Route { body, .. } => 1 + body.lines().count().max(1),
         ChatItem::Notice { text } => text.lines().count().max(1),

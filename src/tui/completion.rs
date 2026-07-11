@@ -28,6 +28,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("runs", "workflow status · next action", false),
     ("logs", "raw logs · stderr · warnings", false),
     ("diff", "show working-tree git diff", false),
+    ("skills", "choose a skill for the next prompt", false),
     (
         "new",
         "start a fresh chat (new session, cleared transcript)",
@@ -185,6 +186,7 @@ mod tests {
         assert!(c.items.iter().any(|i| i.insert == "/note "));
         assert!(c.items.iter().any(|i| i.insert == "/block "));
         assert!(c.items.iter().any(|i| i.insert == "/step "));
+        assert!(c.items.iter().any(|i| i.insert == "/skills"));
     }
 
     #[test]

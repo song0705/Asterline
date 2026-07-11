@@ -99,8 +99,8 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     // Reverse history search (Ctrl+R) takes over the footer while active.
     if let Some((query, matched)) = state.history_search() {
         let mut spans = vec![
-            Span::styled("(reverse-search) ", theme::bold(theme::ACCENT)),
-            Span::styled(format!("`{query}`"), theme::bold(theme::EMPHASIS)),
+            Span::styled("(reverse-search) ", theme::bold(theme::accent_color())),
+            Span::styled(format!("`{query}`"), theme::bold(theme::emphasis_color())),
             Span::styled(" → ", theme::muted()),
         ];
         match matched {
@@ -177,7 +177,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     } else if parts.is_empty() {
         // Idle: one short, faint key-hint line.
         parts.push(Span::styled(
-            "@member to send · Enter send · Shift+Enter newline · /help",
+            "@member first · Enter send · Ctrl+O tools · /skills · /help",
             theme::muted(),
         ));
     }

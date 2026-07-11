@@ -25,32 +25,32 @@ pub(crate) fn workflow_footer_hint(state: &AppState) -> Option<(String, Color)> 
                 "● {} running{progress} · /runs details · /abort cancel",
                 run.id
             ),
-            theme::WARNING,
+            theme::warning_color(),
         )),
         WorkflowRunStatus::Verifying => Some((
             format!(
                 "⏳ {} verifying{progress} · /runs details · /abort cancel",
                 run.id
             ),
-            theme::WARNING,
+            theme::warning_color(),
         )),
         WorkflowRunStatus::Done if run.verification.is_none() => Some((
             format!(
                 "● {} done{progress} · /verify to check · /runs details",
                 run.id
             ),
-            theme::SUCCESS,
+            theme::success_color(),
         )),
         WorkflowRunStatus::Failed => Some((
             format!(
                 "● {} failed{progress} · /runs details · /continue to fix",
                 run.id
             ),
-            theme::ERROR,
+            theme::error_color(),
         )),
         WorkflowRunStatus::Blocked => Some((
             format!("● {} blocked{progress} · /runs details", run.id),
-            theme::ERROR,
+            theme::error_color(),
         )),
         _ => None,
     }
@@ -79,7 +79,7 @@ pub(crate) fn drawer_runs(state: &AppState, width: usize) -> Vec<Line<'static>> 
             if detail {
                 theme::accent_bold()
             } else {
-                theme::bold(theme::TEXT)
+                theme::bold(theme::text_color())
             },
         ),
     ]));
@@ -246,12 +246,12 @@ fn drawer_run(
             row_style.fg(if selected { Color::Black } else { color }),
         )
     };
-    let sep = Span::styled("│ ", row_style.fg(theme::MUTED));
+    let sep = Span::styled("│ ", row_style.fg(theme::muted_color()));
     lines.push(Line::from(vec![
         cell(
             &format!(" {marker} {}", run.id),
             RUNS_COLUMNS[0],
-            theme::ACCENT,
+            theme::accent_color(),
         ),
         sep.clone(),
         Span::styled(
@@ -262,21 +262,21 @@ fn drawer_run(
         cell(
             &format!("#{}", run.attempt),
             RUNS_COLUMNS[2],
-            theme::WARNING,
+            theme::warning_color(),
         ),
         sep.clone(),
         cell(&steps, RUNS_COLUMNS[3], steps_color),
         sep.clone(),
-        cell(&updated, RUNS_COLUMNS[4], theme::TEXT),
+        cell(&updated, RUNS_COLUMNS[4], theme::text_color()),
         sep.clone(),
-        cell(&owner, RUNS_COLUMNS[5], theme::TEXT),
+        cell(&owner, RUNS_COLUMNS[5], theme::text_color()),
         sep,
         Span::styled(
             truncate_width(&run.goal, width.saturating_sub(67).max(10)),
             row_style.fg(if selected {
                 Color::Black
             } else {
-                theme::EMPHASIS
+                theme::emphasis_color()
             }),
         ),
     ]));
@@ -375,10 +375,10 @@ fn workflow_step_line(step: &WorkflowStepSummary, selected: bool, width: usize) 
 
 fn workflow_step_marker(status: WorkflowStepStatus) -> (&'static str, Color) {
     match status {
-        WorkflowStepStatus::Todo => ("○", theme::MUTED),
-        WorkflowStepStatus::Doing => ("●", theme::WARNING),
-        WorkflowStepStatus::Done => ("✓", theme::SUCCESS),
-        WorkflowStepStatus::Blocked => ("■", theme::ERROR),
+        WorkflowStepStatus::Todo => ("○", theme::muted_color()),
+        WorkflowStepStatus::Doing => ("●", theme::warning_color()),
+        WorkflowStepStatus::Done => ("✓", theme::success_color()),
+        WorkflowStepStatus::Blocked => ("■", theme::error_color()),
     }
 }
 
@@ -420,13 +420,13 @@ pub(crate) fn workflow_step_progress(run: &WorkflowRunSummary) -> Option<(String
         parts.push(format!("{} blocked", stats.blocked));
     }
     let color = if stats.blocked > 0 {
-        theme::ERROR
+        theme::error_color()
     } else if stats.doing > 0 {
-        theme::WARNING
+        theme::warning_color()
     } else if stats.done == stats.total {
-        theme::SUCCESS
+        theme::success_color()
     } else {
-        theme::TEXT
+        theme::text_color()
     };
     Some((parts.join(" · "), color))
 }
@@ -439,25 +439,28 @@ fn workflow_step_progress_suffix(run: &WorkflowRunSummary) -> String {
 
 pub(crate) fn workflow_step_table_cell(run: &WorkflowRunSummary) -> (String, Color) {
     let Some(stats) = workflow_step_stats(run) else {
-        return ("-".to_string(), theme::MUTED);
+        return ("-".to_string(), theme::muted_color());
     };
     if stats.blocked > 0 {
         (
             format!("{}/{} block", stats.done, stats.total),
-            theme::ERROR,
+            theme::error_color(),
         )
     } else if stats.doing > 0 {
         (
             format!("{}/{} doing", stats.done, stats.total),
-            theme::WARNING,
+            theme::warning_color(),
         )
     } else if stats.done == stats.total {
         (
             format!("{}/{} done", stats.done, stats.total),
-            theme::SUCCESS,
+            theme::success_color(),
         )
     } else {
-        (format!("{}/{} todo", stats.done, stats.total), theme::TEXT)
+        (
+            format!("{}/{} todo", stats.done, stats.total),
+            theme::text_color(),
+        )
     }
 }
 
@@ -534,11 +537,11 @@ pub(crate) fn workflow_owner_summary(run: &WorkflowRunSummary) -> Option<(String
     }
 
     let color = if parts.iter().any(|part| part.contains("blocked")) {
-        theme::ERROR
+        theme::error_color()
     } else if parts.iter().any(|part| part.contains("active")) {
-        theme::WARNING
+        theme::warning_color()
     } else {
-        theme::SUCCESS
+        theme::success_color()
     };
     Some((parts.join(" · "), color))
 }
@@ -589,16 +592,16 @@ fn workflow_event_line(event: &WorkflowRunEventSummary) -> Line<'static> {
 
 fn workflow_event_color(kind: &str) -> Color {
     match kind {
-        "started" | "continued" | "running" => theme::ACCENT,
-        "note" => theme::EMPHASIS,
+        "started" | "continued" | "running" => theme::accent_color(),
+        "note" => theme::emphasis_color(),
         "step_added" | "step_updated" | "step_renamed" | "step_removed" | "step_assigned" => {
-            theme::ACCENT
+            theme::accent_color()
         }
-        "verifying" => theme::WARNING,
-        "done" | "verification_passed" => theme::SUCCESS,
-        "failed" | "verification_failed" => theme::ERROR,
-        "blocked" => theme::ERROR,
-        _ => theme::TEXT,
+        "verifying" => theme::warning_color(),
+        "done" | "verification_passed" => theme::success_color(),
+        "failed" | "verification_failed" => theme::error_color(),
+        "blocked" => theme::error_color(),
+        _ => theme::text_color(),
     }
 }
 
@@ -673,37 +676,41 @@ pub(crate) fn workflow_history_summary(runs: &[WorkflowRunSummary]) -> String {
 
 pub(crate) fn workflow_outcome(run: &WorkflowRunSummary) -> (String, Color) {
     match (run.status, &run.verification) {
-        (WorkflowRunStatus::Planned, _) => ("planning has not started".to_string(), theme::MUTED),
-        (WorkflowRunStatus::Running, _) => ("team is working".to_string(), theme::WARNING),
-        (WorkflowRunStatus::Verifying, _) => {
-            ("verification is running".to_string(), theme::WARNING)
+        (WorkflowRunStatus::Planned, _) => {
+            ("planning has not started".to_string(), theme::muted_color())
         }
+        (WorkflowRunStatus::Running, _) => ("team is working".to_string(), theme::warning_color()),
+        (WorkflowRunStatus::Verifying, _) => (
+            "verification is running".to_string(),
+            theme::warning_color(),
+        ),
         (WorkflowRunStatus::Done, Some(verification)) if verification.ok => (
             format!("verified by {}", verification.command),
-            theme::SUCCESS,
+            theme::success_color(),
         ),
         (WorkflowRunStatus::Done, Some(verification)) => (
             format!("verification failed: {}", verification.command),
-            theme::ERROR,
+            theme::error_color(),
         ),
         (WorkflowRunStatus::Done, None) => (
             "work done; verification pending".to_string(),
-            theme::WARNING,
+            theme::warning_color(),
         ),
         (WorkflowRunStatus::Failed, Some(verification)) if verification.ok => (
             format!("work failed after check: {}", verification.command),
-            theme::ERROR,
+            theme::error_color(),
         ),
         (WorkflowRunStatus::Failed, Some(verification)) => (
             format!("verification failed: {}", verification.command),
-            theme::ERROR,
+            theme::error_color(),
         ),
-        (WorkflowRunStatus::Failed, None) => {
-            ("run failed before verification".to_string(), theme::ERROR)
-        }
+        (WorkflowRunStatus::Failed, None) => (
+            "run failed before verification".to_string(),
+            theme::error_color(),
+        ),
         (WorkflowRunStatus::Blocked, _) => (
             "blocked; needs user or teammate follow-up".to_string(),
-            theme::ERROR,
+            theme::error_color(),
         ),
     }
 }
@@ -764,11 +771,11 @@ fn workflow_stages(
 
 fn workflow_stage_span(name: &str, state: WorkflowStageState) -> Span<'static> {
     let (marker, label, color) = match state {
-        WorkflowStageState::Pending => ("○", "pending", theme::MUTED),
-        WorkflowStageState::Active => ("●", "active", theme::WARNING),
-        WorkflowStageState::Passed => ("✓", "done", theme::SUCCESS),
-        WorkflowStageState::Failed => ("✕", "failed", theme::ERROR),
-        WorkflowStageState::Blocked => ("■", "blocked", theme::ERROR),
+        WorkflowStageState::Pending => ("○", "pending", theme::muted_color()),
+        WorkflowStageState::Active => ("●", "active", theme::warning_color()),
+        WorkflowStageState::Passed => ("✓", "done", theme::success_color()),
+        WorkflowStageState::Failed => ("✕", "failed", theme::error_color()),
+        WorkflowStageState::Blocked => ("■", "blocked", theme::error_color()),
     };
     Span::styled(
         format!("{marker} {name} {label}"),

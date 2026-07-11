@@ -14,6 +14,7 @@ pub mod header;
 pub mod keymap;
 pub mod markdown;
 pub mod rollout_import;
+pub mod skills;
 pub mod status_indicator;
 pub mod team_builder;
 pub mod team_editor;
@@ -21,6 +22,7 @@ pub mod theme;
 pub mod workflow_view;
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -46,6 +48,74 @@ use crate::tui::keymap::Action;
 use crate::tui::team_editor::TeamEditorOutcome;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RESET_KEYBOARD_TO_LEGACY: &[u8] = b"\x1b[=0u";
+
+/// Asterline uses color for backend identity, status, and selection—not only
+/// decoration. Full-screen interactive sessions therefore keep color enabled
+/// even when a parent process injects `NO_COLOR` into the environment.
+fn enable_tui_colors() {
+    crossterm::style::force_color_output(true);
+}
+
+/// Best-effort terminal state restoration. A fresh stdout handle is used so
+/// cleanup still runs if terminal construction, drawing, or the event loop
+/// returns early. `Drop` is the final safety net for panic/error paths.
+#[derive(Default)]
+struct TerminalRestore {
+    raw_mode: bool,
+    keyboard_enhancement: bool,
+    alternate_screen: bool,
+    mouse_capture: bool,
+    legacy_keyboard_reset: bool,
+}
+
+impl TerminalRestore {
+    fn restore(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        let mut out = io::stdout();
+
+        if self.keyboard_enhancement {
+            record_cleanup(&mut first_error, execute!(out, PopKeyboardEnhancementFlags));
+            self.keyboard_enhancement = false;
+        }
+        if self.mouse_capture {
+            record_cleanup(&mut first_error, execute!(out, DisableMouseCapture));
+            self.mouse_capture = false;
+        }
+        if self.alternate_screen {
+            record_cleanup(&mut first_error, execute!(out, LeaveAlternateScreen));
+            self.alternate_screen = false;
+        }
+        if self.legacy_keyboard_reset {
+            record_cleanup(&mut first_error, reset_keyboard_to_legacy(&mut out));
+        }
+        record_cleanup(&mut first_error, execute!(out, crossterm::cursor::Show));
+        if self.raw_mode {
+            record_cleanup(&mut first_error, disable_raw_mode());
+            self.raw_mode = false;
+        }
+        record_cleanup(&mut first_error, out.flush());
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn record_cleanup(first_error: &mut Option<io::Error>, result: io::Result<()>) {
+    if let Err(err) = result
+        && first_error.is_none()
+    {
+        *first_error = Some(err);
+    }
+}
 
 /// Run the TUI to completion. `events` delivers runtime events; `handle` sends
 /// commands back. On exit the runtime is asked to shut down.
@@ -54,10 +124,31 @@ pub fn run(
     events: Receiver<RuntimeEvent>,
     mut state: AppState,
 ) -> io::Result<()> {
-    enable_raw_mode()?;
+    enable_tui_colors();
+    let mut restore = TerminalRestore::default();
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let vscode_pid = std::env::var_os("VSCODE_PID").is_some();
+    let multiplexed = std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some();
+    let keyboard_enhancement_allowed =
+        terminal_program_allows_keyboard_enhancement(term_program.as_deref(), vscode_pid);
+    restore.legacy_keyboard_reset =
+        terminal_requires_legacy_reset(term_program.as_deref(), vscode_pid, multiplexed);
     let mut stdout = io::stdout();
-    let keyboard_enhancement = enable_keyboard_enhancement(&mut stdout)?;
+    if restore.legacy_keyboard_reset {
+        reset_keyboard_to_legacy(&mut stdout)?;
+        stdout.flush()?;
+    }
+    enable_raw_mode()?;
+    restore.raw_mode = true;
+    restore.alternate_screen = true;
+    restore.mouse_capture = true;
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Kitty keeps separate keyboard-mode stacks for the main and alternate
+    // screens. Push only after entering the alternate screen so cleanup pops
+    // the same stack before leaving it.
+    let keyboard_enhancement =
+        enable_keyboard_enhancement(&mut stdout, keyboard_enhancement_allowed)?;
+    restore.keyboard_enhancement = keyboard_enhancement;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -67,30 +158,26 @@ pub fn run(
         &handle,
         &events,
         keyboard_enhancement,
+        restore.legacy_keyboard_reset,
     );
 
-    // Pop keyboard enhancement before leaving raw mode so the terminal still
-    // processes the escape sequence while in raw mode.
-    disable_keyboard_enhancement(terminal.backend_mut(), keyboard_enhancement)?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    disable_raw_mode()?;
-    terminal.show_cursor()?;
+    // Always attempt every cleanup action; one failed escape write must not
+    // leave the keyboard protocol or raw mode enabled in the user's shell.
+    let cleanup = restore.restore();
 
     handle.send(UiCommand::Shutdown);
-    result
+    result.and(cleanup)
 }
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    // Modifier disambiguation is sufficient for Shift/Alt+Enter. Requesting
+    // REPORT_EVENT_TYPES makes terminals emit `:3u` key-release sequences;
+    // those become visible garbage if a terminal fails to restore its stack.
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
-fn enable_keyboard_enhancement(out: &mut impl Write) -> io::Result<bool> {
-    if supports_keyboard_enhancement().unwrap_or(false) {
+fn enable_keyboard_enhancement(out: &mut impl Write, allowed: bool) -> io::Result<bool> {
+    if allowed && supports_keyboard_enhancement().unwrap_or(false) {
         execute!(
             out,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
@@ -99,6 +186,31 @@ fn enable_keyboard_enhancement(out: &mut impl Write) -> io::Result<bool> {
     } else {
         Ok(false)
     }
+}
+
+fn terminal_program_allows_keyboard_enhancement(
+    term_program: Option<&str>,
+    vscode_pid_present: bool,
+) -> bool {
+    if vscode_pid_present {
+        return false;
+    }
+    !term_program.is_some_and(|program| {
+        let program = program.to_ascii_lowercase();
+        program.contains("vscode") || program.contains("cursor")
+    })
+}
+
+fn terminal_requires_legacy_reset(
+    term_program: Option<&str>,
+    vscode_pid_present: bool,
+    multiplexed: bool,
+) -> bool {
+    !multiplexed && !terminal_program_allows_keyboard_enhancement(term_program, vscode_pid_present)
+}
+
+fn reset_keyboard_to_legacy(out: &mut impl Write) -> io::Result<()> {
+    out.write_all(RESET_KEYBOARD_TO_LEGACY)
 }
 
 fn disable_keyboard_enhancement(out: &mut impl Write, enabled: bool) -> io::Result<()> {
@@ -114,6 +226,7 @@ fn run_loop(
     handle: &RuntimeHandle,
     events: &Receiver<RuntimeEvent>,
     keyboard_enhancement: bool,
+    legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     loop {
         while let Ok(event) = events.try_recv() {
@@ -138,7 +251,14 @@ fn run_loop(
         }
 
         if let Some(req) = state.take_attach_request() {
-            attach_to_member(terminal, state, handle, &req, keyboard_enhancement)?;
+            attach_to_member(
+                terminal,
+                state,
+                handle,
+                &req,
+                keyboard_enhancement,
+                legacy_keyboard_reset,
+            )?;
         }
 
         if state.should_quit() {
@@ -198,11 +318,13 @@ fn attach_to_member(
     handle: &RuntimeHandle,
     req: &attach::AttachRequest,
     keyboard_enhancement: bool,
+    legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     let (program, args) = req.command();
     let exit_hint = match req.backend {
         BackendKind::Codex => "type /exit or press Ctrl+D",
         BackendKind::Claude => "type /exit or press Ctrl+D",
+        BackendKind::Grok => "type /exit or press Ctrl+D",
         BackendKind::Agy => "type /exit or press Ctrl+D",
     };
 
@@ -218,20 +340,23 @@ fn attach_to_member(
     // Snapshot the codex rollout so we can import whatever is typed during the
     // attached session once it exits.
     let snapshot = (req.backend == BackendKind::Codex)
-        .then(|| rollout_import::snapshot(req.session.as_deref()));
+        .then(|| rollout_import::snapshot(req.session.as_deref(), &req.cwd));
 
     // --- Suspend Asterline: hand the real terminal to the child CLI. ---
     // Restore the cooked terminal, leave our alternate screen, and show the
     // cursor, flushing so the child starts from a clean, owned main screen.
-    disable_raw_mode()?;
     let mut out = io::stdout();
     disable_keyboard_enhancement(&mut out, keyboard_enhancement)?;
+    disable_raw_mode()?;
     execute!(
         out,
         DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
+    if legacy_keyboard_reset {
+        reset_keyboard_to_legacy(&mut out)?;
+    }
     writeln!(
         out,
         "\n── {} · {} {} ──\n  Asterline suspended. To return: {exit_hint}\n  (Ctrl+C is sent to the CLI and may not exit it.)\n",
@@ -248,13 +373,13 @@ fn attach_to_member(
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     if keyboard_enhancement {
         execute!(
             out,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         )?;
     }
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     out.flush()?;
     // Drop input the child or the terminal left buffered (e.g. the reply to the
     // alternate-screen switch) so the first key after returning isn't a stray
@@ -352,6 +477,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_previous_workflow_step() {
                     state.select_newer_workflow_run();
                 }
+            } else if state.drawer() == Some(drawers::Drawer::Skills) {
+                state.select_previous_skill();
             } else if state.drawer().is_some() {
                 state.drawer_scroll_up();
             } else if state.completion().is_some() {
@@ -366,6 +493,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_next_workflow_step() {
                     state.select_older_workflow_run();
                 }
+            } else if state.drawer() == Some(drawers::Drawer::Skills) {
+                state.select_next_skill();
             } else if state.drawer().is_some() {
                 state.drawer_scroll_down();
             } else if state.completion().is_some() {
@@ -382,6 +511,9 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
         Action::Complete => {
+            if state.drawer() == Some(drawers::Drawer::Skills) && state.stage_selected_skill() {
+                return;
+            }
             if state.drawer() == Some(drawers::Drawer::Runs)
                 && state.stage_selected_workflow_dispatch()
             {
@@ -409,6 +541,9 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Action::Submit => {
+            if state.drawer() == Some(drawers::Drawer::Skills) && state.stage_selected_skill() {
+                return;
+            }
             if state.drawer() == Some(drawers::Drawer::Runs)
                 && state.stage_selected_workflow_action()
             {
@@ -486,6 +621,8 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.take_composer();
             if let UiCommand::UserMessage { target, body } = &command {
                 state.handle_user_message_submitted(target, body.clone());
+            } else if matches!(command, UiCommand::NewSession) {
+                state.clear_last_message_target();
             }
             handle.send(command);
         }
@@ -496,6 +633,11 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             if drawer == drawers::Drawer::Diff && state.drawer() != Some(drawers::Drawer::Diff) {
                 let diff = compute_git_diff(state.workspace());
                 state.set_diff(diff);
+            }
+            if drawer == drawers::Drawer::Skills && state.drawer() != Some(drawers::Drawer::Skills)
+            {
+                let workspace = Path::new(state.workspace());
+                state.set_skills(skills::discover(workspace));
             }
             state.toggle_drawer(drawer);
         }
@@ -512,9 +654,19 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.take_composer();
             state.toggle_drawer(drawers::Drawer::Palette);
         }
-        Submission::NeedsTarget => state.apply(RuntimeEvent::Notice(
-            "message needs a target prefix: @member, @all, /ask, or /all (draft kept)".to_string(),
-        )),
+        Submission::NeedsTarget => {
+            if let Some((target, body)) = state.inherited_user_message(&text) {
+                state.record_submission(&body);
+                state.take_composer();
+                state.handle_user_message_submitted(&target, body.clone());
+                handle.send(UiCommand::UserMessage { target, body });
+            } else {
+                state.apply(RuntimeEvent::Notice(
+                    "message needs a target prefix: @member, @all, /ask, or /all (draft kept)"
+                        .to_string(),
+                ));
+            }
+        }
         Submission::Empty => {
             state.take_composer();
         }
@@ -536,6 +688,66 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn keyboard_enhancement_cleanup_emits_protocol_pop() {
+        let mut bytes = Vec::new();
+        disable_keyboard_enhancement(&mut bytes, true).unwrap();
+        assert_eq!(bytes, b"\x1b[<1u");
+    }
+
+    #[test]
+    fn keyboard_enhancement_push_uses_only_disambiguation() {
+        let mut bytes = Vec::new();
+        execute!(
+            bytes,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[>1u");
+    }
+
+    #[test]
+    fn embedded_terminal_legacy_reset_uses_explicit_protocol_reset() {
+        let mut bytes = Vec::new();
+        reset_keyboard_to_legacy(&mut bytes).unwrap();
+        assert_eq!(bytes, b"\x1b[=0u");
+
+        assert!(terminal_requires_legacy_reset(Some("vscode"), false, false));
+        assert!(!terminal_requires_legacy_reset(Some("vscode"), false, true));
+        assert!(!terminal_requires_legacy_reset(Some("kitty"), false, false));
+    }
+
+    #[test]
+    fn keyboard_enhancement_never_requests_release_events() {
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn keyboard_enhancement_is_disabled_in_vscode_family_terminals() {
+        assert!(!terminal_program_allows_keyboard_enhancement(
+            Some("vscode"),
+            false
+        ));
+        assert!(!terminal_program_allows_keyboard_enhancement(
+            Some("cursor"),
+            false
+        ));
+        assert!(!terminal_program_allows_keyboard_enhancement(
+            Some("xterm"),
+            true
+        ));
+        assert!(terminal_program_allows_keyboard_enhancement(
+            Some("kitty"),
+            false
+        ));
+
+        let mut bytes = Vec::new();
+        assert!(!enable_keyboard_enhancement(&mut bytes, false).unwrap());
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
     fn untargeted_text_keeps_the_draft() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
@@ -555,6 +767,116 @@ mod tests {
         submit(&mut state, &handle);
 
         assert_eq!(state.composer().text(), "build the parser");
+        assert!(state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::Notice { text } if text.contains("draft kept")
+        )));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn untargeted_text_reuses_previous_target() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: None,
+            workflow_runs: Vec::new(),
+            members: vec![crate::domain::event::MemberSummary {
+                id: crate::domain::team::MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: crate::domain::team::BackendKind::Codex,
+                role: "build".to_string(),
+                status: crate::domain::event::MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: crate::domain::team::SandboxPolicy::WorkspaceWrite,
+                permission_mode: None,
+                session_policy: crate::domain::team::SessionPolicy::Resume,
+            }],
+        });
+
+        for ch in "@builder build the parser".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+        for ch in "now add tests".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+
+        assert!(state.composer().is_empty());
+        assert!(state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::User { body } if body == "@builder now add tests"
+        )));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn new_session_clears_inherited_target() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: None,
+            workflow_runs: Vec::new(),
+            members: vec![crate::domain::event::MemberSummary {
+                id: crate::domain::team::MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: crate::domain::team::BackendKind::Codex,
+                role: "build".to_string(),
+                status: crate::domain::event::MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: crate::domain::team::SandboxPolicy::WorkspaceWrite,
+                permission_mode: None,
+                session_policy: crate::domain::team::SessionPolicy::Resume,
+            }],
+        });
+
+        for ch in "@builder build the parser".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+        for ch in "/new".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+        for ch in "now add tests".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+
+        assert_eq!(state.composer().text(), "now add tests");
         assert!(state.chat().iter().any(|item| matches!(
             item,
             ChatItem::Notice { text } if text.contains("draft kept")

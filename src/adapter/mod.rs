@@ -2,7 +2,7 @@
 //!
 //! The product path runs each member through a [`MemberRunner`] that streams
 //! [`AgentEvent`]s. Real members use [`ProcessRunner`] over a [`StreamAdapter`]
-//! (`claude_stream` / `codex_stream` / `agy_stream`); tests and offline mode use
+//! (`claude_stream` / `codex_stream` / `grok_stream` / `agy_stream`); tests and offline mode use
 //! [`fake::FakeRunner`]. `cli_pty` is retained as a raw-terminal/debug
 //! capability and is not part of the product path.
 
@@ -11,6 +11,8 @@ pub mod claude_stream;
 pub mod cli_pty;
 pub mod codex_stream;
 pub mod fake;
+pub mod grok_stream;
+pub mod models;
 pub mod parser;
 pub mod process;
 
@@ -26,6 +28,8 @@ pub use agy_stream::AgyStreamAdapter;
 pub use claude_stream::ClaudeStreamAdapter;
 pub use codex_stream::CodexStreamAdapter;
 pub use fake::FakeRunner;
+pub use grok_stream::GrokStreamAdapter;
+pub use models::discover_models;
 pub use process::{AdapterCommand, LineParser, ProcessRunner, StreamAdapter, run_streaming};
 
 /// Inputs for one member turn.
@@ -53,6 +57,9 @@ pub fn runner_for(member: &TeamMember, workspace: &Path) -> Box<dyn MemberRunner
             member, workspace,
         ))),
         BackendKind::Codex => Box::new(ProcessRunner::new(CodexStreamAdapter::from_member(
+            member, workspace,
+        ))),
+        BackendKind::Grok => Box::new(ProcessRunner::new(GrokStreamAdapter::from_member(
             member, workspace,
         ))),
         BackendKind::Agy => Box::new(ProcessRunner::new(AgyStreamAdapter::from_member(

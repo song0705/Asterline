@@ -19,7 +19,7 @@ fn replays_chat_in_insertion_order() {
         .record_agent(turn, &builder, "Builder", BackendKind::Codex, "on it")
         .unwrap();
     store
-        .record_tool(turn, &builder, "shell", "cargo test", Some(true))
+        .record_tool(turn, &builder, "shell", "cargo test", "ok", Some(true))
         .unwrap();
     store
         .record_route(turn, &builder, &["reviewer".to_string()], "please review")
@@ -48,7 +48,8 @@ fn replays_chat_in_insertion_order() {
     ));
     assert!(matches!(
         &items[2],
-        ChatItem::Tool { ok: Some(true), summary, .. } if summary == "cargo test"
+        ChatItem::Tool { ok: Some(true), summary, detail, .. }
+            if summary == "cargo test" && detail == "ok"
     ));
     assert!(matches!(
         &items[3],

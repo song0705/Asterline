@@ -1,5 +1,6 @@
 use super::*;
-use crate::domain::team::{BackendKind, DefaultTarget, TeamMember};
+use crate::domain::event::ChatItem;
+use crate::domain::team::{BackendKind, DefaultTarget, Effort, TeamMember};
 
 fn team() -> TeamConfig {
     let mut config = TeamConfig::new("mixed", "/tmp/ws")
@@ -102,29 +103,112 @@ fn completed_message_is_emitted_and_persisted_then_turn_finishes() {
 }
 
 #[test]
-fn team_message_routes_to_another_member() {
+fn tool_input_progress_and_result_are_preserved_separately() {
     let mut rt = runtime();
-    rt.on_ui_command(user("plan it"));
+    rt.on_ui_command(user("run tests"));
     let builder = MemberId::new("builder");
 
-    let step = rt.on_agent_event(
+    rt.on_agent_event(
         &builder,
-        AgentEvent::MessageCompleted(
-            r#"@@team_message {"to":"reviewer","body":"please review"}"#.to_string(),
-        ),
+        AgentEvent::ToolStarted {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            summary: "cargo test".to_string(),
+        },
+    );
+    let progress = rt.on_agent_event(
+        &builder,
+        AgentEvent::ToolProgress {
+            id: "tool-1".to_string(),
+            delta: "running parser tests\n".to_string(),
+        },
+    );
+    let completed = rt.on_agent_event(
+        &builder,
+        AgentEvent::ToolCompleted {
+            id: "tool-1".to_string(),
+            ok: false,
+            summary: "error: parser test failed".to_string(),
+        },
     );
 
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Route { to, .. } if to == &vec!["reviewer".to_string()]
+    assert!(progress.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolProgress { delta, .. } if delta == "running parser tests\n"
     )));
-    // The relay is dispatched to the reviewer.
-    assert!(
-        step.actions
-            .iter()
-            .any(|a| a.member == MemberId::new("reviewer"))
+    assert!(completed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ToolCompleted { ok: false, output, .. }
+            if output.contains("running parser tests")
+                && output.contains("error: parser test failed")
+    )));
+    assert!(rt.store.replay_chat().unwrap().iter().any(|item| matches!(
+        item,
+        ChatItem::Tool { summary, detail, ok: Some(false), .. }
+            if summary == "cargo test"
+                && detail.contains("running parser tests")
+                && detail.contains("error: parser test failed")
+    )));
+}
+
+#[test]
+fn codex_can_explain_frontend_design_to_agy_via_team_message() {
+    let mut config = TeamConfig::new("frontend", "/tmp/ws")
+        .with_member(TeamMember::new(
+            "codex",
+            "Codex",
+            BackendKind::Codex,
+            "frontend implementation",
+        ))
+        .with_member(TeamMember::new(
+            "agy",
+            "Agy",
+            BackendKind::Agy,
+            "frontend research",
+        ));
+    config.default_target = Some(DefaultTarget::Member(MemberId::new("codex")));
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+    rt.on_ui_command(user("Explain the frontend design to Agy"));
+    let codex = MemberId::new("codex");
+    let agy = MemberId::new("agy");
+    let explanation = "Use a chat-first layout, persistent member identity, and visible handoffs.";
+
+    let route = rt.on_agent_event(
+        &codex,
+        AgentEvent::MessageCompleted(format!(
+            r#"@@team_message {{"to":"agy","body":"{explanation}"}}"#
+        )),
     );
-    assert!(step.actions[0].prompt.contains("please review"));
+
+    assert!(route.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Route { from, to, body, .. }
+            if from == &codex && to == &vec!["agy".to_string()] && body == explanation
+    )));
+    let dispatch = route
+        .actions
+        .iter()
+        .find(|action| action.member == agy)
+        .expect("Codex handoff must dispatch a turn to Agy");
+    assert!(dispatch.prompt.contains(explanation));
+
+    rt.on_agent_event(
+        &agy,
+        AgentEvent::MessageCompleted(
+            "Understood; I will evaluate that frontend structure.".to_string(),
+        ),
+    );
+    let replay = rt.store.replay_chat().unwrap();
+    assert!(replay.iter().any(|item| matches!(
+        item,
+        ChatItem::Route { from, to, body }
+            if from == &codex && to == &vec!["agy".to_string()] && body == explanation
+    )));
+    assert!(replay.iter().any(|item| matches!(
+        item,
+        ChatItem::Agent { member, backend: BackendKind::Agy, text, .. }
+            if member == &agy && text.contains("evaluate that frontend structure")
+    )));
 }
 
 #[test]
@@ -425,6 +509,32 @@ fn user_message_with_at_prefix_strips_prefix_for_agent_run() {
     assert!(step.actions[0].prompt.contains("nihao"));
     assert!(!step.actions[0].prompt.contains("@builder"));
     assert!(step.actions[0].prompt.contains("$asterline-team"));
+}
+
+#[test]
+fn codex_prompt_includes_current_team_cards() {
+    let mut builder = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+    builder.model = Some("gpt-5-codex".to_string());
+    builder.effort = Some(Effort::High);
+    let mut reviewer = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+    reviewer.model = Some("sonnet".to_string());
+    reviewer.effort = Some(Effort::Medium);
+    reviewer.cwd = Some(PathBuf::from("/tmp/review"));
+    let mut config = TeamConfig::new("mixed", "/tmp/ws")
+        .with_member(builder)
+        .with_member(reviewer);
+    config.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+
+    let step = rt.on_ui_command(user("who is on the team?"));
+    let prompt = &step.actions[0].prompt;
+
+    assert!(prompt.contains("Current Asterline team roster"));
+    assert!(prompt.contains("Use member ids when routing teammate messages"));
+    assert!(prompt.contains("You are: id=builder"));
+    assert!(prompt.contains("Default target: builder"));
+    assert!(prompt.contains("id=builder display_name=\"Builder\" backend=codex role=\"impl\" status=running model=gpt-5-codex effort=high cwd=\"/tmp/ws\""));
+    assert!(prompt.contains("id=reviewer display_name=\"Reviewer\" backend=claude role=\"review\" status=idle model=sonnet effort=medium cwd=\"/tmp/review\""));
 }
 
 #[test]

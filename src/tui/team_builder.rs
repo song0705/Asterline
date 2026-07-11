@@ -5,14 +5,15 @@
 //! on the same backend, per-member model, and per-member reasoning effort. On a
 //! non-interactive stdout it falls back to the established default roster.
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -27,13 +28,138 @@ use crate::domain::team::{
 };
 use crate::tui::theme;
 
+#[derive(Debug)]
+enum ModelLoad {
+    Loading(Receiver<Result<Vec<String>, String>>),
+    Ready(Result<Vec<String>, String>),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ModelCatalog {
+    loads: HashMap<(BackendKind, PathBuf), ModelLoad>,
+}
+
+pub(crate) enum ModelChoices {
+    Loading,
+    Ready(Vec<String>),
+    Failed(String),
+}
+
+impl ModelCatalog {
+    pub(crate) fn models(&mut self, backend: BackendKind, cwd: &Path) -> ModelChoices {
+        let key = (backend, cwd.to_path_buf());
+        match self.loads.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let worker_cwd = cwd.to_path_buf();
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = tx.send(crate::adapter::discover_models(backend, &worker_cwd));
+                });
+                entry.insert(ModelLoad::Loading(rx));
+                ModelChoices::Loading
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let result = match entry.get_mut() {
+                    ModelLoad::Loading(rx) => match rx.try_recv() {
+                        Ok(result) => result,
+                        Err(TryRecvError::Empty) => return ModelChoices::Loading,
+                        Err(TryRecvError::Disconnected) => {
+                            Err("model discovery worker stopped unexpectedly".to_string())
+                        }
+                    },
+                    ModelLoad::Ready(result) => return model_choices(result),
+                };
+                let choices = model_choices(&result);
+                entry.insert(ModelLoad::Ready(result));
+                choices
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed(&mut self, backend: BackendKind, cwd: &Path, models: Vec<String>) {
+        self.loads
+            .insert((backend, cwd.to_path_buf()), ModelLoad::Ready(Ok(models)));
+    }
+}
+
+fn model_choices(result: &Result<Vec<String>, String>) -> ModelChoices {
+    match result {
+        Ok(models) => ModelChoices::Ready(models.clone()),
+        Err(err) => ModelChoices::Failed(err.clone()),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ModelPicker {
+    options: Vec<Option<String>>,
+    selected: usize,
+}
+
+impl ModelPicker {
+    pub(crate) fn new(current: Option<&str>, models: Vec<String>) -> Self {
+        let mut options = vec![None];
+        if let Some(current) = current
+            && !models.iter().any(|model| model == current)
+        {
+            options.push(Some(current.to_string()));
+        }
+        options.extend(models.into_iter().map(Some));
+        let selected = current
+            .and_then(|current| {
+                options
+                    .iter()
+                    .position(|model| model.as_deref() == Some(current))
+            })
+            .unwrap_or(0);
+        Self { options, selected }
+    }
+
+    pub(crate) fn options(&self) -> &[Option<String>] {
+        &self.options
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn window(&self, max: usize) -> (usize, &[Option<String>]) {
+        let max = max.max(1).min(self.options.len());
+        let start = self
+            .selected
+            .saturating_sub(max / 2)
+            .min(self.options.len().saturating_sub(max));
+        (start, &self.options[start..start + max])
+    }
+
+    pub(crate) fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(crate) fn down(&mut self) {
+        if self.selected + 1 < self.options.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<String> {
+        self.options.get(self.selected).cloned().flatten()
+    }
+}
+
 /// Pick a team interactively from the detected backends. Returns `None` if the
 /// user cancels or nothing is available.
 pub fn run(detected: DetectedBackends, workspace: &Path) -> io::Result<Option<TeamConfig>> {
-    let available: Vec<BackendKind> = [BackendKind::Codex, BackendKind::Claude, BackendKind::Agy]
-        .into_iter()
-        .filter(|b| is_detected(*b, detected))
-        .collect();
+    super::enable_tui_colors();
+    let available: Vec<BackendKind> = [
+        BackendKind::Codex,
+        BackendKind::Claude,
+        BackendKind::Grok,
+        BackendKind::Agy,
+    ]
+    .into_iter()
+    .filter(|b| is_detected(*b, detected))
+    .collect();
 
     if available.is_empty() {
         return Ok(None);
@@ -42,25 +168,29 @@ pub fn run(detected: DetectedBackends, workspace: &Path) -> io::Result<Option<Te
         return Ok(default_team(workspace.to_path_buf(), detected));
     }
 
+    let mut restore = super::TerminalRestore::default();
     enable_raw_mode()?;
+    restore.raw_mode = true;
     let mut stdout = io::stdout();
+    restore.alternate_screen = true;
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let outcome = select_loop(&mut terminal, workspace, &available);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    outcome
+    let cleanup = restore.restore();
+    match outcome {
+        Err(err) => Err(err),
+        Ok(value) => cleanup.map(|()| value),
+    }
 }
 
 fn is_detected(backend: BackendKind, detected: DetectedBackends) -> bool {
     match backend {
         BackendKind::Codex => detected.codex,
         BackendKind::Claude => detected.claude,
+        BackendKind::Grok => detected.grok,
         BackendKind::Agy => detected.agy,
     }
 }
@@ -145,7 +275,11 @@ struct BuilderState {
     members: Vec<TeamMember>,
     selected: usize,
     field: usize,
+    field_mode: bool,
     editing: Option<EditState>,
+    model_catalog: ModelCatalog,
+    model_picker: Option<ModelPicker>,
+    notice: Option<String>,
     cancelled: bool,
 }
 
@@ -163,12 +297,20 @@ impl BuilderState {
             members,
             selected: 0,
             field: 0,
+            field_mode: false,
             editing: None,
+            model_catalog: ModelCatalog::default(),
+            model_picker: None,
+            notice: None,
             cancelled: false,
         }
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self.model_picker.is_some() {
+            self.handle_model_picker_key(code);
+            return false;
+        }
         if self.editing.is_some() {
             self.handle_edit_key(code, modifiers);
             return false;
@@ -177,25 +319,57 @@ impl BuilderState {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Char('c') if ctrl => self.cancelled = true,
+            KeyCode::Esc if self.field_mode => self.field_mode = false,
             KeyCode::Esc | KeyCode::Char('q') => self.cancelled = true,
             KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
+                if self.field_mode {
+                    self.prev_field();
+                } else {
+                    self.selected = self.selected.saturating_sub(1);
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.members.len() {
+                if self.field_mode {
+                    self.next_field();
+                } else if self.selected + 1 < self.members.len() {
                     self.selected += 1;
                 }
             }
-            KeyCode::Left => self.prev_field(),
-            KeyCode::Right | KeyCode::Tab => self.next_field(),
-            KeyCode::BackTab => self.prev_field(),
-            KeyCode::Char('a') => self.add_member(),
-            KeyCode::Char('d') => self.delete_member(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {}
+            KeyCode::Char('a') if !self.field_mode => self.add_member(),
+            KeyCode::Char('d') if !self.field_mode => self.delete_member(),
             KeyCode::Char('s') => return true,
-            KeyCode::Enter => self.activate_field(),
+            KeyCode::Char('e') if self.field_mode && self.selected_field() == Field::Model => {
+                self.edit_selected_field()
+            }
+            KeyCode::Enter if self.field_mode => self.activate_field(),
+            KeyCode::Enter => self.field_mode = true,
             _ => {}
         }
         false
+    }
+
+    fn handle_model_picker_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.up();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.down();
+                }
+            }
+            KeyCode::Enter => {
+                let value = self.model_picker.as_ref().and_then(ModelPicker::value);
+                self.selected_member_mut().model = value;
+                self.model_picker = None;
+                self.notice = Some("model selected · press s to start".to_string());
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            _ => {}
+        }
     }
 
     fn handle_edit_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -271,13 +445,43 @@ impl BuilderState {
 
     fn activate_field(&mut self) {
         let field = self.selected_field();
+        if field == Field::Model {
+            self.cycle_model();
+        } else if field.is_text() {
+            self.edit_selected_field();
+        } else {
+            self.cycle_field(field);
+        }
+    }
+
+    fn edit_selected_field(&mut self) {
+        let field = self.selected_field();
         if field.is_text() {
             self.editing = Some(EditState {
                 field,
                 buffer: field_value(self.selected_member(), field),
             });
-        } else {
-            self.cycle_field(field);
+        }
+    }
+
+    fn cycle_model(&mut self) {
+        let backend = self.selected_member().backend;
+        let cwd = self.selected_member().resolved_cwd(&self.workspace);
+        match self.model_catalog.models(backend, &cwd) {
+            ModelChoices::Loading => {
+                self.notice = Some(format!(
+                    "loading {} models in the background · press Enter again shortly",
+                    backend.as_str()
+                ));
+            }
+            ModelChoices::Ready(models) => {
+                self.model_picker = Some(ModelPicker::new(
+                    self.selected_member().model.as_deref(),
+                    models,
+                ));
+                self.notice = Some("↑/↓ choose model · Enter select · Esc cancel".to_string());
+            }
+            ModelChoices::Failed(err) => self.notice = Some(err),
         }
     }
 
@@ -331,7 +535,7 @@ impl BuilderState {
                 }
             }
             Field::Model => {
-                self.selected_member_mut().model = if value.is_empty() {
+                self.selected_member_mut().model = if value.is_empty() || value == "default" {
                     None
                 } else {
                     Some(value.to_string())
@@ -365,7 +569,12 @@ impl BuilderState {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
-    let height = (state.members.len() as u16 + 22).min(frame.area().height);
+    let picker_height = state
+        .model_picker
+        .as_ref()
+        .map(|picker| picker.window(8).1.len() as u16 + 3)
+        .unwrap_or(0);
+    let height = (state.members.len() as u16 + 22 + picker_height).min(frame.area().height);
     let area = centered(frame.area(), 92, height);
     let block = Block::default()
         .title(" Asterline · build your team ")
@@ -386,7 +595,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     ];
 
     // Distribute available width across columns dynamically.
-    // Layout: " › name @handle backend role=… model=… effort=…"
+    // Layout: " ▶ name @handle backend role=… model=… effort=…"
     let name_w = avail.clamp(8, 18);
     let handle_w = avail.clamp(6, 14);
     let backend_w = 7;
@@ -395,25 +604,32 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     let model_w = rest.saturating_sub(role_w).clamp(6, 16);
 
     for (i, member) in state.members.iter().enumerate() {
-        let pointer = if i == state.selected { "›" } else { " " };
+        let selected = i == state.selected;
         let style = if i == state.selected {
-            theme::selection()
+            theme::bold(theme::emphasis_color())
         } else {
             theme::emphasis()
         };
         let muted_style = if i == state.selected {
-            theme::selection()
+            theme::bold(theme::emphasis_color())
         } else {
             theme::muted()
         };
         let backend_color = theme::backend_color(member.backend);
         let backend_style = if i == state.selected {
-            theme::selection()
+            theme::bold(theme::emphasis_color())
         } else {
             Style::default().fg(backend_color)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {pointer} "), style),
+            Span::styled(
+                if selected { " ▶ " } else { "   " },
+                if selected {
+                    theme::warning_bold()
+                } else {
+                    theme::muted()
+                },
+            ),
             Span::styled(
                 theme::pad_width(&truncate(&member.display_name, name_w), name_w),
                 style,
@@ -466,19 +682,60 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
         Span::styled(" (auto)", theme::muted()),
     ]));
     for (idx, field) in Field::ALL.iter().enumerate() {
-        let selected_field = idx == state.field;
+        let selected_field = state.field_mode && idx == state.field;
         let style = if selected_field {
-            theme::selection_cell()
+            theme::editor_field_focus()
         } else {
             theme::text()
         };
         lines.push(Line::from(Span::styled(
-            format!(" {:>10}: {}", field.label(), field_value(selected, *field)),
+            format!(
+                " {} {:>10}: {}",
+                if selected_field { "›" } else { " " },
+                field.label(),
+                field_value(selected, *field)
+            ),
             style,
         )));
     }
 
+    if let Some(picker) = &state.model_picker {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(" Model choices", theme::accent_bold()));
+        let (start, options) = picker.window(8);
+        if start > 0 {
+            lines.push(Line::styled("    …", theme::muted()));
+        }
+        for (offset, model) in options.iter().enumerate() {
+            let selected = start + offset == picker.selected();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "  › " } else { "    " },
+                    if selected {
+                        theme::editor_focus()
+                    } else {
+                        theme::muted()
+                    },
+                ),
+                Span::styled(
+                    model.as_deref().unwrap_or("default").to_string(),
+                    if selected {
+                        theme::emphasis()
+                    } else {
+                        theme::text()
+                    },
+                ),
+            ]));
+        }
+        if start + options.len() < picker.options().len() {
+            lines.push(Line::styled("    …", theme::muted()));
+        }
+    }
+
     lines.push(Line::raw(""));
+    if let Some(notice) = &state.notice {
+        lines.push(Line::from(Span::styled(notice.clone(), theme::warning())));
+    }
     if let Some(edit) = &state.editing {
         lines.push(Line::from(vec![
             Span::styled(
@@ -493,7 +750,11 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "↑/↓ member · ←/→ field · Enter edit/cycle · a add · d delete · s start · Esc quit",
+            if state.field_mode {
+                "↑/↓ field · Enter edit/cycle · e manual model · s start · Esc members"
+            } else {
+                "↑/↓ member · Enter fields · a add · d delete · s start · Esc quit"
+            },
             theme::muted_italic(),
         )));
     }
@@ -677,5 +938,86 @@ mod tests {
 
         assert_eq!(state.members[1].id, MemberId::new("builder-2"));
         assert_eq!(state.members[1].display_name, "Builder 2");
+    }
+
+    #[test]
+    fn enter_opens_fields_and_up_down_select_them() {
+        let available = [BackendKind::Codex, BackendKind::Claude];
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &available);
+
+        state.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_field(), Field::Name);
+
+        state.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(state.selected_field(), Field::Name);
+
+        state.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.field_mode);
+        assert!(state.editing.is_none());
+
+        state.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(state.selected_field(), Field::Backend);
+        assert_eq!(state.selected, 1);
+
+        state.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!state.field_mode);
+        assert!(!state.cancelled);
+    }
+
+    #[test]
+    fn grok_model_field_opens_picker_and_selects_choice() {
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &[BackendKind::Grok]);
+        state.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .unwrap();
+        state.model_catalog.seed(
+            BackendKind::Grok,
+            Path::new("/tmp/ws"),
+            vec!["grok-build".to_string(), "grok-4.5".to_string()],
+        );
+
+        state.activate_field();
+        assert!(state.model_picker.is_some());
+        state.handle_model_picker_key(KeyCode::Down);
+        state.handle_model_picker_key(KeyCode::Down);
+        state.handle_model_picker_key(KeyCode::Enter);
+        assert_eq!(state.members[0].model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn model_catalog_is_scoped_to_member_working_directory() {
+        let mut catalog = ModelCatalog::default();
+        catalog.seed(
+            BackendKind::Claude,
+            Path::new("/tmp/one"),
+            vec!["project-one".to_string()],
+        );
+        catalog.seed(
+            BackendKind::Claude,
+            Path::new("/tmp/two"),
+            vec!["project-two".to_string()],
+        );
+
+        let ModelChoices::Ready(one) = catalog.models(BackendKind::Claude, Path::new("/tmp/one"))
+        else {
+            panic!("expected first project model");
+        };
+        let ModelChoices::Ready(two) = catalog.models(BackendKind::Claude, Path::new("/tmp/two"))
+        else {
+            panic!("expected second project model");
+        };
+
+        assert_eq!(one, vec!["project-one"]);
+        assert_eq!(two, vec!["project-two"]);
+    }
+
+    #[test]
+    fn model_picker_preserves_a_current_custom_model() {
+        let picker = ModelPicker::new(Some("company-model"), vec!["sonnet".to_string()]);
+
+        assert_eq!(picker.value().as_deref(), Some("company-model"));
+        assert_eq!(picker.selected(), 1);
     }
 }

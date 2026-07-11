@@ -20,7 +20,9 @@ use crate::domain::event::{
     MemberStatus, MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
     WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus,
 };
-use crate::domain::team::{BackendKind, DefaultTarget, Effort, MemberId, TeamConfig, TeamMember};
+use crate::domain::team::{
+    BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig, TeamMember,
+};
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
 use crate::runtime::approval::risky_action_kind;
 use crate::runtime::session_registry::SessionRegistry;
@@ -90,8 +92,14 @@ struct MemberState {
     status: MemberStatus,
     queue: VecDeque<QueuedPrompt>,
     running: Option<RunningState>,
-    tools: HashMap<String, String>,
+    tools: HashMap<String, ActiveTool>,
     effort: Option<Effort>,
+}
+
+struct ActiveTool {
+    name: String,
+    summary: String,
+    detail: String,
 }
 
 impl MemberState {
@@ -730,7 +738,14 @@ impl TeamRuntime {
             AgentEvent::MessageCompleted(text) => self.complete_message(member, text, &mut step),
             AgentEvent::ToolStarted { id, name, summary } => {
                 if let Some(state) = self.members.get_mut(member) {
-                    state.tools.insert(id.clone(), name.clone());
+                    state.tools.insert(
+                        id.clone(),
+                        ActiveTool {
+                            name: name.clone(),
+                            summary: summary.clone(),
+                            detail: String::new(),
+                        },
+                    );
                 }
                 step.events.push(RuntimeEvent::ToolStarted {
                     member: member.clone(),
@@ -739,23 +754,48 @@ impl TeamRuntime {
                     summary,
                 });
             }
-            AgentEvent::ToolProgress { .. } => {}
-            AgentEvent::ToolCompleted { id, ok, summary } => {
-                let name = self
+            AgentEvent::ToolProgress { id, delta } => {
+                if let Some(tool) = self
                     .members
                     .get_mut(member)
-                    .and_then(|s| s.tools.remove(&id))
-                    .unwrap_or_else(|| "tool".to_string());
+                    .and_then(|state| state.tools.get_mut(&id))
+                {
+                    tool.detail.push_str(&delta);
+                }
+                step.events.push(RuntimeEvent::ToolProgress {
+                    member: member.clone(),
+                    tool_id: id,
+                    delta,
+                });
+            }
+            AgentEvent::ToolCompleted { id, ok, summary } => {
+                let tool = self
+                    .members
+                    .get_mut(member)
+                    .and_then(|state| state.tools.remove(&id));
+                let (name, input, mut output) = match tool {
+                    Some(tool) => (tool.name, tool.summary, tool.detail),
+                    None => ("tool".to_string(), String::new(), String::new()),
+                };
+                if !summary.is_empty()
+                    && summary.trim() != input.trim()
+                    && output.trim_end() != summary.trim()
+                {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(&summary);
+                }
                 if let Some(turn) = self.running_turn(member) {
                     let _ = self
                         .store
-                        .record_tool(turn, member, &name, &summary, Some(ok));
+                        .record_tool(turn, member, &name, &input, &output, Some(ok));
                 }
                 step.events.push(RuntimeEvent::ToolCompleted {
                     member: member.clone(),
                     tool_id: id,
                     ok,
-                    summary,
+                    output,
                 });
             }
             AgentEvent::FileChange { files, ok: _ } => {
@@ -1224,10 +1264,75 @@ impl TeamRuntime {
             return prompt;
         }
         let marker = format!("${ASTERLINE_TEAM_SKILL_NAME}");
+        let team_context = self.team_context_for(member);
         if prompt.contains(&marker) {
-            prompt
+            format!("{team_context}\n\n{prompt}")
         } else {
-            format!("{}\n\n{prompt}", team_skill_hint())
+            format!("{team_context}\n\n{}\n\n{prompt}", team_skill_hint())
+        }
+    }
+
+    fn team_context_for(&self, current: &TeamMember) -> String {
+        let mut lines = vec![
+            "Current Asterline team roster. Use member ids when routing teammate messages."
+                .to_string(),
+            format!("You are: {}", self.team_member_card(current)),
+            format!("Default target: {}", self.default_target_label()),
+            "Members:".to_string(),
+        ];
+        for member in &self.config.members {
+            lines.push(format!("- {}", self.team_member_card(member)));
+        }
+        lines.join("\n")
+    }
+
+    fn team_member_card(&self, member: &TeamMember) -> String {
+        let status = self
+            .members
+            .get(&member.id)
+            .map(|state| state.status)
+            .unwrap_or(MemberStatus::Idle);
+        let model = member.model.as_deref().unwrap_or("-");
+        let effort = member.effort.map(Effort::as_str).unwrap_or("-");
+        let permission = member
+            .permission_mode
+            .map(|mode| mode.claude_arg())
+            .unwrap_or("-");
+        let allowed_tools = if member.allowed_tools.is_empty() {
+            "-".to_string()
+        } else {
+            member.allowed_tools.join(",")
+        };
+        format!(
+            "id={} display_name={:?} backend={} role={:?} status={} model={} effort={} cwd={:?} sandbox={} permission_mode={} session_policy={} allowed_tools={}",
+            member.id,
+            member.display_name,
+            member.backend.as_str(),
+            member.role,
+            status.as_str(),
+            model,
+            effort,
+            member
+                .resolved_cwd(&self.config.workspace)
+                .display()
+                .to_string(),
+            member.sandbox.codex_arg(),
+            permission,
+            session_policy_label(member.session_policy),
+            allowed_tools,
+        )
+    }
+
+    fn default_target_label(&self) -> String {
+        match &self.config.default_target {
+            Some(DefaultTarget::All) => "all".to_string(),
+            Some(DefaultTarget::Member(id)) => id.to_string(),
+            None => self
+                .config
+                .members
+                .first()
+                .map(|member| member.id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
         }
     }
 
@@ -1331,6 +1436,13 @@ include!("team_runtime_workflow.inc.rs");
 
 fn relay_prompt(from_display: &str, body: &str) -> String {
     format!("[relay from {from_display}]\n{body}")
+}
+
+fn session_policy_label(policy: SessionPolicy) -> &'static str {
+    match policy {
+        SessionPolicy::Resume => "resume",
+        SessionPolicy::Fresh => "fresh",
+    }
 }
 
 fn strip_routing_prefix(prompt: &str) -> String {

@@ -86,6 +86,7 @@ fn parse_slash(rest: &str) -> Submission {
         "runs" | "run" => Submission::Drawer(Drawer::Runs),
         "logs" => Submission::Drawer(Drawer::Logs),
         "diff" => Submission::Drawer(Drawer::Diff),
+        "skill" | "skills" => Submission::Drawer(Drawer::Skills),
         "new" => Submission::Runtime(UiCommand::NewSession),
         "abort" => Submission::Runtime(UiCommand::Cancel { member: None }),
         "retry" => Submission::Runtime(UiCommand::Retry),
@@ -626,5 +627,11 @@ mod tests {
     #[test]
     fn new_session_command() {
         assert_eq!(parse("/new"), Submission::Runtime(UiCommand::NewSession));
+    }
+
+    #[test]
+    fn skills_command_opens_picker() {
+        assert_eq!(parse("/skills"), Submission::Drawer(Drawer::Skills));
+        assert_eq!(parse("/skill"), Submission::Drawer(Drawer::Skills));
     }
 }

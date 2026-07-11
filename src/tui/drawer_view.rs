@@ -53,6 +53,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
         Drawer::Runs => drawer_runs(state, content.width as usize),
         Drawer::Palette => drawer_palette(),
         Drawer::Diff => drawer_diff(state),
+        Drawer::Skills => drawer_skills(state),
         Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
     };
     // Clamp the scroll offset so content can't be pushed entirely off-screen.
@@ -87,6 +88,15 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             Drawer::Runs => {
                 "x details · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close"
             }
+            Drawer::Skills => "↑↓ choose · Enter/Tab use for next prompt · Esc close",
+            Drawer::Team
+                if state
+                    .team_editor()
+                    .is_some_and(|editor| editor.field_mode()) =>
+            {
+                "↑↓ field · Enter edit/cycle · Esc members"
+            }
+            Drawer::Team => "↑↓ member · Enter fields · Esc close",
             _ => "↑↓ scroll · Esc close",
         };
         frame.render_widget(
@@ -146,8 +156,8 @@ fn drawer_member_logs(state: &AppState, member_id: &MemberId) -> Vec<Line<'stati
 
 /// Build a table header line and its matching rule from column widths.
 fn table_header(cells: &[&str], widths: &[usize], tail: &str) -> (Line<'static>, Line<'static>) {
-    let mut text = String::from(" ");
-    let mut rule = String::from("─");
+    let mut text = String::new();
+    let mut rule = String::new();
     for (cell, width) in cells.iter().zip(widths) {
         text.push_str(&pad_width(cell, *width));
         text.push_str("│ ");
@@ -252,7 +262,11 @@ fn drawer_team_editor(
         ),
     ]));
     lines.push(Line::styled(
-        " ↑/↓ member · ←/→ field · Enter edit/cycle · a add · d delete · t target · * all · s apply · Esc close",
+        if editor.field_mode() {
+            " ↑/↓ field · Enter edit/cycle · e manual model · s apply · Esc members"
+        } else {
+            " ↑/↓ member · Enter fields · a add · d delete · t target · * all · s apply · Esc close"
+        },
         theme::muted(),
     ));
     lines.push(Line::styled(
@@ -264,7 +278,7 @@ fn drawer_team_editor(
     }
     lines.push(Line::raw(""));
     let (header, rule) = table_header(
-        &["  Member", "Backend", "Role", "Model", "Target"],
+        &["   Member", "Backend", "Role", "Model", "Target"],
         &EDITOR_COLUMNS,
         "Status",
     );
@@ -273,21 +287,12 @@ fn drawer_team_editor(
 
     for (idx, member) in editor.members().iter().enumerate() {
         let selected = idx == editor.selected();
-        let selected_field = editor.selected_field();
         let color = theme::backend_color(member.backend);
         let row_style = if selected {
-            theme::selection()
+            theme::bold(theme::emphasis_color())
         } else {
             Style::default().fg(color)
         };
-        let cell_style = |field: Field, default_style: Style| {
-            if selected && selected_field == field {
-                theme::selection_cell()
-            } else {
-                default_style
-            }
-        };
-        let marker = if selected { "›" } else { " " };
         let model = member.model.as_deref().unwrap_or("default");
         let target = editor.default_marker(member);
         let status = state
@@ -298,35 +303,38 @@ fn drawer_team_editor(
             .unwrap_or("new");
         let sep = Span::styled("│ ", theme::muted());
         lines.push(Line::from(vec![
+            Span::raw(" "),
             Span::styled(
-                format!(
-                    " {marker} {}",
-                    pad_width(&member.display_name, EDITOR_COLUMNS[0] - 3)
-                ),
-                cell_style(Field::Name, row_style),
+                if selected { "▶ " } else { "  " },
+                if selected {
+                    theme::warning_bold()
+                } else {
+                    theme::muted()
+                },
+            ),
+            Span::styled(
+                pad_width(&member.display_name, EDITOR_COLUMNS[0] - 3),
+                row_style,
             ),
             sep.clone(),
             Span::styled(
                 pad_width(member.backend.as_str(), EDITOR_COLUMNS[1]),
-                cell_style(Field::Backend, row_style),
+                row_style,
             ),
             sep.clone(),
-            Span::styled(
-                pad_width(&member.role, EDITOR_COLUMNS[2]),
-                cell_style(Field::Role, row_style),
-            ),
+            Span::styled(pad_width(&member.role, EDITOR_COLUMNS[2]), row_style),
             sep.clone(),
-            Span::styled(
-                pad_width(model, EDITOR_COLUMNS[3]),
-                cell_style(Field::Model, row_style),
-            ),
-            sep,
+            Span::styled(pad_width(model, EDITOR_COLUMNS[3]), row_style),
+            sep.clone(),
             Span::styled(pad_width(target, EDITOR_COLUMNS[4]), row_style),
-            Span::styled(format!(" {status}"), theme::muted()),
+            sep,
+            Span::styled(status.to_string(), theme::muted()),
         ]));
     }
 
-    if let Some(member) = editor.selected_member() {
+    if editor.model_picker().is_none()
+        && let Some(member) = editor.selected_member()
+    {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             " Selected member fields",
@@ -338,16 +346,54 @@ fn drawer_team_editor(
             Span::styled(" (auto)", theme::muted()),
         ]));
         for (idx, field) in Field::ALL.iter().enumerate() {
-            let selected = idx == editor.field_index();
+            let selected = editor.field_mode() && idx == editor.field_index();
             let style = if selected {
-                theme::selection_cell()
+                theme::editor_field_focus()
             } else {
                 theme::text()
             };
             lines.push(Line::from(Span::styled(
-                format!(" {:>10}: {}", field.label(), field_value(member, *field)),
+                format!(
+                    " {} {:>10}: {}",
+                    if selected { "›" } else { " " },
+                    field.label(),
+                    field_value(member, *field)
+                ),
                 style,
             )));
+        }
+    }
+
+    if let Some(picker) = editor.model_picker() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(" Model choices", theme::accent_bold()));
+        let (start, options) = picker.window(8);
+        if start > 0 {
+            lines.push(Line::styled("    …", theme::muted()));
+        }
+        for (offset, model) in options.iter().enumerate() {
+            let selected = start + offset == picker.selected();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "  › " } else { "    " },
+                    if selected {
+                        theme::editor_focus()
+                    } else {
+                        theme::muted()
+                    },
+                ),
+                Span::styled(
+                    model.as_deref().unwrap_or("default").to_string(),
+                    if selected {
+                        theme::emphasis()
+                    } else {
+                        theme::text()
+                    },
+                ),
+            ]));
+        }
+        if start + options.len() < picker.options().len() {
+            lines.push(Line::styled("    …", theme::muted()));
         }
     }
 
@@ -379,7 +425,7 @@ fn drawer_team_editor(
 fn drawer_palette() -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            " Messages require @member, @all, /ask, or /all. Bare drafts are kept.",
+            " Start with @member, @all, /ask, or /all; later bare messages reuse the last target.",
             theme::muted(),
         ),
         Line::raw(""),
@@ -415,6 +461,7 @@ fn drawer_palette() -> Vec<Line<'static>> {
         ),
         ("/logs", "Open raw log stream, stderr, and warnings"),
         ("/diff", "Show the working-tree git diff"),
+        ("/skills", "Choose a local skill for the next prompt"),
         ("/retry", "Resume paused routes or re-run the last turn"),
         ("/abort", "Cancel running members and active verification"),
         (
@@ -429,6 +476,49 @@ fn drawer_palette() -> Vec<Line<'static>> {
             Span::styled(format!("  {:<24} ", cmd), theme::accent_bold()),
             Span::styled(format!(" {desc}"), theme::text()),
         ]));
+    }
+    lines
+}
+
+fn drawer_skills(state: &AppState) -> Vec<Line<'static>> {
+    if state.skills().is_empty() {
+        return vec![Line::styled(
+            " No SKILL.md files found in workspace or user skill directories.",
+            theme::muted(),
+        )];
+    }
+    let mut lines = vec![Line::styled(
+        " Select a skill; Asterline stages a targeted draft for one request.",
+        theme::muted(),
+    )];
+    lines.push(Line::raw(""));
+    for (idx, skill) in state.skills().iter().enumerate() {
+        let selected = idx == state.selected_skill();
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " › " } else { "   " },
+                if selected {
+                    theme::editor_focus()
+                } else {
+                    theme::muted()
+                },
+            ),
+            Span::styled(
+                skill.name.clone(),
+                if selected {
+                    theme::accent_bold()
+                } else {
+                    theme::emphasis()
+                },
+            ),
+            Span::styled(format!("  {}", skill.description), theme::text()),
+        ]));
+        if selected {
+            lines.push(Line::styled(
+                format!("     {}", skill.path.display()),
+                theme::muted(),
+            ));
+        }
     }
     lines
 }
@@ -470,12 +560,12 @@ fn drawer_diff(state: &AppState) -> Vec<Line<'static>> {
         {
             out.push(Line::styled(line.to_string(), theme::warning_bold()));
         } else if let Some(rest) = line.strip_prefix('+') {
-            out.push(diff_code_line('+', theme::SUCCESS, rest, &ext));
+            out.push(diff_code_line('+', theme::success_color(), rest, &ext));
         } else if let Some(rest) = line.strip_prefix('-') {
-            out.push(diff_code_line('-', theme::ERROR, rest, &ext));
+            out.push(diff_code_line('-', theme::error_color(), rest, &ext));
         } else {
             let rest = line.strip_prefix(' ').unwrap_or(line);
-            out.push(diff_code_line(' ', theme::MUTED, rest, &ext));
+            out.push(diff_code_line(' ', theme::muted_color(), rest, &ext));
         }
     }
     out
@@ -529,4 +619,150 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
+    use crate::domain::team::{
+        BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
+    };
+    use crate::tui::skills::SkillInfo;
+    use std::path::PathBuf;
+
+    fn ready_state() -> AppState {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: Vec::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "implementation".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+                cwd: "/tmp/ws".to_string(),
+                model: None,
+                effort: None,
+                sandbox: SandboxPolicy::WorkspaceWrite,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
+            }],
+        });
+        state
+    }
+
+    #[test]
+    fn team_editor_shows_field_focus_only_after_enter() {
+        let mut state = ready_state();
+        state.toggle_drawer(Drawer::Team);
+
+        let lines = drawer_team(&state);
+        let marker = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "▶ ")
+            .expect("selected member marker");
+        let builder = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.trim() == "Builder")
+            .expect("selected member row");
+
+        assert_eq!(marker.style.fg, Some(theme::warning_color()));
+        assert_eq!(builder.style.bg, None);
+        assert_eq!(builder.style.fg, Some(theme::emphasis_color()));
+
+        state.handle_team_editor_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let lines = drawer_team(&state);
+        let builder = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.trim() == "Builder")
+            .expect("selected member row while a field is focused");
+        let selected_field = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.starts_with(" ›") && span.content.contains("name:"))
+            .expect("focused field in the details list");
+
+        assert_eq!(builder.style.bg, None);
+        assert_eq!(builder.style.fg, Some(theme::emphasis_color()));
+        assert_eq!(selected_field.style.fg, Some(theme::warning_color()));
+        assert!(
+            !builder
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn team_editor_header_rule_and_rows_share_column_boundaries() {
+        let mut state = ready_state();
+        state.toggle_drawer(Drawer::Team);
+        let lines = drawer_team(&state);
+        let text = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let header = lines
+            .iter()
+            .map(&text)
+            .find(|line| line.contains("Member") && line.contains("Backend"))
+            .expect("team table header");
+        let rule = lines
+            .iter()
+            .map(&text)
+            .find(|line| line.contains('┼'))
+            .expect("team table rule");
+        let row = lines
+            .iter()
+            .map(&text)
+            .find(|line| line.contains("Builder") && line.contains("codex"))
+            .expect("team table row");
+        let positions = |line: &str, separator: char| {
+            line.match_indices(separator)
+                .map(|(byte, _)| theme::display_width(&line[..byte]))
+                .collect::<Vec<_>>()
+        };
+
+        let expected = vec![17, 28, 45, 62, 71];
+        assert_eq!(positions(&header, '│'), expected);
+        assert_eq!(positions(&rule, '┼'), expected);
+        assert_eq!(positions(&row, '│'), expected);
+    }
+
+    #[test]
+    fn skills_drawer_marks_selection_without_background_fill() {
+        let mut state = ready_state();
+        state.set_skills(vec![SkillInfo {
+            name: "review".to_string(),
+            description: "Review a patch".to_string(),
+            path: PathBuf::from("/tmp/review/SKILL.md"),
+        }]);
+
+        let lines = drawer_skills(&state);
+        let selected = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "review")
+            .expect("selected skill");
+
+        assert_eq!(selected.style.bg, None);
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("/tmp/review/SKILL.md"))
+        }));
+    }
 }

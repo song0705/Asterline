@@ -14,6 +14,7 @@ use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, SandboxPolicy, TeamMember};
 
 const TOOL_SUMMARY_MAX: usize = 160;
+const TOOL_OUTPUT_MAX: usize = 4000;
 
 #[derive(Clone, Debug)]
 pub struct CodexStreamAdapter {
@@ -135,10 +136,21 @@ impl CodexLineParser {
                     Phase::Completed => {
                         let exit_ok =
                             item.get("exit_code").and_then(Value::as_i64).unwrap_or(0) == 0;
+                        let mut output = summarize(
+                            str_field(item, "aggregated_output").unwrap_or_default(),
+                            TOOL_OUTPUT_MAX,
+                        );
+                        if output.is_empty() && (!exit_ok || status != "completed") {
+                            output = item
+                                .get("exit_code")
+                                .and_then(Value::as_i64)
+                                .map(|code| format!("command failed with exit code {code}"))
+                                .unwrap_or_else(|| "command failed".to_string());
+                        }
                         vec![AgentEvent::ToolCompleted {
                             id,
                             ok: status == "completed" && exit_ok,
-                            summary,
+                            summary: output,
                         }]
                     }
                 }
@@ -165,7 +177,11 @@ impl CodexLineParser {
                     Phase::Completed => vec![AgentEvent::ToolCompleted {
                         id,
                         ok: status == "completed",
-                        summary: name,
+                        summary: item
+                            .get("result")
+                            .map(|result| summarize(&result.to_string(), TOOL_OUTPUT_MAX))
+                            .filter(|result| !result.is_empty())
+                            .unwrap_or(name),
                     }],
                 }
             }
@@ -357,7 +373,7 @@ mod tests {
                 AgentEvent::ToolCompleted {
                     id: "c1".to_string(),
                     ok: true,
-                    summary: "cargo test".to_string(),
+                    summary: "ok".to_string(),
                 },
             ]
         );

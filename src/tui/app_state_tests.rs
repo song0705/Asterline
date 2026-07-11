@@ -404,7 +404,7 @@ fn tool_completion_updates_existing_cell() {
         member: builder,
         tool_id: "t1".to_string(),
         ok: true,
-        summary: "cargo test".to_string(),
+        output: "all tests passed".to_string(),
     });
     // One tool cell, now marked ok.
     let tools: Vec<_> = state
@@ -413,7 +413,48 @@ fn tool_completion_updates_existing_cell() {
         .filter(|i| matches!(i, ChatItem::Tool { .. }))
         .collect();
     assert_eq!(tools.len(), 1);
-    assert!(matches!(tools[0], ChatItem::Tool { ok: Some(true), .. }));
+    assert!(matches!(
+        tools[0],
+        ChatItem::Tool {
+            ok: Some(true),
+            summary,
+            detail,
+            ..
+        } if summary == "cargo test" && detail == "all tests passed"
+    ));
+}
+
+#[test]
+fn skill_picker_stages_one_shot_targeted_prompt() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.set_skills(vec![crate::tui::skills::SkillInfo {
+        name: "review".to_string(),
+        description: "Review changes".to_string(),
+        path: PathBuf::from("/tmp/review/SKILL.md"),
+    }]);
+    state.toggle_drawer(Drawer::Skills);
+
+    assert!(state.stage_selected_skill());
+    assert_eq!(state.composer().text(), "@builder $review ");
+    assert_eq!(state.drawer(), None);
+}
+
+#[test]
+fn skill_invocation_matches_backend_native_syntax() {
+    let skill = crate::tui::skills::SkillInfo {
+        name: "review".to_string(),
+        description: String::new(),
+        path: PathBuf::from("/tmp/review/SKILL.md"),
+    };
+
+    assert_eq!(skill_invocation(BackendKind::Codex, &skill), "$review");
+    assert_eq!(skill_invocation(BackendKind::Claude, &skill), "/review");
+    for backend in [BackendKind::Grok, BackendKind::Agy] {
+        let invocation = skill_invocation(backend, &skill);
+        assert!(invocation.contains("review"));
+        assert!(invocation.contains("/tmp/review/SKILL.md"));
+    }
 }
 
 #[test]

@@ -33,6 +33,11 @@ impl AttachRequest {
                 vec!["--resume".to_string(), session.clone()],
             ),
             (BackendKind::Claude, None) => ("claude".to_string(), Vec::new()),
+            (BackendKind::Grok, Some(session)) => (
+                "grok".to_string(),
+                vec!["--resume".to_string(), session.clone()],
+            ),
+            (BackendKind::Grok, None) => ("grok".to_string(), Vec::new()),
             (BackendKind::Agy, Some(session)) => (
                 "agy".to_string(),
                 vec!["--conversation".to_string(), session.clone()],
@@ -108,6 +113,24 @@ mod tests {
             (
                 "agy".to_string(),
                 vec!["--conversation".to_string(), "sess-9".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn grok_uses_resume_flag() {
+        let req = AttachRequest {
+            member: MemberId::new("grok"),
+            display_name: "Grok".to_string(),
+            backend: BackendKind::Grok,
+            session: Some("sess-9".to_string()),
+            cwd: "/tmp/ws".to_string(),
+        };
+        assert_eq!(
+            req.command(),
+            (
+                "grok".to_string(),
+                vec!["--resume".to_string(), "sess-9".to_string()]
             )
         );
     }

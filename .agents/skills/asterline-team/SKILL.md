@@ -31,7 +31,7 @@ Required fields: `display_name`, `backend`, `role`.
 Optional fields: `id`, `model`, `effort`, `cwd`, `sandbox`, `permission_mode`, `allowed_tools`, `session_policy`, `system_prompt`.
 
 Rules:
-- `backend` must be `codex`, `claude`, or `agy`.
+- `backend` must be `codex`, `claude`, `grok`, or `agy`.
 - `effort` may be `low`, `medium`, `high`, `xhigh`, or `max`.
 - Only adding is supported; do not request deletes or overwrites.
 - Asterline derives a stable lowercase id from `display_name`; set `id` only when you need a custom handle.

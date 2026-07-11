@@ -8,8 +8,9 @@ use crate::domain::config::default_member;
 use crate::domain::event::UiCommand;
 use crate::domain::team::{BackendKind, DefaultTarget, MemberId, TeamConfig, TeamMember};
 use crate::tui::team_builder::{
-    EditState, Field, cycle_backend, cycle_effort, cycle_permission, cycle_sandbox, field_value,
-    normalize_member_id, unique_display_name, unique_display_name_except, unique_member_id,
+    EditState, Field, ModelCatalog, ModelChoices, ModelPicker, cycle_backend, cycle_effort,
+    cycle_permission, cycle_sandbox, field_value, normalize_member_id, unique_display_name,
+    unique_display_name_except, unique_member_id,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -19,7 +20,7 @@ pub(crate) enum TeamEditorOutcome {
     Close,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct TeamEditor {
     team: String,
     workspace: PathBuf,
@@ -28,7 +29,10 @@ pub(crate) struct TeamEditor {
     available: Vec<BackendKind>,
     selected: usize,
     field: usize,
+    field_mode: bool,
     editing: Option<EditState>,
+    model_catalog: ModelCatalog,
+    model_picker: Option<ModelPicker>,
     dirty: bool,
     notice: Option<String>,
 }
@@ -45,10 +49,18 @@ impl TeamEditor {
             workspace: workspace.into(),
             default_target,
             members,
-            available: vec![BackendKind::Codex, BackendKind::Claude, BackendKind::Agy],
+            available: vec![
+                BackendKind::Codex,
+                BackendKind::Claude,
+                BackendKind::Grok,
+                BackendKind::Agy,
+            ],
             selected: 0,
             field: 0,
+            field_mode: false,
             editing: None,
+            model_catalog: ModelCatalog::default(),
+            model_picker: None,
             dirty: false,
             notice: None,
         }
@@ -66,6 +78,10 @@ impl TeamEditor {
         self.field
     }
 
+    pub(crate) fn field_mode(&self) -> bool {
+        self.field_mode
+    }
+
     pub(crate) fn editing(&self) -> Option<&EditState> {
         self.editing.as_ref()
     }
@@ -76,6 +92,10 @@ impl TeamEditor {
 
     pub(crate) fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
+        self.model_picker.as_ref()
     }
 
     pub(crate) fn default_label(&self) -> String {
@@ -107,6 +127,10 @@ impl TeamEditor {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> TeamEditorOutcome {
+        if self.model_picker.is_some() {
+            self.handle_model_picker_key(code);
+            return TeamEditorOutcome::Consumed(None);
+        }
         if self.editing.is_some() {
             self.handle_edit_key(code, modifiers);
             return TeamEditorOutcome::Consumed(None);
@@ -115,42 +139,43 @@ impl TeamEditor {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Char('c') if ctrl => TeamEditorOutcome::Close,
+            KeyCode::Esc if self.field_mode => {
+                self.field_mode = false;
+                TeamEditorOutcome::Consumed(None)
+            }
             KeyCode::Esc | KeyCode::Char('q') => TeamEditorOutcome::Close,
             KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
+                if self.field_mode {
+                    self.prev_field();
+                } else {
+                    self.selected = self.selected.saturating_sub(1);
+                }
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.members.len() {
+                if self.field_mode {
+                    self.next_field();
+                } else if self.selected + 1 < self.members.len() {
                     self.selected += 1;
                 }
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Left => {
-                self.prev_field();
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Right | KeyCode::Tab => {
-                self.next_field();
-                TeamEditorOutcome::Consumed(None)
-            }
-            KeyCode::BackTab => {
-                self.prev_field();
-                TeamEditorOutcome::Consumed(None)
-            }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !self.field_mode => {
                 self.add_member();
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if !self.field_mode => {
                 self.delete_member();
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Char('t') => {
+            KeyCode::Char('t') if !self.field_mode => {
                 self.set_default_to_selected();
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Char('*') => {
+            KeyCode::Char('*') if !self.field_mode => {
                 self.default_target = Some(DefaultTarget::All);
                 self.dirty = true;
                 self.notice =
@@ -162,12 +187,46 @@ impl TeamEditor {
                 self.notice = Some("discard changes by closing and reopening /team".to_string());
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Enter => {
+            KeyCode::Char('e') if self.field_mode && self.selected_field() == Field::Model => {
+                self.edit_selected_field();
+                TeamEditorOutcome::Consumed(None)
+            }
+            KeyCode::Enter if self.field_mode => {
                 self.activate_field();
+                TeamEditorOutcome::Consumed(None)
+            }
+            KeyCode::Enter => {
+                self.field_mode = true;
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Backspace | KeyCode::Char(_) => TeamEditorOutcome::Consumed(None),
             _ => TeamEditorOutcome::Ignored,
+        }
+    }
+
+    fn handle_model_picker_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.up();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.down();
+                }
+            }
+            KeyCode::Enter => {
+                let value = self.model_picker.as_ref().and_then(ModelPicker::value);
+                if let Some(member) = self.selected_member_mut() {
+                    member.model = value;
+                }
+                self.model_picker = None;
+                self.dirty = true;
+                self.notice = Some("model selected · press s to apply".to_string());
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            _ => {}
         }
     }
 
@@ -251,16 +310,45 @@ impl TeamEditor {
 
     fn activate_field(&mut self) {
         let field = self.selected_field();
-        if field.is_text() {
-            let Some(member) = self.selected_member() else {
-                return;
-            };
-            self.editing = Some(EditState {
-                field,
-                buffer: field_value(member, field),
-            });
+        if field == Field::Model {
+            self.cycle_model();
+        } else if field.is_text() {
+            self.edit_selected_field();
         } else {
             self.cycle_field(field);
+        }
+    }
+
+    fn edit_selected_field(&mut self) {
+        let field = self.selected_field();
+        let Some(member) = self.selected_member() else {
+            return;
+        };
+        self.editing = Some(EditState {
+            field,
+            buffer: field_value(member, field),
+        });
+    }
+
+    fn cycle_model(&mut self) {
+        let Some(member) = self.selected_member() else {
+            return;
+        };
+        let backend = member.backend;
+        let current = member.model.clone();
+        let cwd = member.resolved_cwd(&self.workspace);
+        match self.model_catalog.models(backend, &cwd) {
+            ModelChoices::Loading => {
+                self.notice = Some(format!(
+                    "loading {} models in the background · press Enter again shortly",
+                    backend.as_str()
+                ));
+            }
+            ModelChoices::Ready(models) => {
+                self.model_picker = Some(ModelPicker::new(current.as_deref(), models));
+                self.notice = Some("↑/↓ choose model · Enter select · Esc cancel".to_string());
+            }
+            ModelChoices::Failed(err) => self.notice = Some(err),
         }
     }
 
@@ -470,21 +558,41 @@ mod tests {
     }
 
     #[test]
-    fn left_and_right_arrows_select_member_fields() {
+    fn enter_opens_fields_and_up_down_select_them() {
         let mut editor = editor();
+        editor.add_member();
+        editor.selected = 0;
+        assert!(!editor.field_mode());
+        assert_eq!(editor.selected_field(), Field::Name);
+
+        let down_member = editor.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(down_member, TeamEditorOutcome::Consumed(None));
+        assert_eq!(editor.selected(), 1);
         assert_eq!(editor.selected_field(), Field::Name);
 
         let right = editor.handle_key(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(right, TeamEditorOutcome::Consumed(None));
-        assert_eq!(editor.selected_field(), Field::Backend);
-
-        let left = editor.handle_key(KeyCode::Left, KeyModifiers::NONE);
-        assert_eq!(left, TeamEditorOutcome::Consumed(None));
         assert_eq!(editor.selected_field(), Field::Name);
 
-        let wrap = editor.handle_key(KeyCode::Left, KeyModifiers::NONE);
-        assert_eq!(wrap, TeamEditorOutcome::Consumed(None));
-        assert_eq!(editor.selected_field(), Field::Cwd);
+        let enter = editor.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(enter, TeamEditorOutcome::Consumed(None));
+        assert!(editor.field_mode());
+        assert!(editor.editing().is_none());
+
+        editor.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(editor.selected_field(), Field::Backend);
+        assert_eq!(editor.selected(), 1);
+
+        editor.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(editor.selected_field(), Field::Name);
+
+        let back_to_members = editor.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(back_to_members, TeamEditorOutcome::Consumed(None));
+        assert!(!editor.field_mode());
+        assert_eq!(
+            editor.handle_key(KeyCode::Esc, KeyModifiers::NONE),
+            TeamEditorOutcome::Close
+        );
     }
 
     #[test]
@@ -503,5 +611,56 @@ mod tests {
             default_target,
             Some(DefaultTarget::Member(MemberId::new("builder")))
         );
+    }
+
+    #[test]
+    fn grok_model_field_uses_visible_picker() {
+        let mut editor = TeamEditor::new(
+            "t",
+            "/tmp/ws",
+            None,
+            vec![TeamMember::new(
+                "grok",
+                "Grok",
+                BackendKind::Grok,
+                "implementation",
+            )],
+        );
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .unwrap();
+        editor.model_catalog.seed(
+            BackendKind::Grok,
+            Path::new("/tmp/ws"),
+            vec!["grok-build".to_string()],
+        );
+
+        editor.activate_field();
+        assert!(editor.model_picker().is_some());
+        editor.handle_model_picker_key(KeyCode::Down);
+        editor.handle_model_picker_key(KeyCode::Enter);
+        assert_eq!(editor.members[0].model.as_deref(), Some("grok-build"));
+    }
+
+    #[test]
+    fn codex_model_field_uses_discovered_catalog() {
+        let mut editor = editor();
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .unwrap();
+
+        editor.model_catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-5.6-sol".to_string()],
+        );
+
+        editor.activate_field();
+        editor.handle_model_picker_key(KeyCode::Down);
+        editor.handle_model_picker_key(KeyCode::Enter);
+
+        assert_eq!(editor.members[0].model.as_deref(), Some("gpt-5.6-sol"));
     }
 }

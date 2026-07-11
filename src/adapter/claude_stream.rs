@@ -13,7 +13,7 @@ use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, TeamMember};
 
-const TOOL_SUMMARY_MAX: usize = 160;
+const TOOL_OUTPUT_MAX: usize = 4000;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeStreamAdapter {
@@ -172,7 +172,7 @@ impl ClaudeLineParser {
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let summary = summarize(&content_to_string(&block["content"]), TOOL_SUMMARY_MAX);
+                let summary = summarize(&content_to_string(&block["content"]), TOOL_OUTPUT_MAX);
                 out.push(AgentEvent::ToolCompleted {
                     id,
                     ok: !is_error,

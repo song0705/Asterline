@@ -1,4 +1,4 @@
-//! Opt-in smoke tests against the real `codex` / `claude` / `agy` CLIs. They exercise
+//! Opt-in smoke tests against the real `codex` / `claude` / `grok` / `agy` CLIs. They exercise
 //! the full adapter -> process -> parser path (no TUI) with one trivial turn.
 //!
 //! These are `#[ignore]`d because they call local CLIs and may consume usage.
@@ -7,6 +7,7 @@
 //! ```bash
 //! ASTERLINE_SMOKE_CODEX=1  cargo test --test real_smoke real_codex_smoke  -- --ignored --nocapture
 //! ASTERLINE_SMOKE_CLAUDE=1 cargo test --test real_smoke real_claude_smoke -- --ignored --nocapture
+//! ASTERLINE_SMOKE_GROK=1   cargo test --test real_smoke real_grok_smoke   -- --ignored --nocapture
 //! ASTERLINE_SMOKE_AGY=1    cargo test --test real_smoke real_agy_smoke    -- --ignored --nocapture
 //! ```
 
@@ -149,6 +150,18 @@ fn real_claude_smoke() {
     let member = TeamMember::new("claude", "Claude", BackendKind::Claude, "smoke");
     let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
     assert_healthy_turn("claude", &events);
+}
+
+#[test]
+#[ignore = "calls the real grok CLI; opt in with ASTERLINE_SMOKE_GROK=1"]
+fn real_grok_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_GROK").as_deref() != Ok("1") {
+        return;
+    }
+    let member = TeamMember::new("grok", "Grok", BackendKind::Grok, "smoke");
+    let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
+    assert_healthy_turn("grok", &events);
+    assert_completed_contains("grok", &events, "ASTERLINE_OK");
 }
 
 #[test]

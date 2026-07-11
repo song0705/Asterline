@@ -100,12 +100,13 @@ fn should_rewrite_migrated_config(path: &Path) -> bool {
 pub struct DetectedBackends {
     pub codex: bool,
     pub claude: bool,
+    pub grok: bool,
     pub agy: bool,
 }
 
 impl DetectedBackends {
     pub fn any(self) -> bool {
-        self.codex || self.claude || self.agy
+        self.codex || self.claude || self.grok || self.agy
     }
 }
 
@@ -119,6 +120,7 @@ pub fn detect_backends() -> DetectedBackends {
     DetectedBackends {
         codex: binary_in_dirs(&dirs, "codex"),
         claude: binary_in_dirs(&dirs, "claude"),
+        grok: binary_in_dirs(&dirs, "grok"),
         agy: binary_in_dirs(&dirs, "agy"),
     }
 }
@@ -158,6 +160,12 @@ pub fn default_team(
             let claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "general");
             Some(TeamConfig::new("default-claude", workspace).with_member(claude))
         }
+        (false, false) if detected.grok => {
+            let mut grok = TeamMember::new("grok", "Grok", BackendKind::Grok, "general");
+            grok.sandbox = SandboxPolicy::WorkspaceWrite;
+            grok.permission_mode = Some(PermissionMode::Auto);
+            Some(TeamConfig::new("default-grok", workspace).with_member(grok))
+        }
         (false, false) if detected.agy => {
             let agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "general");
             Some(TeamConfig::new("default-agy", workspace).with_member(agy))
@@ -178,6 +186,12 @@ pub fn default_member(backend: BackendKind) -> TeamMember {
         BackendKind::Claude => {
             let mut m = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
             m.permission_mode = Some(PermissionMode::Plan);
+            m
+        }
+        BackendKind::Grok => {
+            let mut m = TeamMember::new("grok", "Grok", BackendKind::Grok, "implementation");
+            m.sandbox = SandboxPolicy::WorkspaceWrite;
+            m.permission_mode = Some(PermissionMode::Auto);
             m
         }
         BackendKind::Agy => {
@@ -293,6 +307,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: true,
             claude: true,
+            grok: false,
             agy: false,
         };
         let config = default_team("/tmp/ws", detected).expect("mixed team");
@@ -309,6 +324,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: true,
             claude: false,
+            grok: false,
             agy: false,
         };
         let config = default_team("/tmp/ws", detected).expect("codex team");
@@ -322,6 +338,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: true,
+            grok: false,
             agy: false,
         };
         let config = default_team("/tmp/ws", detected).expect("claude team");
@@ -335,6 +352,7 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: false,
+            grok: false,
             agy: false,
         };
         assert!(default_team("/tmp/ws", detected).is_none());
@@ -345,11 +363,30 @@ mod tests {
         let detected = DetectedBackends {
             codex: false,
             claude: false,
+            grok: false,
             agy: true,
         };
         let config = default_team("/tmp/ws", detected).expect("agy team");
         assert_eq!(config.members.len(), 1);
         assert_eq!(config.members[0].backend, BackendKind::Agy);
+    }
+
+    #[test]
+    fn grok_only_default_team_is_single_grok() {
+        let detected = DetectedBackends {
+            codex: false,
+            claude: false,
+            grok: true,
+            agy: false,
+        };
+        let config = default_team("/tmp/ws", detected).expect("grok team");
+        assert_eq!(config.members.len(), 1);
+        assert_eq!(config.members[0].backend, BackendKind::Grok);
+        assert_eq!(config.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(
+            config.members[0].permission_mode,
+            Some(PermissionMode::Auto)
+        );
     }
 
     #[test]
@@ -383,6 +420,7 @@ mod tests {
     fn default_member_maps_backend_to_role() {
         assert_eq!(default_member(BackendKind::Codex).role, "implementation");
         assert_eq!(default_member(BackendKind::Claude).role, "review");
+        assert_eq!(default_member(BackendKind::Grok).backend, BackendKind::Grok);
         assert_eq!(default_member(BackendKind::Agy).backend, BackendKind::Agy);
     }
 
@@ -440,6 +478,7 @@ mod tests {
             DetectedBackends {
                 codex: true,
                 claude: true,
+                grok: false,
                 agy: false,
             },
         )
