@@ -486,10 +486,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pty_command_times_out_and_returns_partial_output() {
-        let error = CliPtyAdapter::new("/bin/sh", "/tmp")
+        let mut session = CliPtyAdapter::new("/bin/sh", "/tmp")
             .with_args(["-lc", "printf 'before-sleep\\n'; sleep 2"])
-            .with_timeout(Duration::from_millis(50))
-            .run_to_exit()
+            .spawn_session()
+            .expect("PTY session should start");
+
+        wait_for_buffered_session_output(&session, "before-sleep");
+        let error = session
+            .wait_for_exit(Duration::from_millis(50))
             .expect_err("PTY command should time out");
 
         assert!(matches!(
@@ -562,6 +566,25 @@ mod tests {
             }
             if started.elapsed() > Duration::from_secs(1) {
                 panic!("session output did not contain {needle:?}; output was {output:?}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_buffered_session_output(session: &CliPtySession, needle: &str) {
+        let started = Instant::now();
+
+        loop {
+            let contains_needle = {
+                let output = session.output.lock().expect("session output should lock");
+                String::from_utf8_lossy(&output.bytes).contains(needle)
+            };
+            if contains_needle {
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(1) {
+                panic!("session output did not contain {needle:?} before timeout testing");
             }
             thread::sleep(Duration::from_millis(10));
         }
