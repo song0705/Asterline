@@ -3,6 +3,13 @@ name = "asterline"
 version = "0.1.0"
 edition = "2024"
 default-run = "asterline"
+description = "Local-first terminal workspace for coordinating coding agents"
+license = "MIT"
+repository = "https://github.com/song0705/Asterline"
+homepage = "https://github.com/song0705/Asterline"
+readme = "README.md"
+keywords = ["ai", "cli", "multi-agent", "terminal", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 crossterm = "0.29"

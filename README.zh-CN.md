@@ -17,14 +17,24 @@ Asterline 直接运行你电脑上已经安装的官方 CLI。它不是模型网
 
 ### 环境要求
 
-- Rust 1.85 或更高版本
+- 从源码构建时需要 Rust 1.85 或更高版本
 - 支持颜色和备用屏幕的终端
 - 至少安装并登录一个 CLI：`codex`、`claude`、`grok` 或 `agy`
 - 推荐安装 Git，以便查看差异和运行验证流程
 
 ### 安装并启动
 
-克隆本仓库后执行：
+从 [GitHub Releases](https://github.com/song0705/Asterline/releases/latest)
+下载对应平台的压缩包，解压后安装其中任意一个命令：
+
+```bash
+install -m 755 ast ~/.local/bin/ast
+```
+
+Release 提供 Linux x86-64、Linux ARM64、macOS Intel 和 macOS Apple silicon
+四种构建，并附带 `SHA256SUMS` 与 GitHub 签名的构建来源证明。
+
+如果希望从源码安装，克隆本仓库后执行：
 
 ```bash
 cargo install --path . --force
@@ -263,6 +273,12 @@ src/
 
 ## 项目状态
 
-Asterline 当前版本为 `0.1.0`，仍在积极开发。当前通过源码安装，尚未发布预编译版本
-和正式支持平台矩阵。配置与持久化数据会尽可能迁移，但在稳定版之前，命令和界面
-细节仍可能变化。
+Asterline 当前版本为 `0.1.0`，仍在积极开发。带版本标签的提交会通过 GitHub
+Actions 自动发布 Linux 和 macOS 预编译包。配置与持久化数据会尽可能迁移，但在
+稳定版之前，命令和界面细节仍可能变化。
+
+发布维护者请参考[发布指南](docs/releasing.md)。
+
+## 许可证
+
+Asterline 使用 [MIT License](LICENSE)。

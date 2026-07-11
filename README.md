@@ -19,14 +19,26 @@ workspace through an Asterline cloud service.
 
 ### Requirements
 
-- Rust 1.85 or newer
+- Rust 1.85 or newer when building from source
 - A terminal with color and alternate-screen support
 - At least one installed and authenticated CLI: `codex`, `claude`, `grok`, or `agy`
 - Git is recommended for diff and verification workflows
 
 ### Install and launch
 
-From a clone of this repository:
+Download the archive for your platform from
+[GitHub Releases](https://github.com/song0705/Asterline/releases/latest), then
+install either binary from the extracted directory:
+
+```bash
+install -m 755 ast ~/.local/bin/ast
+```
+
+Release archives are published for Linux x86-64, Linux ARM64, macOS Intel, and
+macOS Apple silicon. Every release includes `SHA256SUMS` and signed GitHub build
+provenance.
+
+To install from source instead, clone this repository and run:
 
 ```bash
 cargo install --path . --force
@@ -275,8 +287,13 @@ src/
 
 ## Project status
 
-Asterline is currently version `0.1.0` and under active development. The current
-distribution path is installation from source; prebuilt releases and an
-official supported-platform matrix have not yet been published. Configuration
-and persisted data are migrated when possible, but commands and UI details may
-continue to evolve before a stable release.
+Asterline is currently version `0.1.0` and under active development. Tagged
+versions are published as prebuilt Linux and macOS archives through GitHub
+Actions. Configuration and persisted data are migrated when possible, but
+commands and UI details may continue to evolve before a stable release.
+
+Release maintainers should follow the [release guide](docs/releasing.md).
+
+## License
+
+Asterline is available under the [MIT License](LICENSE).
