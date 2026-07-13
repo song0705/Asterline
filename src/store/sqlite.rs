@@ -14,17 +14,18 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::domain::event::{
-    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel, MessageId, TurnId,
-    WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary,
-    WorkflowStepStatus, WorkflowStepSummary, WorkflowVerification,
+    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel, MessageId,
+    ModeRunStatus, TurnId, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
+    WorkflowRunSummary, WorkflowStepStatus, WorkflowStepSummary, WorkflowVerification,
 };
+use crate::domain::mode::{CollabMode, ModeStatusSummary};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
 
 /// Current event-source schema version. Bump this and add a migration arm in
 /// [`SqliteStore::migrate`] whenever the schema changes.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +170,17 @@ impl SqliteStore {
             self.conn
                 .execute_batch("ALTER TABLE workflow_run_steps ADD COLUMN owner TEXT;")?;
         }
+        // v8 -> v9: collaboration mode runs store mode name + JSON state.
+        if from < 9 {
+            if !self.has_column("workflow_runs", "mode")? {
+                self.conn
+                    .execute_batch("ALTER TABLE workflow_runs ADD COLUMN mode TEXT;")?;
+            }
+            if !self.has_column("workflow_runs", "mode_state")? {
+                self.conn
+                    .execute_batch("ALTER TABLE workflow_runs ADD COLUMN mode_state TEXT;")?;
+            }
+        }
         Ok(())
     }
 
@@ -289,7 +301,9 @@ impl SqliteStore {
                 verification_summary TEXT,
                 created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                attempt              INTEGER NOT NULL DEFAULT 1
+                attempt              INTEGER NOT NULL DEFAULT 1,
+                mode                 TEXT,
+                mode_state           TEXT
             );
 
             CREATE TABLE IF NOT EXISTS workflow_run_events (
@@ -465,6 +479,24 @@ impl SqliteStore {
             kind: "error",
             member,
             text: Some(message),
+            ..MessageRow::default()
+        })
+    }
+
+    /// Persist a reviewer verdict as a chat row (`kind = "verdict"`).
+    pub fn record_verdict(
+        &self,
+        turn: TurnId,
+        member: &MemberId,
+        approve: bool,
+        summary: &str,
+    ) -> Result<MessageId> {
+        self.insert_message(MessageRow {
+            turn: Some(turn),
+            kind: "verdict",
+            member: Some(member),
+            text: Some(summary),
+            ok: Some(approve),
             ..MessageRow::default()
         })
     }
@@ -680,6 +712,87 @@ impl SqliteStore {
         let id = WorkflowRunId(self.conn.last_insert_rowid() as u64);
         self.record_workflow_event(id, "started", "Started workflow", Some(goal))?;
         self.workflow_run(id)
+    }
+
+    /// Start a collaboration-mode workflow run with initial `mode` + `mode_state`.
+    pub fn create_mode_workflow_run(
+        &self,
+        goal: &str,
+        coordinator: Option<&MemberId>,
+        mode: CollabMode,
+        mode_state: &str,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "INSERT INTO workflow_runs (goal, status, coordinator, mode, mode_state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                goal,
+                WorkflowRunStatus::Running.as_str(),
+                coordinator.map(MemberId::as_str),
+                mode.as_str(),
+                mode_state
+            ],
+        )?;
+        let id = WorkflowRunId(self.conn.last_insert_rowid() as u64);
+        self.record_workflow_event(id, "started", "Started workflow", Some(goal))?;
+        self.workflow_run(id)
+    }
+
+    /// Persist an updated `mode_state` blob without recording a timeline event.
+    pub fn update_workflow_mode_state(
+        &self,
+        id: WorkflowRunId,
+        mode_state: &str,
+    ) -> Result<WorkflowRunSummary> {
+        self.conn.execute(
+            "UPDATE workflow_runs SET mode_state = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![mode_state, id.0 as i64],
+        )?;
+        self.workflow_run(id)
+    }
+
+    /// Raw `mode_state` JSON for a workflow run, if any.
+    pub fn workflow_mode_state(&self, id: WorkflowRunId) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT mode_state FROM workflow_runs WHERE id = ?1",
+                params![id.0 as i64],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+    }
+
+    /// Record a verdict on a mode run's event timeline.
+    pub fn record_workflow_verdict_event(
+        &self,
+        id: WorkflowRunId,
+        approve: bool,
+        summary: &str,
+    ) -> Result<()> {
+        let title = if approve {
+            "Review approved"
+        } else {
+            "Changes requested"
+        };
+        let detail = if summary.is_empty() {
+            None
+        } else {
+            Some(summary)
+        };
+        self.record_workflow_event(id, "verdict", title, detail)
+    }
+
+    /// Ids of in-flight mode runs (`running`/`verifying` with a non-null mode).
+    pub fn running_mode_runs(&self) -> Result<Vec<WorkflowRunId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM workflow_runs
+              WHERE status IN ('running', 'verifying')
+                AND mode IS NOT NULL
+              ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(WorkflowRunId(row.get::<_, i64>(0)? as u64)))?;
+        rows.collect()
     }
 
     pub fn update_workflow_status(
@@ -958,7 +1071,7 @@ impl SqliteStore {
         let run = self
             .conn
             .query_row(
-                "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt
+                "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
                  FROM workflow_runs ORDER BY id DESC LIMIT 1",
                 [],
                 map_workflow_run,
@@ -969,7 +1082,7 @@ impl SqliteStore {
 
     pub fn recent_workflow_runs(&self, limit: usize) -> Result<Vec<WorkflowRunSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
              FROM workflow_runs ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], map_workflow_run)?;
@@ -982,7 +1095,7 @@ impl SqliteStore {
 
     pub fn workflow_run(&self, id: WorkflowRunId) -> Result<WorkflowRunSummary> {
         let run = self.conn.query_row(
-            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
              FROM workflow_runs WHERE id = ?1",
             params![id.0 as i64],
             map_workflow_run,
@@ -1052,6 +1165,27 @@ impl SqliteStore {
               LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![id.0 as i64, limit as i64], |row| {
+            Ok(WorkflowStepSummary {
+                number: row.get::<_, i64>(0)? as u32,
+                status: WorkflowStepStatus::parse(&row.get::<_, String>(1)?),
+                owner: row.get::<_, Option<String>>(2)?.map(MemberId::new),
+                title: row.get(3)?,
+                note: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// All checklist steps for a run (no LIMIT), ordered by position.
+    pub fn workflow_steps_all(&self, id: WorkflowRunId) -> Result<Vec<WorkflowStepSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT position, status, owner, title, note, updated_at
+               FROM workflow_run_steps
+              WHERE run_id = ?1
+              ORDER BY position ASC",
+        )?;
+        let rows = stmt.query_map(params![id.0 as i64], |row| {
             Ok(WorkflowStepSummary {
                 number: row.get::<_, i64>(0)? as u32,
                 status: WorkflowStepStatus::parse(&row.get::<_, String>(1)?),
@@ -1156,6 +1290,11 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
             member: member_id.map(MemberId::new),
             message: text.unwrap_or_default(),
         },
+        "verdict" => ChatItem::Verdict {
+            member: MemberId::new(member_id.unwrap_or_default()),
+            approve: ok.map(|v| v != 0).unwrap_or(false),
+            summary: text.unwrap_or_default(),
+        },
         _ => return Ok(None),
     };
     Ok(Some(item))
@@ -1176,6 +1315,16 @@ fn map_workflow_run(row: &Row<'_>) -> rusqlite::Result<WorkflowRunSummary> {
     let command: Option<String> = row.get(4)?;
     let ok: Option<i64> = row.get(5)?;
     let summary: Option<String> = row.get(6)?;
+    let mode_col: Option<String> = row.get(10)?;
+    let mode_state_col: Option<String> = row.get(11)?;
+    let mode = mode_col.and_then(|raw| {
+        let mode = CollabMode::parse(&raw)?;
+        let state = mode_state_col
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<ModeStatusSummary>(json).ok())
+            .unwrap_or_default();
+        Some(ModeRunStatus { mode, state })
+    });
     Ok(WorkflowRunSummary {
         id: WorkflowRunId(row.get::<_, i64>(0)? as u64),
         goal: row.get(1)?,
@@ -1194,6 +1343,7 @@ fn map_workflow_run(row: &Row<'_>) -> rusqlite::Result<WorkflowRunSummary> {
         attempt: row.get::<_, i64>(9)? as u32,
         events: Vec::new(),
         steps: Vec::new(),
+        mode,
     })
 }
 

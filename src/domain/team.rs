@@ -11,6 +11,8 @@ use serde::de;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::domain::mode::ModesConfig;
+
 /// The default ceiling on consecutive automatic agent-to-agent relays within a
 /// single turn before the runtime pauses and asks the user to continue.
 pub const DEFAULT_MAX_AUTO_RELAYS: u32 = 6;
@@ -427,6 +429,36 @@ pub enum DefaultTarget {
     All,
 }
 
+/// Which dispatch surfaces the approval gate covers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalSurface {
+    User,
+    Relay,
+    Mode,
+}
+
+/// team.json `approvals` section. Defaults: all built-in categories, all surfaces.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalPolicy {
+    /// Built-in categories to keep enabled (`git`, `shell`, `file`). None -> all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Vec<String>>,
+    /// Custom categories: name -> keyword list (case-insensitive match).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub keywords: std::collections::HashMap<String, Vec<String>>,
+    /// Surfaces the gate applies to. None -> all surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_to: Option<Vec<ApprovalSurface>>,
+}
+
+impl ApprovalPolicy {
+    /// True when every field is at its default (serializes to nothing in team.json).
+    pub fn is_default(&self) -> bool {
+        self.gate.is_none() && self.keywords.is_empty() && self.apply_to.is_none()
+    }
+}
+
 /// Full configuration for a team: workspace, roster, and routing defaults.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TeamConfig {
@@ -437,6 +469,12 @@ pub struct TeamConfig {
     pub default_target: Option<DefaultTarget>,
     #[serde(default = "default_max_auto_relays")]
     pub max_auto_relays: u32,
+    /// Optional collaboration-mode role bindings (`review` / `lead` / `roundtable`).
+    #[serde(default, skip_serializing_if = "ModesConfig::is_default")]
+    pub modes: ModesConfig,
+    /// Optional approval-gate policy (`approvals` in team.json).
+    #[serde(default, skip_serializing_if = "ApprovalPolicy::is_default")]
+    pub approvals: ApprovalPolicy,
 }
 
 fn default_max_auto_relays() -> u32 {
@@ -473,6 +511,8 @@ impl TeamConfig {
             members: Vec::new(),
             default_target: None,
             max_auto_relays: DEFAULT_MAX_AUTO_RELAYS,
+            modes: ModesConfig::default(),
+            approvals: ApprovalPolicy::default(),
         }
     }
 
@@ -719,6 +759,31 @@ mod tests {
         let parsed: TeamConfig = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn default_approvals_policy_serializes_to_nothing() {
+        let config = TeamConfig::new("t", "/tmp/ws").with_member(codex("builder", "impl"));
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(!json.contains("\"approvals\""));
+        assert!(config.approvals.is_default());
+    }
+
+    #[test]
+    fn approvals_policy_round_trips_through_json() {
+        let mut config = TeamConfig::new("t", "/tmp/ws").with_member(codex("builder", "impl"));
+        config.approvals.gate = Some(vec!["git".to_string(), "shell".to_string()]);
+        config
+            .approvals
+            .keywords
+            .insert("deploy".to_string(), vec!["kubectl".to_string()]);
+        config.approvals.apply_to = Some(vec![ApprovalSurface::User, ApprovalSurface::Relay]);
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        let parsed: TeamConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.approvals, config.approvals);
+        assert!(json.contains("\"approvals\""));
+        assert!(json.contains("\"deploy\""));
     }
 
     #[test]

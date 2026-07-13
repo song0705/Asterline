@@ -173,7 +173,7 @@ fn build_runners(team: &TeamConfig, fake: bool) -> Runners {
     let mut runners: Runners = HashMap::new();
     for member in &team.members {
         let runner: Arc<dyn MemberRunner> = if fake {
-            Arc::new(FakeRunner::echo(member.backend))
+            Arc::new(FakeRunner::team(member.backend))
         } else {
             Arc::from(runner_for(member, &team.workspace))
         };

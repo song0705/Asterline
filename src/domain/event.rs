@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use crate::domain::mode::{CollabMode, ModeStatusSummary};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember,
@@ -316,6 +317,12 @@ pub enum UiCommand {
         step: u32,
         owner: Option<MemberId>,
     },
+    /// Start a collaboration mode run (`/review`, `/lead`, `/roundtable`).
+    RunMode {
+        mode: CollabMode,
+        task: String,
+        overrides: Vec<(String, String)>,
+    },
     /// Begin a graceful shutdown.
     Shutdown,
 }
@@ -493,6 +500,13 @@ pub enum WorkflowStepRequest {
     },
 }
 
+/// Collaboration-mode status attached to a workflow run when `mode` is set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModeRunStatus {
+    pub mode: CollabMode,
+    pub state: ModeStatusSummary,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowRunSummary {
     pub id: WorkflowRunId,
@@ -505,6 +519,8 @@ pub struct WorkflowRunSummary {
     pub attempt: u32,
     pub events: Vec<WorkflowRunEventSummary>,
     pub steps: Vec<WorkflowStepSummary>,
+    /// Present when this run was started as a collaboration mode (`/review`, …).
+    pub mode: Option<ModeRunStatus>,
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth
@@ -625,6 +641,13 @@ pub enum RuntimeEvent {
     WorkflowRunUpdated {
         run: WorkflowRunSummary,
     },
+    /// A reviewer verdict was recorded for a mode run.
+    Verdict {
+        run: WorkflowRunId,
+        member: MemberId,
+        approve: bool,
+        summary: String,
+    },
     /// A diagnostic for the logs drawer only.
     Log(LogEntry),
     /// A human-readable system notice shown inline in the chat.
@@ -669,6 +692,11 @@ pub enum ChatItem {
     Error {
         member: Option<MemberId>,
         message: String,
+    },
+    Verdict {
+        member: MemberId,
+        approve: bool,
+        summary: String,
     },
 }
 

@@ -59,6 +59,16 @@ struct HistorySearch {
     match_idx: Option<usize>,
 }
 
+/// Transcript search (`/find`): query, matching chat indices, and current match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FindState {
+    query: String,
+    /// Indices into `chat` captured when the query was set.
+    matches: Vec<usize>,
+    /// Index into `matches` for the current jump target.
+    current: usize,
+}
+
 pub struct AppState {
     team: String,
     workspace: String,
@@ -101,6 +111,8 @@ pub struct AppState {
     running_since: HashMap<MemberId, Instant>,
     /// Active reverse history search (Ctrl+R), if any.
     history_search: Option<HistorySearch>,
+    /// Active transcript search (`/find`), if any.
+    find: Option<FindState>,
     /// Vertical scroll offset for the open drawer (logs / team / diff).
     drawer_scroll: usize,
     /// Captured working-tree diff text for the diff drawer (`/diff`).
@@ -157,6 +169,7 @@ impl AppState {
             history_draft: String::new(),
             running_since: HashMap::new(),
             history_search: None,
+            find: None,
             drawer_scroll: 0,
             diff_text: None,
             team_editor: None,
@@ -398,6 +411,18 @@ impl AppState {
                 }
                 self.ensure_selected_workflow_run();
                 self.ensure_selected_workflow_step();
+            }
+            RuntimeEvent::Verdict {
+                member,
+                approve,
+                summary,
+                ..
+            } => {
+                self.push(ChatItem::Verdict {
+                    member,
+                    approve,
+                    summary,
+                });
             }
             RuntimeEvent::Log(entry) => {
                 self.logs.push(entry);
@@ -954,6 +979,133 @@ impl AppState {
         self.history_search = None;
     }
 
+    // --- transcript search (`/find`) ------------------------------------
+
+    /// Whether `/find` is active (including zero matches).
+    pub fn find_active(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// Active find as `(query, current 1-based, total)`. Out-of-range match
+    /// indices (chat grew/shrank since `set_find`) are clamped in the counter.
+    pub fn find(&self) -> Option<(&str, usize, usize)> {
+        let find = self.find.as_ref()?;
+        let valid: Vec<usize> = find
+            .matches
+            .iter()
+            .copied()
+            .filter(|&idx| idx < self.chat.len())
+            .collect();
+        let total = valid.len();
+        let current = if total == 0 {
+            0
+        } else {
+            // Prefer the stored position among still-valid matches.
+            let preferred = find
+                .matches
+                .get(find.current)
+                .copied()
+                .filter(|&idx| idx < self.chat.len());
+            match preferred {
+                Some(idx) => valid.iter().position(|&i| i == idx).unwrap_or(0) + 1,
+                None => (find.current.min(total - 1)) + 1,
+            }
+        };
+        Some((find.query.as_str(), current, total))
+    }
+
+    /// Index into `chat` for the current find match, if any and still in range.
+    pub fn find_current_chat_index(&self) -> Option<usize> {
+        let find = self.find.as_ref()?;
+        let idx = *find.matches.get(find.current)?;
+        (idx < self.chat.len()).then_some(idx)
+    }
+
+    /// Set or clear transcript search. Empty/whitespace query clears to `None`.
+    /// Otherwise case-insensitive substring match; `current` starts at the last
+    /// (newest) match and the view jumps there.
+    pub fn set_find(&mut self, query: &str) {
+        self.disarm_quit();
+        let query = query.trim();
+        if query.is_empty() {
+            self.find = None;
+            return;
+        }
+        let needle = query.to_lowercase();
+        let matches: Vec<usize> = self
+            .chat
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| chat_item_search_text(item).to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        let current = matches.len().saturating_sub(1);
+        self.find = Some(FindState {
+            query: query.to_string(),
+            matches,
+            current,
+        });
+        if let Some(idx) = self.find_current_chat_index() {
+            self.scroll_to_chat_item(idx);
+        }
+    }
+
+    pub fn find_next(&mut self) {
+        self.disarm_quit();
+        let idx = {
+            let Some(find) = self.find.as_mut() else {
+                return;
+            };
+            if find.matches.is_empty() {
+                return;
+            }
+            find.current = (find.current + 1) % find.matches.len();
+            find.matches[find.current]
+        };
+        if idx < self.chat.len() {
+            self.scroll_to_chat_item(idx);
+        }
+    }
+
+    pub fn find_prev(&mut self) {
+        self.disarm_quit();
+        let idx = {
+            let Some(find) = self.find.as_mut() else {
+                return;
+            };
+            if find.matches.is_empty() {
+                return;
+            }
+            find.current = if find.current == 0 {
+                find.matches.len() - 1
+            } else {
+                find.current - 1
+            };
+            find.matches[find.current]
+        };
+        if idx < self.chat.len() {
+            self.scroll_to_chat_item(idx);
+        }
+    }
+
+    pub fn clear_find(&mut self) {
+        self.disarm_quit();
+        self.find = None;
+    }
+
+    /// Approximate scroll so chat item `idx` sits near the bottom of a
+    /// bottom-anchored view. Uses the same line estimate as scroll pinning when
+    /// new items arrive (approximate: ignores wrap width and markdown layout).
+    pub fn scroll_to_chat_item(&mut self, idx: usize) {
+        if idx >= self.chat.len() {
+            return;
+        }
+        self.scroll = self.chat[idx.saturating_add(1)..]
+            .iter()
+            .map(estimate_item_lines)
+            .sum();
+    }
+
     /// Newest history entry containing `query` (case-insensitive) strictly older
     /// than `before` (or the newest overall when `before` is `None`). An empty
     /// query matches the newest available entry.
@@ -1463,8 +1615,13 @@ fn workflow_step_dispatch_command(run: &WorkflowRunSummary, step: u32) -> Option
         WorkflowStepStatus::Done => "Review completed",
     };
     Some(format!(
-        "@{owner} {instruction} {} step #{}: {}. Update the checklist with @@workflow_step as you progress.",
-        run.id, step.number, step.title
+        "@{owner} {}",
+        crate::runtime::mode_prompts::manual_step_dispatch_text(
+            run.id,
+            instruction,
+            step.number,
+            &step.title,
+        )
     ))
 }
 
@@ -1476,10 +1633,34 @@ fn format_inherited_user_body(target: &MessageTarget, body: &str) -> String {
     }
 }
 
+/// Searchable text for one chat item (used by `/find`).
+fn chat_item_search_text(item: &ChatItem) -> String {
+    match item {
+        ChatItem::User { body } => body.clone(),
+        ChatItem::Agent { text, .. } => text.clone(),
+        ChatItem::Tool {
+            name,
+            summary,
+            detail,
+            ..
+        } => format!("{name} {summary} {detail}"),
+        ChatItem::Diff { files, .. } => files
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        ChatItem::Route { body, .. } => body.clone(),
+        ChatItem::Notice { text } => text.clone(),
+        ChatItem::Error { message, .. } => message.clone(),
+        ChatItem::Verdict { summary, .. } => summary.clone(),
+    }
+}
+
 /// Rough estimate of how many visual lines a [`ChatItem`] will occupy, used
 /// only to keep the scroll position stable when new items arrive while the
-/// user is browsing history. The exact count depends on the render width and
-/// markdown layout, so this is a conservative lower bound.
+/// user is browsing history, and for approximate `/find` jumps. The exact
+/// count depends on the render width and markdown layout, so this is a
+/// conservative lower bound.
 fn estimate_item_lines(item: &ChatItem) -> usize {
     match item {
         ChatItem::User { body } => body.lines().count().max(1),
@@ -1495,6 +1676,7 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
         ChatItem::Route { body, .. } => 1 + body.lines().count().max(1),
         ChatItem::Notice { text } => text.lines().count().max(1),
         ChatItem::Error { message, .. } => message.lines().count().max(1),
+        ChatItem::Verdict { summary, .. } => 1 + summary.lines().count(),
     }
 }
 

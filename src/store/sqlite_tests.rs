@@ -89,6 +89,61 @@ fn error_and_notice_round_trip() {
 }
 
 #[test]
+fn verdict_message_and_workflow_event_round_trip() {
+    use crate::domain::mode::CollabMode;
+
+    let store = store();
+    let turn = store.create_turn().unwrap();
+    let reviewer = MemberId::new("reviewer");
+    store
+        .record_verdict(turn, &reviewer, true, "looks solid")
+        .unwrap();
+
+    let items = store.replay_chat().unwrap();
+    assert!(items.iter().any(|item| matches!(
+        item,
+        ChatItem::Verdict {
+            member,
+            approve: true,
+            summary
+        } if member == &reviewer && summary == "looks solid"
+    )));
+
+    let run = store
+        .create_mode_workflow_run(
+            "review task",
+            Some(&MemberId::new("builder")),
+            CollabMode::Review,
+            r#"{"phase":"reviewing","iteration":1,"max_iterations":3}"#,
+        )
+        .unwrap();
+    store
+        .record_workflow_verdict_event(run.id, false, "needs tests")
+        .unwrap();
+    let loaded = store.workflow_run(run.id).unwrap();
+    assert!(
+        loaded.events.iter().any(|event| {
+            event.kind == "verdict"
+                && event.title == "Changes requested"
+                && event.detail.as_deref() == Some("needs tests")
+        }),
+        "verdict event missing: {:?}",
+        loaded.events
+    );
+
+    store
+        .record_workflow_verdict_event(run.id, true, "")
+        .unwrap();
+    let loaded = store.workflow_run(run.id).unwrap();
+    assert!(loaded.events.iter().any(|event| {
+        event.kind == "verdict" && event.title == "Review approved" && event.detail.is_none()
+    }));
+
+    let state = store.workflow_mode_state(run.id).unwrap();
+    assert!(state.is_some_and(|s| s.contains("reviewing")));
+}
+
+#[test]
 fn sessions_upsert_and_resolve() {
     let store = store();
     let builder = MemberId::new("builder");
@@ -829,4 +884,130 @@ fn migrates_legacy_prototype_schema_then_persists() {
 
     drop(reopened);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn migrates_v8_to_workflow_mode_columns() {
+    let dir = std::env::temp_dir().join(format!("asterline-v9-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v8.sqlite3");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+                CREATE TABLE workflow_runs (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal                 TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    coordinator          TEXT,
+                    verification_command TEXT,
+                    verification_ok      INTEGER,
+                    verification_summary TEXT,
+                    created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    attempt              INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE workflow_run_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id     INTEGER NOT NULL,
+                    attempt    INTEGER NOT NULL,
+                    kind       TEXT NOT NULL,
+                    title      TEXT NOT NULL,
+                    detail     TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE workflow_run_steps (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id     INTEGER NOT NULL,
+                    position   INTEGER NOT NULL,
+                    status     TEXT NOT NULL,
+                    owner      TEXT,
+                    title      TEXT NOT NULL,
+                    note       TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO workflow_runs (goal, status, coordinator, attempt)
+                    VALUES ('ship parser', 'running', 'builder', 1);
+                PRAGMA user_version = 8;
+                "#,
+        )
+        .unwrap();
+    }
+
+    let store = SqliteStore::open(&path).unwrap();
+    let version: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert!(store.has_column("workflow_runs", "mode").unwrap());
+    assert!(store.has_column("workflow_runs", "mode_state").unwrap());
+
+    let run = store.workflow_run(WorkflowRunId(1)).unwrap();
+    assert_eq!(run.goal, "ship parser");
+    assert_eq!(run.mode, None);
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn mode_workflow_run_round_trips_and_filters_running() {
+    use crate::domain::mode::CollabMode;
+
+    let store = store();
+    let builder = MemberId::new("builder");
+    let state = r#"{"phase":"build","iteration":1,"max_iterations":3}"#;
+    let run = store
+        .create_mode_workflow_run(
+            "review the parser",
+            Some(&builder),
+            CollabMode::Review,
+            state,
+        )
+        .unwrap();
+
+    assert_eq!(run.mode.as_ref().map(|m| m.mode), Some(CollabMode::Review));
+    let mode = run.mode.as_ref().expect("mode present");
+    assert_eq!(mode.state.phase, "build");
+    assert_eq!(mode.state.iteration, 1);
+    assert_eq!(mode.state.max_iterations, 3);
+
+    let updated_state = r#"{"phase":"review","iteration":2,"max_iterations":3}"#;
+    let updated = store
+        .update_workflow_mode_state(run.id, updated_state)
+        .unwrap();
+    assert_eq!(updated.mode.as_ref().unwrap().state.phase, "review");
+    assert_eq!(updated.mode.as_ref().unwrap().state.iteration, 2);
+
+    // Plain workflow runs without mode are excluded.
+    let plain = store
+        .create_workflow_run("legacy plan", Some(&builder))
+        .unwrap();
+    assert_eq!(plain.mode, None);
+
+    let running = store.running_mode_runs().unwrap();
+    assert_eq!(running, vec![run.id]);
+
+    store
+        .update_workflow_status(run.id, WorkflowRunStatus::Done)
+        .unwrap();
+    assert!(store.running_mode_runs().unwrap().is_empty());
+
+    // Verifying mode runs still count as in-flight.
+    let verifying = store
+        .create_mode_workflow_run(
+            "lead the release",
+            Some(&builder),
+            CollabMode::Lead,
+            r#"{"phase":"verify"}"#,
+        )
+        .unwrap();
+    store
+        .update_workflow_status(verifying.id, WorkflowRunStatus::Verifying)
+        .unwrap();
+    assert_eq!(store.running_mode_runs().unwrap(), vec![verifying.id]);
 }

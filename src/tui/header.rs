@@ -117,6 +117,21 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         return;
     }
 
+    // Transcript find (`/find`) takes over the footer while active.
+    if let Some((query, current, total)) = state.find() {
+        let mut spans = vec![Span::styled(
+            format!("find: \"{query}\" ({current}/{total})"),
+            theme::accent(),
+        )];
+        if total == 0 {
+            spans.push(Span::styled(" · no matches", theme::accent()));
+        } else {
+            spans.push(Span::styled(" · n/p jump · Esc clear", theme::accent()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let mut parts = Vec::new();
     if state.paused_routes() > 0 {
         parts.push(Span::styled(

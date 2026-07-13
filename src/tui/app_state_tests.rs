@@ -49,6 +49,7 @@ fn workflow_run_updates_insert_then_replace() {
         attempt: 1,
         events: Vec::new(),
         steps: Vec::new(),
+        mode: None,
     };
 
     state.apply(RuntimeEvent::WorkflowRunUpdated { run: run.clone() });
@@ -88,6 +89,7 @@ fn runs_drawer_stages_selected_workflow_action_without_overwriting_draft() {
             attempt: 1,
             events: Vec::new(),
             steps: Vec::new(),
+            mode: None,
         },
     });
 
@@ -123,6 +125,7 @@ fn runs_drawer_can_select_an_older_workflow_run() {
                 attempt: 1,
                 events: Vec::new(),
                 steps: Vec::new(),
+                mode: None,
             },
             WorkflowRunSummary {
                 id: WorkflowRunId(2),
@@ -135,6 +138,7 @@ fn runs_drawer_can_select_an_older_workflow_run() {
                 attempt: 1,
                 events: Vec::new(),
                 steps: Vec::new(),
+                mode: None,
             },
         ],
         members: Vec::new(),
@@ -207,6 +211,7 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
                     updated_at: "2026-06-28 10:04:00".to_string(),
                 },
             ],
+            mode: None,
         },
     });
     state.toggle_drawer(Drawer::Runs);
@@ -291,6 +296,7 @@ fn workflow_action_previews_detected_verify_command() {
             attempt: 1,
             events: Vec::new(),
             steps: Vec::new(),
+            mode: None,
         },
     });
 
@@ -325,6 +331,7 @@ fn workflow_action_continues_failed_and_blocked_runs() {
             attempt: 2,
             events: Vec::new(),
             steps: Vec::new(),
+            mode: None,
         },
     });
 
@@ -351,6 +358,7 @@ fn workflow_action_continues_failed_and_blocked_runs() {
             attempt: 2,
             events: Vec::new(),
             steps: Vec::new(),
+            mode: None,
         },
     });
 
@@ -455,6 +463,107 @@ fn skill_invocation_matches_backend_native_syntax() {
         assert!(invocation.contains("review"));
         assert!(invocation.contains("/tmp/review/SKILL.md"));
     }
+}
+
+#[test]
+fn find_matches_case_insensitively_and_navigates() {
+    let mut state = AppState::new(vec![
+        ChatItem::User {
+            body: "Fix the Parser".to_string(),
+        },
+        ChatItem::Agent {
+            member: MemberId::new("builder"),
+            display_name: "Builder".to_string(),
+            backend: BackendKind::Codex,
+            text: "looking at parser.rs".to_string(),
+        },
+        ChatItem::Tool {
+            member: MemberId::new("builder"),
+            name: "shell".to_string(),
+            summary: "cargo test".to_string(),
+            detail: "ok".to_string(),
+            ok: Some(true),
+        },
+        ChatItem::Notice {
+            text: "other note".to_string(),
+        },
+        ChatItem::Error {
+            member: None,
+            message: "parser panic".to_string(),
+        },
+        ChatItem::Verdict {
+            member: MemberId::new("reviewer"),
+            approve: false,
+            summary: "needs PARSER coverage".to_string(),
+        },
+        ChatItem::Diff {
+            member: MemberId::new("builder"),
+            files: vec![("src/parser.rs".to_string(), "+1".to_string())],
+        },
+        ChatItem::Route {
+            from: MemberId::new("builder"),
+            to: vec!["reviewer".to_string()],
+            body: "please review parser".to_string(),
+        },
+    ]);
+
+    state.set_find("PARSER");
+    let (query, current, total) = state.find().expect("find active");
+    assert_eq!(query, "PARSER");
+    // User, agent, error, verdict, diff, route — not the cargo test tool.
+    assert_eq!(total, 6);
+    assert_eq!(current, 6, "starts at newest match");
+    assert_eq!(state.find_current_chat_index(), Some(7));
+
+    // Jump sets scroll to sum of estimate_item_lines for items below the match.
+    assert_eq!(state.scroll(), 0, "newest match is last item → scroll 0");
+
+    state.find_prev();
+    assert_eq!(state.find().map(|(_, c, _)| c), Some(5));
+    assert_eq!(state.find_current_chat_index(), Some(6));
+    // Item 7 (route) below → estimate_item_lines(Route) = 1 + body lines
+    assert!(state.scroll() > 0);
+
+    state.find_next();
+    assert_eq!(state.find().map(|(_, c, _)| c), Some(6));
+    state.find_next(); // wrap
+    assert_eq!(state.find().map(|(_, c, _)| c), Some(1));
+    assert_eq!(state.find_current_chat_index(), Some(0));
+
+    state.set_find("no-such-needle-xyz");
+    assert_eq!(state.find(), Some(("no-such-needle-xyz", 0, 0)));
+    assert!(state.find_active());
+
+    state.set_find("   ");
+    assert!(!state.find_active());
+    assert_eq!(state.find(), None);
+
+    // New items after set_find do not panic navigation (stale indices skipped).
+    state.set_find("parser");
+    state.apply(RuntimeEvent::Notice("brand new".to_string()));
+    let _ = state.find();
+    state.find_next();
+    state.find_prev();
+}
+
+#[test]
+fn find_jump_scroll_sums_items_below() {
+    let mut state = AppState::new(vec![
+        ChatItem::User {
+            body: "alpha\nline2".to_string(),
+        },
+        ChatItem::Notice {
+            text: "beta".to_string(),
+        },
+        ChatItem::Notice {
+            text: "gamma".to_string(),
+        },
+    ]);
+    state.set_find("alpha");
+    // Items below idx 0: beta (1) + gamma (1)
+    assert_eq!(state.scroll(), 2);
+    state.clear_find();
+    assert!(!state.find_active());
 }
 
 #[test]

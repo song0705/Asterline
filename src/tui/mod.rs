@@ -5,6 +5,7 @@
 pub mod app_state;
 pub mod attach;
 pub mod chat_view;
+pub mod claude_import;
 pub mod commands;
 pub mod completion;
 pub mod composer;
@@ -13,6 +14,7 @@ pub mod drawers;
 pub mod header;
 pub mod keymap;
 pub mod markdown;
+pub mod notify;
 pub mod rollout_import;
 pub mod skills;
 pub mod status_indicator;
@@ -228,8 +230,14 @@ fn run_loop(
     keyboard_enhancement: bool,
     legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
+    let notify_enabled = notify::enabled_from_env();
     loop {
         while let Ok(event) = events.try_recv() {
+            if notify_enabled && let Some(title) = notify_title_for(&event) {
+                let mut out = io::stdout();
+                let _ = notify::emit(&mut out, title);
+                let _ = out.flush();
+            }
             state.apply(event);
         }
 
@@ -337,10 +345,23 @@ fn attach_to_member(
         return Ok(());
     }
 
-    // Snapshot the codex rollout so we can import whatever is typed during the
-    // attached session once it exits.
-    let snapshot = (req.backend == BackendKind::Codex)
-        .then(|| rollout_import::snapshot(req.session.as_deref(), &req.cwd));
+    // Snapshot the backend transcript so we can import whatever is typed during
+    // the attached session once it exits (codex rollouts / claude session jsonl).
+    enum AttachSnapshot {
+        Codex(rollout_import::RolloutSnapshot),
+        Claude(claude_import::ClaudeSnapshot),
+    }
+    let snapshot = match req.backend {
+        BackendKind::Codex => Some(AttachSnapshot::Codex(rollout_import::snapshot(
+            req.session.as_deref(),
+            &req.cwd,
+        ))),
+        BackendKind::Claude => Some(AttachSnapshot::Claude(claude_import::snapshot(
+            req.session.as_deref(),
+            &req.cwd,
+        ))),
+        BackendKind::Grok | BackendKind::Agy => None,
+    };
 
     // --- Suspend Asterline: hand the real terminal to the child CLI. ---
     // Restore the cooked terminal, leave our alternate screen, and show the
@@ -405,7 +426,10 @@ fn attach_to_member(
     // (and persist to) the Asterline transcript. The runtime records them and
     // emits the events the main loop renders.
     if let Some(snapshot) = snapshot {
-        let imported = rollout_import::imported_since(snapshot);
+        let imported = match snapshot {
+            AttachSnapshot::Codex(s) => rollout_import::imported_since(s),
+            AttachSnapshot::Claude(s) => claude_import::imported_since(s),
+        };
         if !imported.is_empty() {
             handle.send(UiCommand::ImportTranscript {
                 member: req.member.clone(),
@@ -427,6 +451,20 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     }
     if action == Action::InsertChar('x') && state.toggle_workflow_runs_detail() {
         return;
+    }
+    // Transcript find: n/p jump when active, composer empty, no drawer.
+    if state.find_active() && state.composer().is_empty() && state.drawer().is_none() {
+        match action {
+            Action::InsertChar('n') => {
+                state.find_next();
+                return;
+            }
+            Action::InsertChar('p') => {
+                state.find_prev();
+                return;
+            }
+            _ => {}
+        }
     }
     match action {
         Action::InsertChar(ch) => state.insert_char(ch),
@@ -522,7 +560,9 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             state.accept_completion();
         }
         Action::CloseOverlay => {
-            if state.completion().is_some() {
+            if state.find_active() {
+                state.clear_find();
+            } else if state.completion().is_some() {
                 state.dismiss_popup();
             } else if state.header_selected().is_some() {
                 state.clear_header_selection();
@@ -615,6 +655,7 @@ fn compute_git_diff(workspace: &str) -> String {
 
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.composer().text();
+    let mut reset_scroll = true;
     match commands::parse(&text) {
         Submission::Runtime(command) => {
             state.record_submission(&text);
@@ -649,6 +690,13 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             }
             None => state.apply(RuntimeEvent::Notice("no pending approval".to_string())),
         },
+        Submission::FindInChat(query) => {
+            state.record_submission(&text);
+            state.take_composer();
+            state.set_find(&query);
+            // Keep the jump from set_find; do not snap back to bottom.
+            reset_scroll = false;
+        }
         Submission::Help => {
             state.record_submission(&text);
             state.take_composer();
@@ -671,7 +719,24 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.take_composer();
         }
     }
-    state.reset_scroll();
+    if reset_scroll {
+        state.reset_scroll();
+    }
+}
+
+/// Titles for attention-needed runtime events (terminal BEL + OSC 9).
+fn notify_title_for(event: &RuntimeEvent) -> Option<&'static str> {
+    match event {
+        RuntimeEvent::ApprovalRequested { .. } => Some("Asterline: approval needed"),
+        RuntimeEvent::RoutePaused { .. } => Some("Asterline: route paused"),
+        RuntimeEvent::WorkflowRunUpdated { run }
+            if run.status == crate::domain::event::WorkflowRunStatus::Blocked =>
+        {
+            Some("Asterline: run blocked")
+        }
+        RuntimeEvent::MemberError { .. } => Some("Asterline: member error"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -914,6 +979,7 @@ mod tests {
                 attempt: 1,
                 events: Vec::new(),
                 steps: Vec::new(),
+                mode: None,
             }],
             members: Vec::new(),
         });
@@ -963,6 +1029,7 @@ mod tests {
                     note: None,
                     updated_at: "2026-06-28 10:05:00".to_string(),
                 }],
+                mode: None,
             }],
             members: Vec::new(),
         });
@@ -1013,6 +1080,7 @@ mod tests {
                     note: None,
                     updated_at: "2026-06-28 10:05:00".to_string(),
                 }],
+                mode: None,
             }],
             members: Vec::new(),
         });

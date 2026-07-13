@@ -8,9 +8,10 @@ use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 
 use crate::domain::event::{
-    WorkflowRunEventSummary, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepStatus,
-    WorkflowStepSummary,
+    ModeRunStatus, WorkflowRunEventSummary, WorkflowRunStatus, WorkflowRunSummary,
+    WorkflowStepStatus, WorkflowStepSummary,
 };
+use crate::domain::mode::CollabMode;
 use crate::tui::app_state::AppState;
 use crate::tui::theme;
 use crate::tui::theme::{pad_width, truncate_width, workflow_status_color};
@@ -18,42 +19,118 @@ use crate::tui::theme::{pad_width, truncate_width, workflow_status_color};
 /// One-line hint about the latest run, shown in the footer when idle.
 pub(crate) fn workflow_footer_hint(state: &AppState) -> Option<(String, Color)> {
     let run = state.latest_workflow_run()?;
-    let progress = workflow_step_progress_suffix(run);
+    let mode_head = mode_run_head(run);
+    let progress = if run.mode.is_some() {
+        mode_progress_suffix(run)
+    } else {
+        workflow_step_progress_suffix(run)
+    };
     match run.status {
         WorkflowRunStatus::Running => Some((
-            format!(
-                "● {} running{progress} · /runs details · /abort cancel",
-                run.id
-            ),
+            if let Some(head) = mode_head {
+                format!("{head}{progress} · /runs details · /abort cancel")
+            } else {
+                format!(
+                    "● {} running{progress} · /runs details · /abort cancel",
+                    run.id
+                )
+            },
             theme::warning_color(),
         )),
         WorkflowRunStatus::Verifying => Some((
-            format!(
-                "⏳ {} verifying{progress} · /runs details · /abort cancel",
-                run.id
-            ),
+            if let Some(head) = mode_head {
+                format!("{head}{progress} · /runs details · /abort cancel")
+            } else {
+                format!(
+                    "⏳ {} verifying{progress} · /runs details · /abort cancel",
+                    run.id
+                )
+            },
             theme::warning_color(),
         )),
         WorkflowRunStatus::Done if run.verification.is_none() => Some((
-            format!(
-                "● {} done{progress} · /verify to check · /runs details",
-                run.id
-            ),
+            if let Some(head) = mode_head {
+                format!("{head}{progress} · /verify to check · /runs details")
+            } else {
+                format!(
+                    "● {} done{progress} · /verify to check · /runs details",
+                    run.id
+                )
+            },
             theme::success_color(),
         )),
         WorkflowRunStatus::Failed => Some((
-            format!(
-                "● {} failed{progress} · /runs details · /continue to fix",
-                run.id
-            ),
+            if let Some(head) = mode_head {
+                format!("{head}{progress} · /runs details · /continue to fix")
+            } else {
+                format!(
+                    "● {} failed{progress} · /runs details · /continue to fix",
+                    run.id
+                )
+            },
             theme::error_color(),
         )),
         WorkflowRunStatus::Blocked => Some((
-            format!("● {} blocked{progress} · /runs details", run.id),
+            if let Some(head) = mode_head {
+                format!("{head}{progress} · /runs details")
+            } else {
+                format!("● {} blocked{progress} · /runs details", run.id)
+            },
             theme::error_color(),
         )),
         _ => None,
     }
+}
+
+/// `◇ {mode} {run.id}` when the run is a collaboration mode.
+fn mode_run_head(run: &WorkflowRunSummary) -> Option<String> {
+    run.mode
+        .as_ref()
+        .map(|mode| format!("◇ {} {}", mode.mode.as_str(), run.id))
+}
+
+/// Phase / iteration progress for mode runs.
+fn mode_progress_suffix(run: &WorkflowRunSummary) -> String {
+    let Some(mode) = &run.mode else {
+        return String::new();
+    };
+    let phase = mode.state.phase.as_str();
+    match mode.mode {
+        CollabMode::Review | CollabMode::Lead => {
+            format!(
+                " · iter {}/{} · {phase}",
+                mode.state.iteration, mode.state.max_iterations
+            )
+        }
+        CollabMode::Roundtable => {
+            format!(
+                " · round {}/{} · {phase}",
+                mode.state.round, mode.state.rounds
+            )
+        }
+    }
+}
+
+/// Detail line under goal/status for mode runs in the `/runs` drawer.
+fn mode_detail_line(mode: &ModeRunStatus) -> Line<'static> {
+    let progress = match mode.mode {
+        CollabMode::Review | CollabMode::Lead => format!(
+            "iter {}/{}",
+            mode.state.iteration, mode.state.max_iterations
+        ),
+        CollabMode::Roundtable => format!("round {}/{}", mode.state.round, mode.state.rounds),
+    };
+    Line::from(vec![
+        Span::styled(" Mode: ", theme::muted()),
+        Span::styled(
+            format!(
+                "{} · phase: {} · {progress}",
+                mode.mode.as_str(),
+                mode.state.phase
+            ),
+            theme::accent_bold(),
+        ),
+    ])
 }
 
 /// The `/runs` drawer body. Compact mode shows what you act on (selected run,
@@ -102,6 +179,9 @@ pub(crate) fn drawer_runs(state: &AppState, width: usize) -> Vec<Line<'static>> 
             Span::styled(" Goal: ", theme::muted()),
             Span::styled(selected.goal.clone(), theme::emphasis()),
         ]));
+        if let Some(mode) = &selected.mode {
+            lines.push(mode_detail_line(mode));
+        }
         if detail {
             let owner = selected
                 .coordinator
@@ -573,7 +653,7 @@ fn workflow_timeline_lines(run: &WorkflowRunSummary) -> Vec<Line<'static>> {
 }
 
 fn workflow_event_line(event: &WorkflowRunEventSummary) -> Line<'static> {
-    let color = workflow_event_color(event.kind.as_str());
+    let color = workflow_event_color(event.kind.as_str(), event.title.as_str());
     let title = event
         .detail
         .as_ref()
@@ -590,7 +670,7 @@ fn workflow_event_line(event: &WorkflowRunEventSummary) -> Line<'static> {
     ])
 }
 
-fn workflow_event_color(kind: &str) -> Color {
+fn workflow_event_color(kind: &str, title: &str) -> Color {
     match kind {
         "started" | "continued" | "running" => theme::accent_color(),
         "note" => theme::emphasis_color(),
@@ -601,6 +681,9 @@ fn workflow_event_color(kind: &str) -> Color {
         "done" | "verification_passed" => theme::success_color(),
         "failed" | "verification_failed" => theme::error_color(),
         "blocked" => theme::error_color(),
+        "verdict" if title.contains("Review approved") => theme::success_color(),
+        "verdict" if title.contains("Changes requested") => theme::warning_color(),
+        "verdict" => theme::text_color(),
         _ => theme::text_color(),
     }
 }
@@ -806,8 +889,14 @@ pub(crate) fn workflow_time(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::event::{WorkflowRunId, WorkflowVerification};
+    use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
+    use crate::domain::event::{ModeRunStatus, WorkflowRunId, WorkflowVerification};
+    use crate::domain::mode::{CollabMode, ModeStatusSummary};
     use crate::domain::team::MemberId;
+    use crate::domain::team::{
+        BackendKind, DefaultTarget, PermissionMode, SandboxPolicy, SessionPolicy,
+    };
+    use crate::tui::app_state::AppState;
 
     fn run(
         id: u64,
@@ -825,7 +914,74 @@ mod tests {
             attempt: 1,
             events: Vec::new(),
             steps: Vec::new(),
+            mode: None,
         }
+    }
+
+    fn mode_run() -> WorkflowRunSummary {
+        let mut run = run(3, WorkflowRunStatus::Running, None);
+        run.goal = "fix the parser".to_string();
+        run.mode = Some(ModeRunStatus {
+            mode: CollabMode::Review,
+            state: ModeStatusSummary {
+                phase: "build".to_string(),
+                iteration: 1,
+                max_iterations: 3,
+                round: 0,
+                rounds: 0,
+            },
+        });
+        run
+    }
+
+    fn state_with(run: WorkflowRunSummary) -> AppState {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            workflow_runs: vec![run],
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "impl".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
+            }],
+        });
+        state
+    }
+
+    #[test]
+    fn mode_footer_hint_shows_badge_and_iteration() {
+        let state = state_with(mode_run());
+        let (text, _) = workflow_footer_hint(&state).expect("footer hint");
+        assert!(text.contains("◇ review"), "missing mode badge: {text}");
+        assert!(text.contains("iter 1/3"), "missing iteration: {text}");
+        assert!(text.contains("build"), "missing phase: {text}");
+        assert!(text.contains("run-3"), "missing run id: {text}");
+    }
+
+    #[test]
+    fn mode_detail_line_in_runs_drawer() {
+        let state = state_with(mode_run());
+        let lines = drawer_runs(&state, 80);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("review") && text.contains("phase:") && text.contains("iter 1/3"),
+            "missing mode detail: {text}"
+        );
     }
 
     #[test]

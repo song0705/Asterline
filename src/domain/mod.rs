@@ -3,16 +3,21 @@
 
 pub mod config;
 pub mod event;
+pub mod mode;
 pub mod team;
 
 pub use event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel,
-    MemberStatus, MemberSummary, MessageId, MessageTarget, RouteTo, RuntimeEvent, TeamMessage,
-    TurnId, UiCommand, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
+    MemberStatus, MemberSummary, MessageId, MessageTarget, ModeRunStatus, RouteTo, RuntimeEvent,
+    TeamMessage, TurnId, UiCommand, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
     WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus, WorkflowStepSummary,
     WorkflowVerification,
 };
+pub use mode::{
+    CollabMode, ModeBinding, ModeLimits, ModeStatusSummary, ModesConfig, ResolvedModeRoles,
+    ReviewVerdict, ReviewVerdictKind, resolve_mode_roles,
+};
 pub use team::{
-    BackendKind, DEFAULT_MAX_AUTO_RELAYS, DefaultTarget, MemberId, PermissionMode, SandboxPolicy,
-    SessionPolicy, TeamConfig, TeamConfigError, TeamMember,
+    ApprovalPolicy, ApprovalSurface, BackendKind, DEFAULT_MAX_AUTO_RELAYS, DefaultTarget, MemberId,
+    PermissionMode, SandboxPolicy, SessionPolicy, TeamConfig, TeamConfigError, TeamMember,
 };

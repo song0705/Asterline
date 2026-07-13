@@ -260,7 +260,14 @@ fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'stati
             items.get(i - 1).and_then(item_sender)
         };
         let show_sender_header = item_sender(item) != previous_sender;
+        let is_find_current = state.find_current_chat_index() == Some(i);
         render_item(item, width, state, out, show_sender_header);
+        if is_find_current && let Some(line) = out.get_mut(before) {
+            // Marker in the gutter for the current `/find` match.
+            let mut spans = vec![Span::styled("»", theme::selection())];
+            spans.append(&mut line.spans);
+            line.spans = spans;
+        }
         // Keep one member's answer, tools, routes, diffs, and errors on the
         // same uninterrupted visual rail. Separate unrelated blocks.
         if out.len() > before {
@@ -290,7 +297,10 @@ fn is_work_activity(item: &ChatItem) -> bool {
 fn is_compact(item: &ChatItem) -> bool {
     matches!(
         item,
-        ChatItem::Tool { .. } | ChatItem::Diff { .. } | ChatItem::Notice { .. }
+        ChatItem::Tool { .. }
+            | ChatItem::Diff { .. }
+            | ChatItem::Notice { .. }
+            | ChatItem::Verdict { .. }
     )
 }
 
@@ -305,6 +315,7 @@ fn item_member(item: &ChatItem) -> Option<&MemberId> {
         | ChatItem::Diff { member, .. } => Some(member),
         ChatItem::Route { from, .. } => Some(from),
         ChatItem::Error { member, .. } => member.as_ref(),
+        ChatItem::Verdict { member, .. } => Some(member),
         ChatItem::User { .. } | ChatItem::Notice { .. } => None,
     }
 }
@@ -414,7 +425,8 @@ fn item_sender(item: &ChatItem) -> Option<ChatSender> {
         | ChatItem::Diff { .. }
         | ChatItem::Route { .. }
         | ChatItem::Notice { .. }
-        | ChatItem::Error { .. } => None,
+        | ChatItem::Error { .. }
+        | ChatItem::Verdict { .. } => None,
     }
 }
 
@@ -562,6 +574,25 @@ fn render_item(
                 }
             } else {
                 push_wrapped(&format!("  ✕ {message}"), width, "", theme::error(), out);
+            }
+        }
+        ChatItem::Verdict {
+            approve, summary, ..
+        } => {
+            if *approve {
+                out.push(Line::from(Span::styled(
+                    "  ✓ review approved",
+                    theme::success_bold(),
+                )));
+            } else {
+                out.push(Line::from(Span::styled(
+                    "  ✗ changes requested",
+                    theme::warning_bold(),
+                )));
+            }
+            let summary = summary.trim();
+            if !summary.is_empty() {
+                push_wrapped(summary, width, "    ", theme::text(), out);
             }
         }
     }
@@ -1244,6 +1275,41 @@ mod tests {
     }
 
     #[test]
+    fn renders_verdict_card_with_title_and_summary() {
+        let state = AppState::new(vec![
+            ChatItem::Verdict {
+                member: MemberId::new("reviewer"),
+                approve: true,
+                summary: "Looks good; ship it.".to_string(),
+            },
+            ChatItem::Verdict {
+                member: MemberId::new("reviewer"),
+                approve: false,
+                summary: "Needs a regression test.".to_string(),
+            },
+        ]);
+        let mut lines = Vec::new();
+        render_chat_history(&state, 70, &mut lines);
+        let text = plain_text(&lines).join("\n");
+        assert!(
+            text.contains("✓ review approved"),
+            "missing approve title: {text}"
+        );
+        assert!(
+            text.contains("Looks good; ship it."),
+            "missing approve summary: {text}"
+        );
+        assert!(
+            text.contains("✗ changes requested"),
+            "missing reject title: {text}"
+        );
+        assert!(
+            text.contains("Needs a regression test."),
+            "missing reject summary: {text}"
+        );
+    }
+
+    #[test]
     fn renders_scrollable_diff_drawer() {
         let mut state = AppState::new(Vec::new());
         state.set_diff(
@@ -1294,6 +1360,7 @@ mod tests {
             attempt: 1,
             events: Vec::new(),
             steps: Vec::new(),
+            mode: None,
         });
 
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
@@ -1336,6 +1403,7 @@ mod tests {
                     updated_at: "2026-06-28 10:10:00".to_string(),
                 },
             ],
+            mode: None,
         });
 
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
@@ -1398,6 +1466,7 @@ mod tests {
                     updated_at: "2026-06-28 10:12:00".to_string(),
                 },
             ],
+            mode: None,
         });
         state.toggle_drawer(Drawer::Runs);
 
@@ -1493,6 +1562,7 @@ mod tests {
                 note: None,
                 updated_at: "2026-06-28 10:05:00".to_string(),
             }],
+            mode: None,
         });
         state.toggle_drawer(Drawer::Runs);
         state.select_next_workflow_step();
@@ -1532,6 +1602,7 @@ mod tests {
                 attempt: 2,
             }],
             steps: Vec::new(),
+            mode: None,
         });
         state.toggle_drawer(Drawer::Runs);
 

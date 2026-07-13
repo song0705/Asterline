@@ -69,10 +69,17 @@ Send a direct task:
 @builder inspect this repository and identify the highest-risk code path
 ```
 
-Or start a coordinated workflow:
+Run a review loop (the builder implements, the reviewer issues structured
+verdicts until the work passes):
 
 ```text
-/plan fix the payment callback race, add regression tests, and have reviewer check the result
+/review fix the payment callback race and add regression tests
+```
+
+Or have a leader plan an owned checklist that Asterline dispatches to the team:
+
+```text
+/plan ship the payment callback fix end to end
 ```
 
 A fresh conversation requires an explicit target. Later plain text reuses the
@@ -164,11 +171,21 @@ and save changes.
 
 ![Asterline Team editor](docs/assets/asterline-team.webp)
 
-### Workflows with an audit trail
+### Collaboration modes with an audit trail
 
-`/plan` creates a tracked run rather than an unstructured chat turn. `/runs`
-shows checklist owners, progress, attempts, recent events, blockers,
-verification results, and the next suggested command.
+`/review`, `/plan` (alias `/lead`), and `/roundtable` are runtime-driven state
+machines, not free-form chat turns. In review mode the builder implements and
+the reviewer must answer with a structured `@@review` verdict; `approve`
+finishes the run (optionally auto-verifying), `request_changes` loops the
+feedback back to the builder, bounded by `max_iterations`. Lead mode has the
+leader plan an owned checklist that Asterline dispatches to each owner before
+the same review loop. Roundtable runs N discussion rounds where each member
+sees the others' arguments, with an optional moderator synthesis.
+
+Who builds, reviews, leads, or moderates is configurable per mode in
+`team.json` and inline (`/review reviewer=claude builder=codex …`). `/runs`
+shows the mode phase, iteration budget, checklist owners, verdict timeline,
+blockers, and the next suggested command.
 
 ```text
 /block waiting for the staging client secret
@@ -178,7 +195,8 @@ verification results, and the next suggested command.
 ```
 
 Without an explicit verification command, Asterline detects common checks such
-as `cargo test`, `npm test`, and `pytest`.
+as `cargo test`, `npm test`, and `pytest`. `/workflow` keeps the original
+prompt-driven coordination as a fallback path.
 
 ### Native session attach
 
@@ -186,8 +204,8 @@ Focus a member with `Ctrl+N` or `Ctrl+B`, move with `←` or `→`, and press
 `Enter`. Asterline suspends its interface and opens that member's native
 interactive CLI, resuming its session when possible. Exit the CLI to return.
 
-Codex messages created while attached are imported into the Asterline
-transcript. Other backends resume their native session but currently do not
+Codex and Claude messages created while attached are imported into the
+Asterline transcript. Grok and Agy resume their native session but do not
 import the attached transcript.
 
 ### Local, durable state
@@ -214,21 +232,24 @@ runtime history; review it and decide whether your project should version it.
 
 ## Essential commands
 
-| Command                | Purpose                                       |
-| ---------------------- | --------------------------------------------- |
-| `@<member> <message>`  | Send to one member                            |
-| `@all <message>`       | Broadcast to the team                         |
-| `/plan <goal>`         | Start a tracked team workflow                 |
-| `/runs`                | Inspect workflow state and next actions       |
-| `/team`                | Edit the live roster                          |
-| `/skills`              | Select a Skill for the next prompt            |
-| `/diff`                | Inspect unstaged changes and untracked files  |
-| `/logs`                | Open persisted diagnostics                    |
-| `/new`                 | Start a new conversation and backend sessions |
-| `/approve` / `/reject` | Resolve a pending approval                    |
-| `/retry`               | Resume a paused route or retry a turn         |
-| `/abort`               | Cancel running work and verification          |
-| `/help`                | Open the command palette                      |
+| Command                | Purpose                                        |
+| ---------------------- | ---------------------------------------------- |
+| `@<member> <message>`  | Send to one member                             |
+| `@all <message>`       | Broadcast to the team                          |
+| `/review <task>`       | Builder implements; reviewer issues verdicts   |
+| `/plan <goal>`         | Leader plans a checklist the engine dispatches |
+| `/roundtable <topic>`  | Multi-agent discussion rounds                  |
+| `/runs`                | Inspect run state, phase, and next actions     |
+| `/team`                | Edit the live roster                           |
+| `/skills`              | Select a Skill for the next prompt             |
+| `/find <text>`         | Search the transcript                          |
+| `/diff`                | Inspect unstaged changes and untracked files   |
+| `/logs`                | Open persisted diagnostics                     |
+| `/new`                 | Start a new conversation and backend sessions  |
+| `/approve` / `/reject` | Resolve a pending approval                     |
+| `/retry`               | Resume a paused route or retry a turn          |
+| `/abort`               | Cancel running work, modes, and verification   |
+| `/help`                | Open the command palette                       |
 
 See the [complete command and keyboard reference](docs/commands.md) for workflow
 step commands, Team controls, prompt history, session attach, and `/runs`
@@ -241,8 +262,11 @@ environment, filesystem access, and network access. It does not sandbox a
 process beyond the controls supported by that backend.
 
 Members may use backend-native sandbox and permission settings. Asterline also
-gates requests it classifies as risky. `--debug` disables the Asterline approval
-gate and is intended only for controlled development environments.
+gates requests it classifies as risky — user messages, agent-to-agent relays,
+and collaboration-mode dispatches — with a configurable policy (see
+[approvals and tool-level control](docs/approvals.md)). `--debug` disables the
+Asterline approval gate and is intended only for controlled development
+environments.
 
 Read [configuration and operations](docs/configuration.md) before using
 `danger-full-access`, bypass-style permission modes, custom system prompts, or
@@ -287,7 +311,7 @@ src/
 
 ## Project status
 
-Asterline is currently version `0.1.0` and under active development. Tagged
+Asterline is currently version `0.1.1` and under active development. Tagged
 versions are published as prebuilt Linux and macOS archives through GitHub
 Actions. Configuration and persisted data are migrated when possible, but
 commands and UI details may continue to evolve before a stable release.

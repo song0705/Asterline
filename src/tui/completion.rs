@@ -19,36 +19,48 @@ pub struct Completion {
     pub items: Vec<CompletionItem>,
 }
 
-/// (name, hint, takes_argument)
-const COMMANDS: &[(&str, &str, bool)] = &[
+/// (name, hint, takes_argument). Also feeds the `/help` palette drawer.
+pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("ask", "send to one member", true),
     ("all", "send to everyone", true),
-    ("effort", "set reasoning effort (low…max)", true),
-    ("team", "edit roster · sessions · approvals", false),
-    ("runs", "workflow status · next action", false),
-    ("logs", "raw logs · stderr · warnings", false),
+    ("abort", "cancel running members", false),
+    ("approve", "approve first pending", false),
+    ("block", "mark a workflow blocked", true),
+    ("continue", "resume latest or selected workflow", true),
     ("diff", "show working-tree git diff", false),
-    ("skills", "choose a skill for the next prompt", false),
+    ("effort", "set reasoning effort (low…max)", true),
+    ("find", "search the transcript", true),
+    ("focus", "view a member's logs", true),
+    ("help", "show commands", false),
+    (
+        "lead",
+        "leader plans, team executes, reviewer verdicts",
+        true,
+    ),
+    ("logs", "raw logs · stderr · warnings", false),
     (
         "new",
         "start a fresh chat (new session, cleared transcript)",
         false,
     ),
-    ("sessions", "session ids", false),
-    ("status", "team status", false),
-    ("retry", "resume paused route / re-run", false),
-    ("abort", "cancel running members", false),
-    ("approve", "approve first pending", false),
-    ("reject", "reject first pending", false),
-    ("plan", "start a tracked team workflow", true),
-    ("workflow", "coordinate a goal across the team", true),
-    ("continue", "resume latest or selected workflow", true),
     ("note", "record a workflow checkpoint", true),
-    ("block", "mark a workflow blocked", true),
+    (
+        "plan",
+        "leader plans, team executes, reviewer verdicts",
+        true,
+    ),
+    ("reject", "reject first pending", false),
+    ("retry", "resume paused route / re-run", false),
+    ("review", "builder implements, reviewer verdicts", true),
+    ("roundtable", "multi-agent discussion rounds", true),
+    ("runs", "workflow status · next action", false),
+    ("sessions", "session ids", false),
+    ("skills", "choose a skill for the next prompt", false),
+    ("status", "team status", false),
     ("step", "manage workflow checklist", true),
+    ("team", "edit roster · sessions · approvals", false),
     ("verify", "verify latest or selected workflow", true),
-    ("focus", "view a member's logs", true),
-    ("help", "show commands", false),
+    ("workflow", "legacy prompt-driven team workflow", true),
 ];
 
 /// Compute the completion for `head` (composer text up to the cursor).
@@ -199,6 +211,14 @@ mod tests {
         assert_eq!(inserts("/ste"), vec!["/step ".to_string()]);
         let a = inserts("/a");
         assert!(a.contains(&"/ask ".to_string()) && a.contains(&"/all ".to_string()));
+        let re = inserts("/re");
+        assert!(
+            re.contains(&"/review ".to_string()) && re.contains(&"/reject".to_string()),
+            "expected review + reject for /re, got {re:?}"
+        );
+        assert!(inserts("/find").contains(&"/find ".to_string()));
+        assert!(inserts("/lead").contains(&"/lead ".to_string()));
+        assert!(inserts("/round").contains(&"/roundtable ".to_string()));
     }
 
     #[test]

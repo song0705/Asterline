@@ -39,17 +39,39 @@ plain text reuses the previous target.
 | `/abort`                                           | Cancel running members and active verification      |
 | `/help`                                            | Open the command palette                            |
 
-## Workflow commands
+## Collaboration modes
 
-| Command                        | Action                                                   |
-| ------------------------------ | -------------------------------------------------------- |
-| `/plan <goal>`                 | Start a coordinated workflow                             |
-| `/workflow <goal>`             | Alias for `/plan`                                        |
-| `/runs`                        | Inspect runs, checklist steps, timeline, and next action |
-| `/continue [run-<id>] [note]`  | Continue a blocked or failed run                         |
-| `/note [run-<id>] <text>`      | Record a checkpoint without waking an agent              |
-| `/block [run-<id>] <reason>`   | Mark a run blocked                                       |
-| `/verify [run-<id>] [command]` | Run verification in the background                       |
+First-class mode runs use the runtime engine (builder/review loops, lead
+checklists, roundtable discussion). Inline `key=value` tokens before the task
+override role bindings and budgets from `team.json`.
+
+| Command                        | Action                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------ |
+| `/review [k=v…] <task>`        | Builder implements; reviewer issues structured verdicts                  |
+| `/plan [k=v…] <goal>`          | Leader plans a checklist; engine dispatches; reviewer verdicts (`/lead`) |
+| `/lead [k=v…] <goal>`          | Alias for `/plan`                                                        |
+| `/roundtable [k=v…] <topic>`   | Multi-agent discussion for N rounds (`/rt`)                              |
+| `/workflow <goal>`             | Legacy prompt-driven team workflow (original path)                       |
+| `/runs`                        | Inspect runs, mode phase, checklist, timeline, and next action           |
+| `/continue [run-<id>] [note]`  | Continue a blocked or failed run                                         |
+| `/note [run-<id>] <text>`      | Record a checkpoint without waking an agent                              |
+| `/block [run-<id>] <reason>`   | Mark a run blocked                                                       |
+| `/verify [run-<id>] [command]` | Run verification in the background                                       |
+| `/find <text>`                 | Search the transcript (case-insensitive); empty query clears             |
+
+Override keys: `builder`, `reviewer`, `leader`, `moderator`, `participants`
+(comma list or `all`), `max_iterations`, `rounds`, `auto_verify`. Example:
+
+```text
+/review reviewer=claude builder=@codex max_iterations=5 fix the parser
+```
+
+Review and lead modes loop on `@@review` verdicts until approve or
+`max_iterations` is exhausted (then the run blocks). A one-line agent verdict:
+
+```text
+@@review {"verdict":"approve","summary":"LGTM"}
+```
 
 If `/verify` has no command, Asterline detects common checks such as
 `cargo test`, `npm test`, and `pytest`.
@@ -78,9 +100,10 @@ If `/verify` has no command, Asterline detects common checks such as
 | `↑` / `↓`                      | Move in the composer, recall history, or move popup selection |
 | `Tab`                          | Accept completion                                             |
 | `Ctrl+R`                       | Reverse-search prompt history                                 |
+| `n` / `p`                      | Next or previous `/find` match (composer empty, no drawer)    |
 | `PageUp` / `PageDown`          | Scroll chat or the open drawer                                |
 | Mouse wheel                    | Scroll chat or the open drawer                                |
-| `Esc`                          | Close or step back from the active overlay                    |
+| `Esc`                          | Clear `/find`, or close / step back from the active overlay   |
 | `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | Expand or collapse successful tool output                     |
 | `Ctrl+L`                       | Open logs                                                     |
 | `Ctrl+P`                       | Open the command palette                                      |
@@ -93,6 +116,10 @@ If `/verify` has no command, Asterline detects common checks such as
 Prompt history behaves like a shell: `↑` and `↓` preserve the current draft
 while browsing older submissions. During `Ctrl+R`, type to refine the match,
 press `Ctrl+R` again for an older match, `Enter` to accept, or `Esc` to cancel.
+
+During `/find`, the footer shows `find: "query" (i/n)`. Press `n` or `p` to
+jump matches (composer must be empty and no drawer open). `Esc` clears find.
+`/find` with no argument also clears the search.
 
 ## Team editor
 
@@ -134,5 +161,7 @@ Press `Ctrl+N` or `Ctrl+B` to focus the top roster, move with `←` or `→`, th
 press `Enter`. Asterline suspends its TUI and opens the selected member's native
 interactive CLI. Exit that CLI with `/exit` or `Ctrl+D` to return.
 
-Codex messages created while attached are imported back into the Asterline
-transcript. Other backends resume the native session without transcript import.
+Codex and Claude messages created while attached are imported back into the
+Asterline transcript (codex rollout diff; Claude session JSONL with timestamp
+filtering for resume forks). Grok and Agy resume the native session but do not
+import the attached transcript.

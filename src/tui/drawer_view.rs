@@ -431,50 +431,15 @@ fn drawer_palette() -> Vec<Line<'static>> {
         Line::raw(""),
     ];
 
-    let items = [
-        ("/ask <member> <msg>", "Send a message to a specific member"),
-        ("@<member> <msg>", "Shortcut to message a specific member"),
-        ("/all <msg>", "Broadcast a message to all members"),
-        ("/team", "Edit team roster, sessions, and approvals"),
-        ("/plan <goal>", "Start a tracked team workflow"),
-        ("/workflow <goal>", "Alias for /plan"),
-        ("/runs", "Open workflow status and next action"),
-        (
-            "/continue [run-id] [note]",
-            "Resume latest or selected workflow run",
-        ),
-        (
-            "/note [run-id] <note>",
-            "Record a human checkpoint on a workflow run",
-        ),
-        (
-            "/block [run-id] <reason>",
-            "Mark a workflow run blocked with a reason",
-        ),
-        (
-            "/step add|assign|done ...",
-            "Manage workflow checklist steps and owners",
-        ),
-        (
-            "/verify [run-id] [cmd]",
-            "Run background verification for latest or selected workflow",
-        ),
-        ("/logs", "Open raw log stream, stderr, and warnings"),
-        ("/diff", "Show the working-tree git diff"),
-        ("/skills", "Choose a local skill for the next prompt"),
-        ("/retry", "Resume paused routes or re-run the last turn"),
-        ("/abort", "Cancel running members and active verification"),
-        (
-            "/approve / /reject",
-            "Approve or reject the first pending approval",
-        ),
-        ("/help", "Show this palette help drawer"),
-    ];
-
-    for (cmd, desc) in items {
+    for (name, hint, takes_arg) in crate::tui::completion::COMMANDS {
+        let cmd = if *takes_arg {
+            format!("/{name} …")
+        } else {
+            format!("/{name}")
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<24} ", cmd), theme::accent_bold()),
-            Span::styled(format!(" {desc}"), theme::text()),
+            Span::styled(format!(" {hint}"), theme::text()),
         ]));
     }
     lines

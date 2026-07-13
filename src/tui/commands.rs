@@ -4,6 +4,7 @@
 use crate::domain::event::{
     ApprovalDecision, MessageTarget, UiCommand, WorkflowRunId, WorkflowStepStatus,
 };
+use crate::domain::mode::CollabMode;
 use crate::domain::team::{Effort, MemberId};
 use crate::tui::drawers::Drawer;
 
@@ -16,6 +17,8 @@ pub enum Submission {
     Drawer(Drawer),
     /// Approve (true) or reject (false) the first pending approval.
     ApproveFirst(ApprovalDecision),
+    /// Search the transcript (`/find`); empty query clears the search.
+    FindInChat(String),
     /// Show help.
     Help,
     /// Non-empty message text without an explicit target prefix.
@@ -102,7 +105,10 @@ fn parse_slash(rest: &str) -> Submission {
                 _ => Submission::Help,
             }
         }
-        "workflow" | "plan" => {
+        "review" => parse_mode_command(CollabMode::Review, arg),
+        "plan" | "lead" => parse_mode_command(CollabMode::Lead, arg),
+        "roundtable" | "rt" => parse_mode_command(CollabMode::Roundtable, arg),
+        "workflow" => {
             if arg.is_empty() {
                 Submission::Help
             } else {
@@ -111,6 +117,7 @@ fn parse_slash(rest: &str) -> Submission {
                 })
             }
         }
+        "find" => Submission::FindInChat(arg.to_string()),
         "continue" | "cont" => {
             let (first, rest) = split_first_word(arg);
             let (run_id, note) = if let Some(run_id) = parse_workflow_run_id(first) {
@@ -173,6 +180,54 @@ fn parse_slash(rest: &str) -> Submission {
         "help" => Submission::Help,
         _ => Submission::Help,
     }
+}
+
+fn parse_mode_command(mode: CollabMode, arg: &str) -> Submission {
+    let (overrides, task) = split_mode_overrides(arg);
+    if task.is_empty() {
+        Submission::Help
+    } else {
+        Submission::Runtime(UiCommand::RunMode {
+            mode,
+            task: task.to_string(),
+            overrides,
+        })
+    }
+}
+
+/// Split leading `key=value` tokens (mode overrides) off the front of `arg`.
+/// A token counts as an override only if it matches ^[a-z_]+=\S+$ (ASCII key).
+fn split_mode_overrides(arg: &str) -> (Vec<(String, String)>, &str) {
+    let mut rest = arg.trim_start();
+    let mut overrides = Vec::new();
+    loop {
+        let (token, after) = split_first_word(rest);
+        if token.is_empty() {
+            break;
+        }
+        match parse_override_token(token) {
+            Some((key, value)) => {
+                overrides.push((key, value));
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    (overrides, rest)
+}
+
+fn parse_override_token(token: &str) -> Option<(String, String)> {
+    let eq = token.find('=')?;
+    let key = &token[..eq];
+    let value = &token[eq + 1..];
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    if !key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        return None;
+    }
+    // Value is a single whitespace-delimited token, so it is already \S+.
+    Some((key.to_string(), value.to_string()))
 }
 
 fn parse_step_command(arg: &str) -> Submission {
@@ -456,8 +511,10 @@ mod tests {
         );
         assert_eq!(
             parse("/plan build a parser"),
-            Submission::Runtime(UiCommand::RunWorkflow {
-                goal: "build a parser".to_string(),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Lead,
+                task: "build a parser".to_string(),
+                overrides: Vec::new(),
             })
         );
         assert_eq!(
@@ -590,6 +647,75 @@ mod tests {
         assert_eq!(parse("/workflow"), Submission::Help);
         assert_eq!(parse("/plan"), Submission::Help);
         assert_eq!(parse("/focus"), Submission::Help);
+    }
+
+    #[test]
+    fn mode_commands_parse_overrides_and_task() {
+        assert_eq!(
+            parse("/review reviewer=claude builder=@codex fix the parser"),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Review,
+                task: "fix the parser".to_string(),
+                overrides: vec![
+                    ("reviewer".to_string(), "claude".to_string()),
+                    ("builder".to_string(), "@codex".to_string()),
+                ],
+            })
+        );
+        assert_eq!(
+            parse("/review fix it"),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Review,
+                task: "fix it".to_string(),
+                overrides: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse("/rt topic"),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Roundtable,
+                task: "topic".to_string(),
+                overrides: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse("/lead goal"),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Lead,
+                task: "goal".to_string(),
+                overrides: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse("/workflow goal"),
+            Submission::Runtime(UiCommand::RunWorkflow {
+                goal: "goal".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("/find needle"),
+            Submission::FindInChat("needle".to_string())
+        );
+        assert_eq!(parse("/find"), Submission::FindInChat(String::new()));
+        // Override-only input has no task → Help.
+        assert_eq!(parse("/review max_iterations=3"), Submission::Help);
+        // `=` later in the task is not an override token.
+        assert_eq!(
+            parse("/review fix the a=b case"),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Review,
+                task: "fix the a=b case".to_string(),
+                overrides: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse("/roundtable max_iterations=2 discuss design"),
+            Submission::Runtime(UiCommand::RunMode {
+                mode: CollabMode::Roundtable,
+                task: "discuss design".to_string(),
+                overrides: vec![("max_iterations".to_string(), "2".to_string())],
+            })
+        );
     }
 
     #[test]

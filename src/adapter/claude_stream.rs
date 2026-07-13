@@ -69,7 +69,11 @@ impl StreamAdapter for ClaudeStreamAdapter {
             args.push("--model".to_string());
             args.push(model.clone());
         }
-        if let Some(mode) = self.permission_mode {
+        // Recent Claude CLIs (e.g. v2.1.207) list acceptEdits/auto/plan/… but not
+        // `default`; omit the flag so the CLI's own default applies.
+        if let Some(mode) = self.permission_mode
+            && mode != PermissionMode::Default
+        {
             args.push("--permission-mode".to_string());
             args.push(mode.claude_arg().to_string());
         }
@@ -206,10 +210,14 @@ impl LineParser for ClaudeLineParser {
                         session.to_string(),
                     )));
                 }
-                if str_field(&value, "subtype") != Some("init") {
+                // `thinking_tokens` progress rows arrive many times per turn
+                // (observed on claude 2.1.207); logging each would flood the
+                // logs drawer.
+                let subtype = str_field(&value, "subtype");
+                if subtype != Some("init") && subtype != Some("thinking_tokens") {
                     out.push(AgentEvent::Log(format!(
                         "claude system/{}",
-                        str_field(&value, "subtype").unwrap_or("event")
+                        subtype.unwrap_or("event")
                     )));
                 }
             }
@@ -311,6 +319,16 @@ mod tests {
     }
 
     #[test]
+    fn command_omits_permission_mode_default() {
+        let mut member = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+        member.permission_mode = Some(PermissionMode::Default);
+        let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let command = adapter.build_command("hello", None, None);
+        assert!(!command.args.iter().any(|a| a == "--permission-mode"));
+        assert!(!command.args.iter().any(|a| a == "default"));
+    }
+
+    #[test]
     fn captures_session_from_init() {
         let events = parse_all(&[
             r#"{"type":"system","subtype":"init","session_id":"sess-abc","model":"claude"}"#,
@@ -320,6 +338,24 @@ mod tests {
             vec![AgentEvent::SessionDiscovered(AgentSessionId(
                 "sess-abc".to_string()
             ))]
+        );
+    }
+
+    #[test]
+    fn thinking_tokens_progress_rows_are_not_logged() {
+        let events = parse_all(&[
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":15,"session_id":"sess-abc"}"#,
+        ]);
+        // Session id still tracked (deduped downstream), but no Log spam.
+        assert_eq!(
+            events,
+            vec![AgentEvent::SessionDiscovered(AgentSessionId(
+                "sess-abc".to_string()
+            ))]
+        );
+        let events = parse_all(&[r#"{"type":"system","subtype":"compact_boundary"}"#]);
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Log(msg)] if msg.contains("compact_boundary"))
         );
     }
 

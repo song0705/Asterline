@@ -12,17 +12,51 @@ const TEAM_PROTOCOL_BEGIN: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_BEGIN -->";
 const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
 pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL.md";
+/// Bump when the embedded skill protocol gains breaking agent-facing changes.
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 2;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
+const MANAGED_SKILL_MARKER: &str =
+    "<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->";
 
+/// Ensure the workspace skill file is present and, when Asterline manages it,
+/// upgraded to the embedded protocol version. User-rewritten copies are left alone.
 pub fn ensure_team_skill(workspace: &Path) -> io::Result<()> {
     let path = workspace.join(ASTERLINE_TEAM_SKILL_PATH);
     if path.is_file() {
+        let existing = fs::read_to_string(&path)?;
+        if is_managed_skill(&existing) && skill_version(&existing) < ASTERLINE_TEAM_SKILL_VERSION {
+            fs::write(&path, ASTERLINE_TEAM_SKILL)?;
+        }
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, ASTERLINE_TEAM_SKILL)
+}
+
+/// Frontmatter `version:` value; missing or invalid values are treated as v1.
+fn skill_version(text: &str) -> u32 {
+    let mut in_frontmatter = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "---" {
+            if in_frontmatter {
+                break;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if in_frontmatter && let Some(rest) = line.strip_prefix("version:") {
+            return rest.trim().parse().unwrap_or(1);
+        }
+    }
+    1
+}
+
+/// True for files Asterline wrote (managed marker or the historical name line).
+fn is_managed_skill(text: &str) -> bool {
+    text.contains(MANAGED_SKILL_MARKER) || text.contains("name: asterline-team")
 }
 
 pub fn team_skill_hint() -> String {
@@ -466,6 +500,54 @@ mod tests {
         assert!(text.contains("@@team_message"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_team_skill_upgrades_managed_v1_file() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-skill-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // v1 managed files had the name line but no version / managed marker.
+        std::fs::write(
+            &path,
+            "---\nname: asterline-team\ndescription: old\n---\n\n# Old protocol\n@@team_message\n",
+        )
+        .unwrap();
+
+        ensure_team_skill(&dir).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("version: 2"));
+        assert!(text.contains("@@review"));
+        assert!(text.contains(MANAGED_SKILL_MARKER));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_team_skill_leaves_user_rewritten_file_alone() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-skill-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let custom = "# My custom team notes\nDo not overwrite me.\n";
+        std::fs::write(&path, custom).unwrap();
+
+        ensure_team_skill(&dir).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, custom);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embedded_team_skill_is_protocol_v2() {
+        assert!(ASTERLINE_TEAM_SKILL.contains("version: 2"));
+        assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
+        assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 2);
     }
 
     #[test]

@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::config::{
     ASTERLINE_TEAM_SKILL_NAME, inject_team_protocol, strip_team_protocol, strip_team_protocols,
     team_skill_hint,
@@ -19,12 +21,21 @@ use crate::domain::event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ImportedMessage, LogEntry,
     MemberStatus, MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
     WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus,
+    WorkflowStepSummary,
 };
+use crate::domain::mode::{CollabMode, ReviewVerdict, ReviewVerdictKind, resolve_mode_roles};
 use crate::domain::team::{
-    BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig, TeamMember,
+    ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
+    TeamMember,
 };
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
-use crate::runtime::approval::risky_action_kind;
+use crate::runtime::approval::ApprovalMatcher;
+use crate::runtime::mode_prompts::{
+    lead_iteration_prompt, lead_nudge_prompt, lead_plan_prompt, lead_progress_prompt,
+    lead_review_prompt, moderator_prompt, review_iteration_prompt, review_prompt,
+    review_task_prompt, roundtable_digest_prompt, roundtable_prompt, step_dispatch_prompt,
+    verdict_nudge_prompt,
+};
 use crate::runtime::session_registry::SessionRegistry;
 use crate::store::sqlite::SqliteStore;
 use crate::workflow::suggested_verify_command;
@@ -125,7 +136,10 @@ struct PausedRoute {
 struct HeldApproval {
     turn: TurnId,
     targets: Vec<MemberId>,
-    body: String,
+    /// The prompt actually enqueued on approve (relay-wrapped for relays).
+    prompt: String,
+    /// The mode run to block if this dispatch is rejected (set by the M3 engine).
+    mode_run: Option<WorkflowRunId>,
 }
 
 pub struct TeamRuntime {
@@ -139,9 +153,11 @@ pub struct TeamRuntime {
     held_approvals: HashMap<ApprovalId, HeldApproval>,
     workflow_turns: HashMap<TurnId, WorkflowRunId>,
     failed_workflow_runs: HashSet<WorkflowRunId>,
+    mode_sessions: HashMap<WorkflowRunId, ModeSession>,
     last_user: Option<(MessageTarget, String)>,
     next_message_id: u64,
     approvals_enabled: bool,
+    matcher: ApprovalMatcher,
 }
 
 impl TeamRuntime {
@@ -151,6 +167,12 @@ impl TeamRuntime {
         if let Ok(conversation) = store.current_conversation() {
             store.set_conversation(conversation);
         }
+        // In-flight mode runs cannot be resumed losslessly across process restarts.
+        if let Ok(ids) = store.running_mode_runs() {
+            for id in ids {
+                let _ = store.block_workflow_run(id, "interrupted by restart");
+            }
+        }
         let sessions = SessionRegistry::from_store(&store, &config.all_member_ids());
         let members = config
             .members
@@ -158,6 +180,7 @@ impl TeamRuntime {
             .map(|m| (m.id.clone(), MemberState::new(m.effort)))
             .collect();
         let relay = RelayGuard::new(config.max_auto_relays);
+        let matcher = ApprovalMatcher::from_policy(&config.approvals);
         Self {
             config,
             store,
@@ -169,9 +192,11 @@ impl TeamRuntime {
             held_approvals: HashMap::new(),
             workflow_turns: HashMap::new(),
             failed_workflow_runs: HashSet::new(),
+            mode_sessions: HashMap::new(),
             last_user: None,
             next_message_id: 0,
             approvals_enabled: true,
+            matcher,
         }
     }
 
@@ -312,6 +337,11 @@ impl TeamRuntime {
                 step: step_number,
                 owner,
             } => self.handle_assign_workflow_step(run_id, step_number, owner, &mut step),
+            UiCommand::RunMode {
+                mode,
+                task,
+                overrides,
+            } => self.handle_run_mode(mode, task, overrides, &mut step),
             UiCommand::Shutdown => self.handle_cancel(None, &mut step),
         }
         step
@@ -362,21 +392,23 @@ impl TeamRuntime {
         }
 
         if self.approvals_enabled
-            && let Some(kind) = risky_action_kind(&body)
+            && self.matcher.applies_to(ApprovalSurface::User)
+            && let Some(kind) = self.matcher.classify(&body)
         {
-            if let Ok(id) = self.store.insert_approval(Some(turn), None, kind, &body) {
+            if let Ok(id) = self.store.insert_approval(Some(turn), None, &kind, &body) {
                 self.held_approvals.insert(
                     id,
                     HeldApproval {
                         turn,
                         targets,
-                        body: body.clone(),
+                        prompt: body.clone(),
+                        mode_run: None,
                     },
                 );
                 step.events.push(RuntimeEvent::ApprovalRequested {
                     id,
                     member: None,
-                    action: kind.to_string(),
+                    action: kind,
                     body,
                 });
             }
@@ -415,6 +447,7 @@ impl TeamRuntime {
         let targets: Vec<MemberId> = match member {
             Some(m) => vec![m],
             None => {
+                self.block_all_mode_sessions("aborted by user", step);
                 self.paused_routes.clear();
                 self.members.keys().cloned().collect()
             }
@@ -444,6 +477,7 @@ impl TeamRuntime {
     }
 
     fn handle_new_session(&mut self, step: &mut RuntimeStep) {
+        self.block_all_mode_sessions("superseded by /new", step);
         // A fresh chat: a new conversation (so the transcript starts clean and
         // restart shows only this chat) plus new backend sessions for everyone.
         if let Ok(conversation) = self.store.create_conversation() {
@@ -543,6 +577,9 @@ impl TeamRuntime {
         let mut operational_config = raw_config.clone();
         inject_team_protocol(&mut operational_config);
         self.config = operational_config;
+        // Rebuild even though ReplaceTeam does not carry approvals yet, so a
+        // future path that mutates config.approvals stays correct.
+        self.matcher = ApprovalMatcher::from_policy(&self.config.approvals);
         let _ = self.store.upsert_team(&self.config);
 
         for member in self.config.members.clone() {
@@ -670,12 +707,15 @@ impl TeamRuntime {
         match decision {
             ApprovalDecision::Approve => {
                 for member in held.targets {
-                    self.enqueue_prompt(&member, held.turn, held.body.clone(), step);
+                    self.enqueue_prompt(&member, held.turn, held.prompt.clone(), step);
                 }
             }
             ApprovalDecision::Reject => {
                 step.events
                     .push(RuntimeEvent::Notice("request rejected".to_string()));
+                if let Some(run_id) = held.mode_run {
+                    self.block_mode_run(run_id, "dispatch rejected by user", step);
+                }
                 self.check_turn_complete(held.turn, step);
             }
         }
@@ -891,16 +931,17 @@ impl TeamRuntime {
             );
         }
 
-        if !parsed.visible_text.is_empty() {
+        let visible_text = parsed.visible_text;
+        if !visible_text.is_empty() {
             let display = self.member_display(member);
             let backend = self.member_backend(member);
             let _ = self
                 .store
-                .record_agent(turn, member, &display, backend, &parsed.visible_text);
+                .record_agent(turn, member, &display, backend, &visible_text);
         }
         step.events.push(RuntimeEvent::MessageCompleted {
             msg,
-            text: parsed.visible_text,
+            text: visible_text.clone(),
         });
 
         if let Some(state) = self.members.get_mut(member)
@@ -909,6 +950,8 @@ impl TeamRuntime {
             running.message = None;
             running.text.clear();
         }
+
+        self.mode_record_message(member, turn, &visible_text, &parsed.reviews, step);
 
         for member_request in parsed.members {
             self.add_team_member_from_agent(member, member_request, step);
@@ -1018,11 +1061,42 @@ impl TeamRuntime {
         }
         match self.relay.record_auto_relay(turn, from) {
             RelayDecision::Continue { .. } => {
+                // Gate risky relay bodies the same way as user messages. A
+                // user-resumed paused route (/retry) is intentionally left
+                // ungated below / in resolve_next_paused_route — that path is
+                // itself an explicit human decision.
+                if self.approvals_enabled
+                    && self.matcher.applies_to(ApprovalSurface::Relay)
+                    && let Some(kind) = self.matcher.classify(&tmsg.body)
+                {
+                    if let Ok(id) =
+                        self.store
+                            .insert_approval(Some(turn), Some(from), &kind, &tmsg.body)
+                    {
+                        self.held_approvals.insert(
+                            id,
+                            HeldApproval {
+                                turn,
+                                targets: resolved.members,
+                                prompt,
+                                mode_run: None,
+                            },
+                        );
+                        step.events.push(RuntimeEvent::ApprovalRequested {
+                            id,
+                            member: Some(from.clone()),
+                            action: kind,
+                            body: tmsg.body,
+                        });
+                    }
+                    return;
+                }
                 for member in resolved.members {
                     self.enqueue_prompt(&member, turn, prompt.clone(), step);
                 }
             }
             RelayDecision::Pause { count } => {
+                // Ungated: resume via /retry is an explicit human decision.
                 self.pause_route(
                     turn,
                     from,
@@ -1148,6 +1222,7 @@ impl TeamRuntime {
         if cancelled {
             // A user-requested cancel kills the process (no exit code); that is
             // expected, not an error.
+            self.mode_mark_turn_cancelled(turn);
             step.events
                 .push(RuntimeEvent::Notice(format!("{member} cancelled")));
         } else if !ok {
@@ -1339,13 +1414,22 @@ impl TeamRuntime {
     fn check_turn_complete(&mut self, turn: TurnId, step: &mut RuntimeStep) {
         if !self.turn_active(turn) {
             self.relay.reset_turn(turn);
-            if let Some(run_id) = self.workflow_turns.remove(&turn)
-                && !self.failed_workflow_runs.contains(&run_id)
-                && let Ok(run) = self
-                    .store
-                    .update_workflow_status(run_id, WorkflowRunStatus::Done)
-            {
-                step.events.push(RuntimeEvent::WorkflowRunUpdated { run });
+            let run_id = self.workflow_turns.remove(&turn);
+            match run_id {
+                Some(run_id) if self.mode_sessions.contains_key(&run_id) => {
+                    step.events.push(RuntimeEvent::TurnFinished { turn });
+                    self.mode_on_turn_complete(run_id, step);
+                    return;
+                }
+                Some(run_id) if !self.failed_workflow_runs.contains(&run_id) => {
+                    if let Ok(run) = self
+                        .store
+                        .update_workflow_status(run_id, WorkflowRunStatus::Done)
+                    {
+                        step.events.push(RuntimeEvent::WorkflowRunUpdated { run });
+                    }
+                }
+                _ => {}
             }
             step.events.push(RuntimeEvent::TurnFinished { turn });
         }
@@ -1433,6 +1517,9 @@ impl TeamRuntime {
 // Workflow handlers (handle_run_workflow … on_verify_output), split out for
 // readability. Still inside this module so private fields are accessible.
 include!("team_runtime_workflow.inc.rs");
+
+// Collaboration-mode engine (review in M3; lead/roundtable in M4).
+include!("team_runtime_modes.inc.rs");
 
 fn relay_prompt(from_display: &str, body: &str) -> String {
     format!("[relay from {from_display}]\n{body}")

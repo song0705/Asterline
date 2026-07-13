@@ -81,6 +81,17 @@ impl TeamRuntime {
         let Some(run) = self.workflow_run_or_latest(run_id, "continue", step) else {
             return;
         };
+        if run.mode.is_some() {
+            if self.mode_sessions.contains_key(&run.id) {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "{} is already active",
+                    run.id
+                )));
+                return;
+            }
+            self.mode_resume(run, note, step);
+            return;
+        }
         if matches!(
             run.status,
             WorkflowRunStatus::Running | WorkflowRunStatus::Verifying
@@ -234,6 +245,15 @@ impl TeamRuntime {
         let Some(run) = self.workflow_run_or_latest(run_id, "verify", step) else {
             return;
         };
+        // The mode engine owns verification for live sessions; a manual /verify
+        // mid-phase would fight the FSM over the run status.
+        if self.mode_sessions.contains_key(&run.id) {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "{} is an active mode run — /abort it before manual verification",
+                run.id
+            )));
+            return;
+        }
         if run.status == WorkflowRunStatus::Verifying {
             step.events.push(RuntimeEvent::Notice(format!(
                 "{} is already verifying",
@@ -483,6 +503,16 @@ impl TeamRuntime {
             Err(err) => step.events.push(RuntimeEvent::Notice(format!(
                 "could not save verification result: {err}"
             ))),
+        }
+        if self
+            .mode_sessions
+            .get(&output.run_id)
+            .is_some_and(|session| session.phase == ModePhase::Verifying)
+        {
+            self.mode_sessions.remove(&output.run_id);
+            if !ok {
+                self.failed_workflow_runs.insert(output.run_id);
+            }
         }
         step
     }

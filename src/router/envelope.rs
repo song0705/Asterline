@@ -12,6 +12,7 @@
 //! @@workflow_step {"action":"add","owner":"builder","title":"Write parser tests"}
 //! @@workflow_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
 //! @@workflow_step {"action":"assign","step":2,"owner":"reviewer"}
+//! @@review {"verdict":"approve","summary":"Looks good"}
 //! ```
 
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::domain::event::{RouteTo, TeamMessage, WorkflowStepRequest, WorkflowStepStatus};
+use crate::domain::mode::{ReviewVerdict, ReviewVerdictKind};
 use crate::domain::team::{
     BackendKind, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy, TeamMember,
     derived_member_id,
@@ -27,6 +29,7 @@ use crate::domain::team::{
 const TEAM_MESSAGE_PREFIX: &str = "@@team_message";
 const TEAM_MEMBER_PREFIX: &str = "@@team_member";
 const WORKFLOW_STEP_PREFIX: &str = "@@workflow_step";
+const REVIEW_PREFIX: &str = "@@review";
 
 /// The result of scanning one agent message for envelopes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -39,6 +42,11 @@ pub struct ParsedAgentOutput {
     pub members: Vec<TeamMember>,
     /// Workflow checklist mutations parsed from the output, in order.
     pub workflow_steps: Vec<WorkflowStepRequest>,
+    /// Review verdicts parsed from the output, in order.
+    ///
+    /// The collaboration engine consumes the **last** verdict when multiple
+    /// `@@review` lines appear in one agent message.
+    pub reviews: Vec<ReviewVerdict>,
     /// Human-readable warnings for malformed envelopes (kept in the logs drawer).
     pub warnings: Vec<String>,
 }
@@ -93,6 +101,15 @@ struct WorkflowStepRaw {
 }
 
 #[derive(Deserialize)]
+struct ReviewRaw {
+    verdict: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    items: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum ToField {
     One(String),
@@ -117,42 +134,70 @@ impl ToField {
     }
 }
 
-/// Scan one agent message for `@@team_message` envelopes.
+/// Parsed value from one prefix-table entry.
+enum EnvelopeValue {
+    Message(TeamMessage),
+    Member(TeamMember),
+    Workflow(WorkflowStepRequest),
+    Review(ReviewVerdict),
+}
+
+type EnvelopeParser = fn(&str) -> Result<EnvelopeValue, String>;
+
+fn parse_message_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_team_message(payload).map(EnvelopeValue::Message)
+}
+
+fn parse_member_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_team_member(payload).map(EnvelopeValue::Member)
+}
+
+fn parse_workflow_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_workflow_step(payload).map(EnvelopeValue::Workflow)
+}
+
+fn parse_review_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_review(payload).map(EnvelopeValue::Review)
+}
+
+/// Flat prefix table: first matching prefix wins. Keeps behavior identical to the
+/// previous nested-match chain while remaining easy to extend.
+const ENVELOPE_PARSERS: &[(&str, EnvelopeParser)] = &[
+    (TEAM_MESSAGE_PREFIX, parse_message_envelope),
+    (TEAM_MEMBER_PREFIX, parse_member_envelope),
+    (WORKFLOW_STEP_PREFIX, parse_workflow_envelope),
+    (REVIEW_PREFIX, parse_review_envelope),
+];
+
+/// Scan one agent message for control envelopes (`@@team_message`, …).
 pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut kept_lines = Vec::new();
     let mut messages = Vec::new();
     let mut members = Vec::new();
     let mut workflow_steps = Vec::new();
+    let mut reviews = Vec::new();
     let mut warnings = Vec::new();
 
     for line in text.lines() {
-        match envelope_payload(line, TEAM_MESSAGE_PREFIX) {
-            Some(payload) => match parse_team_message(payload) {
-                Ok(message) => messages.push(message),
-                Err(warning) => {
-                    warnings.push(warning);
-                    kept_lines.push(line);
-                }
-            },
-            None => match envelope_payload(line, TEAM_MEMBER_PREFIX) {
-                Some(payload) => match parse_team_member(payload) {
-                    Ok(member) => members.push(member),
+        let mut matched = false;
+        for &(prefix, parse_fn) in ENVELOPE_PARSERS {
+            if let Some(payload) = envelope_payload(line, prefix) {
+                matched = true;
+                match parse_fn(payload) {
+                    Ok(EnvelopeValue::Message(message)) => messages.push(message),
+                    Ok(EnvelopeValue::Member(member)) => members.push(member),
+                    Ok(EnvelopeValue::Workflow(request)) => workflow_steps.push(request),
+                    Ok(EnvelopeValue::Review(review)) => reviews.push(review),
                     Err(warning) => {
                         warnings.push(warning);
                         kept_lines.push(line);
                     }
-                },
-                None => match envelope_payload(line, WORKFLOW_STEP_PREFIX) {
-                    Some(payload) => match parse_workflow_step(payload) {
-                        Ok(request) => workflow_steps.push(request),
-                        Err(warning) => {
-                            warnings.push(warning);
-                            kept_lines.push(line);
-                        }
-                    },
-                    None => kept_lines.push(line),
-                },
-            },
+                }
+                break;
+            }
+        }
+        if !matched {
+            kept_lines.push(line);
         }
     }
 
@@ -161,6 +206,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         messages,
         members,
         workflow_steps,
+        reviews,
         warnings,
     }
 }
@@ -332,6 +378,51 @@ fn parse_step_owner(owner: String) -> Result<MemberId, String> {
         return Err("@@workflow_step owner must be a non-empty member token".to_string());
     }
     Ok(MemberId::new(owner))
+}
+
+fn parse_review(payload: &str) -> Result<ReviewVerdict, String> {
+    let raw: ReviewRaw =
+        serde_json::from_str(payload).map_err(|err| format!("invalid @@review envelope: {err}"))?;
+    let verdict = normalize_review_verdict(&raw.verdict).ok_or_else(|| {
+        format!(
+            "invalid @@review verdict: {} (use approve or request_changes)",
+            raw.verdict
+        )
+    })?;
+
+    let mut summary_parts = Vec::new();
+    if let Some(summary) = raw
+        .summary
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        summary_parts.push(summary);
+    }
+    if let Some(items) = raw.items {
+        for item in items {
+            let item = item.trim();
+            if !item.is_empty() {
+                summary_parts.push(format!("- {item}"));
+            }
+        }
+    }
+    let summary = if summary_parts.is_empty() {
+        None
+    } else {
+        Some(summary_parts.join("\n"))
+    };
+
+    Ok(ReviewVerdict { verdict, summary })
+}
+
+fn normalize_review_verdict(raw: &str) -> Option<ReviewVerdictKind> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "approve" | "approved" | "accept" | "accepted" | "lgtm" => Some(ReviewVerdictKind::Approve),
+        "request_changes" | "changes_requested" | "needs_changes" | "reject" | "rejected" => {
+            Some(ReviewVerdictKind::RequestChanges)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -576,5 +667,96 @@ mod tests {
         assert!(parsed.members.is_empty());
         assert_eq!(parsed.warnings.len(), 1);
         assert!(parsed.visible_text.contains("@@team_member"));
+    }
+
+    #[test]
+    fn parses_review_approve() {
+        let parsed =
+            parse_agent_output(r#"@@review {"verdict":"approve","summary":"Looks good overall"}"#);
+
+        assert_eq!(
+            parsed.reviews,
+            vec![ReviewVerdict {
+                verdict: ReviewVerdictKind::Approve,
+                summary: Some("Looks good overall".to_string()),
+            }]
+        );
+        assert_eq!(parsed.visible_text, "");
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_review_request_changes_with_items() {
+        let parsed = parse_agent_output(
+            r#"@@review {"verdict":"request_changes","summary":"Needs work","items":["fix tests","rename helper"]}"#,
+        );
+
+        assert_eq!(
+            parsed.reviews,
+            vec![ReviewVerdict {
+                verdict: ReviewVerdictKind::RequestChanges,
+                summary: Some("Needs work\n- fix tests\n- rename helper".to_string()),
+            }]
+        );
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn normalizes_review_verdict_aliases() {
+        for (raw, expected) in [
+            ("APPROVED", ReviewVerdictKind::Approve),
+            ("lgtm", ReviewVerdictKind::Approve),
+            ("accept", ReviewVerdictKind::Approve),
+            ("request-changes", ReviewVerdictKind::RequestChanges),
+            ("changes_requested", ReviewVerdictKind::RequestChanges),
+            ("needs_changes", ReviewVerdictKind::RequestChanges),
+            ("rejected", ReviewVerdictKind::RequestChanges),
+        ] {
+            let line = format!(r#"@@review {{"verdict":"{raw}"}}"#);
+            let parsed = parse_agent_output(&line);
+            assert_eq!(parsed.reviews.len(), 1, "failed for {raw}");
+            assert_eq!(parsed.reviews[0].verdict, expected, "failed for {raw}");
+            assert!(parsed.reviews[0].summary.is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_review_verdict_warns_and_keeps_line() {
+        let parsed = parse_agent_output(r#"@@review {"verdict":"maybe"}"#);
+
+        assert!(parsed.reviews.is_empty());
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.visible_text.contains("@@review"));
+    }
+
+    #[test]
+    fn review_mixed_with_other_envelopes_and_visible_text() {
+        let parsed = parse_agent_output(
+            "Looks ok to me.\n@@team_message {\"to\":\"builder\",\"body\":\"fix nits\"}\n@@review {\"verdict\":\"approve\",\"summary\":\"Ship it\"}\nThanks.",
+        );
+
+        assert_eq!(parsed.visible_text, "Looks ok to me.\nThanks.");
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].body, "fix nits");
+        assert_eq!(
+            parsed.reviews,
+            vec![ReviewVerdict {
+                verdict: ReviewVerdictKind::Approve,
+                summary: Some("Ship it".to_string()),
+            }]
+        );
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn collects_all_review_envelopes_in_order() {
+        let parsed = parse_agent_output(
+            "@@review {\"verdict\":\"request_changes\",\"summary\":\"first\"}\n@@review {\"verdict\":\"approve\",\"summary\":\"second\"}",
+        );
+
+        assert_eq!(parsed.reviews.len(), 2);
+        assert_eq!(parsed.reviews[0].verdict, ReviewVerdictKind::RequestChanges);
+        assert_eq!(parsed.reviews[1].verdict, ReviewVerdictKind::Approve);
+        assert_eq!(parsed.reviews[1].summary.as_deref(), Some("second"));
     }
 }

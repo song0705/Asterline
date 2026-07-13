@@ -49,7 +49,29 @@ member runners, and save the updated team.
       "sandbox": "workspace-write",
       "permission_mode": "auto"
     }
-  ]
+  ],
+  "modes": {
+    "review": {
+      "builder": "builder",
+      "reviewer": "reviewer",
+      "max_iterations": 3
+    },
+    "lead": {
+      "leader": "builder",
+      "reviewer": "reviewer",
+      "max_iterations": 3,
+      "auto_verify": true
+    },
+    "roundtable": {
+      "participants": ["builder", "reviewer", "grok"],
+      "moderator": "reviewer",
+      "rounds": 2
+    }
+  },
+  "approvals": {
+    "gate": ["git", "shell", "file"],
+    "apply_to": ["user", "relay", "mode"]
+  }
 }
 ```
 
@@ -65,6 +87,50 @@ member runners, and save the updated team.
 | `members`         | Yes      | Non-empty member list                           |
 | `default_target`  | No       | `{"member":"id"}`, `"all"`, or the first member |
 | `max_auto_relays` | No       | Automatic teammate handoff limit; default `6`   |
+| `modes`           | No       | Role bindings and budgets for collab modes      |
+| `approvals`       | No       | Approval-gate categories and surfaces           |
+
+### Collaboration modes (`modes`)
+
+Optional bindings for `/review`, `/plan` (`/lead`), and `/roundtable`. When a
+field is omitted, Asterline derives it from member roles and `default_target`
+(builder ≈ default target or first non-reviewer; reviewer ≈ role contains
+"review"; leader/moderator ≈ role contains "plan" or "lead"; participants =
+full roster). Defaults for budgets: `max_iterations = 3`, `rounds = 2`,
+`auto_verify = true`.
+
+| Field            | Modes              | Meaning                                            |
+| ---------------- | ------------------ | -------------------------------------------------- |
+| `builder`        | review, lead       | Member who implements changes                      |
+| `reviewer`       | review, lead       | Member who emits `@@review` verdicts               |
+| `leader`         | lead               | Member who writes the owned checklist              |
+| `moderator`      | roundtable         | Optional synthesizer after discussion rounds       |
+| `participants`   | roundtable         | Roster for discussion turns                        |
+| `max_iterations` | review, lead       | Builder↔reviewer loop budget before blocking       |
+| `rounds`         | roundtable         | Number of full discussion rounds                   |
+| `auto_verify`    | lead (and similar) | Run suggested verification after approve when true |
+
+Inline `/review builder=@x max_iterations=5 …` overrides beat `team.json`, which
+beats role derivation.
+
+### Approvals (`approvals`)
+
+Policy for the approval gate. With no `approvals` section, all built-in
+categories and all surfaces are enabled.
+
+| Field      | Meaning                                                                 |
+| ---------- | ----------------------------------------------------------------------- |
+| `gate`     | Built-in categories to keep: `git`, `shell`, `file`. Omit for all three |
+| `keywords` | Custom categories: name → keyword list (case-insensitive match)         |
+| `apply_to` | Surfaces: `user`, `relay`, `mode`. Omit for all surfaces                |
+
+`user` is ordinary user messages; `relay` is agent-to-agent routes; `mode` is
+engine dispatches for collaboration modes. Set `ASTERLINE_NO_BELL=1` to disable
+terminal BEL/OSC 9 notifications on approval, paused route, blocked run, and
+member error events.
+
+See [approvals and tool-level control](approvals.md) for how this gate relates
+to backend-native sandbox and permission enforcement.
 
 ### Member fields
 
@@ -95,20 +161,22 @@ This table describes what the current Asterline adapters actually pass to each
 CLI. It is intentionally narrower than the union of fields accepted by the
 Team editor.
 
-| Setting                | Codex                                                                          | Claude                   | Grok                                          | Agy                                                               |
-| ---------------------- | ------------------------------------------------------------------------------ | ------------------------ | --------------------------------------------- | ----------------------------------------------------------------- |
-| `cwd`                  | Process cwd and `-C` on a fresh session                                        | Process cwd              | Process cwd                                   | Process cwd                                                       |
-| `model`                | `-m`                                                                           | `--model`                | `--model`                                     | `--model`                                                         |
-| `effort`               | `model_reasoning_effort`; values above `high` clamp to `high`                  | `--effort`               | `--reasoning-effort`                          | Not passed                                                        |
-| `sandbox`              | `-s` on a fresh session; resumed session restores its own sandbox              | Not passed               | `--sandbox` with an Asterline profile mapping | `--sandbox` unless configured as `danger-full-access`             |
-| `permission_mode`      | Not passed                                                                     | `--permission-mode`      | `--permission-mode`                           | Only `bypassPermissions` maps to `--dangerously-skip-permissions` |
-| `allowed_tools`        | Not passed                                                                     | `--allowed-tools`        | `--tools`                                     | Not passed                                                        |
-| custom `system_prompt` | Not passed as a backend system prompt; Asterline prepends current team context | `--append-system-prompt` | `--rules`                                     | Prepended to stdin text                                           |
-| `session_policy`       | Resume or fresh                                                                | Resume or fresh          | Resume or fresh                               | Resume or fresh conversation                                      |
+| Setting                | Codex                                                                          | Claude                                      | Grok                                          | Agy                                                               |
+| ---------------------- | ------------------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------- |
+| `cwd`                  | Process cwd and `-C` on a fresh session                                        | Process cwd                                 | Process cwd                                   | Process cwd                                                       |
+| `model`                | `-m`                                                                           | `--model`                                   | `--model`                                     | `--model`                                                         |
+| `effort`               | `model_reasoning_effort`; values above `high` clamp to `high`                  | `--effort`                                  | `--reasoning-effort`                          | Not passed                                                        |
+| `sandbox`              | `-s` on a fresh session; resumed session restores its own sandbox              | Not passed                                  | `--sandbox` with an Asterline profile mapping | `--sandbox` unless configured as `danger-full-access`             |
+| `permission_mode`      | Not passed                                                                     | `--permission-mode` (omitted for `default`) | `--permission-mode`                           | Only `bypassPermissions` maps to `--dangerously-skip-permissions` |
+| `allowed_tools`        | Not passed                                                                     | `--allowed-tools`                           | `--tools`                                     | Not passed                                                        |
+| custom `system_prompt` | Not passed as a backend system prompt; Asterline prepends current team context | `--append-system-prompt`                    | `--rules`                                     | Prepended to stdin text                                           |
+| `session_policy`       | Resume or fresh                                                                | Resume or fresh                             | Resume or fresh                               | Resume or fresh conversation                                      |
 
 For Claude and Grok, choose only permission modes accepted by the installed CLI
 version. Asterline serializes the configured value but does not negotiate
-vendor-version compatibility before launch.
+vendor-version compatibility before launch. Recent Claude CLIs no longer list
+`default` as a `--permission-mode` choice; Asterline omits the flag when the
+configured mode is `default` so the CLI default applies.
 
 ## Model discovery
 

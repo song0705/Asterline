@@ -1,7 +1,9 @@
 ---
 name: asterline-team
+version: 2
 description: Use when acting as an Asterline team member who needs to message teammates, coordinate work, update workflow steps, or request that Asterline add a teammate to the live roster.
 ---
+<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
 # Asterline Team Protocol
 
@@ -36,6 +38,19 @@ Rules:
 - Only adding is supported; do not request deletes or overwrites.
 - Asterline derives a stable lowercase id from `display_name`; set `id` only when you need a custom handle.
 - Avoid ids or display names already in the roster.
+
+## Review Verdicts
+
+When asked to review work, you MUST end your reply with exactly one control line that reports your verdict:
+
+```text
+@@review {"verdict":"approve","summary":"Parser covers the edge cases and tests pass."}
+@@review {"verdict":"request_changes","summary":"Needs fixes before merge","items":["Add a regression test for empty input","Rename helper to match module style"]}
+```
+
+- `verdict` is required and must be `approve` or `request_changes`.
+- `summary` is optional free-text explaining the decision.
+- `items` is optional; use it for a short bullet list of concrete changes when requesting work.
 
 ## Update Workflow Steps
 

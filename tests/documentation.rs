@@ -1,4 +1,4 @@
-use asterline::domain::team::{BackendKind, DefaultTarget, MemberId, TeamConfig};
+use asterline::domain::team::{ApprovalSurface, BackendKind, DefaultTarget, MemberId, TeamConfig};
 use unicode_width::UnicodeWidthStr;
 
 const CONFIGURATION_DOC: &str = include_str!("../docs/configuration.md");
@@ -10,6 +10,7 @@ const DOCUMENTS: &[(&str, &str)] = &[
         "docs/configuration.md",
         include_str!("../docs/configuration.md"),
     ),
+    ("docs/approvals.md", include_str!("../docs/approvals.md")),
 ];
 
 #[test]
@@ -37,6 +38,35 @@ fn documented_team_json_is_valid_and_loadable() {
             .map(|member| member.backend)
             .collect::<Vec<_>>(),
         vec![BackendKind::Codex, BackendKind::Claude, BackendKind::Grok]
+    );
+
+    assert!(
+        config.modes.review.is_some(),
+        "documented modes.review must be present"
+    );
+    assert!(
+        config.modes.lead.is_some(),
+        "documented modes.lead must be present"
+    );
+    assert!(
+        config.modes.roundtable.is_some(),
+        "documented modes.roundtable must be present"
+    );
+    assert_eq!(
+        config.approvals.apply_to,
+        Some(vec![
+            ApprovalSurface::User,
+            ApprovalSurface::Relay,
+            ApprovalSurface::Mode
+        ])
+    );
+    assert_eq!(
+        config.approvals.gate,
+        Some(vec![
+            "git".to_string(),
+            "shell".to_string(),
+            "file".to_string()
+        ])
     );
 }
 

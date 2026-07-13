@@ -7,6 +7,7 @@
 
 pub mod agent_runner;
 pub mod approval;
+pub mod mode_prompts;
 pub mod session_registry;
 pub mod team_runtime;
 
@@ -252,7 +253,7 @@ fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> JoinHandle<Vec<u8>> {
 
 fn build_runner(member: &TeamMember, workspace: &Path, fake: bool) -> Arc<dyn MemberRunner> {
     if fake {
-        Arc::new(FakeRunner::echo(member.backend))
+        Arc::new(FakeRunner::team(member.backend))
     } else {
         Arc::from(runner_for(member, workspace))
     }
