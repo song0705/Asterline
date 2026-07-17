@@ -32,6 +32,14 @@ impl Composer {
         self.cursor += 1;
     }
 
+    /// Insert a complete paste in one operation, leaving the cursor after it.
+    pub fn insert_text(&mut self, text: &str) {
+        let inserted = text.chars().collect::<Vec<_>>();
+        let count = inserted.len();
+        self.chars.splice(self.cursor..self.cursor, inserted);
+        self.cursor += count;
+    }
+
     /// Insert a hard line break at the cursor (multi-line composer).
     pub fn insert_newline(&mut self) {
         self.insert('\n');
@@ -294,6 +302,16 @@ mod tests {
         c.left();
         c.insert('b');
         assert_eq!(c.text(), "abc");
+    }
+
+    #[test]
+    fn inserts_pasted_text_atomically_at_cursor() {
+        let mut composer = Composer::new();
+        composer.insert_text("ab\ncd");
+        composer.left();
+        composer.insert_text("XY");
+        assert_eq!(composer.text(), "ab\ncXYd");
+        assert_eq!(composer.cursor(), 6);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use super::*;
 use crate::domain::event::ChatItem;
-use crate::domain::team::{ApprovalSurface, BackendKind, DefaultTarget, Effort, TeamMember};
+use crate::domain::team::{
+    ApprovalSurface, BackendKind, DefaultTarget, Effort, SessionPolicy, TeamMember,
+};
 
 fn team() -> TeamConfig {
     let mut config = TeamConfig::new("mixed", "/tmp/ws")
@@ -42,6 +44,20 @@ fn runtime_in_workspace(workspace: impl Into<PathBuf>) -> TeamRuntime {
     TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false)
 }
 
+#[test]
+fn targeted_slash_skill_uses_backend_native_syntax() {
+    assert_eq!(
+        normalize_backend_command(BackendKind::Codex, "/review-patch staged".to_string()),
+        "$review-patch staged"
+    );
+    for backend in [BackendKind::Claude, BackendKind::Grok, BackendKind::Agy] {
+        assert_eq!(
+            normalize_backend_command(backend, "/review-patch staged".to_string()),
+            "/review-patch staged"
+        );
+    }
+}
+
 fn user(body: &str) -> UiCommand {
     UiCommand::UserMessage {
         target: MessageTarget::Default,
@@ -66,6 +82,61 @@ fn user_message_starts_a_run_for_default_member() {
         RuntimeEvent::MemberStatus {
             status: MemberStatus::Running,
             ..
+        }
+    )));
+}
+
+#[test]
+fn selected_terminal_mode_dispatches_subsequent_plain_messages() {
+    let mut rt = runtime();
+    let changed = rt.on_ui_command(UiCommand::SetMode {
+        mode: TerminalMode::Review,
+    });
+    assert!(changed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Review
+        }
+    )));
+
+    let step = rt.on_ui_command(user("fix parser"));
+    assert_eq!(step.actions.len(), 1);
+    assert_eq!(step.actions[0].member, MemberId::new("builder"));
+    assert!(step.actions[0].prompt.contains("fix parser"));
+    assert!(
+        step.actions[0]
+            .prompt
+            .contains("builder in a review workflow")
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::WorkflowRunUpdated { run }
+            if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
+    )));
+}
+
+#[test]
+fn new_chat_keeps_selected_terminal_mode_until_explicitly_changed() {
+    let mut rt = runtime();
+    rt.on_ui_command(UiCommand::SetMode {
+        mode: TerminalMode::Review,
+    });
+    rt.on_ui_command(UiCommand::NewSession);
+
+    let review = rt.on_ui_command(user("fix parser"));
+    assert!(review.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::WorkflowRunUpdated { run }
+            if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
+    )));
+
+    let changed = rt.on_ui_command(UiCommand::SetMode {
+        mode: TerminalMode::Normal,
+    });
+    assert!(changed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Normal
         }
     )));
 }
@@ -418,6 +489,117 @@ fn session_discovered_is_persisted_and_emitted() {
 }
 
 #[test]
+fn configured_session_id_is_used_for_the_first_turn() {
+    let mut config = team();
+    config
+        .members
+        .iter_mut()
+        .find(|member| member.id == MemberId::new("builder"))
+        .unwrap()
+        .session_id = Some("chosen-thread".to_string());
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+
+    let step = rt.on_ui_command(user("continue selected history"));
+    assert_eq!(
+        step.actions[0].session,
+        Some(AgentSessionId("chosen-thread".to_string()))
+    );
+}
+
+#[test]
+fn fresh_session_is_created_once_then_pinned_for_later_turns() {
+    let mut config = team();
+    config
+        .members
+        .iter_mut()
+        .find(|member| member.id == MemberId::new("builder"))
+        .unwrap()
+        .session_policy = SessionPolicy::Fresh;
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+    let builder = MemberId::new("builder");
+
+    let first = rt.on_ui_command(user("first"));
+    assert_eq!(first.actions[0].session, None);
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::SessionDiscovered(AgentSessionId("fresh-thread".to_string())),
+    );
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    let second = rt.on_ui_command(user("second"));
+    assert_eq!(
+        second.actions[0].session,
+        Some(AgentSessionId("fresh-thread".to_string()))
+    );
+}
+
+#[test]
+fn fresh_session_keeps_its_pinned_id_after_runtime_restart() {
+    let mut config = team();
+    config
+        .members
+        .iter_mut()
+        .find(|member| member.id == MemberId::new("builder"))
+        .unwrap()
+        .session_policy = SessionPolicy::Fresh;
+    let store = SqliteStore::in_memory().unwrap();
+    store
+        .upsert_session(
+            &MemberId::new("builder"),
+            BackendKind::Codex,
+            &AgentSessionId("pinned-thread".to_string()),
+        )
+        .unwrap();
+
+    let mut restarted = TeamRuntime::new(config, store).with_approvals(false);
+    let step = restarted.on_ui_command(user("continue"));
+    assert_eq!(
+        step.actions[0].session,
+        Some(AgentSessionId("pinned-thread".to_string()))
+    );
+}
+
+#[test]
+fn switching_to_fresh_discards_old_session_only_once() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+    rt.on_ui_command(user("resume this"));
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::SessionDiscovered(AgentSessionId("old-thread".to_string())),
+    );
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    let mut updated = team();
+    updated
+        .members
+        .iter_mut()
+        .find(|member| member.id == builder)
+        .unwrap()
+        .session_policy = SessionPolicy::Fresh;
+    rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: updated.members,
+        default_target: updated.default_target,
+    });
+
+    assert_eq!(rt.store.session_for(&builder).unwrap(), None);
+    let first_fresh = rt.on_ui_command(user("start fresh"));
+    assert_eq!(first_fresh.actions[0].session, None);
+}
+
+#[test]
 fn risky_request_is_gated_until_approved() {
     let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap()); // approvals on
     let step = rt.on_ui_command(user("run git push origin main"));
@@ -530,7 +712,9 @@ fn codex_prompt_includes_current_team_cards() {
     let prompt = &step.actions[0].prompt;
 
     assert!(prompt.contains("Current Asterline team roster"));
-    assert!(prompt.contains("Use member ids when routing teammate messages"));
+    assert!(prompt.contains("available members only"));
+    assert!(prompt.contains("do not message them unless collaboration is necessary"));
+    assert!(prompt.contains("If routing is needed, use member ids"));
     assert!(prompt.contains("You are: id=builder"));
     assert!(prompt.contains("Default target: builder"));
     assert!(prompt.contains("id=builder display_name=\"Builder\" backend=codex role=\"impl\" status=running model=gpt-5-codex effort=high cwd=\"/tmp/ws\""));

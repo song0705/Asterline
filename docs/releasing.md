@@ -15,8 +15,10 @@ must exactly match the package version in `Cargo.toml`.
    cargo test --locked
    ```
 
-4. Commit and push the version change.
-5. Create and push an annotated tag:
+4. Add `docs/releases/v<version>.md` with a user-facing summary. When this file
+   is absent, the workflow falls back to GitHub-generated notes.
+5. Commit and push the version change and release notes.
+6. Create and push an annotated tag:
 
    ```bash
    version=0.1.0
@@ -34,7 +36,8 @@ Pushing the tag starts `.github/workflows/release.yml`. The workflow:
    and macOS Apple silicon;
 4. packages each target with the license and readmes;
 5. creates `SHA256SUMS` and signed GitHub artifact attestations;
-6. publishes a GitHub Release with generated release notes.
+6. publishes a GitHub Release using `docs/releases/<tag>.md`, or generated
+   release notes when no matching file exists.
 
 Monitor a release from the command line:
 

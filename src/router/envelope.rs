@@ -84,6 +84,8 @@ struct TeamMemberRaw {
     #[serde(default)]
     session_policy: SessionPolicy,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     effort: Option<Effort>,
 }
 
@@ -283,6 +285,10 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
         permission_mode: raw.permission_mode,
         allowed_tools: raw.allowed_tools,
         session_policy: raw.session_policy,
+        session_id: raw
+            .session_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty()),
         effort: raw.effort,
     })
 }

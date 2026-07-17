@@ -13,7 +13,7 @@ const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
 pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 2;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 5;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 const MANAGED_SKILL_MARKER: &str =
     "<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->";
@@ -61,7 +61,7 @@ fn is_managed_skill(text: &str) -> bool {
 
 pub fn team_skill_hint() -> String {
     format!(
-        "Use ${ASTERLINE_TEAM_SKILL_NAME} for Asterline teammate messaging and roster changes. If skills are unavailable, read {ASTERLINE_TEAM_SKILL_PATH}."
+        "${ASTERLINE_TEAM_SKILL_NAME} documents optional Asterline team controls. The roster only lists available members; do not message them unless collaboration is necessary or explicitly requested. If skills are unavailable, read {ASTERLINE_TEAM_SKILL_PATH}."
     )
 }
 
@@ -324,9 +324,12 @@ fn build_protocol(me: &str, teammates: &[String]) -> String {
         protocol.push_str("You are the only member; there are no teammates to message.\n");
     } else {
         protocol.push_str(&format!(
-            "Teammates you can message: {}.\n",
+            "Available teammates (optional; their presence does not require messaging): {}.\n",
             teammates.join(", ")
         ));
+        protocol.push_str(
+            "Work independently unless the user or active workflow explicitly requires collaboration.\n",
+        );
     }
     protocol.push_str("All other text you write is shown to the user.");
     protocol
@@ -478,6 +481,8 @@ mod tests {
         assert!(!prompt.contains("@@team_message"));
         assert!(!prompt.contains("@@team_member"));
         assert!(prompt.contains("reviewer"));
+        assert!(prompt.contains("their presence does not require messaging"));
+        assert!(prompt.contains("Work independently"));
         assert!(prompt.contains("custom prompt"));
 
         let stripped = strip_team_protocols(config);
@@ -503,23 +508,25 @@ mod tests {
     }
 
     #[test]
-    fn ensure_team_skill_upgrades_managed_v1_file() {
+    fn ensure_team_skill_upgrades_managed_v4_file() {
         let dir =
             std::env::temp_dir().join(format!("asterline-skill-upgrade-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // v1 managed files had the name line but no version / managed marker.
         std::fs::write(
             &path,
-            "---\nname: asterline-team\ndescription: old\n---\n\n# Old protocol\n@@team_message\n",
+            format!(
+                "---\nname: asterline-team\nmetadata:\n  version: 4\ndescription: old\n---\n{MANAGED_SKILL_MARKER}\n\n# Old protocol\n@@team_message\n"
+            ),
         )
         .unwrap();
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 2"));
+        assert!(text.contains("version: 5"));
         assert!(text.contains("@@review"));
+        assert!(text.contains("Work independently by default"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -543,11 +550,18 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v2() {
-        assert!(ASTERLINE_TEAM_SKILL.contains("version: 2"));
+    fn embedded_team_skill_is_protocol_v5() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 5);
+        assert!(ASTERLINE_TEAM_SKILL.contains("metadata:\n  version: 5"));
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 2);
+        assert!(ASTERLINE_TEAM_SKILL.contains("Work independently by default"));
+        assert!(
+            ASTERLINE_TEAM_SKILL.contains("task involves search, research, review, or planning")
+        );
+        assert!(ASTERLINE_TEAM_SKILL.contains("`session_id`"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("`/mode plan`"));
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 5);
     }
 
     #[test]

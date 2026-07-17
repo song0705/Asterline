@@ -4,7 +4,7 @@
 use crate::domain::event::{
     ApprovalDecision, MessageTarget, UiCommand, WorkflowRunId, WorkflowStepStatus,
 };
-use crate::domain::mode::CollabMode;
+use crate::domain::mode::{CollabMode, TerminalMode};
 use crate::domain::team::{Effort, MemberId};
 use crate::tui::drawers::Drawer;
 
@@ -105,6 +105,8 @@ fn parse_slash(rest: &str) -> Submission {
                 _ => Submission::Help,
             }
         }
+        "mode" => parse_mode_selector(arg),
+        // Legacy direct entries remain accepted for scripts and prompt history.
         "review" => parse_mode_command(CollabMode::Review, arg),
         "plan" | "lead" => parse_mode_command(CollabMode::Lead, arg),
         "roundtable" | "rt" => parse_mode_command(CollabMode::Roundtable, arg),
@@ -180,6 +182,16 @@ fn parse_slash(rest: &str) -> Submission {
         "help" => Submission::Help,
         _ => Submission::Help,
     }
+}
+
+fn parse_mode_selector(arg: &str) -> Submission {
+    let (selected, extra) = split_first_word(arg);
+    if !extra.is_empty() {
+        return Submission::Help;
+    }
+    TerminalMode::parse(selected).map_or(Submission::Help, |mode| {
+        Submission::Runtime(UiCommand::SetMode { mode })
+    })
 }
 
 fn parse_mode_command(mode: CollabMode, arg: &str) -> Submission {
@@ -753,6 +765,24 @@ mod tests {
     #[test]
     fn new_session_command() {
         assert_eq!(parse("/new"), Submission::Runtime(UiCommand::NewSession));
+    }
+
+    #[test]
+    fn mode_command_selects_normal_and_collaboration_modes() {
+        for (text, mode) in [
+            ("/mode normal", TerminalMode::Normal),
+            ("/mode review", TerminalMode::Review),
+            ("/mode plan", TerminalMode::Plan),
+            ("/mode roundtable", TerminalMode::Roundtable),
+            ("/mode workflow", TerminalMode::Workflow),
+        ] {
+            assert_eq!(
+                parse(text),
+                Submission::Runtime(UiCommand::SetMode { mode })
+            );
+        }
+        assert_eq!(parse("/mode"), Submission::Help);
+        assert_eq!(parse("/mode review fix parser"), Submission::Help);
     }
 
     #[test]

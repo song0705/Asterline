@@ -15,6 +15,8 @@ pub fn discover(workspace: &Path) -> Vec<SkillInfo> {
         workspace.join(".agents/skills"),
         workspace.join(".codex/skills"),
         workspace.join(".claude/skills"),
+        workspace.join(".grok/skills"),
+        workspace.join(".augment/skills"),
     ];
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
@@ -24,6 +26,10 @@ pub fn discover(workspace: &Path) -> Vec<SkillInfo> {
             home.join(".codex/plugins/cache"),
             home.join(".claude/skills"),
             home.join(".claude/plugins/cache"),
+            home.join(".grok/skills"),
+            home.join(".grok/plugins"),
+            home.join(".augment/skills"),
+            home.join(".augment/plugins"),
         ]);
     }
 

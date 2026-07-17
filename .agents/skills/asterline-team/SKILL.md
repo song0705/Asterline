@@ -1,7 +1,8 @@
 ---
 name: asterline-team
-version: 2
-description: Use when acting as an Asterline team member who needs to message teammates, coordinate work, update workflow steps, or request that Asterline add a teammate to the live roster.
+description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update workflow steps, or request that Asterline add a teammate to the live roster. A visible roster only lists available members and does not by itself trigger messaging or delegation.
+metadata:
+  version: 5
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -9,9 +10,21 @@ description: Use when acting as an Asterline team member who needs to message te
 
 Asterline reads special control lines from your final output. Put each control line on its own line with valid single-line JSON. Parsed control lines are removed from the visible chat.
 
+## Roster And Messaging Policy
+
+The roster is an availability directory, not an assignment or an instruction to contact anyone. Work independently by default.
+
+Do not send a teammate message merely because teammates are listed, because another member has a relevant role, or because the task involves search, research, review, or planning. Send a message only when at least one of these conditions holds:
+
+- The user explicitly requests collaboration, delegation, or a teammate's input.
+- The active Asterline workflow explicitly requires a handoff or coordinated multi-member work.
+- You are blocked on information or action that a specific teammate must provide and you cannot complete the task independently.
+
+If you can complete the request yourself, do not emit `@@team_message`. Do not send unsolicited status updates or FYI messages.
+
 ## Message Teammates
 
-Send work, questions, or status to one or more teammates:
+When the messaging policy above permits it, send necessary work or questions to one or more teammates:
 
 ```text
 @@team_message {"to":"reviewer","body":"Please review the parser changes."}
@@ -30,7 +43,7 @@ When the roster lacks a needed specialty, request a new teammate:
 ```
 
 Required fields: `display_name`, `backend`, `role`.
-Optional fields: `id`, `model`, `effort`, `cwd`, `sandbox`, `permission_mode`, `allowed_tools`, `session_policy`, `system_prompt`.
+Optional fields: `id`, `model`, `effort`, `cwd`, `sandbox`, `permission_mode`, `allowed_tools`, `session_policy`, `session_id`, `system_prompt`.
 
 Rules:
 - `backend` must be `codex`, `claude`, `grok`, or `agy`.
@@ -54,7 +67,7 @@ When asked to review work, you MUST end your reply with exactly one control line
 
 ## Update Workflow Steps
 
-During `/plan` or `/continue` work, keep the run checklist current:
+During `/mode plan` or `/continue` work, keep the run checklist current:
 
 ```text
 @@workflow_step {"action":"add","owner":"builder","title":"Write parser tests"}

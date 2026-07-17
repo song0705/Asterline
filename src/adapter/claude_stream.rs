@@ -4,16 +4,17 @@
 //! and translates the NDJSON stream into [`AgentEvent`]s. Sessions are resumable
 //! (`--resume <id>`); `--no-session-persistence` is never used.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::adapter::parser::{str_field, summarize};
+use crate::adapter::parser::{str_field, summarize, tool_value};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, TeamMember};
 
-const TOOL_OUTPUT_MAX: usize = 4000;
+const TOOL_OUTPUT_MAX: usize = 32_000;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeStreamAdapter {
@@ -110,6 +111,8 @@ impl StreamAdapter for ClaudeStreamAdapter {
 pub struct ClaudeLineParser {
     message_open: bool,
     text_acc: String,
+    tool_blocks: HashMap<u64, String>,
+    tool_input_started: HashSet<u64>,
 }
 
 impl ClaudeLineParser {
@@ -141,11 +144,23 @@ impl ClaudeLineParser {
                 if str_field(block, "type") == Some("tool_use") {
                     let id = str_field(block, "id").unwrap_or_default().to_string();
                     let name = str_field(block, "name").unwrap_or("tool").to_string();
+                    let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    self.tool_blocks.insert(index, id.clone());
                     out.push(AgentEvent::ToolStarted {
-                        id,
+                        id: id.clone(),
                         summary: name.clone(),
                         name,
                     });
+                    if let Some(input) = block.get("input") {
+                        let input = tool_value(input, TOOL_OUTPUT_MAX);
+                        if !input.is_empty() && input != "{}" {
+                            self.tool_input_started.insert(index);
+                            out.push(AgentEvent::ToolProgress {
+                                id,
+                                delta: format!("input:\n{input}\n"),
+                            });
+                        }
+                    }
                 }
             }
             Some("content_block_delta") => {
@@ -156,6 +171,33 @@ impl ClaudeLineParser {
                     self.open_message(out);
                     self.text_acc.push_str(text);
                     out.push(AgentEvent::TextDelta(text.to_string()));
+                } else if str_field(delta, "type") == Some("input_json_delta")
+                    && let Some(partial) = str_field(delta, "partial_json")
+                    && let Some(index) = event.get("index").and_then(Value::as_u64)
+                    && let Some(id) = self.tool_blocks.get(&index)
+                {
+                    let prefix = if self.tool_input_started.insert(index) {
+                        "input:\n"
+                    } else {
+                        ""
+                    };
+                    out.push(AgentEvent::ToolProgress {
+                        id: id.clone(),
+                        delta: format!("{prefix}{partial}"),
+                    });
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some(index) = event.get("index").and_then(Value::as_u64) {
+                    let input_started = self.tool_input_started.remove(&index);
+                    if let Some(id) = self.tool_blocks.remove(&index)
+                        && input_started
+                    {
+                        out.push(AgentEvent::ToolProgress {
+                            id,
+                            delta: "\n".to_string(),
+                        });
+                    }
                 }
             }
             Some("message_stop") => self.close_message(out),
@@ -176,7 +218,7 @@ impl ClaudeLineParser {
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let summary = summarize(&content_to_string(&block["content"]), TOOL_OUTPUT_MAX);
+                let summary = tool_value(&block["content"], TOOL_OUTPUT_MAX);
                 out.push(AgentEvent::ToolCompleted {
                     id,
                     ok: !is_error,
@@ -249,18 +291,6 @@ impl LineParser for ClaudeLineParser {
         let mut out = Vec::new();
         self.close_message(&mut out);
         out
-    }
-}
-
-fn content_to_string(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| str_field(block, "text").map(str::to_string))
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
     }
 }
 
@@ -399,6 +429,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn tool_input_and_multiline_result_are_preserved() {
+        let events = parse_all(&[
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"printf hi\""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"line one\n  line two"}],"is_error":false}]}}"#,
+        ]);
+
+        assert!(events.contains(&AgentEvent::ToolProgress {
+            id: "toolu_1".to_string(),
+            delta: "input:\n{\"command\":\"printf hi\"".to_string(),
+        }));
+        assert!(events.contains(&AgentEvent::ToolCompleted {
+            id: "toolu_1".to_string(),
+            ok: true,
+            summary: "line one\n  line two".to_string(),
+        }));
     }
 
     #[test]

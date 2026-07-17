@@ -15,7 +15,7 @@ pub use event::{
 };
 pub use mode::{
     CollabMode, ModeBinding, ModeLimits, ModeStatusSummary, ModesConfig, ResolvedModeRoles,
-    ReviewVerdict, ReviewVerdictKind, resolve_mode_roles,
+    ReviewVerdict, ReviewVerdictKind, TerminalMode, resolve_mode_roles,
 };
 pub use team::{
     ApprovalPolicy, ApprovalSurface, BackendKind, DEFAULT_MAX_AUTO_RELAYS, DefaultTarget, MemberId,

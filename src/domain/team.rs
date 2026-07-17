@@ -183,15 +183,16 @@ impl PermissionMode {
     }
 }
 
-/// Whether a member keeps a single resumable backend session or starts fresh
-/// on every turn.
+/// How a member chooses its initial backend session. Once a backend reports a
+/// session id, Asterline pins and reuses it for later turns.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPolicy {
-    /// Persist the backend session and resume it on later turns (product default).
+    /// Reuse an existing persisted session when available (product default).
     #[default]
     Resume,
-    /// Start a new backend session for every turn.
+    /// When selected, discard the old session once; create and then pin a new
+    /// session on the member's next turn.
     Fresh,
 }
 
@@ -268,6 +269,8 @@ pub struct TeamMember {
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Vec<String>,
     pub session_policy: SessionPolicy,
+    /// Optional native CLI session/conversation id to resume explicitly.
+    pub session_id: Option<String>,
     pub effort: Option<Effort>,
 }
 
@@ -285,6 +288,7 @@ impl Serialize for TeamMember {
         let include_permission = self.permission_mode.is_some();
         let include_allowed_tools = !self.allowed_tools.is_empty();
         let include_session = self.session_policy != SessionPolicy::default();
+        let include_session_id = self.session_id.is_some();
         let include_effort = self.effort.is_some();
 
         let field_count = 3
@@ -296,6 +300,7 @@ impl Serialize for TeamMember {
             + usize::from(include_permission)
             + usize::from(include_allowed_tools)
             + usize::from(include_session)
+            + usize::from(include_session_id)
             + usize::from(include_effort);
         let mut state = serializer.serialize_struct("TeamMember", field_count)?;
         if include_id {
@@ -324,6 +329,9 @@ impl Serialize for TeamMember {
         }
         if include_session {
             state.serialize_field("session_policy", &self.session_policy)?;
+        }
+        if include_session_id {
+            state.serialize_field("session_id", &self.session_id)?;
         }
         if include_effort {
             state.serialize_field("effort", &self.effort)?;
@@ -360,6 +368,8 @@ impl<'de> Deserialize<'de> for TeamMember {
             #[serde(default)]
             session_policy: SessionPolicy,
             #[serde(default)]
+            session_id: Option<String>,
+            #[serde(default)]
             effort: Option<Effort>,
         }
 
@@ -386,6 +396,10 @@ impl<'de> Deserialize<'de> for TeamMember {
             permission_mode: input.permission_mode,
             allowed_tools: input.allowed_tools,
             session_policy: input.session_policy,
+            session_id: input
+                .session_id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
             effort: input.effort,
         })
     }
@@ -411,6 +425,7 @@ impl TeamMember {
             permission_mode: None,
             allowed_tools: Vec::new(),
             session_policy: SessionPolicy::default(),
+            session_id: None,
             effort: None,
         }
     }
@@ -629,6 +644,23 @@ mod tests {
 
         assert_eq!(member.id, MemberId::new("lead-engineer"));
         assert_eq!(member.display_name, "Lead Engineer");
+    }
+
+    #[test]
+    fn member_session_id_round_trips_and_trims() {
+        let member: TeamMember = serde_json::from_str(
+            r#"{
+                "display_name": "Builder",
+                "backend": "codex",
+                "role": "implementation",
+                "session_id": "  thread-123  "
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(member.session_id.as_deref(), Some("thread-123"));
+        let json = serde_json::to_string(&member).unwrap();
+        assert!(json.contains("\"session_id\":\"thread-123\""));
     }
 
     #[test]

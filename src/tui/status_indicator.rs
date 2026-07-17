@@ -59,7 +59,7 @@ pub(crate) fn member_activity_text(
             if let Some(profile) = runtime_profile {
                 parts.push(profile.to_string());
             }
-            parts.push("Ctrl+C to interrupt".to_string());
+            parts.push("Esc/Ctrl+C to interrupt".to_string());
             format!("{spin} Working ({})", parts.join(" • "))
         }
         MemberStatus::Queued => format!("{spin} Queued"),
@@ -104,7 +104,7 @@ pub(crate) fn running_footer_text(
         .map(fmt_elapsed_compact)
         .unwrap_or_else(|| "0s".to_string());
     let mut text =
-        format!("{spin} Working {running_count} {noun} ({elapsed} • Ctrl+C to interrupt)");
+        format!("{spin} Working {running_count} {noun} ({elapsed} • Esc/Ctrl+C to interrupt)");
     if !names.is_empty() {
         text.push_str(" · ");
         text.push_str(&names.join(", "));
@@ -127,7 +127,7 @@ mod tests {
     fn activity_text_keeps_interrupt_hint_stable() {
         assert_eq!(
             member_activity_text(MemberStatus::Running, None, Some(64), "⠋", None),
-            "⠋ Working (1m 04s • Ctrl+C to interrupt)"
+            "⠋ Working (1m 04s • Esc/Ctrl+C to interrupt)"
         );
         assert_eq!(
             member_activity_text(
@@ -147,7 +147,7 @@ mod tests {
                 "⠋",
                 Some("model: gpt-5-codex • effort: high")
             ),
-            "⠋ Working (1m 04s • model: gpt-5-codex • effort: high • Ctrl+C to interrupt)"
+            "⠋ Working (1m 04s • model: gpt-5-codex • effort: high • Esc/Ctrl+C to interrupt)"
         );
     }
 
@@ -161,7 +161,8 @@ mod tests {
                 "⠋"
             ),
             Some(
-                "⠋ Working 2 members (1h 02m 03s • Ctrl+C to interrupt) · Builder, QA".to_string()
+                "⠋ Working 2 members (1h 02m 03s • Esc/Ctrl+C to interrupt) · Builder, QA"
+                    .to_string()
             )
         );
         assert_eq!(running_footer_text(0, None, &[], "⠋"), None);

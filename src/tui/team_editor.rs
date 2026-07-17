@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::domain::config::default_member;
 use crate::domain::event::UiCommand;
 use crate::domain::team::{BackendKind, DefaultTarget, MemberId, TeamConfig, TeamMember};
+use crate::tui::session_picker::SessionPicker;
 use crate::tui::team_builder::{
     EditState, Field, ModelCatalog, ModelChoices, ModelPicker, cycle_backend, cycle_effort,
     cycle_permission, cycle_sandbox, field_value, normalize_member_id, unique_display_name,
@@ -33,6 +34,7 @@ pub(crate) struct TeamEditor {
     editing: Option<EditState>,
     model_catalog: ModelCatalog,
     model_picker: Option<ModelPicker>,
+    session_picker: Option<SessionPicker>,
     dirty: bool,
     notice: Option<String>,
 }
@@ -61,6 +63,7 @@ impl TeamEditor {
             editing: None,
             model_catalog: ModelCatalog::default(),
             model_picker: None,
+            session_picker: None,
             dirty: false,
             notice: None,
         }
@@ -86,6 +89,14 @@ impl TeamEditor {
         self.editing.as_ref()
     }
 
+    pub(crate) fn insert_edit_text(&mut self, text: &str) -> bool {
+        let Some(edit) = self.editing.as_mut() else {
+            return false;
+        };
+        edit.insert_text(text);
+        true
+    }
+
     pub(crate) fn dirty(&self) -> bool {
         self.dirty
     }
@@ -96,6 +107,10 @@ impl TeamEditor {
 
     pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
         self.model_picker.as_ref()
+    }
+
+    pub(crate) fn session_picker(&self) -> Option<&SessionPicker> {
+        self.session_picker.as_ref()
     }
 
     pub(crate) fn default_label(&self) -> String {
@@ -127,6 +142,10 @@ impl TeamEditor {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> TeamEditorOutcome {
+        if self.session_picker.is_some() {
+            self.handle_session_picker_key(code, modifiers);
+            return TeamEditorOutcome::Consumed(None);
+        }
         if self.model_picker.is_some() {
             self.handle_model_picker_key(code);
             return TeamEditorOutcome::Consumed(None);
@@ -187,7 +206,10 @@ impl TeamEditor {
                 self.notice = Some("discard changes by closing and reopening /team".to_string());
                 TeamEditorOutcome::Consumed(None)
             }
-            KeyCode::Char('e') if self.field_mode && self.selected_field() == Field::Model => {
+            KeyCode::Char('e')
+                if self.field_mode
+                    && matches!(self.selected_field(), Field::Model | Field::SessionId) =>
+            {
                 self.edit_selected_field();
                 TeamEditorOutcome::Consumed(None)
             }
@@ -230,6 +252,41 @@ impl TeamEditor {
         }
     }
 
+    fn handle_session_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        const PAGE: usize = 8;
+        match code {
+            KeyCode::Up => self.session_picker.as_mut().unwrap().up(),
+            KeyCode::Down => self.session_picker.as_mut().unwrap().down(),
+            KeyCode::PageUp => self.session_picker.as_mut().unwrap().page_up(PAGE),
+            KeyCode::PageDown => self.session_picker.as_mut().unwrap().page_down(PAGE),
+            KeyCode::Backspace => self.session_picker.as_mut().unwrap().pop_query(),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.session_picker.as_mut().unwrap().clear_query();
+            }
+            KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.session_picker.as_mut().unwrap().push_query(ch);
+            }
+            KeyCode::Enter => {
+                let selected = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(SessionPicker::selected_entry)
+                    .map(|entry| entry.id.clone());
+                self.session_picker = None;
+                if let Some(session_id) = selected {
+                    let member_id = self.selected_member().map(|member| member.id.clone());
+                    if let Some(member_id) = member_id {
+                        self.set_session_id(&member_id, session_id);
+                    }
+                } else {
+                    self.notice = Some("no matching session selected".to_string());
+                }
+            }
+            KeyCode::Esc => self.session_picker = None,
+            _ => {}
+        }
+    }
+
     fn handle_edit_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         let Some(mut edit) = self.editing.take() else {
             return;
@@ -237,19 +294,10 @@ impl TeamEditor {
         match code {
             KeyCode::Esc => {}
             KeyCode::Enter => self.commit_edit(edit),
-            KeyCode::Backspace => {
-                edit.buffer.pop();
+            _ => {
+                edit.apply_key(code, modifiers);
                 self.editing = Some(edit);
             }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                edit.buffer.clear();
-                self.editing = Some(edit);
-            }
-            KeyCode::Char(ch) => {
-                edit.buffer.push(ch);
-                self.editing = Some(edit);
-            }
-            _ => self.editing = Some(edit),
         }
     }
 
@@ -312,6 +360,20 @@ impl TeamEditor {
         let field = self.selected_field();
         if field == Field::Model {
             self.cycle_model();
+        } else if field == Field::SessionId {
+            let Some(member) = self.selected_member() else {
+                return;
+            };
+            let backend = member.backend;
+            let cwd = member.resolved_cwd(&self.workspace);
+            let picker = SessionPicker::discover(backend, &cwd);
+            self.notice = picker.error().map(str::to_string).or_else(|| {
+                Some(format!(
+                    "{} session(s) found · type to filter",
+                    picker.visible_len()
+                ))
+            });
+            self.session_picker = Some(picker);
         } else if field.is_text() {
             self.edit_selected_field();
         } else {
@@ -319,15 +381,27 @@ impl TeamEditor {
         }
     }
 
+    pub(crate) fn set_session_id(&mut self, member_id: &MemberId, session_id: String) {
+        let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| &member.id == member_id)
+        else {
+            self.notice = Some(format!("session selected for unknown member: {member_id}"));
+            return;
+        };
+        member.session_id = Some(session_id.clone());
+        member.session_policy = crate::domain::team::SessionPolicy::Resume;
+        self.dirty = true;
+        self.notice = Some(format!("session {session_id} selected · press s to apply"));
+    }
+
     fn edit_selected_field(&mut self) {
         let field = self.selected_field();
         let Some(member) = self.selected_member() else {
             return;
         };
-        self.editing = Some(EditState {
-            field,
-            buffer: field_value(member, field),
-        });
+        self.editing = Some(EditState::new(field, field_value(member, field)));
     }
 
     fn cycle_model(&mut self) {
@@ -360,6 +434,7 @@ impl TeamEditor {
                     let next = cycle_backend(current, &self.available);
                     if let Some(member) = self.selected_member_mut() {
                         member.backend = next;
+                        member.session_id = None;
                     }
                 }
             }
@@ -388,6 +463,9 @@ impl TeamEditor {
                             crate::domain::team::SessionPolicy::Resume
                         }
                     };
+                    if member.session_policy == crate::domain::team::SessionPolicy::Fresh {
+                        member.session_id = None;
+                    }
                 }
             }
             _ => {}
@@ -437,6 +515,19 @@ impl TeamEditor {
                     } else {
                         Some(value.to_string())
                     };
+                }
+            }
+            Field::SessionId => {
+                let session_id = if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                if let Some(member) = self.selected_member_mut() {
+                    member.session_id = session_id;
+                    if member.session_id.is_some() {
+                        member.session_policy = crate::domain::team::SessionPolicy::Resume;
+                    }
                 }
             }
             Field::Cwd => {
@@ -535,10 +626,7 @@ mod tests {
     #[test]
     fn default_target_updates_when_name_changes_handle() {
         let mut editor = editor();
-        editor.commit_edit(EditState {
-            field: Field::Name,
-            buffer: "Lead Engineer".to_string(),
-        });
+        editor.commit_edit(EditState::new(Field::Name, "Lead Engineer".to_string()));
 
         assert_eq!(
             editor.normalized_default_target(),
@@ -611,6 +699,62 @@ mod tests {
             default_target,
             Some(DefaultTarget::Member(MemberId::new("builder")))
         );
+    }
+
+    #[test]
+    fn session_id_field_binds_and_clears_native_history() {
+        let mut editor = editor();
+        editor.commit_edit(EditState::new(Field::SessionId, "thread-123".to_string()));
+        assert_eq!(editor.members[0].session_id.as_deref(), Some("thread-123"));
+        assert_eq!(
+            editor.members[0].session_policy,
+            crate::domain::team::SessionPolicy::Resume
+        );
+
+        editor.commit_edit(EditState::new(Field::SessionId, "auto".to_string()));
+        assert_eq!(editor.members[0].session_id, None);
+    }
+
+    #[test]
+    fn escape_cancels_focused_field_edit() {
+        let mut editor = editor();
+        editor.field_mode = true;
+        editor.edit_selected_field();
+        editor.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(editor.editing().unwrap().buffer, "Builderx");
+
+        editor.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(editor.editing().is_none());
+        assert_eq!(editor.members[0].display_name, "Builder");
+        assert!(!editor.dirty());
+    }
+
+    #[test]
+    fn internal_session_picker_selection_updates_draft() {
+        let mut editor = editor();
+        editor.field_mode = true;
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::SessionId)
+            .unwrap();
+        editor.session_picker = Some(crate::tui::session_picker::SessionPicker::from_entries(
+            BackendKind::Codex,
+            vec![crate::tui::session_picker::SessionEntry::fixture(
+                "thread-picked",
+                "Fix the TUI",
+                "/tmp/ws",
+            )],
+        ));
+
+        assert_eq!(
+            editor.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            TeamEditorOutcome::Consumed(None)
+        );
+        assert_eq!(
+            editor.members[0].session_id.as_deref(),
+            Some("thread-picked")
+        );
+        assert!(editor.dirty());
     }
 
     #[test]

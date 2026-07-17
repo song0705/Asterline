@@ -18,7 +18,7 @@ use crate::tui::theme::pad_width;
 use crate::tui::workflow_view::drawer_runs;
 
 pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &Drawer) {
-    let popup = centered_rect(area, 86, 76);
+    let popup = drawer_rect(area);
     frame.render_widget(Clear, popup);
     let title = match drawer {
         Drawer::MemberLogs(member) => format!("Logs: {member}"),
@@ -49,7 +49,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
 
     let lines = match drawer {
         Drawer::Logs => drawer_logs(state),
-        Drawer::Team => drawer_team(state),
+        Drawer::Team => drawer_team(state, content.width as usize),
         Drawer::Runs => drawer_runs(state, content.width as usize),
         Drawer::Palette => drawer_palette(),
         Drawer::Diff => drawer_diff(state),
@@ -92,6 +92,13 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             Drawer::Team
                 if state
                     .team_editor()
+                    .is_some_and(|editor| editor.editing().is_some()) =>
+            {
+                "Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit"
+            }
+            Drawer::Team
+                if state
+                    .team_editor()
                     .is_some_and(|editor| editor.field_mode()) =>
             {
                 "↑↓ field · Enter edit/cycle · Esc members"
@@ -104,6 +111,18 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             hint_row,
         );
     }
+
+    if matches!(drawer, Drawer::Team)
+        && let Some(edit) = state.team_editor().and_then(|editor| editor.editing())
+    {
+        crate::tui::team_builder::render_edit_box(frame, content, edit);
+    }
+}
+
+/// Exact outer rectangle used by every drawer. Mouse selection uses the same
+/// geometry so dragging inside an overlay cannot spill into the background UI.
+pub(crate) fn drawer_rect(area: Rect) -> Rect {
+    centered_rect(area, 86, 76)
 }
 
 /// Display width of all spans in a line (for scroll clamping with wrapping).
@@ -172,9 +191,9 @@ fn table_header(cells: &[&str], widths: &[usize], tail: &str) -> (Line<'static>,
     )
 }
 
-fn drawer_team(state: &AppState) -> Vec<Line<'static>> {
+fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
     if let Some(editor) = state.team_editor() {
-        return drawer_team_editor(state, editor);
+        return drawer_team_editor(state, editor, width);
     }
 
     let mut lines = Vec::new();
@@ -247,6 +266,7 @@ const EDITOR_COLUMNS: [usize; 5] = [17, 9, 15, 15, 7];
 fn drawer_team_editor(
     state: &AppState,
     editor: &crate::tui::team_editor::TeamEditor,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let dirty = if editor.dirty() { "modified" } else { "saved" };
@@ -263,7 +283,7 @@ fn drawer_team_editor(
     ]));
     lines.push(Line::styled(
         if editor.field_mode() {
-            " ↑/↓ field · Enter edit/cycle · e manual model · s apply · Esc members"
+            " ↑/↓ field · Enter edit/cycle/pick session · e manual model/session · s apply · Esc members"
         } else {
             " ↑/↓ member · Enter fields · a add · d delete · t target · * all · s apply · Esc close"
         },
@@ -333,6 +353,7 @@ fn drawer_team_editor(
     }
 
     if editor.model_picker().is_none()
+        && editor.session_picker().is_none()
         && let Some(member) = editor.selected_member()
     {
         lines.push(Line::raw(""));
@@ -397,17 +418,78 @@ fn drawer_team_editor(
         }
     }
 
-    if let Some(edit) = editor.editing() {
+    if let Some(picker) = editor.session_picker() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" editing {}: ", edit.field.label()),
-                theme::warning_bold(),
+                format!(" {} sessions ", picker.backend().as_str()),
+                theme::accent_bold(),
             ),
-            Span::styled(edit.buffer.clone(), theme::emphasis()),
+            Span::styled(
+                format!("{} match(es)", picker.visible_len()),
+                theme::muted(),
+            ),
         ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Search: ", theme::muted()),
+            Span::styled(
+                if picker.query().is_empty() {
+                    "type title, project, or id…".to_string()
+                } else {
+                    picker.query().to_string()
+                },
+                if picker.query().is_empty() {
+                    theme::muted_italic()
+                } else {
+                    theme::emphasis()
+                },
+            ),
+        ]));
+        if let Some(error) = picker.error() {
+            lines.push(Line::styled(format!(" {error}"), theme::warning()));
+        } else if picker.visible_len() == 0 {
+            lines.push(Line::styled(" No matching sessions.", theme::muted()));
+        } else {
+            let available = width.saturating_sub(6).max(32);
+            let session_columns = [available * 35 / 100, available * 30 / 100, 8];
+            let id_width = available.saturating_sub(session_columns.iter().sum::<usize>());
+            let (header, rule) = table_header(
+                &["   Title", "Project", "Updated"],
+                &session_columns,
+                "Session ID",
+            );
+            lines.push(header);
+            lines.push(rule);
+            let (start, entries) = picker.window(8);
+            for (offset, entry) in entries.iter().enumerate() {
+                let selected = start + offset == picker.selected();
+                let row_style = if selected {
+                    theme::emphasis()
+                } else {
+                    theme::text()
+                };
+                let sep = Span::styled("│ ", theme::muted());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if selected { " ▶ " } else { "   " },
+                        if selected {
+                            theme::warning_bold()
+                        } else {
+                            theme::muted()
+                        },
+                    ),
+                    Span::styled(pad_width(&entry.title, session_columns[0] - 3), row_style),
+                    sep.clone(),
+                    Span::styled(pad_width(&entry.project, session_columns[1]), row_style),
+                    sep.clone(),
+                    Span::styled(pad_width(&entry.age(), session_columns[2]), theme::muted()),
+                    sep,
+                    Span::styled(theme::clip_width(&entry.id, id_width.max(1)), row_style),
+                ]));
+            }
+        }
         lines.push(Line::styled(
-            " Enter commit · Esc cancel · Ctrl+U clear",
+            " Type filter · ↑/↓ select · PgUp/PgDn · Enter bind · Esc cancel · Ctrl+U clear",
             theme::muted_italic(),
         ));
     }
@@ -626,7 +708,7 @@ mod tests {
         let mut state = ready_state();
         state.toggle_drawer(Drawer::Team);
 
-        let lines = drawer_team(&state);
+        let lines = drawer_team(&state, 100);
         let marker = lines
             .iter()
             .flat_map(|line| &line.spans)
@@ -646,7 +728,7 @@ mod tests {
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         );
-        let lines = drawer_team(&state);
+        let lines = drawer_team(&state, 100);
         let builder = lines
             .iter()
             .flat_map(|line| &line.spans)
@@ -673,7 +755,7 @@ mod tests {
     fn team_editor_header_rule_and_rows_share_column_boundaries() {
         let mut state = ready_state();
         state.toggle_drawer(Drawer::Team);
-        let lines = drawer_team(&state);
+        let lines = drawer_team(&state, 100);
         let text = |line: &Line<'_>| {
             line.spans
                 .iter()

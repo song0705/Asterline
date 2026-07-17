@@ -16,7 +16,7 @@ surfaces:
 | ------- | ------------------------------------------------------------------- |
 | `user`  | Messages you type (`@member …`, `/ask …`)                           |
 | `relay` | Automatic agent-to-agent handoffs (`@@team_message` routes)         |
-| `mode`  | Engine dispatches inside `/review`, `/plan`, and `/roundtable` runs |
+| `mode`  | Engine dispatches inside selected collaboration-mode runs           |
 
 Rejecting a gated mode dispatch blocks the run (resume later with `/continue`).
 A route resumed explicitly with `/retry` is not re-gated: the resume itself is

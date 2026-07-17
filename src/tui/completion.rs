@@ -19,6 +19,13 @@ pub struct Completion {
     pub items: Vec<CompletionItem>,
 }
 
+/// A backend skill that can be invoked after an explicit `@member` target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSkill {
+    pub name: String,
+    pub description: String,
+}
+
 /// (name, hint, takes_argument). Also feeds the `/help` palette drawer.
 pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("ask", "send to one member", true),
@@ -32,27 +39,16 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("find", "search the transcript", true),
     ("focus", "view a member's logs", true),
     ("help", "show commands", false),
-    (
-        "lead",
-        "leader plans, team executes, reviewer verdicts",
-        true,
-    ),
     ("logs", "raw logs · stderr · warnings", false),
+    ("mode", "set the mode for subsequent messages", true),
     (
         "new",
         "start a fresh chat (new session, cleared transcript)",
         false,
     ),
     ("note", "record a workflow checkpoint", true),
-    (
-        "plan",
-        "leader plans, team executes, reviewer verdicts",
-        true,
-    ),
     ("reject", "reject first pending", false),
     ("retry", "resume paused route / re-run", false),
-    ("review", "builder implements, reviewer verdicts", true),
-    ("roundtable", "multi-agent discussion rounds", true),
     ("runs", "workflow status · next action", false),
     ("sessions", "session ids", false),
     ("skills", "choose a skill for the next prompt", false),
@@ -60,12 +56,36 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("step", "manage workflow checklist", true),
     ("team", "edit roster · sessions · approvals", false),
     ("verify", "verify latest or selected workflow", true),
-    ("workflow", "legacy prompt-driven team workflow", true),
+];
+
+/// (name, hint) entries shown after `/mode `.
+const MODES: &[(&str, &str)] = &[
+    ("normal", "keep using direct messages until changed"),
+    ("review", "keep using builder/reviewer runs until changed"),
+    ("plan", "keep using leader/checklist runs until changed"),
+    ("roundtable", "keep using discussion rounds until changed"),
+    (
+        "workflow",
+        "keep using prompt-driven workflows until changed",
+    ),
 ];
 
 /// Compute the completion for `head` (composer text up to the cursor).
 pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
+    compute_with_agent_skills(head, members, &[])
+}
+
+/// Compute completion, including backend-native skills after `@member /`.
+pub fn compute_with_agent_skills(
+    head: &str,
+    members: &[String],
+    skills: &[AgentSkill],
+) -> Option<Completion> {
     let chars: Vec<char> = head.chars().collect();
+
+    if let Some(completion) = targeted_skill_completion(&chars, members, skills) {
+        return Some(completion);
+    }
 
     if head.starts_with('/') {
         return match chars.iter().position(|c| c.is_whitespace()) {
@@ -90,6 +110,23 @@ pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
             // Command chosen; only `/ask` completes its first argument (a member).
             Some(space) => {
                 let cmd: String = chars[1..space].iter().collect();
+                if cmd == "mode" {
+                    let arg: Vec<char> = chars[space + 1..].to_vec();
+                    if arg.iter().any(|c| c.is_whitespace()) {
+                        return None;
+                    }
+                    let prefix: String = arg.iter().collect();
+                    let lower = prefix.to_lowercase();
+                    let items = MODES
+                        .iter()
+                        .filter(|(name, _)| name.starts_with(&lower))
+                        .map(|(name, hint)| CompletionItem {
+                            label: format!("{name} — {hint}"),
+                            insert: format!("{name} "),
+                        })
+                        .collect();
+                    return non_empty("modes", space + 1, items);
+                }
                 if cmd != "ask" && cmd != "effort" && cmd != "focus" {
                     return None;
                 }
@@ -135,6 +172,42 @@ pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
     }
 
     None
+}
+
+fn targeted_skill_completion(
+    chars: &[char],
+    members: &[String],
+    skills: &[AgentSkill],
+) -> Option<Completion> {
+    if chars.first() != Some(&'@') || skills.is_empty() {
+        return None;
+    }
+    let member_end = chars.iter().position(|c| c.is_whitespace())?;
+    let member: String = chars[1..member_end].iter().collect();
+    if !members.iter().any(|candidate| candidate == &member) {
+        return None;
+    }
+    let command_start = chars[member_end..]
+        .iter()
+        .position(|c| !c.is_whitespace())?
+        + member_end;
+    if chars.get(command_start) != Some(&'/')
+        || chars[command_start + 1..].iter().any(|c| c.is_whitespace())
+    {
+        return None;
+    }
+
+    let prefix: String = chars[command_start + 1..].iter().collect();
+    let lower = prefix.to_lowercase();
+    let items = skills
+        .iter()
+        .filter(|skill| skill.name.to_lowercase().starts_with(&lower))
+        .map(|skill| CompletionItem {
+            label: format!("/{} — {}", skill.name, skill.description),
+            insert: format!("/{} ", skill.name),
+        })
+        .collect();
+    non_empty("agent skills", command_start, items)
 }
 
 fn member_completion(
@@ -193,7 +266,9 @@ mod tests {
         assert_eq!(c.token_start, 0);
         assert!(c.items.iter().any(|i| i.insert == "/ask "));
         assert!(c.items.iter().any(|i| i.insert == "/team"));
-        assert!(c.items.iter().any(|i| i.insert == "/plan "));
+        assert!(c.items.iter().any(|i| i.insert == "/mode "));
+        assert!(!c.items.iter().any(|i| i.insert == "/plan "));
+        assert!(!c.items.iter().any(|i| i.insert == "/review "));
         assert!(c.items.iter().any(|i| i.insert == "/continue "));
         assert!(c.items.iter().any(|i| i.insert == "/note "));
         assert!(c.items.iter().any(|i| i.insert == "/block "));
@@ -204,7 +279,8 @@ mod tests {
     #[test]
     fn slash_prefix_filters() {
         assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
-        assert_eq!(inserts("/pl"), vec!["/plan ".to_string()]);
+        assert_eq!(inserts("/mo"), vec!["/mode ".to_string()]);
+        assert!(inserts("/pl").is_empty());
         assert_eq!(inserts("/con"), vec!["/continue ".to_string()]);
         assert_eq!(inserts("/no"), vec!["/note ".to_string()]);
         assert_eq!(inserts("/blo"), vec!["/block ".to_string()]);
@@ -212,13 +288,27 @@ mod tests {
         let a = inserts("/a");
         assert!(a.contains(&"/ask ".to_string()) && a.contains(&"/all ".to_string()));
         let re = inserts("/re");
-        assert!(
-            re.contains(&"/review ".to_string()) && re.contains(&"/reject".to_string()),
-            "expected review + reject for /re, got {re:?}"
-        );
+        assert_eq!(re, vec!["/reject".to_string(), "/retry".to_string()]);
         assert!(inserts("/find").contains(&"/find ".to_string()));
-        assert!(inserts("/lead").contains(&"/lead ".to_string()));
-        assert!(inserts("/round").contains(&"/roundtable ".to_string()));
+        assert!(inserts("/lead").is_empty());
+        assert!(inserts("/round").is_empty());
+    }
+
+    #[test]
+    fn mode_command_opens_second_level_mode_completion() {
+        let modes = compute("/mode ", &members()).unwrap();
+        assert_eq!(modes.title, "modes");
+        assert_eq!(modes.token_start, 6);
+        assert_eq!(
+            modes
+                .items
+                .iter()
+                .map(|item| item.insert.as_str())
+                .collect::<Vec<_>>(),
+            vec!["normal ", "review ", "plan ", "roundtable ", "workflow "]
+        );
+        assert_eq!(inserts("/mode ro"), vec!["roundtable ".to_string()]);
+        assert!(compute("/mode review fix it", &members()).is_none());
     }
 
     #[test]
@@ -301,5 +391,37 @@ mod tests {
     #[test]
     fn unknown_slash_prefix_has_no_items() {
         assert!(compute("/zzz", &members()).is_none());
+    }
+
+    #[test]
+    fn targeted_slash_completes_agent_skills() {
+        let skills = vec![
+            AgentSkill {
+                name: "review-patch".to_string(),
+                description: "Review a patch carefully".to_string(),
+            },
+            AgentSkill {
+                name: "write-tests".to_string(),
+                description: "Add regression tests".to_string(),
+            },
+        ];
+
+        let completion = compute_with_agent_skills("@builder /rev", &members(), &skills).unwrap();
+        assert_eq!(completion.title, "agent skills");
+        assert_eq!(completion.token_start, 9);
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(completion.items[0].insert, "/review-patch ");
+    }
+
+    #[test]
+    fn agent_skill_completion_requires_an_explicit_known_target() {
+        let skills = vec![AgentSkill {
+            name: "review-patch".to_string(),
+            description: "Review a patch carefully".to_string(),
+        }];
+
+        assert!(compute_with_agent_skills("/rev", &members(), &skills).is_none());
+        assert!(compute_with_agent_skills("@unknown /rev", &members(), &skills).is_none());
+        assert!(compute_with_agent_skills("@builder /rev now", &members(), &skills).is_none());
     }
 }

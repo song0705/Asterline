@@ -19,7 +19,11 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     let width = area.width as usize;
 
     // Line 1: title on the left, workspace path on the right.
-    let title = format!(" Asterline · {}", state.team());
+    let title = format!(
+        " Asterline · {} · mode:{}",
+        state.team(),
+        state.active_mode()
+    );
     let workspace = state.workspace().to_string();
     let title_width = display_width(&title);
     let space = width.saturating_sub(title_width).saturating_sub(1);

@@ -4,17 +4,18 @@
 //! translates the JSONL thread events into [`AgentEvent`]s. Sessions are
 //! resumable via the thread id; `--ephemeral` is never used.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::adapter::parser::{str_field, summarize};
+use crate::adapter::parser::{str_field, summarize, tool_detail, tool_value};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, SandboxPolicy, TeamMember};
 
 const TOOL_SUMMARY_MAX: usize = 160;
-const TOOL_OUTPUT_MAX: usize = 4000;
+const TOOL_OUTPUT_MAX: usize = 32_000;
 
 #[derive(Clone, Debug)]
 pub struct CodexStreamAdapter {
@@ -94,7 +95,7 @@ impl StreamAdapter for CodexStreamAdapter {
     }
 
     fn parser(&self) -> Box<dyn LineParser> {
-        Box::new(CodexLineParser)
+        Box::new(CodexLineParser::default())
     }
 }
 
@@ -105,10 +106,13 @@ enum Phase {
 }
 
 /// Parser for the `codex exec --json` thread-event stream.
-pub struct CodexLineParser;
+#[derive(Default)]
+pub struct CodexLineParser {
+    command_output: HashMap<String, String>,
+}
 
 impl CodexLineParser {
-    fn handle_item(&self, item: &Value, phase: Phase) -> Vec<AgentEvent> {
+    fn handle_item(&mut self, item: &Value, phase: Phase) -> Vec<AgentEvent> {
         let id = str_field(item, "id").unwrap_or_default().to_string();
         let status = str_field(item, "status").unwrap_or_default();
         match str_field(item, "type") {
@@ -128,15 +132,18 @@ impl CodexLineParser {
                     TOOL_SUMMARY_MAX,
                 );
                 match phase {
-                    Phase::Started => vec![AgentEvent::ToolStarted {
-                        id,
-                        name: "shell".to_string(),
-                        summary,
-                    }],
+                    Phase::Started => {
+                        self.command_output.insert(id.clone(), String::new());
+                        vec![AgentEvent::ToolStarted {
+                            id,
+                            name: "shell".to_string(),
+                            summary,
+                        }]
+                    }
                     Phase::Completed => {
                         let exit_ok =
                             item.get("exit_code").and_then(Value::as_i64).unwrap_or(0) == 0;
-                        let mut output = summarize(
+                        let mut output = tool_detail(
                             str_field(item, "aggregated_output").unwrap_or_default(),
                             TOOL_OUTPUT_MAX,
                         );
@@ -147,6 +154,7 @@ impl CodexLineParser {
                                 .map(|code| format!("command failed with exit code {code}"))
                                 .unwrap_or_else(|| "command failed".to_string());
                         }
+                        self.command_output.remove(&id);
                         vec![AgentEvent::ToolCompleted {
                             id,
                             ok: status == "completed" && exit_ok,
@@ -169,17 +177,27 @@ impl CodexLineParser {
                     str_field(item, "tool").unwrap_or("tool")
                 );
                 match phase {
-                    Phase::Started => vec![AgentEvent::ToolStarted {
-                        id,
-                        summary: name.clone(),
-                        name,
-                    }],
+                    Phase::Started => {
+                        let input = item
+                            .get("arguments")
+                            .or_else(|| item.get("input"))
+                            .map(|value| {
+                                summarize(&tool_value(value, TOOL_SUMMARY_MAX), TOOL_SUMMARY_MAX)
+                            })
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| name.clone());
+                        vec![AgentEvent::ToolStarted {
+                            id,
+                            summary: input,
+                            name,
+                        }]
+                    }
                     Phase::Completed => vec![AgentEvent::ToolCompleted {
                         id,
                         ok: status == "completed",
                         summary: item
                             .get("result")
-                            .map(|result| summarize(&result.to_string(), TOOL_OUTPUT_MAX))
+                            .map(|result| tool_value(result, TOOL_OUTPUT_MAX))
                             .filter(|result| !result.is_empty())
                             .unwrap_or(name),
                     }],
@@ -198,8 +216,13 @@ impl CodexLineParser {
                     }],
                     Phase::Completed => vec![AgentEvent::ToolCompleted {
                         id,
-                        ok: true,
-                        summary: query,
+                        ok: status != "failed",
+                        summary: item
+                            .get("results")
+                            .or_else(|| item.get("result"))
+                            .map(|result| tool_value(result, TOOL_OUTPUT_MAX))
+                            .filter(|result| !result.is_empty())
+                            .unwrap_or(query),
                     }],
                 }
             }
@@ -247,7 +270,25 @@ impl LineParser for CodexLineParser {
             )],
             Some("item.started") => self.handle_item(&value["item"], Phase::Started),
             Some("item.completed") => self.handle_item(&value["item"], Phase::Completed),
-            Some("item.updated") => Vec::new(),
+            Some("item.updated") => {
+                let item = &value["item"];
+                if str_field(item, "type") != Some("command_execution") {
+                    return Vec::new();
+                }
+                let id = str_field(item, "id").unwrap_or_default().to_string();
+                let output = str_field(item, "aggregated_output").unwrap_or_default();
+                let previous = self.command_output.entry(id.clone()).or_default();
+                let delta = output.strip_prefix(previous.as_str()).unwrap_or(output);
+                *previous = output.to_string();
+                if delta.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![AgentEvent::ToolProgress {
+                        id,
+                        delta: delta.to_string(),
+                    }]
+                }
+            }
             Some(other) => vec![AgentEvent::Log(format!("codex event: {other}"))],
             None => vec![AgentEvent::ParseWarning(format!(
                 "codex: event without type: {}",
@@ -279,7 +320,7 @@ mod tests {
     use super::*;
 
     fn parse_all(lines: &[&str]) -> Vec<AgentEvent> {
-        let mut parser = CodexLineParser;
+        let mut parser = CodexLineParser::default();
         let mut out = Vec::new();
         for line in lines {
             out.extend(parser.parse_line(line));
@@ -377,6 +418,30 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn command_output_streams_and_preserves_formatting() {
+        let events = parse_all(&[
+            r#"{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"cargo test","status":"in_progress"}}"#,
+            r#"{"type":"item.updated","item":{"id":"c1","type":"command_execution","aggregated_output":"first\n  second\n"}}"#,
+            r#"{"type":"item.updated","item":{"id":"c1","type":"command_execution","aggregated_output":"first\n  second\nthird\n"}}"#,
+            r#"{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"cargo test","aggregated_output":"first\n  second\nthird\n","exit_code":0,"status":"completed"}}"#,
+        ]);
+
+        assert!(events.contains(&AgentEvent::ToolProgress {
+            id: "c1".to_string(),
+            delta: "first\n  second\n".to_string(),
+        }));
+        assert!(events.contains(&AgentEvent::ToolProgress {
+            id: "c1".to_string(),
+            delta: "third\n".to_string(),
+        }));
+        assert!(events.contains(&AgentEvent::ToolCompleted {
+            id: "c1".to_string(),
+            ok: true,
+            summary: "first\n  second\nthird".to_string(),
+        }));
     }
 
     #[test]

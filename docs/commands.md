@@ -12,6 +12,13 @@ dismiss the popup.
 A fresh conversation requires an explicit target. After the first message,
 plain text reuses the previous target.
 
+Use `@<member> /<skill>` to invoke a skill through that member's native CLI.
+Typing `/` after the explicit member prefix opens discovered skill completion.
+Codex invocations are translated to its native `$skill` syntax; Claude, Grok,
+and Agy keep `/skill`. Slash commands without a member prefix remain Asterline
+commands. Interactive-only backend commands such as model pickers require
+native session attach and are not available through headless dispatch.
+
 | Input                     | Action                         |
 | ------------------------- | ------------------------------ |
 | `@<member> <message>`     | Send to one member             |
@@ -42,25 +49,29 @@ plain text reuses the previous target.
 ## Collaboration modes
 
 First-class mode runs use the runtime engine (builder/review loops, lead
-checklists, roundtable discussion). Inline `key=value` tokens before the task
-override role bindings and budgets from `team.json`.
+checklists, roundtable discussion). Type `/mode`, accept it, then select a
+concrete mode from the second completion list. The selection remains active
+for every later message in this terminal until another `/mode` replaces it;
+`/new` starts a new chat without resetting the selected mode.
 
-| Command                        | Action                                                                   |
-| ------------------------------ | ------------------------------------------------------------------------ |
-| `/review [k=v…] <task>`        | Builder implements; reviewer issues structured verdicts                  |
-| `/plan [k=v…] <goal>`          | Leader plans a checklist; engine dispatches; reviewer verdicts (`/lead`) |
-| `/lead [k=v…] <goal>`          | Alias for `/plan`                                                        |
-| `/roundtable [k=v…] <topic>`   | Multi-agent discussion for N rounds (`/rt`)                              |
-| `/workflow <goal>`             | Legacy prompt-driven team workflow (original path)                       |
-| `/runs`                        | Inspect runs, mode phase, checklist, timeline, and next action           |
-| `/continue [run-<id>] [note]`  | Continue a blocked or failed run                                         |
-| `/note [run-<id>] <text>`      | Record a checkpoint without waking an agent                              |
-| `/block [run-<id>] <reason>`   | Mark a run blocked                                                       |
-| `/verify [run-<id>] [command]` | Run verification in the background                                       |
-| `/find <text>`                 | Search the transcript (case-insensitive); empty query clears             |
+| Command                             | Action                                                                   |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| `/mode normal`                      | Select normal direct-message dispatch                                    |
+| `/mode review`                      | Select builder/reviewer mode                                             |
+| `/mode plan`                        | Select leader/checklist/reviewer mode                                    |
+| `/mode roundtable`                  | Select multi-agent discussion mode                                       |
+| `/mode workflow`                    | Select legacy prompt-driven team workflow                                |
+| `/runs`                             | Inspect runs, mode phase, checklist, timeline, and next action           |
+| `/continue [run-<id>] [note]`       | Continue a blocked or failed run                                         |
+| `/note [run-<id>] <text>`           | Record a checkpoint without waking an agent                              |
+| `/block [run-<id>] <reason>`        | Mark a run blocked                                                       |
+| `/verify [run-<id>] [command]`      | Run verification in the background                                       |
+| `/find <text>`                      | Search the transcript (case-insensitive); empty query clears             |
 
-Override keys: `builder`, `reviewer`, `leader`, `moderator`, `participants`
-(comma list or `all`), `max_iterations`, `rounds`, `auto_verify`. Example:
+Mode defaults come from `team.json`. Legacy one-shot mode commands remain
+available for inline overrides. Override keys: `builder`, `reviewer`, `leader`,
+`moderator`, `participants` (comma list or `all`), `max_iterations`, `rounds`,
+`auto_verify`. Example:
 
 ```text
 /review reviewer=claude builder=@codex max_iterations=5 fix the parser
@@ -102,8 +113,9 @@ If `/verify` has no command, Asterline detects common checks such as
 | `Ctrl+R`                       | Reverse-search prompt history                                 |
 | `n` / `p`                      | Next or previous `/find` match (composer empty, no drawer)    |
 | `PageUp` / `PageDown`          | Scroll chat or the open drawer                                |
+| Mouse drag                     | Select visible text and copy it to the clipboard              |
 | Mouse wheel                    | Scroll chat or the open drawer                                |
-| `Esc`                          | Clear `/find`, or close / step back from the active overlay   |
+| `Esc`                          | Close the active overlay, or cancel running work              |
 | `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | Expand or collapse successful tool output                     |
 | `Ctrl+L`                       | Open logs                                                     |
 | `Ctrl+P`                       | Open the command palette                                      |
@@ -129,16 +141,27 @@ field list.
 | Key       | Member selection                            | Field selection                                  |
 | --------- | ------------------------------------------- | ------------------------------------------------ |
 | `↑` / `↓` | Select a member                             | Select a field                                   |
-| `Enter`   | Open member fields                          | Edit, cycle, or open model choices               |
+| `Enter`   | Open member fields                          | Edit, cycle, or open a model/session table       |
 | `Esc`     | Close Team                                  | Return to member selection                       |
 | `a` / `d` | Add or delete a member                      | —                                                |
 | `t`       | Make the selected member the default target | —                                                |
 | `*`       | Make all members the default target         | —                                                |
 | `s`       | Apply and save                              | Apply and save                                   |
-| `e`       | —                                           | Manually enter a model name on the `model` field |
+| `e`       | —                                           | Manually enter a model or session ID             |
 
-When editing text, press `Enter` to commit, `Esc` to cancel, and `Ctrl+U` to
-clear the buffer. Model pickers use `↑`, `↓`, `Enter`, and `Esc`.
+Text fields open in a focused input box. Press `Enter` to commit or `Esc` to
+cancel; use `←`/`→`, `Home`/`End`, `Delete`/`Backspace`, `Ctrl+A/E/B/F`,
+`Ctrl+U/K/W`, or `Alt+B/F` for shell-style cursor editing. Pasted multiline
+text is inserted atomically with line breaks folded to spaces. Model pickers
+use `↑`, `↓`, `Enter`, and `Esc`.
+
+On the `session id` field, `Enter` opens Asterline's session table. It extracts
+the title, project, update time, and native ID from local Codex, Claude, or Grok
+history, then keeps only sessions belonging to that member's effective working
+directory. Type to filter, use `↑`/`↓` or `PageUp`/`PageDown` to move, and press
+`Enter` to place the selected ID in the Team draft. Press `s` to apply it. Use
+`e` for manual entry; Agy currently requires this path because no verified
+local history format is available.
 
 ## Workflow Runs drawer
 

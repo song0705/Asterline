@@ -73,17 +73,25 @@ Run a review loop (the builder implements, the reviewer issues structured
 verdicts until the work passes):
 
 ```text
-/review fix the payment callback race and add regression tests
+/mode review
+fix the payment callback race and add regression tests
 ```
 
 Or have a leader plan an owned checklist that Asterline dispatches to the team:
 
 ```text
-/plan ship the payment callback fix end to end
+/mode plan
+ship the payment callback fix end to end
 ```
 
 A fresh conversation requires an explicit target. Later plain text reuses the
 previous target; `@all` and `/all` broadcast to the team.
+
+To invoke a skill installed for a member CLI, type the member prefix followed
+by `/`, for example `@codex /review-patch`. Asterline completes discovered
+skills and passes the invocation to that member; Codex is translated to its
+native `$review-patch` form. Unprefixed `/mode`, `/team`, and similar commands
+remain Asterline commands.
 
 ## Why Asterline
 
@@ -173,8 +181,10 @@ and save changes.
 
 ### Collaboration modes with an audit trail
 
-`/review`, `/plan` (alias `/lead`), and `/roundtable` are runtime-driven state
-machines, not free-form chat turns. In review mode the builder implements and
+`/mode review`, `/mode plan`, and `/mode roundtable` select the active mode for
+the current terminal. Every later message uses that mode until another
+`/mode` selection replaces it; `/new` does not reset the selection, and
+`/mode normal` returns to regular direct messages. In review mode the builder implements and
 the reviewer must answer with a structured `@@review` verdict; `approve`
 finishes the run (optionally auto-verifying), `request_changes` loops the
 feedback back to the builder, bounded by `max_iterations`. Lead mode has the
@@ -183,7 +193,8 @@ the same review loop. Roundtable runs N discussion rounds where each member
 sees the others' arguments, with an optional moderator synthesis.
 
 Who builds, reviews, leads, or moderates is configurable per mode in
-`team.json` and inline (`/review reviewer=claude builder=codex …`). `/runs`
+`team.json`. Legacy one-shot commands such as
+`/review reviewer=claude builder=codex …` still accept inline overrides. `/runs`
 shows the mode phase, iteration budget, checklist owners, verdict timeline,
 blockers, and the next suggested command.
 
@@ -195,8 +206,8 @@ blockers, and the next suggested command.
 ```
 
 Without an explicit verification command, Asterline detects common checks such
-as `cargo test`, `npm test`, and `pytest`. `/workflow` keeps the original
-prompt-driven coordination as a fallback path.
+as `cargo test`, `npm test`, and `pytest`. Selecting `/mode workflow` sends
+subsequent messages through the original prompt-driven coordination path.
 
 ### Native session attach
 
@@ -207,6 +218,14 @@ interactive CLI, resuming its session when possible. Exit the CLI to return.
 Codex and Claude messages created while attached are imported into the
 Asterline transcript. Grok and Agy resume their native session but do not
 import the attached transcript.
+
+To bind a member to an existing native CLI conversation, open `/team`, select
+the member and press `Enter` on `session id`. Asterline extracts local Codex,
+Claude, and Grok history metadata for that member's working directory into its
+own searchable session table; choose a row with `↑`/`↓` and `Enter`, then press
+`s` to apply. Press `e` for manual entry (required for Agy), or enter `auto` to
+remove an explicit binding. The selected ID is persisted in `team.json` and
+passed to the backend's native resume command.
 
 ### Local, durable state
 
@@ -236,9 +255,7 @@ runtime history; review it and decide whether your project should version it.
 | ---------------------- | ---------------------------------------------- |
 | `@<member> <message>`  | Send to one member                             |
 | `@all <message>`       | Broadcast to the team                          |
-| `/review <task>`       | Builder implements; reviewer issues verdicts   |
-| `/plan <goal>`         | Leader plans a checklist the engine dispatches |
-| `/roundtable <topic>`  | Multi-agent discussion rounds                  |
+| `/mode`                | Choose normal or a collaboration mode          |
 | `/runs`                | Inspect run state, phase, and next actions     |
 | `/team`                | Edit the live roster                           |
 | `/skills`              | Select a Skill for the next prompt             |
@@ -311,7 +328,7 @@ src/
 
 ## Project status
 
-Asterline is currently version `0.1.1` and under active development. Tagged
+Asterline is currently version `0.1.2` and under active development. Tagged
 versions are published as prebuilt Linux and macOS archives through GitHub
 Actions. Configuration and persisted data are migrated when possible, but
 commands and UI details may continue to evolve before a stable release.

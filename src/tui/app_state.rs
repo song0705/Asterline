@@ -12,12 +12,13 @@ use crate::domain::event::{
     ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
     WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepStatus,
 };
+use crate::domain::mode::TerminalMode;
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember,
 };
 use crate::tui::attach::AttachRequest;
-use crate::tui::completion::{self, Completion};
+use crate::tui::completion::{self, AgentSkill, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
 use crate::tui::skills::SkillInfo;
@@ -73,6 +74,7 @@ pub struct AppState {
     team: String,
     workspace: String,
     default_target: Option<DefaultTarget>,
+    active_mode: TerminalMode,
     members: Vec<MemberView>,
     chat: Vec<ChatItem>,
     message_index: HashMap<MessageId, usize>,
@@ -140,6 +142,7 @@ impl AppState {
             team: "Asterline".to_string(),
             workspace: String::new(),
             default_target: None,
+            active_mode: TerminalMode::Normal,
             members: Vec::new(),
             chat,
             message_index: HashMap::new(),
@@ -199,6 +202,7 @@ impl AppState {
                 workflow_runs,
             } => {
                 self.team = team;
+                self.skills = crate::tui::skills::discover(Path::new(&workspace));
                 self.workspace = workspace;
                 self.default_target = default_target;
                 self.workflow_runs = workflow_runs;
@@ -243,6 +247,7 @@ impl AppState {
                     self.open_team_editor();
                 }
             }
+            RuntimeEvent::ModeChanged { mode } => self.active_mode = mode,
             RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {
                 self.active_reasoning.clear();
             }
@@ -591,6 +596,9 @@ impl AppState {
     pub fn team(&self) -> &str {
         &self.team
     }
+    pub fn active_mode(&self) -> TerminalMode {
+        self.active_mode
+    }
     pub fn workspace(&self) -> &str {
         &self.workspace
     }
@@ -719,7 +727,15 @@ impl AppState {
         if self.popup_dismissed {
             return None;
         }
-        completion::compute(&self.composer.head(), &self.member_ids())
+        let skills = self
+            .skills
+            .iter()
+            .map(|skill| AgentSkill {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+            })
+            .collect::<Vec<_>>();
+        completion::compute_with_agent_skills(&self.composer.head(), &self.member_ids(), &skills)
     }
 
     pub fn popup_selected(&self) -> usize {
@@ -739,6 +755,14 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.insert(ch);
+        self.history_cursor = None;
+        self.reset_popup();
+    }
+    pub fn insert_text(&mut self, text: &str) {
+        self.disarm_quit();
+        self.header_selected = None;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.composer.insert_text(&text);
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1397,6 +1421,15 @@ impl AppState {
         editor.handle_key(code, modifiers)
     }
 
+    pub(crate) fn insert_team_editor_text(&mut self, text: &str) -> bool {
+        if self.drawer != Some(Drawer::Team) {
+            return false;
+        }
+        self.team_editor
+            .as_mut()
+            .is_some_and(|editor| editor.insert_edit_text(text))
+    }
+
     fn open_team_editor(&mut self) {
         let members = self
             .members
@@ -1427,6 +1460,7 @@ impl AppState {
         member.sandbox = view.sandbox;
         member.permission_mode = view.permission_mode;
         member.session_policy = view.session_policy;
+        member.session_id = view.session.clone();
         member.effort = view.effort;
         member
     }
@@ -1519,12 +1553,9 @@ impl AppState {
 fn skill_invocation(backend: BackendKind, skill: &SkillInfo) -> String {
     match backend {
         BackendKind::Codex => format!("${}", skill.name),
-        BackendKind::Claude => format!("/{}", skill.name),
-        BackendKind::Grok | BackendKind::Agy => format!(
-            "Use the skill `{}` from `{}` for this request.",
-            skill.name,
-            skill.path.display()
-        ),
+        BackendKind::Claude | BackendKind::Grok | BackendKind::Agy => {
+            format!("/{}", skill.name)
+        }
     }
 }
 

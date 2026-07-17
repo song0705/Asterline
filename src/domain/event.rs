@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::domain::mode::{CollabMode, ModeStatusSummary};
+use crate::domain::mode::{CollabMode, ModeStatusSummary, TerminalMode};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember,
@@ -230,6 +230,8 @@ pub struct ImportedMessage {
 /// Commands sent from the TUI to the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiCommand {
+    /// Select the mode used by subsequent messages in this terminal session.
+    SetMode { mode: TerminalMode },
     /// Submit a user message to one or more members.
     UserMessage { target: MessageTarget, body: String },
     /// Cancel a specific member's run, or all running members when `None`.
@@ -534,6 +536,10 @@ pub enum RuntimeEvent {
         default_target: Option<DefaultTarget>,
         members: Vec<MemberSummary>,
         workflow_runs: Vec<WorkflowRunSummary>,
+    },
+    /// The terminal-scoped message dispatch mode changed.
+    ModeChanged {
+        mode: TerminalMode,
     },
     TurnStarted {
         turn: TurnId,

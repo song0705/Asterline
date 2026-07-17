@@ -23,7 +23,9 @@ use crate::domain::event::{
     WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus,
     WorkflowStepSummary,
 };
-use crate::domain::mode::{CollabMode, ReviewVerdict, ReviewVerdictKind, resolve_mode_roles};
+use crate::domain::mode::{
+    CollabMode, ReviewVerdict, ReviewVerdictKind, TerminalMode, resolve_mode_roles,
+};
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
     TeamMember,
@@ -154,6 +156,9 @@ pub struct TeamRuntime {
     workflow_turns: HashMap<TurnId, WorkflowRunId>,
     failed_workflow_runs: HashSet<WorkflowRunId>,
     mode_sessions: HashMap<WorkflowRunId, ModeSession>,
+    /// Selection for subsequent messages in this terminal process. It is not
+    /// reset by `/new`; only another `/mode` selection replaces it.
+    active_mode: TerminalMode,
     last_user: Option<(MessageTarget, String)>,
     next_message_id: u64,
     approvals_enabled: bool,
@@ -173,7 +178,14 @@ impl TeamRuntime {
                 let _ = store.block_workflow_run(id, "interrupted by restart");
             }
         }
-        let sessions = SessionRegistry::from_store(&store, &config.all_member_ids());
+        let mut sessions = SessionRegistry::from_store(&store, &config.all_member_ids());
+        for member in &config.members {
+            if let Some(id) = &member.session_id {
+                let session = AgentSessionId(id.clone());
+                sessions.set(member.id.clone(), session.clone());
+                let _ = store.upsert_session(&member.id, member.backend, &session);
+            }
+        }
         let members = config
             .members
             .iter()
@@ -193,6 +205,7 @@ impl TeamRuntime {
             workflow_turns: HashMap::new(),
             failed_workflow_runs: HashSet::new(),
             mode_sessions: HashMap::new(),
+            active_mode: TerminalMode::Normal,
             last_user: None,
             next_message_id: 0,
             approvals_enabled: true,
@@ -245,13 +258,20 @@ impl TeamRuntime {
     pub fn on_ui_command(&mut self, cmd: UiCommand) -> RuntimeStep {
         let mut step = RuntimeStep::default();
         match cmd {
+            UiCommand::SetMode { mode } => {
+                self.active_mode = mode;
+                step.events.push(RuntimeEvent::ModeChanged { mode });
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "terminal mode → {mode} (applies until changed)"
+                )));
+            }
             UiCommand::UserMessage { target, body } => {
-                self.handle_user_message(target, body, &mut step);
+                self.handle_active_user_message(target, body, &mut step);
             }
             UiCommand::Cancel { member } => self.handle_cancel(member, &mut step),
             UiCommand::Retry => {
                 if let Some((target, body)) = self.last_user.clone() {
-                    self.handle_user_message(target, body, &mut step);
+                    self.handle_active_user_message(target, body, &mut step);
                 } else {
                     step.events
                         .push(RuntimeEvent::Notice("nothing to retry".to_string()));
@@ -345,6 +365,28 @@ impl TeamRuntime {
             UiCommand::Shutdown => self.handle_cancel(None, &mut step),
         }
         step
+    }
+
+    fn handle_active_user_message(
+        &mut self,
+        target: MessageTarget,
+        body: String,
+        step: &mut RuntimeStep,
+    ) {
+        self.last_user = Some((target.clone(), body.clone()));
+        let task = strip_routing_prefix(&body);
+        match self.active_mode {
+            TerminalMode::Normal => {
+                self.handle_user_message(target, body, step);
+            }
+            TerminalMode::Workflow => self.handle_run_workflow(task, step),
+            mode => self.handle_run_mode(
+                mode.collab_mode().expect("collaboration terminal mode"),
+                task,
+                Vec::new(),
+                step,
+            ),
+        }
     }
 
     fn handle_user_message(
@@ -533,19 +575,23 @@ impl TeamRuntime {
             }
         }
 
-        let old_backends: HashMap<MemberId, BackendKind> = self
+        let old_members: HashMap<MemberId, TeamMember> = self
             .config
             .members
             .iter()
-            .map(|member| (member.id.clone(), member.backend))
+            .cloned()
+            .map(|member| (member.id.clone(), member))
             .collect();
-        let changed_backend_ids: Vec<MemberId> = raw_config
+        let reset_session_ids: Vec<MemberId> = raw_config
             .members
             .iter()
             .filter(|member| {
-                old_backends
-                    .get(&member.id)
-                    .is_some_and(|backend| *backend != member.backend)
+                old_members.get(&member.id).is_some_and(|old| {
+                    old.backend != member.backend
+                        || (old.session_policy != SessionPolicy::Fresh
+                            && member.session_policy == SessionPolicy::Fresh)
+                        || old.session_id != member.session_id
+                })
             })
             .map(|member| member.id.clone())
             .collect();
@@ -562,9 +608,19 @@ impl TeamRuntime {
             step.runner_changes.push(RunnerChange::Remove(id.clone()));
         }
 
-        for id in &changed_backend_ids {
+        for id in &reset_session_ids {
             self.sessions.clear(id);
             let _ = self.store.delete_session(id);
+        }
+
+        for member in &raw_config.members {
+            if let Some(id) = &member.session_id {
+                let session = AgentSessionId(id.clone());
+                self.sessions.set(member.id.clone(), session.clone());
+                let _ = self
+                    .store
+                    .upsert_session(&member.id, member.backend, &session);
+            }
         }
 
         for member in &raw_config.members {
@@ -1300,11 +1356,10 @@ impl TeamRuntime {
         prompt: String,
         step: &mut RuntimeStep,
     ) {
-        let session = if self.member_uses_resume(member) {
-            self.sessions.get(member)
-        } else {
-            None
-        };
+        // Both policies pin the first session id reported by the backend.
+        // `fresh` only controls whether an older id is discarded when that
+        // policy is selected; it must not create a new session every turn.
+        let session = self.sessions.get(member);
         let cancel = Arc::new(AtomicBool::new(false));
         let effort = self.members.get(member).and_then(|s| s.effort);
         if let Some(state) = self.members.get_mut(member) {
@@ -1321,6 +1376,7 @@ impl TeamRuntime {
             member: member.clone(),
             status: MemberStatus::Running,
         });
+        let prompt = normalize_backend_command(self.member_backend(member), prompt);
         let prompt = self.prompt_for_member(member, prompt);
         step.actions.push(RunAction {
             member: member.clone(),
@@ -1349,7 +1405,7 @@ impl TeamRuntime {
 
     fn team_context_for(&self, current: &TeamMember) -> String {
         let mut lines = vec![
-            "Current Asterline team roster. Use member ids when routing teammate messages."
+            "Current Asterline team roster. This lists available members only; do not message them unless collaboration is necessary or explicitly requested. If routing is needed, use member ids."
                 .to_string(),
             format!("You are: {}", self.team_member_card(current)),
             format!("Default target: {}", self.default_target_label()),
@@ -1504,14 +1560,6 @@ impl TeamRuntime {
             .map(|m| m.backend)
             .unwrap_or(BackendKind::Codex)
     }
-
-    fn member_uses_resume(&self, member: &MemberId) -> bool {
-        use crate::domain::team::SessionPolicy;
-        self.config
-            .member(member)
-            .map(|m| m.session_policy == SessionPolicy::Resume)
-            .unwrap_or(true)
-    }
 }
 
 // Workflow handlers (handle_run_workflow … on_verify_output), split out for
@@ -1540,6 +1588,18 @@ fn strip_routing_prefix(prompt: &str) -> String {
         return rest[idx..].trim().to_string();
     }
     prompt.to_string()
+}
+
+/// Asterline exposes a consistent `@member /skill` composer syntax. Codex's
+/// non-interactive skill invocation uses `$skill`; the other backends accept
+/// the slash form directly.
+fn normalize_backend_command(backend: BackendKind, prompt: String) -> String {
+    if backend == BackendKind::Codex
+        && let Some(command) = prompt.strip_prefix('/')
+    {
+        return format!("${command}");
+    }
+    prompt
 }
 
 fn summarize_verify_output(stdout: &[u8], stderr: &[u8]) -> String {

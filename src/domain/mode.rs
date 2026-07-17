@@ -11,6 +11,59 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
 
+/// Mode selected for the lifetime of the current terminal session.
+///
+/// Unlike [`CollabMode`], this includes ordinary chat and workflow dispatch.
+/// A selection remains active until another `SetMode` command replaces it.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    #[default]
+    Normal,
+    Review,
+    Plan,
+    Roundtable,
+    Workflow,
+}
+
+impl TerminalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Review => "review",
+            Self::Plan => "plan",
+            Self::Roundtable => "roundtable",
+            Self::Workflow => "workflow",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "normal" | "chat" => Some(Self::Normal),
+            "review" => Some(Self::Review),
+            "plan" | "lead" => Some(Self::Plan),
+            "roundtable" | "rt" => Some(Self::Roundtable),
+            "workflow" => Some(Self::Workflow),
+            _ => None,
+        }
+    }
+
+    pub fn collab_mode(self) -> Option<CollabMode> {
+        match self {
+            Self::Review => Some(CollabMode::Review),
+            Self::Plan => Some(CollabMode::Lead),
+            Self::Roundtable => Some(CollabMode::Roundtable),
+            Self::Normal | Self::Workflow => None,
+        }
+    }
+}
+
+impl fmt::Display for TerminalMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Which collaboration mode a run uses.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -453,6 +506,16 @@ mod tests {
             .with_member(member("planner", "planning lead"))
             .with_member(member("builder", "implementation"))
             .with_member(member("reviewer", "code review"))
+    }
+
+    #[test]
+    fn terminal_mode_parses_user_facing_names() {
+        assert_eq!(TerminalMode::parse("normal"), Some(TerminalMode::Normal));
+        assert_eq!(TerminalMode::parse("plan"), Some(TerminalMode::Plan));
+        assert_eq!(TerminalMode::parse("lead"), Some(TerminalMode::Plan));
+        assert_eq!(TerminalMode::parse("rt"), Some(TerminalMode::Roundtable));
+        assert_eq!(TerminalMode::parse("unknown"), None);
+        assert_eq!(TerminalMode::Plan.to_string(), "plan");
     }
 
     #[test]

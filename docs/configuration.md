@@ -92,7 +92,7 @@ member runners, and save the updated team.
 
 ### Collaboration modes (`modes`)
 
-Optional bindings for `/review`, `/plan` (`/lead`), and `/roundtable`. When a
+Optional bindings for `/mode review`, `/mode plan`, and `/mode roundtable`. When a
 field is omitted, Asterline derives it from member roles and `default_target`
 (builder ≈ default target or first non-reviewer; reviewer ≈ role contains
 "review"; leader/moderator ≈ role contains "plan" or "lead"; participants =
@@ -110,8 +110,9 @@ full roster). Defaults for budgets: `max_iterations = 3`, `rounds = 2`,
 | `rounds`         | roundtable         | Number of full discussion rounds                   |
 | `auto_verify`    | lead (and similar) | Run suggested verification after approve when true |
 
-Inline `/review builder=@x max_iterations=5 …` overrides beat `team.json`, which
-beats role derivation.
+Legacy one-shot `/review builder=@x max_iterations=5 …` overrides beat
+`team.json`, which beats role derivation. Persistent `/mode review` uses the
+configured/derived defaults for every subsequent message.
 
 ### Approvals (`approvals`)
 
@@ -148,6 +149,18 @@ to backend-native sandbox and permission enforcement.
 | `permission_mode` | No                          | Backend-native permission mode                          |
 | `allowed_tools`   | No                          | Backend-specific tool allowlist                         |
 | `session_policy`  | No                          | `resume` (default) or `fresh`                           |
+| `session_id`      | No                          | Native CLI session/conversation ID to resume            |
+
+Both policies pin and reuse the backend session ID after the first call.
+`resume` keeps an existing persisted ID when available. Switching a member to
+`fresh` discards its old ID once, so the next call creates a new native CLI
+conversation; that newly discovered ID is then reused for subsequent calls.
+`fresh` does not create a separate conversation for every turn.
+
+Set `session_id` to bind a team member to a specific conversation from its
+native CLI history. Asterline passes it through the backend's native resume
+mechanism (`codex exec resume`, `claude --resume`, `grok --resume`, or Agy
+`--conversation`). In the Team editor, use `auto` to clear the explicit ID.
 
 Permission modes, sandbox mappings, and allowed-tool behavior depend on the
 backend. Do not assume a field has the same effect across all four CLIs.
@@ -171,6 +184,7 @@ Team editor.
 | `allowed_tools`        | Not passed                                                                     | `--allowed-tools`                           | `--tools`                                     | Not passed                                                        |
 | custom `system_prompt` | Not passed as a backend system prompt; Asterline prepends current team context | `--append-system-prompt`                    | `--rules`                                     | Prepended to stdin text                                           |
 | `session_policy`       | Resume or fresh                                                                | Resume or fresh                             | Resume or fresh                               | Resume or fresh conversation                                      |
+| `session_id`           | `codex exec resume <id>`                                                       | `claude --resume <id>`                      | `grok --resume <id>`                          | `agy --conversation <id>`                                         |
 
 For Claude and Grok, choose only permission modes accepted by the installed CLI
 version. Asterline serializes the configured value but does not negotiate

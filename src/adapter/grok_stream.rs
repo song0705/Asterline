@@ -9,13 +9,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::adapter::parser::{str_field, summarize};
+use crate::adapter::parser::{str_field, summarize, tool_detail, tool_value};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
 
 const TOOL_SUMMARY_MAX: usize = 160;
-const TOOL_OUTPUT_MAX: usize = 4000;
+const TOOL_OUTPUT_MAX: usize = 32_000;
 
 #[derive(Clone, Debug)]
 pub struct GrokStreamAdapter {
@@ -184,7 +184,7 @@ impl GrokLineParser {
         AgentEvent::ToolCompleted {
             id,
             ok: !is_error && !matches!(outcome, "error" | "failed" | "failure"),
-            summary: event_summary(value, &name, TOOL_OUTPUT_MAX),
+            summary: event_detail(value, &name, TOOL_OUTPUT_MAX),
         }
     }
 }
@@ -275,6 +275,21 @@ fn event_summary(value: &Value, fallback: &str, max: usize) -> String {
         format!("{data} ({outcome})")
     };
     summarize(&summary, max)
+}
+
+fn event_detail(value: &Value, fallback: &str, max: usize) -> String {
+    let detail = ["output", "result", "content", "data", "error"]
+        .into_iter()
+        .find_map(|field| value.get(field).map(|value| tool_value(value, max)))
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    let outcome = str_field(value, "outcome").unwrap_or_default();
+    let detail = if outcome.is_empty() || detail.contains(outcome) {
+        detail
+    } else {
+        format!("{detail}\n[{outcome}]")
+    };
+    tool_detail(&detail, max)
 }
 
 #[cfg(test)]
@@ -407,10 +422,27 @@ mod tests {
                 AgentEvent::ToolCompleted {
                     id: "grok-tool-1-shell".to_string(),
                     ok: true,
-                    summary: "cargo test (success)".to_string(),
+                    summary: "cargo test\n[success]".to_string(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn tool_completion_preserves_structured_multiline_output() {
+        let events = parse_all(&[
+            r#"{"type":"tool_started","tool_name":"shell","tool_id":"t1","data":"run tests"}"#,
+            r#"{"type":"tool_completed","tool_name":"shell","tool_id":"t1","output":{"stdout":"one\n  two","stderr":""},"outcome":"success"}"#,
+        ]);
+
+        let output = events.iter().find_map(|event| match event {
+            AgentEvent::ToolCompleted { summary, .. } => Some(summary),
+            _ => None,
+        });
+        let output = output.expect("tool output");
+        assert!(output.contains("stdout"));
+        assert!(output.contains("one\\n  two"));
+        assert!(output.contains("[success]"));
     }
 
     #[test]

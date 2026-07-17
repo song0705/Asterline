@@ -36,6 +36,25 @@ fn ready_populates_header() {
 }
 
 #[test]
+fn team_field_paste_goes_to_the_focused_editor() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.toggle_drawer(Drawer::Team);
+    state.handle_team_editor_key(KeyCode::Enter, KeyModifiers::NONE);
+    state.handle_team_editor_key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(state.insert_team_editor_text(" Lead\nEngineer"));
+    assert_eq!(
+        state
+            .team_editor()
+            .and_then(TeamEditor::editing)
+            .map(|edit| edit.buffer.as_str()),
+        Some("Builder Lead Engineer")
+    );
+    assert!(state.composer().is_empty());
+}
+
+#[test]
 fn workflow_run_updates_insert_then_replace() {
     let mut state = AppState::new(Vec::new());
     let run = WorkflowRunSummary {
@@ -459,9 +478,7 @@ fn skill_invocation_matches_backend_native_syntax() {
     assert_eq!(skill_invocation(BackendKind::Codex, &skill), "$review");
     assert_eq!(skill_invocation(BackendKind::Claude, &skill), "/review");
     for backend in [BackendKind::Grok, BackendKind::Agy] {
-        let invocation = skill_invocation(backend, &skill);
-        assert!(invocation.contains("review"));
-        assert!(invocation.contains("/tmp/review/SKILL.md"));
+        assert_eq!(skill_invocation(backend, &skill), "/review");
     }
 }
 
@@ -749,6 +766,19 @@ fn slash_opens_command_popup_and_accept_inserts() {
     assert_eq!(completion.items[0].insert, "/ask ");
     assert!(state.accept_completion());
     assert_eq!(state.composer().text(), "/ask ");
+}
+
+#[test]
+fn accepting_mode_command_immediately_opens_mode_choices() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.insert_text("/mode");
+
+    assert!(state.accept_completion());
+    assert_eq!(state.composer().text(), "/mode ");
+    let modes = state.completion().expect("second-level mode popup");
+    assert_eq!(modes.title, "modes");
+    assert_eq!(modes.items[0].insert, "normal ");
 }
 
 #[test]

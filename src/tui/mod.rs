@@ -16,6 +16,8 @@ pub mod keymap;
 pub mod markdown;
 pub mod notify;
 pub mod rollout_import;
+pub mod selection;
+pub mod session_picker;
 pub mod skills;
 pub mod status_indicator;
 pub mod team_builder;
@@ -28,10 +30,11 @@ use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind,
-    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -42,11 +45,13 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::domain::event::{RuntimeEvent, UiCommand};
+use crate::domain::mode::TerminalMode;
 use crate::domain::team::BackendKind;
 use crate::runtime::RuntimeHandle;
 use crate::tui::app_state::AppState;
 use crate::tui::commands::Submission;
 use crate::tui::keymap::Action;
+use crate::tui::selection::MouseSelection;
 use crate::tui::team_editor::TeamEditorOutcome;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -68,6 +73,7 @@ struct TerminalRestore {
     keyboard_enhancement: bool,
     alternate_screen: bool,
     mouse_capture: bool,
+    bracketed_paste: bool,
     legacy_keyboard_reset: bool,
 }
 
@@ -83,6 +89,10 @@ impl TerminalRestore {
         if self.mouse_capture {
             record_cleanup(&mut first_error, execute!(out, DisableMouseCapture));
             self.mouse_capture = false;
+        }
+        if self.bracketed_paste {
+            record_cleanup(&mut first_error, execute!(out, DisableBracketedPaste));
+            self.bracketed_paste = false;
         }
         if self.alternate_screen {
             record_cleanup(&mut first_error, execute!(out, LeaveAlternateScreen));
@@ -144,7 +154,13 @@ pub fn run(
     restore.raw_mode = true;
     restore.alternate_screen = true;
     restore.mouse_capture = true;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    restore.bracketed_paste = true;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     // Kitty keeps separate keyboard-mode stacks for the main and alternate
     // screens. Push only after entering the alternate screen so cleanup pops
     // the same stack before leaving it.
@@ -231,6 +247,7 @@ fn run_loop(
     legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     let notify_enabled = notify::enabled_from_env();
+    let mut selection = MouseSelection::default();
     loop {
         while let Ok(event) = events.try_recv() {
             if notify_enabled && let Some(title) = notify_title_for(&event) {
@@ -241,11 +258,22 @@ fn run_loop(
             state.apply(event);
         }
 
-        terminal.draw(|frame| chat_view::render(frame, state))?;
+        let screen = terminal
+            .draw(|frame| {
+                chat_view::render(frame, state);
+                selection.render(frame.buffer_mut());
+            })?
+            .buffer
+            .clone();
 
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if selection.is_active() && key.code == KeyCode::Esc {
+                        selection.clear();
+                        continue;
+                    }
+                    selection.clear();
                     if handle_team_editor_key(key, state, handle) {
                         continue;
                     }
@@ -253,7 +281,13 @@ fn run_loop(
                         handle_action(action, state, handle);
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(mouse, state),
+                Event::Mouse(mouse) => handle_mouse(mouse, state, &mut selection, &screen)?,
+                Event::Paste(text) => {
+                    selection.clear();
+                    if !state.insert_team_editor_text(&text) {
+                        state.insert_text(&text);
+                    }
+                }
                 _ => {}
             }
         }
@@ -268,7 +302,6 @@ fn run_loop(
                 legacy_keyboard_reset,
             )?;
         }
-
         if state.should_quit() {
             return Ok(());
         }
@@ -292,23 +325,47 @@ fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
 }
 
 /// Mouse wheel scrolls the conversation (or the open drawer), a few lines per
-/// tick. Real mouse capture means the wheel no longer arrives as ↑/↓ arrow keys
-/// (which now recall prompt history).
-fn handle_mouse(mouse: MouseEvent, state: &mut AppState) {
-    const STEP: usize = 3;
-    let up = match mouse.kind {
-        MouseEventKind::ScrollUp => true,
-        MouseEventKind::ScrollDown => false,
-        _ => return,
-    };
-    for _ in 0..STEP {
-        match (state.drawer().is_some(), up) {
-            (true, true) => state.drawer_scroll_up(),
-            (true, false) => state.drawer_scroll_down(),
-            (false, true) => state.scroll_up(),
-            (false, false) => state.scroll_down(),
+/// tick. Mouse capture keeps wheel events distinct from keyboard arrow keys.
+fn handle_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    selection: &mut MouseSelection,
+    screen: &ratatui::buffer::Buffer,
+) -> io::Result<()> {
+    const STEP: usize = 6;
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            selection.clear();
+            let up = mouse.kind == MouseEventKind::ScrollUp;
+            for _ in 0..STEP {
+                match (state.drawer().is_some(), up) {
+                    (true, true) => state.drawer_scroll_up(),
+                    (true, false) => state.drawer_scroll_down(),
+                    (false, true) => state.scroll_up(),
+                    (false, false) => state.scroll_down(),
+                }
+            }
         }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if state.drawer().is_some() {
+                selection.begin_bounded(
+                    mouse.column,
+                    mouse.row,
+                    drawer_view::drawer_rect(screen.area),
+                );
+            } else {
+                selection.begin(mouse.column, mouse.row);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => selection.update(mouse.column, mouse.row),
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(text) = selection.finish(mouse.column, mouse.row, screen) {
+                execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text))?;
+            }
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 /// Check whether `name` is an executable on the current `PATH`.
@@ -371,6 +428,7 @@ fn attach_to_member(
     disable_raw_mode()?;
     execute!(
         out,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
@@ -394,7 +452,12 @@ fn attach_to_member(
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     if keyboard_enhancement {
         execute!(
             out,
@@ -568,6 +631,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state.clear_header_selection();
             } else if state.drawer().is_some() {
                 state.close_drawer();
+            } else if state.running_count() > 0 {
+                handle.send(UiCommand::Cancel { member: None });
             }
         }
         Action::Interrupt => {
@@ -661,7 +726,16 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.record_submission(&text);
             state.take_composer();
             if let UiCommand::UserMessage { target, body } = &command {
-                state.handle_user_message_submitted(target, body.clone());
+                // Collaboration/workflow modes emit their own canonical user
+                // event after resolving participants. Only normal chat can be
+                // rendered optimistically with a known local target.
+                if state.active_mode() == TerminalMode::Normal {
+                    state.handle_user_message_submitted(target, body.clone());
+                }
+            } else if let UiCommand::SetMode { mode } = &command {
+                // Mirror Codex's mode picker: update the terminal UI state
+                // immediately, then let the runtime acknowledge the setting.
+                state.apply(RuntimeEvent::ModeChanged { mode: *mode });
             } else if matches!(command, UiCommand::NewSession) {
                 state.clear_last_message_target();
             }
@@ -703,7 +777,15 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.toggle_drawer(drawers::Drawer::Palette);
         }
         Submission::NeedsTarget => {
-            if let Some((target, body)) = state.inherited_user_message(&text) {
+            if state.active_mode() != TerminalMode::Normal {
+                let body = text.trim().to_string();
+                state.record_submission(&body);
+                state.take_composer();
+                handle.send(UiCommand::UserMessage {
+                    target: crate::domain::event::MessageTarget::Default,
+                    body,
+                });
+            } else if let Some((target, body)) = state.inherited_user_message(&text) {
                 state.record_submission(&body);
                 state.take_composer();
                 state.handle_user_message_submitted(&target, body.clone());
@@ -813,6 +895,36 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_chat_independently_of_arrow_history() {
+        let mut state = AppState::new(Vec::new());
+        let mut selection = MouseSelection::default();
+        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::ScrollUp),
+            &mut state,
+            &mut selection,
+            &screen,
+        )
+        .unwrap();
+        assert_eq!(state.scroll(), 6);
+        handle_mouse(
+            mouse(MouseEventKind::ScrollDown),
+            &mut state,
+            &mut selection,
+            &screen,
+        )
+        .unwrap();
+        assert_eq!(state.scroll(), 0);
+    }
+
+    #[test]
     fn untargeted_text_keeps_the_draft() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
@@ -833,6 +945,39 @@ mod tests {
 
         assert_eq!(state.composer().text(), "build the parser");
         assert!(state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::Notice { text } if text.contains("draft kept")
+        )));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn selected_mode_accepts_plain_text_without_an_inherited_target() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Review,
+        });
+        for ch in "build the parser".chars() {
+            state.insert_char(ch);
+        }
+
+        submit(&mut state, &handle);
+
+        assert!(state.composer().is_empty());
+        assert_eq!(state.active_mode(), TerminalMode::Review);
+        assert!(!state.chat().iter().any(|item| matches!(
             item,
             ChatItem::Notice { text } if text.contains("draft kept")
         )));

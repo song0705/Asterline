@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
@@ -19,7 +19,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use crate::domain::config::{DetectedBackends, default_member, default_team};
 use crate::domain::team::{
@@ -173,7 +174,8 @@ pub fn run(detected: DetectedBackends, workspace: &Path) -> io::Result<Option<Te
     restore.raw_mode = true;
     let mut stdout = io::stdout();
     restore.alternate_screen = true;
-    execute!(stdout, EnterAlternateScreen)?;
+    restore.bracketed_paste = true;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -205,15 +207,21 @@ fn select_loop(
     loop {
         terminal.draw(|frame| render(frame, &state))?;
 
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            if state.handle_key(key.code, key.modifiers) {
-                return Ok(state.finish());
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if state.handle_key(key.code, key.modifiers) {
+                    return Ok(state.finish());
+                }
+                if state.cancelled {
+                    return Ok(None);
+                }
             }
-            if state.cancelled {
-                return Ok(None);
+            Event::Paste(text) => {
+                if let Some(edit) = state.editing.as_mut() {
+                    edit.insert_text(&text);
+                }
             }
+            _ => {}
         }
     }
 }
@@ -228,11 +236,12 @@ pub(crate) enum Field {
     Sandbox,
     Permission,
     Session,
+    SessionId,
     Cwd,
 }
 
 impl Field {
-    pub(crate) const ALL: [Field; 9] = [
+    pub(crate) const ALL: [Field; 10] = [
         Field::Name,
         Field::Backend,
         Field::Role,
@@ -241,6 +250,7 @@ impl Field {
         Field::Sandbox,
         Field::Permission,
         Field::Session,
+        Field::SessionId,
         Field::Cwd,
     ];
 
@@ -254,12 +264,16 @@ impl Field {
             Self::Sandbox => "sandbox",
             Self::Permission => "permission",
             Self::Session => "session",
+            Self::SessionId => "session id",
             Self::Cwd => "cwd",
         }
     }
 
     pub(crate) fn is_text(self) -> bool {
-        matches!(self, Self::Name | Self::Role | Self::Model | Self::Cwd)
+        matches!(
+            self,
+            Self::Name | Self::Role | Self::Model | Self::SessionId | Self::Cwd
+        )
     }
 }
 
@@ -267,6 +281,157 @@ impl Field {
 pub(crate) struct EditState {
     pub(crate) field: Field,
     pub(crate) buffer: String,
+    /// Cursor as a Unicode scalar index, so movement never splits UTF-8.
+    pub(crate) cursor: usize,
+}
+
+impl EditState {
+    pub(crate) fn new(field: Field, buffer: String) -> Self {
+        let cursor = buffer.chars().count();
+        Self {
+            field,
+            buffer,
+            cursor,
+        }
+    }
+
+    pub(crate) fn insert_text(&mut self, text: &str) {
+        let text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        let mut chars = self.buffer.chars().collect::<Vec<_>>();
+        let inserted = text.chars().collect::<Vec<_>>();
+        let count = inserted.len();
+        let insert_at = self.cursor.min(chars.len());
+        chars.splice(insert_at..insert_at, inserted);
+        self.cursor = insert_at.saturating_add(count);
+        self.buffer = chars.into_iter().collect();
+    }
+
+    pub(crate) fn apply_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let alt = modifiers.contains(KeyModifiers::ALT);
+        match code {
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Char('b') if ctrl => self.move_left(),
+            KeyCode::Char('f') if ctrl => self.move_right(),
+            KeyCode::Char('b') if alt => self.move_word_left(),
+            KeyCode::Char('f') if alt => self.move_word_right(),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.char_len(),
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.char_len(),
+            KeyCode::Backspace => self.delete_backward(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Char('d') if ctrl => self.delete_forward(),
+            KeyCode::Char('u') if ctrl => self.delete_to_start(),
+            KeyCode::Char('k') if ctrl => self.delete_to_end(),
+            KeyCode::Char('w') if ctrl => self.delete_word_backward(),
+            KeyCode::Char(ch) if !ctrl && !alt && !ch.is_control() => {
+                self.insert_text(&ch.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn visible_window(&self, width: usize) -> (String, u16) {
+        if width == 0 {
+            return (String::new(), 0);
+        }
+        let chars = self.buffer.chars().collect::<Vec<_>>();
+        let cursor = self.cursor.min(chars.len());
+        let mut start = cursor;
+        let mut cursor_width = 0;
+        while start > 0 {
+            let char_width = UnicodeWidthChar::width(chars[start - 1]).unwrap_or(0);
+            if char_width > 0 && cursor_width + char_width > width.saturating_sub(1) {
+                break;
+            }
+            start -= 1;
+            cursor_width += char_width;
+        }
+        let mut visible = String::new();
+        let mut visible_width = 0;
+        for ch in &chars[start..] {
+            let char_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+            if char_width > 0 && visible_width + char_width > width {
+                break;
+            }
+            visible.push(*ch);
+            visible_width += char_width;
+        }
+        (visible, cursor_width.min(width) as u16)
+    }
+
+    fn char_len(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = self.cursor.saturating_add(1).min(self.char_len());
+    }
+
+    fn move_word_left(&mut self) {
+        let chars = self.buffer.chars().collect::<Vec<_>>();
+        while self.cursor > 0 && chars[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && !chars[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+    }
+
+    fn move_word_right(&mut self) {
+        let chars = self.buffer.chars().collect::<Vec<_>>();
+        while self.cursor < chars.len() && !chars[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        while self.cursor < chars.len() && chars[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+    }
+
+    fn delete_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let mut chars = self.buffer.chars().collect::<Vec<_>>();
+        self.cursor -= 1;
+        chars.remove(self.cursor);
+        self.buffer = chars.into_iter().collect();
+    }
+
+    fn delete_forward(&mut self) {
+        let mut chars = self.buffer.chars().collect::<Vec<_>>();
+        if self.cursor < chars.len() {
+            chars.remove(self.cursor);
+            self.buffer = chars.into_iter().collect();
+        }
+    }
+
+    fn delete_to_start(&mut self) {
+        let mut chars = self.buffer.chars().collect::<Vec<_>>();
+        chars.drain(..self.cursor.min(chars.len()));
+        self.cursor = 0;
+        self.buffer = chars.into_iter().collect();
+    }
+
+    fn delete_to_end(&mut self) {
+        let mut chars = self.buffer.chars().collect::<Vec<_>>();
+        chars.truncate(self.cursor.min(chars.len()));
+        self.buffer = chars.into_iter().collect();
+    }
+
+    fn delete_word_backward(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        let mut chars = self.buffer.chars().collect::<Vec<_>>();
+        chars.drain(self.cursor..end.min(chars.len()));
+        self.buffer = chars.into_iter().collect();
+    }
 }
 
 struct BuilderState {
@@ -379,19 +544,10 @@ impl BuilderState {
         match code {
             KeyCode::Esc => {}
             KeyCode::Enter => self.commit_edit(edit),
-            KeyCode::Backspace => {
-                edit.buffer.pop();
+            _ => {
+                edit.apply_key(code, modifiers);
                 self.editing = Some(edit);
             }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                edit.buffer.clear();
-                self.editing = Some(edit);
-            }
-            KeyCode::Char(ch) => {
-                edit.buffer.push(ch);
-                self.editing = Some(edit);
-            }
-            _ => self.editing = Some(edit),
         }
     }
 
@@ -457,10 +613,10 @@ impl BuilderState {
     fn edit_selected_field(&mut self) {
         let field = self.selected_field();
         if field.is_text() {
-            self.editing = Some(EditState {
+            self.editing = Some(EditState::new(
                 field,
-                buffer: field_value(self.selected_member(), field),
-            });
+                field_value(self.selected_member(), field),
+            ));
         }
     }
 
@@ -490,7 +646,9 @@ impl BuilderState {
             Field::Backend => {
                 let current = self.selected_member().backend;
                 let next = cycle_backend(current, &self.available);
-                self.selected_member_mut().backend = next;
+                let member = self.selected_member_mut();
+                member.backend = next;
+                member.session_id = None;
             }
             Field::Effort => {
                 let next = cycle_effort(self.selected_member().effort);
@@ -509,7 +667,11 @@ impl BuilderState {
                     SessionPolicy::Resume => SessionPolicy::Fresh,
                     SessionPolicy::Fresh => SessionPolicy::Resume,
                 };
-                self.selected_member_mut().session_policy = next;
+                let member = self.selected_member_mut();
+                member.session_policy = next;
+                if next == SessionPolicy::Fresh {
+                    member.session_id = None;
+                }
             }
             _ => {}
         }
@@ -540,6 +702,18 @@ impl BuilderState {
                 } else {
                     Some(value.to_string())
                 };
+            }
+            Field::SessionId => {
+                let session_id = if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                let member = self.selected_member_mut();
+                member.session_id = session_id;
+                if member.session_id.is_some() {
+                    member.session_policy = SessionPolicy::Resume;
+                }
             }
             Field::Cwd => {
                 self.selected_member_mut().cwd = if value.is_empty() {
@@ -736,19 +910,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     if let Some(notice) = &state.notice {
         lines.push(Line::from(Span::styled(notice.clone(), theme::warning())));
     }
-    if let Some(edit) = &state.editing {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" editing {}: ", edit.field.label()),
-                theme::warning_bold(),
-            ),
-            Span::styled(edit.buffer.clone(), theme::emphasis()),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "Enter commit · Esc cancel · Ctrl+U clear",
-            theme::muted_italic(),
-        )));
-    } else {
+    if state.editing.is_none() {
         lines.push(Line::from(Span::styled(
             if state.field_mode {
                 "↑/↓ field · Enter edit/cycle · e manual model · s start · Esc members"
@@ -760,6 +922,9 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+    if let Some(edit) = &state.editing {
+        render_edit_box(frame, inner, edit);
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -783,6 +948,55 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
             Constraint::Min(0),
         ])
         .split(vertical[1])[1]
+}
+
+/// Focused single-line editor shared by startup and the live Team drawer.
+pub(crate) fn render_edit_box(frame: &mut ratatui::Frame<'_>, area: Rect, edit: &EditState) {
+    let popup = centered(
+        area,
+        area.width.saturating_sub(2).min(72),
+        area.height.min(7),
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" Edit {} ", edit.field.label()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent_bold());
+    let body = block.inner(popup);
+    frame.render_widget(block, popup);
+    if body.height == 0 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(body);
+    let input_block = Block::default()
+        .title(" Value ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(theme::warning_bold());
+    let input_inner = input_block.inner(chunks[0]);
+    frame.render_widget(input_block, chunks[0]);
+    let (visible, cursor_x) = edit.visible_window(input_inner.width as usize);
+    frame.render_widget(Paragraph::new(Line::raw(visible)), input_inner);
+    if input_inner.width > 0 && input_inner.height > 0 {
+        frame.set_cursor_position((
+            input_inner.x + cursor_x.min(input_inner.width.saturating_sub(1)),
+            input_inner.y,
+        ));
+    }
+    if chunks[1].height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit",
+                theme::muted_italic(),
+            )),
+            chunks[1],
+        );
+    }
 }
 
 pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
@@ -811,6 +1025,10 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
             SessionPolicy::Resume => "resume".to_string(),
             SessionPolicy::Fresh => "fresh".to_string(),
         },
+        Field::SessionId => member
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
         Field::Cwd => member
             .cwd
             .as_ref()
@@ -931,10 +1149,7 @@ mod tests {
         let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &available);
         state.add_member();
         state.selected = 1;
-        state.commit_edit(EditState {
-            field: Field::Name,
-            buffer: "Builder".to_string(),
-        });
+        state.commit_edit(EditState::new(Field::Name, "Builder".to_string()));
 
         assert_eq!(state.members[1].id, MemberId::new("builder-2"));
         assert_eq!(state.members[1].display_name, "Builder 2");
@@ -1019,5 +1234,30 @@ mod tests {
 
         assert_eq!(picker.value().as_deref(), Some("company-model"));
         assert_eq!(picker.selected(), 1);
+    }
+
+    #[test]
+    fn edit_state_moves_and_edits_unicode_at_the_cursor() {
+        let mut edit = EditState::new(Field::Role, "你 model".to_string());
+        edit.apply_key(KeyCode::Left, KeyModifiers::NONE);
+        edit.apply_key(KeyCode::Left, KeyModifiers::NONE);
+        edit.insert_text("好");
+        assert_eq!(edit.buffer, "你 mod好el");
+
+        edit.apply_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(edit.buffer, "el");
+        assert_eq!(edit.cursor, 0);
+        edit.apply_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(edit.buffer, "l");
+    }
+
+    #[test]
+    fn edit_state_windows_long_values_around_cursor() {
+        let mut edit = EditState::new(Field::Cwd, "/very/long/project/path".to_string());
+        edit.apply_key(KeyCode::Home, KeyModifiers::NONE);
+        edit.apply_key(KeyCode::Right, KeyModifiers::NONE);
+        let (visible, cursor) = edit.visible_window(8);
+        assert!(theme::display_width(&visible) <= 8);
+        assert_eq!(cursor, 1);
     }
 }

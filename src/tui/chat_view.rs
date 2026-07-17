@@ -500,7 +500,9 @@ fn render_item(
                 } else {
                     theme::muted()
                 };
-                let max_lines = if state.tools_expanded() || *ok == Some(false) {
+                let max_lines = if state.tools_expanded() {
+                    usize::MAX
+                } else if *ok == Some(false) {
                     20
                 } else {
                     1
@@ -514,7 +516,7 @@ fn render_item(
                         Span::styled(line, detail_style),
                     ]));
                 }
-                if clipped && !state.tools_expanded() && *ok != Some(false) {
+                if clipped && !state.tools_expanded() {
                     out.push(Line::from(vec![
                         chat_rail(rail_color),
                         Span::styled("       … Ctrl+O expand tool output", theme::muted_italic()),
