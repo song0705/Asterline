@@ -22,9 +22,9 @@ pub struct MessageId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ApprovalId(pub u64);
 
-/// A persisted workflow run started from `/plan` (`/workflow` remains an alias).
+/// A persisted run used by team and structured collaboration modes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct WorkflowRunId(pub u64);
+pub struct RunId(pub u64);
 
 macro_rules! impl_id_display {
     ($($ty:ty => $prefix:literal),* $(,)?) => {
@@ -40,7 +40,7 @@ impl_id_display! {
     TurnId => "turn-",
     MessageId => "msg-",
     ApprovalId => "approval-",
-    WorkflowRunId => "run-",
+    RunId => "run-",
 }
 
 /// A backend session/thread id used to resume a member's conversation.
@@ -105,9 +105,9 @@ impl ApprovalDecision {
     }
 }
 
-/// High-level lifecycle for a user-visible workflow run.
+/// High-level lifecycle for a user-visible run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WorkflowRunStatus {
+pub enum RunStatus {
     Planned,
     Running,
     Verifying,
@@ -116,7 +116,7 @@ pub enum WorkflowRunStatus {
     Blocked,
 }
 
-impl WorkflowRunStatus {
+impl RunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Planned => "planned",
@@ -140,7 +140,7 @@ impl WorkflowRunStatus {
     }
 }
 
-impl fmt::Display for WorkflowRunStatus {
+impl fmt::Display for RunStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -148,14 +148,14 @@ impl fmt::Display for WorkflowRunStatus {
 
 /// Per-run checklist item state shown in `/runs`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WorkflowStepStatus {
+pub enum RunStepStatus {
     Todo,
     Doing,
     Done,
     Blocked,
 }
 
-impl WorkflowStepStatus {
+impl RunStepStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Todo => "todo",
@@ -175,7 +175,7 @@ impl WorkflowStepStatus {
     }
 }
 
-impl fmt::Display for WorkflowStepStatus {
+impl fmt::Display for RunStepStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -257,74 +257,66 @@ pub enum UiCommand {
     /// Start a fresh chat: a new conversation and new backend sessions, with the
     /// transcript cleared. (codex's `/new`.)
     NewSession,
+    /// Ask the runtime for saved chats so the TUI can open the `/resume` picker.
+    RequestResume,
+    /// Restore one chat selected from the `/resume` picker.
+    ResumeConversation { conversation: i64 },
     /// Import messages exchanged in a member's native session (after attaching),
     /// so they appear in the Asterline transcript and persist.
     ImportTranscript {
         member: MemberId,
         items: Vec<ImportedMessage>,
     },
-    /// Run a built-in coordinating workflow for a goal.
-    RunWorkflow { goal: String },
-    /// Continue an existing workflow run, usually after a blocker or failed
+    /// Continue an existing run, usually after a blocker or failed
     /// verification. Without a run id, the runtime targets the latest run.
-    ContinueWorkflow {
-        run_id: Option<WorkflowRunId>,
+    ContinueRun {
+        run_id: Option<RunId>,
         note: Option<String>,
     },
-    /// Append a human checkpoint note to a workflow run without changing its
+    /// Append a human checkpoint note to a run without changing its
     /// lifecycle status. Without a run id, the runtime targets the latest run.
-    NoteWorkflow {
-        run_id: Option<WorkflowRunId>,
-        note: String,
-    },
-    /// Mark a workflow run as blocked and record the reason in its timeline.
+    NoteRun { run_id: Option<RunId>, note: String },
+    /// Mark a run as blocked and record the reason in its timeline.
     /// Without a run id, the runtime targets the latest run.
-    BlockWorkflow {
-        run_id: Option<WorkflowRunId>,
+    BlockRun {
+        run_id: Option<RunId>,
         reason: String,
     },
-    /// Run verification for the latest workflow run, or a specific run when
+    /// Run verification for the latest run, or a specific run when
     /// launched from `/runs`.
-    VerifyWorkflow {
-        run_id: Option<WorkflowRunId>,
+    VerifyRun {
+        run_id: Option<RunId>,
         command: Option<String>,
     },
-    /// Add one checklist step to the latest or specified workflow run.
-    AddWorkflowStep {
-        run_id: Option<WorkflowRunId>,
+    /// Add one checklist step to the latest or specified run.
+    AddRunStep {
+        run_id: Option<RunId>,
         owner: Option<MemberId>,
         title: String,
     },
     /// Update a checklist step by its 1-based number in `/runs`.
-    UpdateWorkflowStep {
-        run_id: Option<WorkflowRunId>,
+    UpdateRunStep {
+        run_id: Option<RunId>,
         step: u32,
-        status: WorkflowStepStatus,
+        status: RunStepStatus,
         note: Option<String>,
     },
     /// Rename a checklist step by its 1-based number in `/runs`.
-    RenameWorkflowStep {
-        run_id: Option<WorkflowRunId>,
+    RenameRunStep {
+        run_id: Option<RunId>,
         step: u32,
         title: String,
     },
     /// Remove a checklist step by its 1-based number in `/runs`.
-    RemoveWorkflowStep {
-        run_id: Option<WorkflowRunId>,
-        step: u32,
-    },
+    RemoveRunStep { run_id: Option<RunId>, step: u32 },
     /// Assign or clear a checklist step owner by its 1-based number in `/runs`.
-    AssignWorkflowStep {
-        run_id: Option<WorkflowRunId>,
+    AssignRunStep {
+        run_id: Option<RunId>,
         step: u32,
         owner: Option<MemberId>,
     },
-    /// Start a collaboration mode run (`/review`, `/lead`, `/roundtable`).
-    RunMode {
-        mode: CollabMode,
-        task: String,
-        overrides: Vec<(String, String)>,
-    },
+    /// Start a collaboration mode run.
+    RunMode { mode: CollabMode, task: String },
     /// Begin a graceful shutdown.
     Shutdown,
 }
@@ -453,14 +445,14 @@ pub struct MemberSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkflowVerification {
+pub struct RunVerification {
     pub command: String,
     pub ok: bool,
     pub summary: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkflowRunEventSummary {
+pub struct RunEventSummary {
     pub kind: String,
     pub title: String,
     pub detail: Option<String>,
@@ -469,9 +461,9 @@ pub struct WorkflowRunEventSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkflowStepSummary {
+pub struct RunStepSummary {
     pub number: u32,
-    pub status: WorkflowStepStatus,
+    pub status: RunStepStatus,
     pub owner: Option<MemberId>,
     pub title: String,
     pub note: Option<String>,
@@ -479,14 +471,14 @@ pub struct WorkflowStepSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WorkflowStepRequest {
+pub enum RunStepRequest {
     Add {
         owner: Option<MemberId>,
         title: String,
     },
     Update {
         step: u32,
-        status: WorkflowStepStatus,
+        status: RunStepStatus,
         note: Option<String>,
     },
     Rename {
@@ -502,7 +494,7 @@ pub enum WorkflowStepRequest {
     },
 }
 
-/// Collaboration-mode status attached to a workflow run when `mode` is set.
+/// Collaboration-mode status attached to a run when `mode` is set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModeRunStatus {
     pub mode: CollabMode,
@@ -510,19 +502,25 @@ pub struct ModeRunStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkflowRunSummary {
-    pub id: WorkflowRunId,
+pub struct RunSummary {
+    pub id: RunId,
     pub goal: String,
-    pub status: WorkflowRunStatus,
+    pub status: RunStatus,
     pub coordinator: Option<MemberId>,
-    pub verification: Option<WorkflowVerification>,
+    pub verification: Option<RunVerification>,
     pub created_at: String,
     pub updated_at: String,
     pub attempt: u32,
-    pub events: Vec<WorkflowRunEventSummary>,
-    pub steps: Vec<WorkflowStepSummary>,
-    /// Present when this run was started as a collaboration mode (`/review`, …).
+    pub events: Vec<RunEventSummary>,
+    pub steps: Vec<RunStepSummary>,
+    /// Present when this run was started as a collaboration mode (`/mode review`, …).
     pub mode: Option<ModeRunStatus>,
+    /// Raw `runs.mode` string when it is non-null but not a known [`CollabMode`].
+    ///
+    /// Used so legacy rows (e.g. `"roundtable"`) still appear in `/runs` and
+    /// `/continue` can refuse them with a clear notice instead of treating them
+    /// as ordinary TEAM runs.
+    pub legacy_mode: Option<String>,
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth
@@ -535,7 +533,7 @@ pub enum RuntimeEvent {
         workspace: String,
         default_target: Option<DefaultTarget>,
         members: Vec<MemberSummary>,
-        workflow_runs: Vec<WorkflowRunSummary>,
+        runs: Vec<RunSummary>,
     },
     /// The terminal-scoped message dispatch mode changed.
     ModeChanged {
@@ -644,12 +642,12 @@ pub enum RuntimeEvent {
         member: MemberId,
         message: String,
     },
-    WorkflowRunUpdated {
-        run: WorkflowRunSummary,
+    RunUpdated {
+        run: RunSummary,
     },
     /// A reviewer verdict was recorded for a mode run.
     Verdict {
-        run: WorkflowRunId,
+        run: RunId,
         member: MemberId,
         approve: bool,
         summary: String,
@@ -661,6 +659,25 @@ pub enum RuntimeEvent {
     /// Clear the transcript to begin a fresh chat (from `/new`). Members, logs,
     /// and prompt history are kept.
     SessionReset,
+    /// Saved chats available to the `/resume` picker.
+    ResumeChoices {
+        conversations: Vec<ConversationSummary>,
+    },
+    /// Replace the visible transcript after restoring a saved chat.
+    ConversationResumed {
+        conversation: i64,
+        chat: Vec<ChatItem>,
+    },
+}
+
+/// One row in the `/resume` saved-chat picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationSummary {
+    pub id: i64,
+    pub created_at: String,
+    pub preview: String,
+    pub message_count: usize,
+    pub member_count: usize,
 }
 
 /// A rendered conversation block in the single-column chat. The TUI builds these
@@ -715,7 +732,7 @@ mod tests {
         assert_eq!(TurnId(3).to_string(), "turn-3");
         assert_eq!(MessageId(7).to_string(), "msg-7");
         assert_eq!(ApprovalId(1).to_string(), "approval-1");
-        assert_eq!(WorkflowRunId(2).to_string(), "run-2");
+        assert_eq!(RunId(2).to_string(), "run-2");
     }
 
     #[test]

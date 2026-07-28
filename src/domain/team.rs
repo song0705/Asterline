@@ -205,6 +205,7 @@ pub enum Effort {
     High,
     Xhigh,
     Max,
+    Ultra,
 }
 
 impl Effort {
@@ -216,16 +217,13 @@ impl Effort {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
-    /// The value for Codex's `model_reasoning_effort` (clamped to its range).
+    /// The value for Codex's `model_reasoning_effort`.
     pub fn codex_value(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High | Self::Xhigh | Self::Max => "high",
-        }
+        self.as_str()
     }
 
     pub fn as_str(self) -> &'static str {
@@ -239,7 +237,8 @@ impl Effort {
             Self::Medium => Self::High,
             Self::High => Self::Xhigh,
             Self::Xhigh => Self::Max,
-            Self::Max => Self::Low,
+            Self::Max => Self::Ultra,
+            Self::Ultra => Self::Low,
         }
     }
 
@@ -250,6 +249,7 @@ impl Effort {
             "high" => Some(Self::High),
             "xhigh" => Some(Self::Xhigh),
             "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
             _ => None,
         }
     }
@@ -484,7 +484,7 @@ pub struct TeamConfig {
     pub default_target: Option<DefaultTarget>,
     #[serde(default = "default_max_auto_relays")]
     pub max_auto_relays: u32,
-    /// Optional collaboration-mode role bindings (`review` / `lead` / `roundtable`).
+    /// Optional collaboration-mode role bindings (`review` / `plan` / `brainstorm`).
     #[serde(default, skip_serializing_if = "ModesConfig::is_default")]
     pub modes: ModesConfig,
     /// Optional approval-gate policy (`approvals` in team.json).
@@ -502,6 +502,11 @@ pub enum TeamConfigError {
     Empty,
     DuplicateMember(String),
     UnknownDefaultTarget(String),
+    UnsupportedEffort {
+        member: String,
+        backend: BackendKind,
+        effort: Effort,
+    },
 }
 
 impl fmt::Display for TeamConfigError {
@@ -512,6 +517,15 @@ impl fmt::Display for TeamConfigError {
             Self::UnknownDefaultTarget(id) => {
                 write!(f, "default target refers to unknown member: {id}")
             }
+            Self::UnsupportedEffort {
+                member,
+                backend,
+                effort,
+            } => write!(
+                f,
+                "member {member} uses {backend}, which does not support {} effort",
+                effort.as_str()
+            ),
         }
     }
 }
@@ -548,6 +562,17 @@ impl TeamConfig {
         for member in &self.members {
             if !seen.insert(member.id.as_str()) {
                 return Err(TeamConfigError::DuplicateMember(member.id.to_string()));
+            }
+            if let Some(effort) = member.effort
+                && ((member.backend == BackendKind::Agy
+                    && !matches!(effort, Effort::Low | Effort::Medium | Effort::High))
+                    || (effort == Effort::Ultra && member.backend != BackendKind::Codex))
+            {
+                return Err(TeamConfigError::UnsupportedEffort {
+                    member: member.id.to_string(),
+                    backend: member.backend,
+                    effort,
+                });
             }
         }
 
@@ -741,6 +766,34 @@ mod tests {
             config.validate(),
             Err(TeamConfigError::UnknownDefaultTarget("ghost".to_string()))
         );
+    }
+
+    #[test]
+    fn unsupported_backend_effort_is_rejected() {
+        let mut agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "research");
+        agy.effort = Some(Effort::Xhigh);
+        let err = TeamConfig::new("team", "/tmp").with_member(agy).validate();
+        assert!(matches!(
+            err,
+            Err(TeamConfigError::UnsupportedEffort {
+                backend: BackendKind::Agy,
+                effort: Effort::Xhigh,
+                ..
+            })
+        ));
+
+        let mut claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "review");
+        claude.effort = Some(Effort::Ultra);
+        assert!(matches!(
+            TeamConfig::new("team", "/tmp")
+                .with_member(claude)
+                .validate(),
+            Err(TeamConfigError::UnsupportedEffort {
+                backend: BackendKind::Claude,
+                effort: Effort::Ultra,
+                ..
+            })
+        ));
     }
 
     #[test]

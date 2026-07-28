@@ -1,0 +1,4 @@
+interface:
+  display_name: "Asterline Brainstorm"
+  short_description: "Structured idea cards, voting, and synthesis"
+  default_prompt: "Use $asterline-brainstorm to run a structured brainstorm with extractable idea cards and private voting."

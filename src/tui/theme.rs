@@ -12,7 +12,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::domain::event::{LogLevel, MemberStatus, WorkflowRunStatus};
+use crate::domain::event::{LogLevel, MemberStatus, RunStatus};
 use crate::domain::team::BackendKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,12 +252,12 @@ pub fn status_label(status: MemberStatus) -> &'static str {
     }
 }
 
-pub fn workflow_status_color(status: WorkflowRunStatus) -> Color {
+pub fn run_status_color(status: RunStatus) -> Color {
     match status {
-        WorkflowRunStatus::Running | WorkflowRunStatus::Verifying => warning_color(),
-        WorkflowRunStatus::Done => success_color(),
-        WorkflowRunStatus::Failed | WorkflowRunStatus::Blocked => error_color(),
-        WorkflowRunStatus::Planned => muted_color(),
+        RunStatus::Running | RunStatus::Verifying => warning_color(),
+        RunStatus::Done => success_color(),
+        RunStatus::Failed | RunStatus::Blocked => error_color(),
+        RunStatus::Planned => muted_color(),
     }
 }
 

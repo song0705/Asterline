@@ -11,7 +11,8 @@ use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
 use crate::domain::config::{
-    detect_backends, ensure_team_skill, inject_team_protocol, load_team_config,
+    detect_backends, ensure_brainstorm_skill, ensure_team_skill, inject_team_protocol,
+    load_team_config,
 };
 use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
@@ -113,6 +114,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         }
     };
     ensure_team_skill(&team.workspace)?;
+    ensure_brainstorm_skill(&team.workspace)?;
     inject_team_protocol(&mut team);
 
     let db_path = config

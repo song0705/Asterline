@@ -13,8 +13,12 @@ const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
 pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 5;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 12;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
+pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
+pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
+const ASTERLINE_BRAINSTORM_SKILL: &str =
+    include_str!("../../.agents/skills/asterline-brainstorm/SKILL.md");
 const MANAGED_SKILL_MARKER: &str =
     "<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->";
 
@@ -33,6 +37,26 @@ pub fn ensure_team_skill(workspace: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, ASTERLINE_TEAM_SKILL)
+}
+
+/// Install the default brainstorm protocol once. Existing deployment-local
+/// copies are always preserved so teams can customize the method and card text.
+pub fn ensure_brainstorm_skill(workspace: &Path) -> io::Result<()> {
+    let path = workspace.join(ASTERLINE_BRAINSTORM_SKILL_PATH);
+    if path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, ASTERLINE_BRAINSTORM_SKILL)
+}
+
+/// Load the deployment-local brainstorm protocol, falling back to the embedded
+/// default for tests and workspaces that have not been initialized yet.
+pub fn brainstorm_skill_text(workspace: &Path) -> String {
+    fs::read_to_string(workspace.join(ASTERLINE_BRAINSTORM_SKILL_PATH))
+        .unwrap_or_else(|_| ASTERLINE_BRAINSTORM_SKILL.to_string())
 }
 
 /// Frontmatter `version:` value; missing or invalid values are treated as v1.
@@ -68,65 +92,19 @@ pub fn team_skill_hint() -> String {
 /// Read and validate a team config from a JSON file.
 pub fn load_team_config(path: &Path) -> io::Result<TeamConfig> {
     let text = fs::read_to_string(path)?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|err| invalid_config(path, err.to_string(), &text))?;
-    let migrated = migrate_legacy_backends(&mut value);
-    let config: TeamConfig = serde_json::from_value(value)
-        .map_err(|err| invalid_config(path, err.to_string(), &text))?;
+    let config: TeamConfig =
+        serde_json::from_str(&text).map_err(|err| invalid_config(path, err.to_string()))?;
     config
         .validate()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    if migrated && should_rewrite_migrated_config(path) {
-        let _ = fs::write(
-            path,
-            serde_json::to_string_pretty(&config).unwrap_or_default(),
-        );
-    }
     Ok(config)
 }
 
-fn invalid_config(path: &Path, err: String, text: &str) -> io::Error {
-    let migration_hint = if text.contains("\"gemini\"") {
-        " Legacy Gemini backend configs should be migrated to backend \"agy\"; re-run with --pick-team if automatic migration fails."
-    } else {
-        ""
-    };
+fn invalid_config(path: &Path, err: String) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "invalid team config {}: {err}.{migration_hint}",
-            path.display()
-        ),
+        format!("invalid team config {}: {err}", path.display()),
     )
-}
-
-fn migrate_legacy_backends(value: &mut serde_json::Value) -> bool {
-    let mut migrated = false;
-    let Some(members) = value
-        .get_mut("members")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return false;
-    };
-    for member in members {
-        let Some(backend) = member.get_mut("backend") else {
-            continue;
-        };
-        if backend.as_str() == Some("gemini") {
-            *backend = serde_json::Value::String("agy".to_string());
-            migrated = true;
-        }
-    }
-    migrated
-}
-
-fn should_rewrite_migrated_config(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("team.json")
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            == Some(".asterline")
 }
 
 /// Which backend CLIs are available on the current `PATH`.
@@ -141,6 +119,15 @@ pub struct DetectedBackends {
 impl DetectedBackends {
     pub fn any(self) -> bool {
         self.codex || self.claude || self.grok || self.agy
+    }
+
+    pub fn contains(self, backend: BackendKind) -> bool {
+        match backend {
+            BackendKind::Codex => self.codex,
+            BackendKind::Claude => self.claude,
+            BackendKind::Grok => self.grok,
+            BackendKind::Agy => self.agy,
+        }
     }
 }
 
@@ -328,7 +315,7 @@ fn build_protocol(me: &str, teammates: &[String]) -> String {
             teammates.join(", ")
         ));
         protocol.push_str(
-            "Work independently unless the user or active workflow explicitly requires collaboration.\n",
+            "Work independently unless the user or active run explicitly requires collaboration.\n",
         );
     }
     protocol.push_str("All other text you write is shown to the user.");
@@ -508,6 +495,31 @@ mod tests {
     }
 
     #[test]
+    fn ensure_brainstorm_skill_installs_default_and_preserves_custom_copy() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-brainstorm-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_brainstorm_skill(&dir).unwrap();
+
+        let path = dir.join(ASTERLINE_BRAINSTORM_SKILL_PATH);
+        let installed = std::fs::read_to_string(&path).unwrap();
+        assert!(installed.contains("name: asterline-brainstorm"));
+        assert!(installed.contains("@@brainstorm_card"));
+        assert!(installed.contains("@@brainstorm_vote"));
+
+        let custom = installed.replace(
+            "Use relevance, novelty,",
+            "Use deployment-specific value, novelty,",
+        );
+        std::fs::write(&path, &custom).unwrap();
+        ensure_brainstorm_skill(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+        assert_eq!(brainstorm_skill_text(&dir), custom);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn ensure_team_skill_upgrades_managed_v4_file() {
         let dir =
             std::env::temp_dir().join(format!("asterline-skill-upgrade-{}", std::process::id()));
@@ -524,7 +536,7 @@ mod tests {
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 5"));
+        assert!(text.contains("version: 12"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Work independently by default"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -550,18 +562,25 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v5() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 5);
-        assert!(ASTERLINE_TEAM_SKILL.contains("metadata:\n  version: 5"));
+    fn embedded_team_skill_is_protocol_v12() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 12);
+        assert!(ASTERLINE_TEAM_SKILL.contains("metadata:\n  version: 12"));
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("Brainstorm Generation and Voting"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("$asterline-brainstorm"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("@@brainstorm_card"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("@@brainstorm_vote"));
         assert!(ASTERLINE_TEAM_SKILL.contains("Work independently by default"));
         assert!(
             ASTERLINE_TEAM_SKILL.contains("task involves search, research, review, or planning")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains("`session_id`"));
         assert!(ASTERLINE_TEAM_SKILL.contains("`/mode plan`"));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 5);
+        assert!(ASTERLINE_TEAM_SKILL.contains("@@run_step"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("Every Received Message Must Be Answered"));
+        assert!(ASTERLINE_TEAM_SKILL.contains(r#""kind":"reply""#));
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 12);
     }
 
     #[test]
@@ -619,31 +638,35 @@ mod tests {
     }
 
     #[test]
-    fn load_team_config_migrates_old_gemini_backend() {
-        let dir = std::env::temp_dir().join(format!("asterline-cfg-gemini-{}", std::process::id()));
-        let config_dir = dir.join(".asterline");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let path = config_dir.join("team.json");
+    fn load_team_config_rejects_legacy_roundtable_modes_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-cfg-legacy-roundtable-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("team.json");
         std::fs::write(
             &path,
             r#"{
-              "name": "old",
+              "name": "legacy",
               "workspace": "/tmp/ws",
               "members": [{
-                "id": "researcher",
-                "display_name": "Researcher",
-                "backend": "gemini",
-                "role": "research"
-              }]
+                "id": "builder",
+                "display_name": "Builder",
+                "backend": "codex",
+                "role": "impl"
+              }],
+              "modes": { "roundtable": {} }
             }"#,
         )
         .unwrap();
 
-        let config = load_team_config(&path).expect("old gemini backend is migrated");
-        assert_eq!(config.members[0].backend, BackendKind::Agy);
-        let rewritten = std::fs::read_to_string(&path).unwrap();
-        assert!(rewritten.contains("\"backend\": \"agy\""));
-        assert!(!rewritten.contains("\"gemini\""));
+        let err = load_team_config(&path).expect_err("legacy roundtable key must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid team config") && msg.contains("roundtable"),
+            "startup error should name the file and unknown field: {msg}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

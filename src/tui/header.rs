@@ -1,5 +1,5 @@
 //! The top header (title bar + member chips + rule) and the bottom footer
-//! (search prompt, alerts, running status, workflow hint, or key hints).
+//! (search prompt, alerts, running status, run hint, or key hints).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -8,10 +8,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::domain::event::MemberStatus;
 use crate::tui::app_state::{AppState, MemberView};
+use crate::tui::runs_view::run_footer_hint;
 use crate::tui::status_indicator;
 use crate::tui::theme;
 use crate::tui::theme::{clip_width, display_width, truncate_width};
-use crate::tui::workflow_view::workflow_footer_hint;
 
 /// Header: `Asterline · team    …    workspace`, one chip per member, and a
 /// thin rule that separates the header block from the conversation.
@@ -188,7 +188,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             .unwrap_or_default(),
             theme::warning_bold(),
         ));
-    } else if let Some((text, color)) = workflow_footer_hint(state) {
+    } else if let Some((text, color)) = run_footer_hint(state) {
         if !parts.is_empty() {
             parts.push(Span::raw("   "));
         }

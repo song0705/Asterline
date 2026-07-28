@@ -1,4 +1,4 @@
-//! Shared workflow helpers used by the runtime and TUI.
+//! Shared run helpers used by the runtime and TUI.
 
 use std::path::Path;
 

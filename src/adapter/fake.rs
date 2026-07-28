@@ -9,7 +9,8 @@ use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::BackendKind;
 use crate::runtime::mode_prompts::{
-    LEAD_PLAN_HINT, MODERATOR_HINT, REVIEW_PROTOCOL_HINT, ROUNDTABLE_HINT,
+    BRAINSTORM_BUILD_HINT, BRAINSTORM_PROPOSE_HINT, BRAINSTORM_STRETCH_HINT,
+    BRAINSTORM_SYNTHESIS_HINT, BRAINSTORM_VOTE_HINT, PLAN_MODE_HINT, REVIEW_PROTOCOL_HINT,
 };
 
 type Responder = Box<dyn Fn(&RunRequest) -> Vec<AgentEvent> + Send + Sync>;
@@ -68,22 +69,50 @@ fn team_response(backend: BackendKind, prompt: &str) -> String {
         return "Reviewed the work.\n@@review {\"verdict\":\"approve\",\"summary\":\"fake approve\"}"
             .to_string();
     }
-    if prompt.contains(LEAD_PLAN_HINT) {
-        return lead_plan_response(prompt);
+    if prompt.contains(PLAN_MODE_HINT) {
+        return plan_plan_response(prompt);
     }
     if prompt.contains("step #") {
         return step_done_response(prompt);
     }
-    if prompt.contains(MODERATOR_HINT) {
-        return "Fake synthesis: converge on option A.".to_string();
+    if prompt.contains(BRAINSTORM_SYNTHESIS_HINT) {
+        return "## Ranked result\n\n1. R1-A#1 — 10 points\n2. R1-B#1 — 8 points\n\nPrimary recommendation: validate R1-A#1 with a small experiment."
+            .to_string();
     }
-    if prompt.contains(ROUNDTABLE_HINT) {
-        return format!("Fake perspective from {backend}.");
+    if prompt.contains(BRAINSTORM_VOTE_HINT) {
+        return format!(
+            "I ranked candidates for relevance and testability.\n\
+             @@brainstorm_vote {{\"ranked\":[\"R1-A#1\",\"R1-B#1\",\"R2-A#2\",\"R2-B#2\",\"R3-A#3\"],\"summary\":\"{backend} ballot\"}}"
+        );
+    }
+    if prompt.contains(BRAINSTORM_STRETCH_HINT) {
+        return format!(
+            "@@brainstorm_card {{\"title\":\"Invert {backend}\",\"proposal\":\"Remove the default assumption\",\"mechanism\":\"Reverse the usual dependency\",\"operation\":\"INVERT\",\"sources\":[\"R2-A#1\"]}}\n\
+             @@brainstorm_card {{\"title\":\"No constraint {backend}\",\"proposal\":\"Imagine the main constraint disappears\",\"mechanism\":\"Explore the newly reachable design space\",\"operation\":\"REMOVE_CONSTRAINT\",\"sources\":[\"R2-A#2\"]}}\n\
+             @@brainstorm_card {{\"title\":\"Ecology analogy {backend}\",\"proposal\":\"Borrow a mechanism from ecology\",\"mechanism\":\"Map ecological feedback onto the topic\",\"operation\":\"ANALOGY\",\"sources\":[\"R2-A#3\"]}}\n\
+             @@brainstorm_card {{\"title\":\"Bridge {backend}\",\"proposal\":\"Combine two prior batches\",\"mechanism\":\"Join their complementary mechanisms\",\"operation\":\"BRIDGE\",\"sources\":[\"R2-A#1\",\"R2-B#1\"]}}"
+        );
+    }
+    if prompt.contains(BRAINSTORM_BUILD_HINT) {
+        return format!(
+            "@@brainstorm_card {{\"title\":\"New {backend} direction\",\"proposal\":\"Try an independent direction\",\"mechanism\":\"Start from a separate assumption\",\"operation\":\"NEW\",\"sources\":[]}}\n\
+             @@brainstorm_card {{\"title\":\"Build {backend} seed\",\"proposal\":\"Extend the shared seed\",\"mechanism\":\"Add one reinforcing capability\",\"operation\":\"BUILD\",\"sources\":[\"R1-A#1\"]}}\n\
+             @@brainstorm_card {{\"title\":\"Combine {backend} seeds\",\"proposal\":\"Join two mechanisms\",\"mechanism\":\"Compose their strongest interactions\",\"operation\":\"COMBINE\",\"sources\":[\"R1-A#1\",\"R1-B#1\"]}}\n\
+             @@brainstorm_card {{\"title\":\"Mutate {backend} audience\",\"proposal\":\"Change the target user\",\"mechanism\":\"Reframe the seed around another actor\",\"operation\":\"MUTATE\",\"sources\":[\"R1-A#2\"]}}"
+        );
+    }
+    if prompt.contains(BRAINSTORM_PROPOSE_HINT) {
+        return format!(
+            "@@brainstorm_card {{\"title\":\"{backend} seed\",\"proposal\":\"A seed tailored to the backend\",\"mechanism\":\"Use its native strengths\",\"operation\":\"SEED\",\"sources\":[]}}\n\
+             @@brainstorm_card {{\"title\":\"Low-tech {backend} seed\",\"proposal\":\"Try a contrasting low-tech path\",\"mechanism\":\"Replace automation with a simple workflow\",\"operation\":\"SEED\",\"sources\":[]}}\n\
+             @@brainstorm_card {{\"title\":\"Service {backend} seed\",\"proposal\":\"Use a service model\",\"mechanism\":\"Deliver the capability as an ongoing service\",\"operation\":\"SEED\",\"sources\":[]}}\n\
+             @@brainstorm_card {{\"title\":\"Wild {backend} inversion\",\"proposal\":\"Invert the usual relationship\",\"mechanism\":\"Make the receiver initiate the exchange\",\"operation\":\"SEED\",\"sources\":[]}}"
+        );
     }
     format!("[{backend} fake] {prompt}")
 }
 
-fn lead_plan_response(prompt: &str) -> String {
+fn plan_plan_response(prompt: &str) -> String {
     let mut lines = Vec::new();
     lines.push("Planned the work.".to_string());
     let teammates = prompt.lines().find_map(|line| {
@@ -93,8 +122,7 @@ fn lead_plan_response(prompt: &str) -> String {
     if let Some(ids) = teammates {
         if ids.is_empty() {
             lines.push(
-                "@@workflow_step {\"action\":\"add\",\"title\":\"Fake step (no owners)\"}"
-                    .to_string(),
+                "@@run_step {\"action\":\"add\",\"title\":\"Fake step (no owners)\"}".to_string(),
             );
         } else {
             for id in ids {
@@ -103,13 +131,13 @@ fn lead_plan_response(prompt: &str) -> String {
                     continue;
                 }
                 lines.push(format!(
-                    "@@workflow_step {{\"action\":\"add\",\"owner\":\"{id}\",\"title\":\"Fake step for {id}\"}}"
+                    "@@run_step {{\"action\":\"add\",\"owner\":\"{id}\",\"title\":\"Fake step for {id}\"}}"
                 ));
             }
         }
     } else {
         lines.push(
-            "@@workflow_step {\"action\":\"add\",\"title\":\"Fake step (no owners)\"}".to_string(),
+            "@@run_step {\"action\":\"add\",\"title\":\"Fake step (no owners)\"}".to_string(),
         );
     }
     lines.join("\n")
@@ -128,9 +156,7 @@ fn step_done_response(prompt: &str) -> String {
     let mut lines = Vec::new();
     lines.push("did the work".to_string());
     for n in numbers {
-        lines.push(format!(
-            "@@workflow_step {{\"action\":\"done\",\"step\":{n}}}"
-        ));
+        lines.push(format!("@@run_step {{\"action\":\"done\",\"step\":{n}}}"));
     }
     lines.join("\n")
 }

@@ -1,5 +1,8 @@
 use super::*;
 use crate::domain::event::ChatItem;
+use crate::domain::mode::{
+    BrainstormModeConfig, PlanModeConfig, ReviewModeConfig, resolve_mode_roles,
+};
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, SessionPolicy, TeamMember,
 };
@@ -65,6 +68,13 @@ fn user(body: &str) -> UiCommand {
     }
 }
 
+fn start_team(rt: &mut TeamRuntime, goal: &str) -> RuntimeStep {
+    rt.on_ui_command(UiCommand::SetMode {
+        mode: TerminalMode::Team,
+    });
+    rt.on_ui_command(user(goal))
+}
+
 #[test]
 fn user_message_starts_a_run_for_default_member() {
     let mut rt = runtime();
@@ -103,42 +113,134 @@ fn selected_terminal_mode_dispatches_subsequent_plain_messages() {
     assert_eq!(step.actions.len(), 1);
     assert_eq!(step.actions[0].member, MemberId::new("builder"));
     assert!(step.actions[0].prompt.contains("fix parser"));
-    assert!(
-        step.actions[0]
-            .prompt
-            .contains("builder in a review workflow")
-    );
+    assert!(step.actions[0].prompt.contains("builder in review mode"));
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
     )));
 }
 
 #[test]
-fn new_chat_keeps_selected_terminal_mode_until_explicitly_changed() {
+fn new_chat_resets_selected_terminal_mode_to_normal() {
     let mut rt = runtime();
     rt.on_ui_command(UiCommand::SetMode {
         mode: TerminalMode::Review,
     });
-    rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession);
 
-    let review = rt.on_ui_command(user("fix parser"));
-    assert!(review.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
-    )));
-
-    let changed = rt.on_ui_command(UiCommand::SetMode {
-        mode: TerminalMode::Normal,
-    });
-    assert!(changed.events.iter().any(|event| matches!(
+    assert!(reset.events.iter().any(|event| matches!(
         event,
         RuntimeEvent::ModeChanged {
             mode: TerminalMode::Normal
         }
     )));
+
+    let normal = rt.on_ui_command(user("fix parser"));
+    assert!(!normal.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::RunUpdated { run }
+            if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
+    )));
+}
+
+#[test]
+fn new_and_resume_scope_ready_runs_to_the_selected_conversation() {
+    let mut rt = runtime();
+    let original = rt.store.active_conversation();
+    let original_run = rt.store.create_run("original chat run", None).unwrap();
+    assert!(matches!(
+        rt.ready_event(),
+        RuntimeEvent::Ready { runs, .. }
+            if runs.iter().map(|run| run.id).collect::<Vec<_>>() == vec![original_run.id]
+    ));
+
+    rt.on_ui_command(UiCommand::NewSession);
+    assert!(matches!(
+        rt.ready_event(),
+        RuntimeEvent::Ready { runs, .. } if runs.is_empty()
+    ));
+
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: original,
+    });
+    assert!(resumed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Ready { runs, .. }
+            if runs.iter().map(|run| run.id).collect::<Vec<_>>() == vec![original_run.id]
+    )));
+}
+
+#[test]
+fn resume_picker_restores_chat_roster_and_native_member_sessions() {
+    let mut rt = runtime();
+    let original = rt.store.active_conversation();
+    let builder = MemberId::new("builder");
+
+    rt.on_ui_command(user("original question"));
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::SessionDiscovered(AgentSessionId("codex-original".to_string())),
+    );
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::MessageCompleted("original answer".to_string()),
+    );
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    rt.on_ui_command(UiCommand::NewSession);
+    let replacement = TeamMember::new("researcher", "Researcher", BackendKind::Grok, "research");
+    rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: vec![replacement],
+        default_target: Some(DefaultTarget::Member(MemberId::new("researcher"))),
+    });
+
+    let choices = rt.on_ui_command(UiCommand::RequestResume);
+    assert!(choices.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ResumeChoices { conversations }
+            if conversations.iter().any(|conversation| {
+                conversation.id == original
+                    && conversation.preview == "original question"
+                    && conversation.member_count == 2
+            })
+    )));
+
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: original,
+    });
+    assert!(resumed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ConversationResumed { conversation, chat }
+            if *conversation == original
+                && chat.iter().any(|item| matches!(
+                    item,
+                    ChatItem::User { body } if body == "original question"
+                ))
+    )));
+    assert!(resumed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Ready { members, .. }
+            if members.len() == 2
+                && members.iter().any(|member| {
+                    member.id == builder
+                        && member.session.as_deref() == Some("codex-original")
+                })
+    )));
+    assert_eq!(rt.store.active_conversation(), original);
+
+    let continued = rt.on_ui_command(user("continue original"));
+    assert_eq!(continued.actions[0].member, builder);
+    assert_eq!(
+        continued.actions[0].session,
+        Some(AgentSessionId("codex-original".to_string()))
+    );
 }
 
 #[test]
@@ -740,12 +842,57 @@ fn set_effort_updates_member_and_carries_into_runs() {
 }
 
 #[test]
+fn replace_team_model_and_effort_carry_into_runner_and_run() {
+    let mut rt = runtime();
+    let mut members = team().members;
+    let builder = members
+        .iter_mut()
+        .find(|member| member.id == MemberId::new("builder"))
+        .unwrap();
+    builder.model = Some("gpt-5.6-sol".to_string());
+    builder.effort = Some(Effort::Xhigh);
+
+    let replaced = rt.on_ui_command(UiCommand::ReplaceTeam {
+        members,
+        default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+    });
+
+    assert!(replaced.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. }
+            if member.id == MemberId::new("builder")
+                && member.model.as_deref() == Some("gpt-5.6-sol")
+                && member.effort == Some(Effort::Xhigh)
+    )));
+    let run = rt.on_ui_command(user("go"));
+    assert_eq!(run.actions[0].effort, Some(Effort::Xhigh));
+}
+
+#[test]
+fn set_effort_rejects_levels_the_backend_cannot_use() {
+    let mut rt = runtime();
+    let step = rt.on_ui_command(UiCommand::SetEffort {
+        member: MemberId::new("reviewer"),
+        effort: Effort::Ultra,
+    });
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(message) if message.contains("does not support ultra")
+    )));
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::MemberEffort { .. }))
+    );
+}
+
+#[test]
 fn replace_team_adds_member_and_requests_runner() {
     let mut rt = runtime();
     let mut members = team().members;
     let mut researcher = TeamMember::new("researcher", "Researcher", BackendKind::Agy, "research");
     researcher.model = Some("agy-pro".to_string());
-    researcher.effort = Some(Effort::High);
     members.push(researcher);
 
     let step = rt.on_ui_command(UiCommand::ReplaceTeam {
@@ -815,45 +962,358 @@ fn replace_team_rejects_removing_active_member() {
 }
 
 #[test]
-fn workflow_kicks_off_via_a_coordinator() {
+fn team_mode_kicks_off_via_a_coordinator() {
     let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
+    let step = start_team(&mut rt, "ship the parser");
 
     let run = step
         .events
         .iter()
         .find_map(|e| match e {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run),
+            RuntimeEvent::RunUpdated { run } => Some(run),
             _ => None,
         })
-        .expect("workflow run event");
-    assert_eq!(run.status, WorkflowRunStatus::Running);
+        .expect("team run event");
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(
+        run.mode.as_ref().map(|mode| mode.mode),
+        Some(CollabMode::Team)
+    );
+    assert_eq!(run.mode.as_ref().map(|m| m.state.iteration), Some(1));
+    assert_eq!(run.mode.as_ref().map(|m| m.state.max_iterations), Some(3));
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::UserMessage { body, .. } if body == "/plan ship the parser"
+        RuntimeEvent::UserMessage { body, .. }
+            if body.starts_with("[team run-") && body.ends_with(": ship the parser")
     )));
     assert_eq!(step.actions.len(), 1);
     assert!(step.actions[0].prompt.contains("ship the parser"));
     assert!(step.actions[0].prompt.contains("$asterline-team"));
+    assert!(
+        step.actions[0].prompt.contains("@@run_step"),
+        "start prompt must require checklist-first discipline"
+    );
     assert!(!step.actions[0].prompt.contains("@@team_message"));
 }
 
 #[test]
-fn workflow_marks_done_when_its_turn_finishes() {
+fn team_run_complete_dispatches_auto_verify() {
+    let dir = std::env::temp_dir().join(format!("asterline-team-verify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    let builder = MemberId::new("builder");
+    let step = start_team(&mut rt, "ship it");
+    let run_id = find_run_id(&step);
+
+    let step = complete_ok(&mut rt, &builder, "coordinated; all done");
+    assert!(
+        !step.verify_actions.is_empty(),
+        "team finish should schedule verification"
+    );
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Verifying
+    )));
+    assert_eq!(
+        rt.store
+            .run(run_id)
+            .unwrap()
+            .mode
+            .as_ref()
+            .map(|m| m.state.phase.as_str()),
+        Some("verifying")
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_verify_command_config_honored() {
     let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
+    rt.config.modes.team = Some(crate::domain::mode::TeamModeConfig {
+        verify_command: Some("just check".to_string()),
+        ..crate::domain::mode::TeamModeConfig::default()
     });
+    let builder = MemberId::new("builder");
+    start_team(&mut rt, "use just");
+    let step = complete_ok(&mut rt, &builder, "done");
+    assert_eq!(
+        step.verify_actions
+            .iter()
+            .map(|a| a.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["just check"]
+    );
+}
+
+#[test]
+fn team_verify_pass_marks_done() {
+    let dir =
+        std::env::temp_dir().join(format!("asterline-team-verify-pass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    let builder = MemberId::new("builder");
+    let step = start_team(&mut rt, "pass gate");
+    let run_id = find_run_id(&step);
+    let step = complete_ok(&mut rt, &builder, "done");
+    let command = step.verify_actions[0].command.clone();
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command,
+        ok: true,
+        stdout: b"ok".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(step.actions.is_empty(), "pass must not re-dispatch");
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
+    )));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_verify_fail_auto_continues_coordinator() {
+    let dir =
+        std::env::temp_dir().join(format!("asterline-team-verify-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    let builder = MemberId::new("builder");
+    let step = start_team(&mut rt, "repair after fail");
+    let run_id = find_run_id(&step);
+    let step = complete_ok(&mut rt, &builder, "first pass");
+    let command = step.verify_actions[0].command.clone();
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: command.clone(),
+        ok: false,
+        stdout: b"team gate failed: missing tests".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(
+        step.actions.iter().any(|a| {
+            a.member == builder
+                && a.prompt.contains("missing tests")
+                && a.prompt.contains(&command)
+                && a.prompt.contains("@@run_step")
+                && a.prompt.contains("failed")
+        }),
+        "coordinator should auto-continue with failure + checklist: {:?}",
+        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+    );
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.attempt, 2);
+    assert_eq!(run.mode.as_ref().map(|m| m.state.iteration), Some(2));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_verify_fail_exhausted_stays_failed() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-team-verify-exhausted-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    rt.config.modes.team = Some(crate::domain::mode::TeamModeConfig {
+        max_iterations: Some(1),
+        ..crate::domain::mode::TeamModeConfig::default()
+    });
+    let builder = MemberId::new("builder");
+    let step = start_team(&mut rt, "no budget");
+    let run_id = find_run_id(&step);
+    let step = complete_ok(&mut rt, &builder, "done");
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: step.verify_actions[0].command.clone(),
+        ok: false,
+        stdout: b"boom".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(step.actions.is_empty(), "exhausted must not re-dispatch");
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::Notice(text)
+            if text.contains("after 1 attempts") && text.contains("team run failed")
+    )));
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_auto_verify_false_marks_done_immediately() {
+    let mut rt = runtime();
+    rt.config.modes.team = Some(crate::domain::mode::TeamModeConfig {
+        auto_verify: Some(false),
+        ..crate::domain::mode::TeamModeConfig::default()
+    });
+    let builder = MemberId::new("builder");
+    let step = start_team(&mut rt, "no verify");
+    let run_id = find_run_id(&step);
+    let step = complete_ok(&mut rt, &builder, "all done");
+    assert!(
+        step.verify_actions.is_empty(),
+        "auto_verify false must not verify"
+    );
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
+    )));
+}
+
+#[test]
+fn team_verify_cancelled_no_auto_continue() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-team-verify-cancel-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    let builder = MemberId::new("builder");
+    let step = start_team(&mut rt, "cancel gate");
+    let run_id = find_run_id(&step);
+    let step = complete_ok(&mut rt, &builder, "done");
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: step.verify_actions[0].command.clone(),
+        ok: false,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: true,
+    });
+    assert!(
+        step.actions.is_empty(),
+        "cancelled verification must not auto-continue"
+    );
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_mode_uses_mode_approval_gate() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
+    let step = start_team(&mut rt, "run `cargo test`");
+    assert!(step.actions.is_empty());
+    let approval = step.events.iter().find_map(|event| match event {
+        RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
+        _ => None,
+    });
+    let id = approval.expect("team dispatch should request approval");
+    let step = rt.on_ui_command(UiCommand::Approve {
+        id,
+        decision: ApprovalDecision::Reject,
+    });
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::RunUpdated { run }
+            if run.status == RunStatus::Blocked
+    )));
+}
+
+#[test]
+fn abort_blocks_team_run_and_continue_resumes_it() {
+    let mut rt = runtime();
+    let step = start_team(&mut rt, "ship parser");
+    let run_id = find_run_id(&step);
+
+    rt.on_ui_command(UiCommand::Cancel { member: None });
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: None,
+            ok: false,
+        },
+    );
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
+
+    let step = rt.on_ui_command(UiCommand::ContinueRun {
+        run_id: Some(run_id),
+        note: Some("resume".to_string()),
+    });
+    assert!(
+        step.actions
+            .iter()
+            .any(|action| action.member == MemberId::new("builder"))
+    );
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.attempt, 2);
+}
+
+#[test]
+fn second_team_run_while_active_is_refused() {
+    let mut rt = runtime();
+    start_team(&mut rt, "first");
+    let step = start_team(&mut rt, "second");
+    assert!(step.actions.is_empty());
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("already active")
+    )));
+}
+
+#[test]
+fn run_marks_done_when_its_turn_finishes() {
+    let mut rt = runtime();
+    let step = start_team(&mut rt, "ship the parser");
     let run_id = step
         .events
         .iter()
         .find_map(|e| match e {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id");
+        .expect("run id");
 
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
@@ -865,8 +1325,8 @@ fn workflow_marks_done_when_its_turn_finishes() {
 
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
     )));
     assert!(
         step.events
@@ -876,16 +1336,15 @@ fn workflow_marks_done_when_its_turn_finishes() {
 }
 
 #[test]
-fn verify_workflow_records_successful_check() {
+fn verify_run_records_successful_check() {
     let dir = std::env::temp_dir().join(format!("asterline-verify-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut rt = runtime_in_workspace(dir.clone());
 
-    rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
-    let step = rt.on_ui_command(UiCommand::VerifyWorkflow {
+    start_team(&mut rt, "ship the parser");
+    complete_ok(&mut rt, &MemberId::new("builder"), "done");
+    let step = rt.on_ui_command(UiCommand::VerifyRun {
         run_id: None,
         command: Some("printf verified".to_string()),
     });
@@ -896,8 +1355,8 @@ fn verify_workflow_records_successful_check() {
     assert_eq!(action.workspace, dir);
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.status == WorkflowRunStatus::Verifying
+        RuntimeEvent::RunUpdated { run }
+            if run.status == RunStatus::Verifying
     )));
 
     let step = rt.on_verify_output(VerifyOutput {
@@ -911,8 +1370,8 @@ fn verify_workflow_records_successful_check() {
     });
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.status == RunStatus::Done
                 && run.verification.as_ref().is_some_and(|v| {
                     v.ok && v.command == "printf verified" && v.summary == "verified"
                 })
@@ -922,36 +1381,33 @@ fn verify_workflow_records_successful_check() {
 }
 
 #[test]
-fn verify_workflow_can_target_an_older_run() {
+fn verify_run_can_target_an_older_run() {
     let dir = std::env::temp_dir().join(format!("asterline-verify-target-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut rt = runtime_in_workspace(dir.clone());
 
-    let first = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship parser".to_string(),
-    });
+    let first = start_team(&mut rt, "ship parser");
     let first_id = first
         .events
         .iter()
         .find_map(|e| match e {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
         .expect("first run id");
-    let second = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "refactor ui".to_string(),
-    });
+    complete_ok(&mut rt, &MemberId::new("builder"), "first done");
+    let second = start_team(&mut rt, "refactor ui");
     let second_id = second
         .events
         .iter()
         .find_map(|e| match e {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
         .expect("second run id");
 
-    let verify = rt.on_ui_command(UiCommand::VerifyWorkflow {
+    let verify = rt.on_ui_command(UiCommand::VerifyRun {
         run_id: Some(first_id),
         command: Some("printf first".to_string()),
     });
@@ -961,27 +1417,25 @@ fn verify_workflow_can_target_an_older_run() {
     assert_ne!(verify.verify_actions[0].run_id, second_id);
     assert!(verify.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == first_id && run.status == WorkflowRunStatus::Verifying
+        RuntimeEvent::RunUpdated { run }
+            if run.id == first_id && run.status == RunStatus::Verifying
     )));
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn continue_workflow_resumes_failed_run() {
+fn continue_run_resumes_failed_run() {
     let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
+    let step = start_team(&mut rt, "ship the parser");
     let run_id = step
         .events
         .iter()
         .find_map(|event| match event {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id");
+        .expect("run id");
     rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::Exited {
@@ -989,7 +1443,7 @@ fn continue_workflow_resumes_failed_run() {
             ok: true,
         },
     );
-    let verify = rt.on_ui_command(UiCommand::VerifyWorkflow {
+    let verify = rt.on_ui_command(UiCommand::VerifyRun {
         run_id: Some(run_id),
         command: Some("cargo test".to_string()),
     });
@@ -1004,15 +1458,15 @@ fn continue_workflow_resumes_failed_run() {
         cancelled: false,
     });
 
-    let step = rt.on_ui_command(UiCommand::ContinueWorkflow {
+    let step = rt.on_ui_command(UiCommand::ContinueRun {
         run_id: Some(run_id),
         note: Some("fix verification".to_string()),
     });
 
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Running && run.attempt == 2
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Running && run.attempt == 2
     )));
     assert!(step.events.iter().any(|event| matches!(
         event,
@@ -1041,54 +1495,52 @@ fn continue_workflow_resumes_failed_run() {
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
                 && run.attempt == 2
             && run.verification.is_none()
     )));
 }
 
 #[test]
-fn workflow_note_and_block_update_timeline() {
+fn run_note_and_block_update_timeline() {
     let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
+    let step = start_team(&mut rt, "ship the parser");
     let run_id = step
         .events
         .iter()
         .find_map(|event| match event {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id");
+        .expect("run id");
 
-    let step = rt.on_ui_command(UiCommand::NoteWorkflow {
+    let step = rt.on_ui_command(UiCommand::NoteRun {
         run_id: Some(run_id),
         note: "waiting for API docs".to_string(),
     });
     assert!(step.actions.is_empty());
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
-                && run.status == WorkflowRunStatus::Running
+                && run.status == RunStatus::Running
                 && run.events.last().is_some_and(|event| {
                     event.kind == "note"
                         && event.detail.as_deref() == Some("waiting for API docs")
                 })
     )));
 
-    let step = rt.on_ui_command(UiCommand::BlockWorkflow {
+    let step = rt.on_ui_command(UiCommand::BlockRun {
         run_id: Some(run_id),
         reason: "missing API token".to_string(),
     });
     assert!(step.actions.is_empty());
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
-                && run.status == WorkflowRunStatus::Blocked
+                && run.status == RunStatus::Blocked
                 && run.events.last().is_some_and(|event| {
                     event.kind == "blocked"
                         && event.detail.as_deref() == Some("missing API token")
@@ -1097,21 +1549,19 @@ fn workflow_note_and_block_update_timeline() {
 }
 
 #[test]
-fn workflow_steps_update_checklist_without_running_agents() {
+fn run_steps_update_checklist_without_running_agents() {
     let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
+    let step = start_team(&mut rt, "ship the parser");
     let run_id = step
         .events
         .iter()
         .find_map(|event| match event {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id");
+        .expect("run id");
 
-    let step = rt.on_ui_command(UiCommand::AddWorkflowStep {
+    let step = rt.on_ui_command(UiCommand::AddRunStep {
         run_id: Some(run_id),
         owner: None,
         title: "write parser tests".to_string(),
@@ -1119,15 +1569,15 @@ fn workflow_steps_update_checklist_without_running_agents() {
     assert!(step.actions.is_empty());
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
                 && run.steps.len() == 1
-                && run.steps[0].status == WorkflowStepStatus::Todo
+                && run.steps[0].status == RunStepStatus::Todo
                 && run.steps[0].owner.is_none()
                 && run.steps[0].title == "write parser tests"
     )));
 
-    let step = rt.on_ui_command(UiCommand::AssignWorkflowStep {
+    let step = rt.on_ui_command(UiCommand::AssignRunStep {
         run_id: Some(run_id),
         step: 1,
         owner: Some(MemberId::new("reviewer")),
@@ -1135,53 +1585,53 @@ fn workflow_steps_update_checklist_without_running_agents() {
     assert!(step.actions.is_empty());
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
                 && run.steps[0].owner == Some(MemberId::new("reviewer"))
                 && run.events.last().is_some_and(|event| event.kind == "step_assigned")
     )));
 
-    let step = rt.on_ui_command(UiCommand::UpdateWorkflowStep {
+    let step = rt.on_ui_command(UiCommand::UpdateRunStep {
         run_id: Some(run_id),
         step: 1,
-        status: WorkflowStepStatus::Done,
+        status: RunStepStatus::Done,
         note: Some("covered lexer edge cases".to_string()),
     });
     assert!(step.actions.is_empty());
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
-                && run.steps[0].status == WorkflowStepStatus::Done
+                && run.steps[0].status == RunStepStatus::Done
                 && run.steps[0].note.as_deref() == Some("covered lexer edge cases")
                 && run.events.last().is_some_and(|event| event.kind == "step_updated")
     )));
 
-    rt.on_ui_command(UiCommand::AddWorkflowStep {
+    rt.on_ui_command(UiCommand::AddRunStep {
         run_id: Some(run_id),
         owner: None,
         title: "obsolete duplicate".to_string(),
     });
-    let step = rt.on_ui_command(UiCommand::RenameWorkflowStep {
+    let step = rt.on_ui_command(UiCommand::RenameRunStep {
         run_id: Some(run_id),
         step: 2,
         title: "document parser setup".to_string(),
     });
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
                 && run.steps[1].title == "document parser setup"
                 && run.events.last().is_some_and(|event| event.kind == "step_renamed")
     )));
 
-    let step = rt.on_ui_command(UiCommand::RemoveWorkflowStep {
+    let step = rt.on_ui_command(UiCommand::RemoveRunStep {
         run_id: Some(run_id),
         step: 1,
     });
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
                 && run.steps.len() == 1
                 && run.steps[0].number == 1
@@ -1189,46 +1639,44 @@ fn workflow_steps_update_checklist_without_running_agents() {
                 && run.events.last().is_some_and(|event| event.kind == "step_removed")
     )));
 
-    let step = rt.on_ui_command(UiCommand::AssignWorkflowStep {
+    let step = rt.on_ui_command(UiCommand::AssignRunStep {
         run_id: Some(run_id),
         step: 1,
         owner: None,
     });
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id && run.steps[0].owner.is_none()
     )));
 }
 
 #[test]
-fn agent_workflow_step_envelope_updates_active_workflow_checklist() {
+fn agent_run_step_envelope_updates_active_run_checklist() {
     let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
+    let step = start_team(&mut rt, "ship the parser");
     let run_id = step
         .events
         .iter()
         .find_map(|event| match event {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id");
+        .expect("run id");
 
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::MessageCompleted(
-            r#"@@workflow_step {"action":"add","owner":"builder","title":"Write parser tests"}"#
+            r#"@@run_step {"action":"add","owner":"builder","title":"Write parser tests"}"#
                 .to_string(),
         ),
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
                 && run.steps.len() == 1
-                && run.steps[0].status == WorkflowStepStatus::Todo
+                && run.steps[0].status == RunStepStatus::Todo
                 && run.steps[0].owner == Some(MemberId::new("builder"))
                 && run.steps[0].title == "Write parser tests"
     )));
@@ -1236,55 +1684,55 @@ fn agent_workflow_step_envelope_updates_active_workflow_checklist() {
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::MessageCompleted(
-            r#"@@workflow_step {"action":"assign","step":1,"owner":"reviewer"}"#.to_string(),
+            r#"@@run_step {"action":"assign","step":1,"owner":"reviewer"}"#.to_string(),
         ),
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id && run.steps[0].owner == Some(MemberId::new("reviewer"))
     )));
 
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::MessageCompleted(
-            r#"@@workflow_step {"action":"done","step":1,"note":"Covered edge cases"}"#.to_string(),
+            r#"@@run_step {"action":"done","step":1,"note":"Covered edge cases"}"#.to_string(),
         ),
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
-                && run.steps[0].status == WorkflowStepStatus::Done
+                && run.steps[0].status == RunStepStatus::Done
                 && run.steps[0].note.as_deref() == Some("Covered edge cases")
     )));
 
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::MessageCompleted(
-            r#"@@workflow_step {"action":"rename","step":1,"title":"Write parser coverage tests"}"#
+            r#"@@run_step {"action":"rename","step":1,"title":"Write parser coverage tests"}"#
                 .to_string(),
         ),
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id && run.steps[0].title == "Write parser coverage tests"
     )));
 
     rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::MessageCompleted(
-            r#"@@workflow_step {"action":"add","title":"Temporary duplicate"}"#.to_string(),
+            r#"@@run_step {"action":"add","title":"Temporary duplicate"}"#.to_string(),
         ),
     );
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
-        AgentEvent::MessageCompleted(r#"@@workflow_step {"action":"remove","step":2}"#.to_string()),
+        AgentEvent::MessageCompleted(r#"@@run_step {"action":"remove","step":2}"#.to_string()),
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::WorkflowRunUpdated { run }
+        RuntimeEvent::RunUpdated { run }
             if run.id == run_id
                 && run.steps.len() == 1
                 && run.steps[0].title == "Write parser coverage tests"
@@ -1292,14 +1740,14 @@ fn agent_workflow_step_envelope_updates_active_workflow_checklist() {
 }
 
 #[test]
-fn agent_workflow_step_envelope_outside_workflow_is_ignored() {
+fn agent_run_step_envelope_outside_a_run_is_ignored() {
     let mut rt = runtime();
     rt.on_ui_command(user("@builder hello"));
 
     let step = rt.on_agent_event(
         &MemberId::new("builder"),
         AgentEvent::MessageCompleted(
-            r#"@@workflow_step {"action":"add","title":"Write parser tests"}"#.to_string(),
+            r#"@@run_step {"action":"add","title":"Write parser tests"}"#.to_string(),
         ),
     );
 
@@ -1307,34 +1755,33 @@ fn agent_workflow_step_envelope_outside_workflow_is_ignored() {
         !step
             .events
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::WorkflowRunUpdated { .. }))
+            .any(|event| matches!(event, RuntimeEvent::RunUpdated { .. }))
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
         RuntimeEvent::Notice(text)
-            if text.contains("ignored workflow step update: no active workflow run")
+            if text.contains("ignored run step update: no active run")
     )));
 }
 
 #[test]
-fn failed_verification_is_not_overwritten_by_later_exit() {
+fn failed_verification_remains_failed() {
     let dir = std::env::temp_dir().join(format!("asterline-verify-fail-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut rt = runtime_in_workspace(dir.clone());
 
-    let step = rt.on_ui_command(UiCommand::RunWorkflow {
-        goal: "ship the parser".to_string(),
-    });
+    let step = start_team(&mut rt, "ship the parser");
     let run_id = step
         .events
         .iter()
         .find_map(|e| match e {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id");
-    let verify = rt.on_ui_command(UiCommand::VerifyWorkflow {
+        .expect("run id");
+    complete_ok(&mut rt, &MemberId::new("builder"), "done");
+    let verify = rt.on_ui_command(UiCommand::VerifyRun {
         run_id: None,
         command: Some("printf nope; exit 2".to_string()),
     });
@@ -1359,12 +1806,12 @@ fn failed_verification_is_not_overwritten_by_later_exit() {
 
     assert!(!step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
     )));
     assert_eq!(
-        rt.store.latest_workflow_run().unwrap().unwrap().status,
-        WorkflowRunStatus::Failed
+        rt.store.latest_run().unwrap().unwrap().status,
+        RunStatus::Failed
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1447,6 +1894,40 @@ fn approved_relay_dispatches_wrapped_prompt() {
         "prompt should contain original body: {}",
         action.prompt
     );
+    assert!(
+        action
+            .prompt
+            .contains(r#"@@team_message {"to":"a","kind":"reply""#),
+        "ordinary relays must require a reply to their sender: {}",
+        action.prompt
+    );
+}
+
+#[test]
+fn reply_relay_does_not_require_an_acknowledgement_loop() {
+    let mut rt = TeamRuntime::new(two_member_team(), SqliteStore::in_memory().unwrap())
+        .with_approvals(false);
+    let a = MemberId::new("a");
+    let b = MemberId::new("b");
+    rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(a.clone()),
+        body: "coordinate with b".to_string(),
+    });
+
+    let step = rt.on_agent_event(
+        &a,
+        AgentEvent::MessageCompleted(
+            r#"@@team_message {"to":"b","kind":"reply","body":"done"}"#.to_string(),
+        ),
+    );
+    let action = step
+        .actions
+        .iter()
+        .find(|action| action.member == b)
+        .expect("reply should still be delivered");
+
+    assert!(action.prompt.contains("marked as a reply"));
+    assert!(!action.prompt.contains("MUST answer the sender"));
 }
 
 #[test]
@@ -1572,18 +2053,18 @@ fn debug_mode_disables_all_gates() {
     );
 }
 
-// --- M3 review mode / M4 lead + roundtable --------------------------------
+// --- Review, plan, and brainstorm modes ------------------------------------
 
 use crate::domain::mode::CollabMode;
 use crate::runtime::mode_prompts::{
-    LEAD_PLAN_HINT, MODERATOR_HINT, REVIEW_PROTOCOL_HINT, ROUNDTABLE_HINT,
+    BRAINSTORM_BUILD_HINT, BRAINSTORM_PROPOSE_HINT, BRAINSTORM_STRETCH_HINT,
+    BRAINSTORM_SYNTHESIS_HINT, BRAINSTORM_VOTE_HINT, PLAN_MODE_HINT, REVIEW_PROTOCOL_HINT,
 };
 
 fn run_mode(task: &str) -> UiCommand {
     UiCommand::RunMode {
         mode: CollabMode::Review,
         task: task.to_string(),
-        overrides: vec![],
     }
 }
 
@@ -1608,18 +2089,18 @@ fn complete_ok(rt: &mut TeamRuntime, member: &MemberId, text: &str) -> RuntimeSt
     step
 }
 
-fn latest_run(rt: &TeamRuntime) -> WorkflowRunSummary {
-    rt.store.latest_workflow_run().unwrap().expect("run exists")
+fn latest_run(rt: &TeamRuntime) -> RunSummary {
+    rt.store.latest_run().unwrap().expect("run exists")
 }
 
-fn find_run_id(step: &RuntimeStep) -> WorkflowRunId {
+fn find_run_id(step: &RuntimeStep) -> RunId {
     step.events
         .iter()
         .find_map(|e| match e {
-            RuntimeEvent::WorkflowRunUpdated { run } => Some(run.id),
+            RuntimeEvent::RunUpdated { run } => Some(run.id),
             _ => None,
         })
-        .expect("workflow run id")
+        .expect("run id")
 }
 
 #[test]
@@ -1663,8 +2144,8 @@ fn review_approve_flow_completes_run() {
     )));
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
     )));
     assert!(
         step.verify_actions.is_empty(),
@@ -1714,8 +2195,8 @@ fn review_auto_verify_runs_on_approve() {
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.status == WorkflowRunStatus::Verifying
+        RuntimeEvent::RunUpdated { run }
+            if run.status == RunStatus::Verifying
     )));
     let run_id = step.verify_actions[0].run_id;
 
@@ -1730,8 +2211,8 @@ fn review_auto_verify_runs_on_approve() {
     });
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
     )));
 
     // Session freed.
@@ -1739,6 +2220,426 @@ fn review_auto_verify_runs_on_approve() {
     assert!(step.actions.iter().any(|a| a.member == builder));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn review_verify_fail_loops_builder_then_passes() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-review-verify-loop-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    rt.on_ui_command(run_mode("ship feature"));
+    complete_ok(&mut rt, &builder, "first attempt");
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"looks fine\"}",
+    );
+    assert!(!step.verify_actions.is_empty());
+    let run_id = step.verify_actions[0].run_id;
+    let command = step.verify_actions[0].command.clone();
+
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: command.clone(),
+        ok: false,
+        stdout: b"test failed: edge case".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(
+        step.actions.iter().any(|a| {
+            a.member == builder && a.prompt.contains(&command) && a.prompt.contains("edge case")
+        }),
+        "builder should get verify_failure_prompt with command+summary: {:?}",
+        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+    );
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Running
+    )));
+    assert_eq!(latest_run(&rt).mode.as_ref().unwrap().state.iteration, 2);
+
+    complete_ok(&mut rt, &builder, "fixed the edge case");
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"good now\"}",
+    );
+    assert!(!step.verify_actions.is_empty());
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: step.verify_actions[0].command.clone(),
+        ok: true,
+        stdout: b"ok".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
+    )));
+    // Session freed: another review can start.
+    let step = rt.on_ui_command(run_mode("next"));
+    assert!(step.actions.iter().any(|a| a.member == builder));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn review_verify_fail_exhausted_stays_failed() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-review-verify-exhausted-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    rt.config.modes.review = Some(ReviewModeConfig {
+        max_iterations: Some(1),
+        ..ReviewModeConfig::default()
+    });
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    rt.on_ui_command(run_mode("tight"));
+    complete_ok(&mut rt, &builder, "attempt");
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
+    );
+    let run_id = step.verify_actions[0].run_id;
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: step.verify_actions[0].command.clone(),
+        ok: false,
+        stdout: b"boom".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(
+        step.actions.is_empty(),
+        "exhausted iterations must not re-dispatch"
+    );
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::Notice(text) if text.contains("after 1 iterations") && text.contains("failed")
+    )));
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    // Session gone: new review can start.
+    let step = rt.on_ui_command(run_mode("again"));
+    assert!(step.actions.iter().any(|a| a.member == builder));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn review_verify_cancelled_no_loopback() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-review-verify-cancel-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut rt = runtime_in_workspace(dir.clone());
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    rt.on_ui_command(run_mode("cancel verify"));
+    complete_ok(&mut rt, &builder, "work");
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
+    );
+    let run_id = step.verify_actions[0].run_id;
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: step.verify_actions[0].command.clone(),
+        ok: false,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: true,
+    });
+    assert!(
+        step.actions.is_empty(),
+        "cancelled verification must not loop back"
+    );
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn review_verify_command_config_reaches_verify_action() {
+    let mut rt = runtime();
+    rt.config.modes.review = Some(ReviewModeConfig {
+        verify_command: Some("just check".to_string()),
+        ..ReviewModeConfig::default()
+    });
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+    rt.on_ui_command(run_mode("use just"));
+    complete_ok(&mut rt, &builder, "done");
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
+    );
+    assert_eq!(
+        step.verify_actions
+            .iter()
+            .map(|a| a.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["just check"]
+    );
+}
+
+#[test]
+fn plan_verify_fail_loops_leader_with_plan_hint() {
+    let dir =
+        std::env::temp_dir().join(format!("asterline-plan-verify-loop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut config = plan_team();
+    config.workspace = dir.clone();
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    let step = rt.on_ui_command(run_plan("ship plan"));
+    let run_id = find_run_id(&step);
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Do it\"}",
+    );
+    complete_ok(
+        &mut rt,
+        &builder,
+        "@@run_step {\"action\":\"done\",\"step\":1}\ndone",
+    );
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
+    );
+    assert!(!step.verify_actions.is_empty());
+    let command = step.verify_actions[0].command.clone();
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command: command.clone(),
+        ok: false,
+        stdout: b"plan verify failed: missing tests".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+    assert!(
+        step.actions.iter().any(|a| {
+            a.member == planner
+                && a.prompt.contains(PLAN_MODE_HINT)
+                && a.prompt.contains(&command)
+                && a.prompt.contains("missing tests")
+        }),
+        "leader should get plan_verify_failure_prompt: {:?}",
+        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn plan_verify_command_config_reaches_verify_action() {
+    let mut rt = plan_runtime();
+    rt.config.modes.plan = Some(PlanModeConfig {
+        verify_command: Some("just check".to_string()),
+        ..PlanModeConfig::default()
+    });
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+    rt.on_ui_command(run_plan("use just for plan"));
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Do it\"}",
+    );
+    complete_ok(
+        &mut rt,
+        &builder,
+        "@@run_step {\"action\":\"done\",\"step\":1}\ndone",
+    );
+    let step = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
+    );
+    assert_eq!(
+        step.verify_actions
+            .iter()
+            .map(|a| a.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["just check"]
+    );
+}
+
+#[test]
+fn plan_progress_prompt_includes_blocked_step_note() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    rt.on_ui_command(run_plan("note fidelity"));
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Do the thing\"}",
+    );
+    let step = complete_ok(
+        &mut rt,
+        &builder,
+        "@@run_step {\"action\":\"block\",\"step\":1,\"note\":\"waiting for secret\"}\nblocked",
+    );
+    assert!(
+        step.actions.iter().any(|a| {
+            a.member == planner
+                && a.prompt.contains("waiting for secret")
+                && a.prompt.contains('—')
+                && a.prompt.contains("assign an owner")
+        }),
+        "progress prompt must include blocked note: {:?}",
+        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn plan_executing_member_failure_replans_leader() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+
+    rt.on_ui_command(run_plan("owner fail replan"));
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Fragile work\"}",
+    );
+    // Builder process fails during Executing.
+    let step = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+    assert!(
+        step.actions.iter().any(|a| {
+            a.member == planner
+                && a.prompt.contains("member run failed")
+                && a.prompt.contains(PLAN_MODE_HINT)
+        }),
+        "leader should re-plan after owner failure: {:?}",
+        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+    );
+    assert_eq!(latest_run(&rt).status, RunStatus::Running);
+}
+
+#[test]
+fn plan_executing_member_failure_exhausted_blocks() {
+    let mut rt = plan_runtime();
+    rt.config.modes.plan = Some(PlanModeConfig {
+        max_iterations: Some(1),
+        ..PlanModeConfig::default()
+    });
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+
+    let step = rt.on_ui_command(run_plan("owner fail exhaust"));
+    let run_id = find_run_id(&step);
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Fragile work\"}",
+    );
+    let step = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+    assert!(step.actions.is_empty(), "exhausted must not re-plan");
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Blocked
+    )));
+}
+
+#[test]
+fn plan_executing_user_abort_blocks_immediately() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+
+    let step = rt.on_ui_command(run_plan("abort mid execute"));
+    let run_id = find_run_id(&step);
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Work\"}",
+    );
+    // Global cancel blocks all mode sessions immediately (no re-plan).
+    let step = rt.on_ui_command(UiCommand::Cancel { member: None });
+    assert!(
+        step.actions.is_empty(),
+        "user abort must not re-plan: {} actions",
+        step.actions.len()
+    );
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Blocked
+    )));
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
 }
 
 #[test]
@@ -1763,7 +2664,7 @@ fn review_request_changes_iterates_builder() {
     );
     let run = latest_run(&rt);
     assert_eq!(run.mode.as_ref().unwrap().state.iteration, 2);
-    assert_eq!(run.status, WorkflowRunStatus::Running);
+    assert_eq!(run.status, RunStatus::Running);
 }
 
 #[test]
@@ -1772,10 +2673,13 @@ fn review_max_iterations_blocks() {
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
 
+    rt.config.modes.review = Some(ReviewModeConfig {
+        max_iterations: Some(1),
+        ..ReviewModeConfig::default()
+    });
     let step = rt.on_ui_command(UiCommand::RunMode {
         mode: CollabMode::Review,
         task: "tight loop".to_string(),
-        overrides: vec![("max_iterations".to_string(), "1".to_string())],
     });
     let run_id = find_run_id(&step);
 
@@ -1787,8 +2691,8 @@ fn review_max_iterations_blocks() {
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Blocked
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Blocked
     )));
     assert!(step.events.iter().any(|e| matches!(
         e,
@@ -1843,8 +2747,8 @@ fn abort_blocks_mode_run() {
     let step = rt.on_ui_command(UiCommand::Cancel { member: None });
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Blocked
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Blocked
     )));
     assert!(step.events.iter().any(|e| matches!(
         e,
@@ -1859,13 +2763,13 @@ fn abort_blocks_mode_run() {
             ok: false,
         },
     );
-    let run = rt.store.workflow_run(run_id).unwrap();
-    assert_eq!(run.status, WorkflowRunStatus::Blocked);
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Blocked);
     assert!(
         !step.events.iter().any(|e| matches!(
             e,
-            RuntimeEvent::WorkflowRunUpdated { run }
-                if run.id == run_id && run.status == WorkflowRunStatus::Done
+            RuntimeEvent::RunUpdated { run }
+                if run.id == run_id && run.status == RunStatus::Done
         )),
         "abort must not be overwritten to Done"
     );
@@ -1902,8 +2806,8 @@ fn mode_dispatch_hits_approval_gate_and_reject_blocks() {
     });
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Blocked
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Blocked
     )));
     assert!(step.events.iter().any(|e| matches!(
         e,
@@ -1945,10 +2849,7 @@ fn restart_blocks_running_mode_run() {
     let mut rt = TeamRuntime::new(team(), store).with_approvals(false);
     let step = rt.on_ui_command(run_mode("interrupted work"));
     let run_id = find_run_id(&step);
-    assert_eq!(
-        rt.store.workflow_run(run_id).unwrap().status,
-        WorkflowRunStatus::Running
-    );
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Running);
     drop(rt);
 
     let store = SqliteStore::open(&path).unwrap();
@@ -1956,14 +2857,40 @@ fn restart_blocks_running_mode_run() {
     drop(_rt);
 
     let store = SqliteStore::open(&path).unwrap();
-    let run = store.workflow_run(run_id).unwrap();
-    assert_eq!(run.status, WorkflowRunStatus::Blocked);
+    let run = store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Blocked);
     assert!(
         run.events
             .iter()
             .any(|e| e.kind == "blocked" && e.detail.as_deref() == Some("interrupted by restart")),
         "expected restart block event: {:?}",
         run.events
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn restart_blocks_running_team_run() {
+    let dir = std::env::temp_dir().join(format!("asterline-team-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+
+    let store = SqliteStore::open(&path).unwrap();
+    let mut rt = TeamRuntime::new(team(), store).with_approvals(false);
+    let step = start_team(&mut rt, "interrupted team work");
+    let run_id = find_run_id(&step);
+    drop(rt);
+
+    let store = SqliteStore::open(&path).unwrap();
+    drop(TeamRuntime::new(team(), store).with_approvals(false));
+
+    let store = SqliteStore::open(&path).unwrap();
+    let run = store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Blocked);
+    assert_eq!(
+        run.mode.as_ref().map(|mode| mode.mode),
+        Some(CollabMode::Team)
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1984,12 +2911,9 @@ fn continue_resumes_blocked_review() {
             ok: false,
         },
     );
-    assert_eq!(
-        rt.store.workflow_run(run_id).unwrap().status,
-        WorkflowRunStatus::Blocked
-    );
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
 
-    let step = rt.on_ui_command(UiCommand::ContinueWorkflow {
+    let step = rt.on_ui_command(UiCommand::ContinueRun {
         run_id: Some(run_id),
         note: None,
     });
@@ -1998,8 +2922,8 @@ fn continue_resumes_blocked_review() {
         "continue should re-dispatch the building phase: {:?}",
         step.actions.iter().map(|a| &a.member).collect::<Vec<_>>()
     );
-    let run = rt.store.workflow_run(run_id).unwrap();
-    assert_eq!(run.status, WorkflowRunStatus::Running);
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Running);
     assert_eq!(run.attempt, 2);
 }
 
@@ -2039,10 +2963,10 @@ fn verdict_outside_review_is_ignored() {
     );
 }
 
-// --- M4 lead + roundtable helpers ----------------------------------------
+// --- Plan + brainstorm helpers --------------------------------------------
 
-fn lead_team() -> TeamConfig {
-    let mut config = TeamConfig::new("lead-team", "/tmp/ws")
+fn plan_team() -> TeamConfig {
+    let mut config = TeamConfig::new("plan-team", "/tmp/ws")
         .with_member(TeamMember::new(
             "planner",
             "Planner",
@@ -2065,23 +2989,21 @@ fn lead_team() -> TeamConfig {
     config
 }
 
-fn lead_runtime() -> TeamRuntime {
-    TeamRuntime::new(lead_team(), SqliteStore::in_memory().unwrap()).with_approvals(false)
+fn plan_runtime() -> TeamRuntime {
+    TeamRuntime::new(plan_team(), SqliteStore::in_memory().unwrap()).with_approvals(false)
 }
 
-fn run_lead(task: &str) -> UiCommand {
+fn run_plan(task: &str) -> UiCommand {
     UiCommand::RunMode {
-        mode: CollabMode::Lead,
+        mode: CollabMode::Plan,
         task: task.to_string(),
-        overrides: vec![],
     }
 }
 
-fn run_roundtable(task: &str, overrides: Vec<(String, String)>) -> UiCommand {
+fn run_brainstorm(task: &str) -> UiCommand {
     UiCommand::RunMode {
-        mode: CollabMode::Roundtable,
+        mode: CollabMode::Brainstorm,
         task: task.to_string(),
-        overrides,
     }
 }
 
@@ -2101,17 +3023,17 @@ fn complete_all(rt: &mut TeamRuntime, members: &[(MemberId, &str)]) -> RuntimeSt
 }
 
 #[test]
-fn lead_dispatches_owned_todo_steps() {
-    let mut rt = lead_runtime();
+fn plan_dispatches_owned_todo_steps() {
+    let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
 
-    let step = rt.on_ui_command(run_lead("ship the feature"));
+    let step = rt.on_ui_command(run_plan("ship the feature"));
     assert!(
         step.actions.iter().any(|a| {
             a.member == planner
-                && a.prompt.contains(LEAD_PLAN_HINT)
+                && a.prompt.contains(PLAN_MODE_HINT)
                 && a.prompt.contains("Teammates: ")
         }),
         "leader should get plan prompt: {:?}",
@@ -2123,8 +3045,8 @@ fn lead_dispatches_owned_todo_steps() {
         &mut rt,
         &planner,
         "plan\n\
-         @@workflow_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Implement core\"}\n\
-         @@workflow_step {\"action\":\"add\",\"owner\":\"reviewer\",\"title\":\"Write tests\"}",
+         @@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Implement core\"}\n\
+         @@run_step {\"action\":\"add\",\"owner\":\"reviewer\",\"title\":\"Write tests\"}",
     );
     let builder_action = step
         .actions
@@ -2146,6 +3068,13 @@ fn lead_dispatches_owned_todo_steps() {
         "builder should not see reviewer step"
     );
     assert!(
+        builder_action
+            .prompt
+            .contains(r#"@@team_message {"to":"planner","kind":"reply""#),
+        "builder must report completion to the planning lead: {}",
+        builder_action.prompt
+    );
+    assert!(
         reviewer_action.prompt.contains("step #2"),
         "reviewer owns step 2: {}",
         reviewer_action.prompt
@@ -2154,38 +3083,42 @@ fn lead_dispatches_owned_todo_steps() {
         !reviewer_action.prompt.contains("step #1"),
         "reviewer should not see builder step"
     );
-
-    let run = rt.store.workflow_run(run_id).unwrap();
     assert!(
-        run.steps
-            .iter()
-            .all(|s| s.status == WorkflowStepStatus::Doing),
+        reviewer_action
+            .prompt
+            .contains(r#"@@team_message {"to":"planner","kind":"reply""#),
+        "every owner must report completion to the planning lead"
+    );
+
+    let run = rt.store.run(run_id).unwrap();
+    assert!(
+        run.steps.iter().all(|s| s.status == RunStepStatus::Doing),
         "owned todos should be Doing: {:?}",
         run.steps
     );
 }
 
 #[test]
-fn lead_empty_checklist_nudges_then_blocks() {
-    let mut rt = lead_runtime();
+fn plan_empty_checklist_nudges_then_blocks() {
+    let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
 
-    let step = rt.on_ui_command(run_lead("empty plan"));
+    let step = rt.on_ui_command(run_plan("empty plan"));
     let run_id = find_run_id(&step);
 
     let step = complete_ok(&mut rt, &planner, "I thought about it but wrote nothing");
     assert!(
         step.actions
             .iter()
-            .any(|a| a.member == planner && a.prompt.contains(LEAD_PLAN_HINT)),
+            .any(|a| a.member == planner && a.prompt.contains(PLAN_MODE_HINT)),
         "empty checklist should nudge the leader"
     );
 
     let step = complete_ok(&mut rt, &planner, "still nothing useful");
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Blocked
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Blocked
     )));
     assert!(step.events.iter().any(|e| matches!(
         e,
@@ -2194,16 +3127,16 @@ fn lead_empty_checklist_nudges_then_blocks() {
 }
 
 #[test]
-fn lead_unfinished_steps_return_to_leader() {
-    let mut rt = lead_runtime();
+fn plan_unfinished_steps_return_to_leader() {
+    let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
 
-    rt.on_ui_command(run_lead("partial work"));
+    rt.on_ui_command(run_plan("partial work"));
     complete_ok(
         &mut rt,
         &planner,
-        "@@workflow_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Do the thing\"}",
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Do the thing\"}",
     );
 
     let step = complete_ok(&mut rt, &builder, "I worked but forgot to mark done");
@@ -2216,24 +3149,24 @@ fn lead_unfinished_steps_return_to_leader() {
     );
     let run = latest_run(&rt);
     assert_eq!(run.mode.as_ref().unwrap().state.iteration, 2);
-    assert_eq!(run.mode.as_ref().unwrap().state.phase, "leading");
+    assert_eq!(run.mode.as_ref().unwrap().state.phase, "planning");
 }
 
 #[test]
-fn lead_all_done_enters_review_and_approve_finishes() {
-    let mut rt = lead_runtime();
+fn plan_all_done_enters_review_and_approve_finishes() {
+    let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
 
-    let step = rt.on_ui_command(run_lead("finish path"));
+    let step = rt.on_ui_command(run_plan("finish path"));
     let run_id = find_run_id(&step);
 
     complete_ok(
         &mut rt,
         &planner,
-        "@@workflow_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Implement core\"}\n\
-         @@workflow_step {\"action\":\"add\",\"owner\":\"reviewer\",\"title\":\"Write docs\"}",
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Implement core\"}\n\
+         @@run_step {\"action\":\"add\",\"owner\":\"reviewer\",\"title\":\"Write docs\"}",
     );
 
     let step = complete_all(
@@ -2241,11 +3174,11 @@ fn lead_all_done_enters_review_and_approve_finishes() {
         &[
             (
                 builder,
-                "@@workflow_step {\"action\":\"done\",\"step\":1}\ncore done",
+                "@@run_step {\"action\":\"done\",\"step\":1}\ncore done",
             ),
             (
                 reviewer.clone(),
-                "@@workflow_step {\"action\":\"done\",\"step\":2}\ndocs done",
+                "@@run_step {\"action\":\"done\",\"step\":2}\ndocs done",
             ),
         ],
     );
@@ -2256,7 +3189,7 @@ fn lead_all_done_enters_review_and_approve_finishes() {
                 && a.prompt.contains("Implement core")
                 && a.prompt.contains("Write docs")
         }),
-        "reviewer should get lead review with step titles: {:?}",
+        "reviewer should get plan review with step titles: {:?}",
         step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
     );
 
@@ -2267,28 +3200,28 @@ fn lead_all_done_enters_review_and_approve_finishes() {
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
+        RuntimeEvent::RunUpdated { run }
+            if run.id == run_id && run.status == RunStatus::Done
     )));
 }
 
 #[test]
-fn lead_request_changes_returns_to_leader() {
-    let mut rt = lead_runtime();
+fn plan_request_changes_returns_to_leader() {
+    let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
 
-    rt.on_ui_command(run_lead("needs changes"));
+    rt.on_ui_command(run_plan("needs changes"));
     complete_ok(
         &mut rt,
         &planner,
-        "@@workflow_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Build it\"}",
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Build it\"}",
     );
     complete_ok(
         &mut rt,
         &builder,
-        "@@workflow_step {\"action\":\"done\",\"step\":1}\ndone",
+        "@@run_step {\"action\":\"done\",\"step\":1}\ndone",
     );
     let step = complete_ok(
         &mut rt,
@@ -2303,108 +3236,324 @@ fn lead_request_changes_returns_to_leader() {
         step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
     );
     let run = latest_run(&rt);
-    assert_eq!(run.mode.as_ref().unwrap().state.phase, "leading");
+    assert_eq!(run.mode.as_ref().unwrap().state.phase, "planning");
 }
 
 #[test]
-fn roundtable_runs_rounds_then_moderates() {
-    let mut rt = lead_runtime();
+fn brainstorm_records_original_topic_as_visible_user_message() {
+    let mut rt = plan_runtime();
+    let topic = "ways to redesign graph retrieval";
+    let step = rt.on_ui_command(run_brainstorm(topic));
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. } if body == topic
+    )));
+    assert!(rt.store.replay_chat().unwrap().iter().any(|item| matches!(
+        item,
+        ChatItem::User { body } if body == topic
+    )));
+    assert_eq!(step.actions.len(), 3);
+    assert!(
+        step.actions
+            .iter()
+            .all(|action| action.prompt.contains(BRAINSTORM_PROPOSE_HINT)
+                && action.prompt.contains("Suspend judgment")
+                && action.prompt.contains("$asterline-brainstorm")
+                && action.prompt.contains("@@brainstorm_card")
+                && !action.prompt.contains("trade-offs and a first step"))
+    );
+}
+
+#[test]
+fn brainstorm_structured_cards_are_rendered_and_persisted() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let start = rt.on_ui_command(run_brainstorm("structured cards"));
+    let run_id = find_run_id(&start);
+    let completed = rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted(
+            "@@brainstorm_card {\"title\":\"Graph memory\",\"proposal\":\"Retrieve prior subgraphs\",\"mechanism\":\"Index WL fingerprints\",\"operation\":\"seed\",\"sources\":[]}\n@@brainstorm_card {\"title\":\"Path memory\",\"proposal\":\"Retrieve useful walks\",\"mechanism\":\"Rank constrained paths\",\"operation\":\"seed\",\"sources\":[]}".to_string(),
+        ),
+    );
+
+    let rendered = completed
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::MessageCompleted { text, .. } => Some(text),
+            _ => None,
+        })
+        .expect("rendered message");
+    assert!(rendered.contains("### Card 1 · Graph memory"));
+    assert!(rendered.contains("### Card 2 · Path memory"));
+    assert!(!rendered.contains("@@brainstorm_card"));
+
+    let state: serde_json::Value =
+        serde_json::from_str(&rt.store.run_mode_state(run_id).unwrap().unwrap()).unwrap();
+    assert_eq!(state["idea_count"], 2);
+    assert_eq!(state["idea_batches"][0]["cards"][0]["operation"], "SEED");
+    assert_eq!(state["idea_batches"][0]["cards"][1]["title"], "Path memory");
+}
+
+#[test]
+fn brainstorm_retries_append_changed_ideas_without_duplicating_exact_replays() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let start = rt.on_ui_command(run_brainstorm("preserve attempts"));
+    let run_id = find_run_id(&start);
+
+    rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted("first seed batch".to_string()),
+    );
+    rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted("revised seed batch".to_string()),
+    );
+    rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted("revised seed batch".to_string()),
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&rt.store.run_mode_state(run_id).unwrap().unwrap()).unwrap();
+    let batches = state["idea_batches"].as_array().expect("idea batches");
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0]["text"], "first seed batch");
+    assert_eq!(batches[1]["text"], "revised seed batch");
+}
+
+#[test]
+fn brainstorm_runs_generation_private_vote_and_ranked_synthesis() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+    let step = rt.on_ui_command(run_brainstorm("expand architecture options"));
+    let run_id = find_run_id(&step);
+
+    let build = complete_all(
+        &mut rt,
+        &[
+            (
+                planner.clone(),
+                "@@brainstorm_card {\"title\":\"planner seed\",\"proposal\":\"planner proposal\",\"mechanism\":\"planner mechanism\",\"operation\":\"SEED\",\"sources\":[]}",
+            ),
+            (
+                builder.clone(),
+                "@@brainstorm_card {\"title\":\"builder seed\",\"proposal\":\"builder proposal\",\"mechanism\":\"builder mechanism\",\"operation\":\"SEED\",\"sources\":[]}",
+            ),
+            (
+                reviewer.clone(),
+                "@@brainstorm_card {\"title\":\"reviewer seed\",\"proposal\":\"reviewer proposal\",\"mechanism\":\"reviewer mechanism\",\"operation\":\"SEED\",\"sources\":[]}",
+            ),
+        ],
+    );
+    assert_eq!(build.actions.len(), 3);
+    assert!(
+        build
+            .actions
+            .iter()
+            .all(|action| action.prompt.contains(BRAINSTORM_BUILD_HINT))
+    );
+    let planner_build = build
+        .actions
+        .iter()
+        .find(|action| action.member == planner)
+        .expect("planner build prompt");
+    assert!(planner_build.prompt.contains("planner seed"));
+    assert!(planner_build.prompt.contains("builder seed"));
+    assert!(
+        !planner_build.prompt.contains("reviewer seed"),
+        "each member should receive a rotating peer subset, not all prior ideas"
+    );
+
+    let stretch = complete_all(
+        &mut rt,
+        &[
+            (
+                planner.clone(),
+                "@@brainstorm_card {\"title\":\"planner build\",\"proposal\":\"planner build proposal\",\"mechanism\":\"planner build mechanism\",\"operation\":\"BUILD\",\"sources\":[\"R1-A#1\"]}",
+            ),
+            (
+                builder.clone(),
+                "@@brainstorm_card {\"title\":\"builder build\",\"proposal\":\"builder build proposal\",\"mechanism\":\"builder build mechanism\",\"operation\":\"BUILD\",\"sources\":[\"R1-B#1\"]}",
+            ),
+            (
+                reviewer.clone(),
+                "@@brainstorm_card {\"title\":\"reviewer build\",\"proposal\":\"reviewer build proposal\",\"mechanism\":\"reviewer build mechanism\",\"operation\":\"BUILD\",\"sources\":[\"R1-C#1\"]}",
+            ),
+        ],
+    );
+    assert_eq!(stretch.actions.len(), 3);
+    assert!(
+        stretch
+            .actions
+            .iter()
+            .all(|action| action.prompt.contains(BRAINSTORM_STRETCH_HINT)
+                && action.prompt.contains("do not select a preferred option"))
+    );
+    let planner_stretch = stretch
+        .actions
+        .iter()
+        .find(|action| action.member == planner)
+        .expect("planner stretch prompt");
+    assert!(planner_stretch.prompt.contains("planner build"));
+    assert!(planner_stretch.prompt.contains("reviewer build"));
+    assert!(!planner_stretch.prompt.contains("builder build"));
+
+    let vote = complete_all(
+        &mut rt,
+        &[
+            (
+                planner.clone(),
+                "@@brainstorm_card {\"title\":\"planner stretch\",\"proposal\":\"planner stretch proposal\",\"mechanism\":\"planner stretch mechanism\",\"operation\":\"INVERT\",\"sources\":[\"R2-A#1\"]}",
+            ),
+            (
+                builder.clone(),
+                "@@brainstorm_card {\"title\":\"builder stretch\",\"proposal\":\"builder stretch proposal\",\"mechanism\":\"builder stretch mechanism\",\"operation\":\"ANALOGY\",\"sources\":[\"R2-B#1\"]}",
+            ),
+            (
+                reviewer.clone(),
+                "@@brainstorm_card {\"title\":\"reviewer stretch\",\"proposal\":\"reviewer stretch proposal\",\"mechanism\":\"reviewer stretch mechanism\",\"operation\":\"BRIDGE\",\"sources\":[\"R2-C#1\"]}",
+            ),
+        ],
+    );
+    assert_eq!(vote.actions.len(), 3);
+    assert!(
+        vote.actions
+            .iter()
+            .all(|action| action.prompt.contains(BRAINSTORM_VOTE_HINT)
+                && action.prompt.contains("@@brainstorm_vote")
+                && action.prompt.contains("[R1-A#1] planner seed")
+                && action.prompt.contains("[R3-C#1] reviewer stretch"))
+    );
+
+    let synthesize = complete_all(
+        &mut rt,
+        &[
+            (
+                planner.clone(),
+                "planner ballot\n@@brainstorm_vote {\"ranked\":[\"R1-A#1\",\"R2-B#1\",\"R3-C#1\"],\"summary\":\"balanced\"}",
+            ),
+            (
+                builder,
+                "builder ballot\n@@brainstorm_vote {\"ranked\":[\"R2-B#1\",\"R1-A#1\",\"R3-C#1\"],\"summary\":\"feasible\"}",
+            ),
+            (
+                reviewer,
+                "reviewer ballot\n@@brainstorm_vote {\"ranked\":[\"R1-A#1\",\"R3-C#1\",\"R2-B#1\"],\"summary\":\"high leverage\"}",
+            ),
+        ],
+    );
+    assert_eq!(synthesize.actions.len(), 1);
+    assert_eq!(synthesize.actions[0].member, planner);
+    assert!(
+        synthesize.actions[0]
+            .prompt
+            .contains(BRAINSTORM_SYNTHESIS_HINT)
+    );
+    assert!(synthesize.actions[0].prompt.contains("R1-A#1 — 14 points"));
+
+    let done = complete_ok(
+        &mut rt,
+        &MemberId::new("planner"),
+        "## Ranked result\n\n1. R1-A#1\n2. R2-B#1\n\nPrimary: test R1-A#1.",
+    );
+    assert!(done.actions.is_empty());
+    assert!(done.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("ranked result ready")
+                && text.contains("9 idea cards from 9 contributions")
+                && text.contains("3 generation waves")
+                && text.contains("3/3 private ballots")
+    )));
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Done);
+    assert_eq!(
+        run.mode.as_ref().map(|mode| mode.state.phase.as_str()),
+        Some("done")
+    );
+    assert!(
+        run.events
+            .iter()
+            .filter(|event| event.kind == "vote")
+            .count()
+            == 3,
+        "every private ballot must be recorded in the run timeline"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&rt.store.run_mode_state(run_id).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        state["idea_batches"].as_array().map(Vec::len),
+        Some(9),
+        "all generation waves must remain append-only in the IdeaSet"
+    );
+    assert_eq!(state["vote_count"], 3);
+    assert_eq!(state["votes"].as_array().map(Vec::len), Some(3));
+    assert!(
+        state["brainstorm_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("Primary"))
+    );
+}
+
+#[test]
+fn brainstorm_respects_configured_generation_budget() {
+    let mut rt = plan_runtime();
+    rt.config.modes.brainstorm = Some(BrainstormModeConfig {
+        generation_rounds: Some(2),
+        ideas_per_round: Some(6),
+        ..BrainstormModeConfig::default()
+    });
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
 
-    let step = rt.on_ui_command(run_roundtable("pick an architecture", vec![]));
-    assert_eq!(
-        step.actions.len(),
-        3,
-        "round 1 should dispatch all participants: {:?}",
-        step.actions.iter().map(|a| &a.member).collect::<Vec<_>>()
-    );
+    let start = rt.on_ui_command(run_brainstorm("two waves"));
     assert!(
-        step.actions
+        start
+            .actions
             .iter()
-            .all(|a| a.prompt.contains(ROUNDTABLE_HINT)),
-        "round 1 prompts should include ROUNDTABLE_HINT"
+            .all(|action| action.prompt.contains("at least 6"))
     );
-    let run_id = find_run_id(&step);
-
-    let step = complete_all(
+    let stretch = complete_all(
         &mut rt,
         &[
-            (planner.clone(), "Planner says use monolith"),
-            (builder.clone(), "Builder says use microservices"),
-            (reviewer.clone(), "Reviewer says hybrid"),
-        ],
-    );
-    assert_eq!(
-        step.actions.len(),
-        3,
-        "round 2 should dispatch all three: {:?}",
-        step.actions.iter().map(|a| &a.member).collect::<Vec<_>>()
-    );
-    for action in &step.actions {
-        assert!(
-            action.prompt.contains(ROUNDTABLE_HINT),
-            "digest should keep ROUNDTABLE_HINT"
-        );
-        // Digests contain OTHER members' texts, not own.
-        match action.member.as_str() {
-            "planner" => {
-                assert!(action.prompt.contains("Builder says use microservices"));
-                assert!(action.prompt.contains("Reviewer says hybrid"));
-                assert!(!action.prompt.contains("Planner says use monolith"));
-            }
-            "builder" => {
-                assert!(action.prompt.contains("Planner says use monolith"));
-                assert!(action.prompt.contains("Reviewer says hybrid"));
-                assert!(!action.prompt.contains("Builder says use microservices"));
-            }
-            "reviewer" => {
-                assert!(action.prompt.contains("Planner says use monolith"));
-                assert!(action.prompt.contains("Builder says use microservices"));
-                assert!(!action.prompt.contains("Reviewer says hybrid"));
-            }
-            other => panic!("unexpected member {other}"),
-        }
-    }
-
-    let step = complete_all(
-        &mut rt,
-        &[
-            (planner.clone(), "still monolith"),
-            (builder.clone(), "still micro"),
-            (reviewer.clone(), "still hybrid"),
+            (planner.clone(), "p seed"),
+            (builder.clone(), "b seed"),
+            (reviewer.clone(), "r seed"),
         ],
     );
     assert!(
-        step.actions.iter().any(|a| {
-            a.member == planner
-                && a.prompt.contains(MODERATOR_HINT)
-                && (a.prompt.contains("still monolith")
-                    || a.prompt.contains("still micro")
-                    || a.prompt.contains("still hybrid")
-                    || a.prompt.contains("Planner")
-                    || a.prompt.contains("Builder"))
-        }),
-        "moderator should get synthesis prompt with transcripts: {:?}",
-        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+        stretch
+            .actions
+            .iter()
+            .all(|action| action.prompt.contains(BRAINSTORM_STRETCH_HINT))
     );
-
-    let step = complete_ok(&mut rt, &planner, "Converge on hybrid.");
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
-    )));
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Notice(text) if text.contains("roundtable") && text.contains("finished")
-    )));
+    let vote = complete_all(
+        &mut rt,
+        &[
+            (planner, "p stretch"),
+            (builder, "b stretch"),
+            (reviewer, "r stretch"),
+        ],
+    );
+    assert_eq!(vote.actions.len(), 3);
+    assert!(
+        vote.actions
+            .iter()
+            .all(|action| action.prompt.contains(BRAINSTORM_VOTE_HINT))
+    );
+    assert_eq!(latest_run(&rt).status, RunStatus::Running);
 }
 
 #[test]
-fn roundtable_without_moderator_finishes() {
-    let mut config = TeamConfig::new("rt-no-mod", "/tmp/ws")
+fn brainstorm_roles_are_only_the_participant_set() {
+    let config = TeamConfig::new("pair", "/tmp/ws")
         .with_member(TeamMember::new(
             "alice",
             "Alice",
@@ -2417,38 +3566,21 @@ fn roundtable_without_moderator_finishes() {
             BackendKind::Claude,
             "research",
         ));
-    config.default_target = Some(DefaultTarget::Member(MemberId::new("alice")));
-    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
-
-    let alice = MemberId::new("alice");
-    let bob = MemberId::new("bob");
-    let step = rt.on_ui_command(run_roundtable(
-        "quick chat",
-        vec![("rounds".to_string(), "1".to_string())],
-    ));
-    let run_id = find_run_id(&step);
-    assert_eq!(step.actions.len(), 2);
-
-    let step = complete_all(&mut rt, &[(alice, "Alice view"), (bob, "Bob view")]);
-    assert!(
-        step.actions.is_empty(),
-        "no moderator → no further dispatch: {:?}",
-        step.actions.iter().map(|a| &a.member).collect::<Vec<_>>()
+    let (roles, _) = resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap();
+    assert_eq!(
+        roles.participants,
+        vec![MemberId::new("alice"), MemberId::new("bob")]
     );
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::WorkflowRunUpdated { run }
-            if run.id == run_id && run.status == WorkflowRunStatus::Done
-    )));
 }
 
 #[test]
-fn roundtable_single_participant_refused() {
-    let mut rt = lead_runtime();
-    let step = rt.on_ui_command(run_roundtable(
-        "solo",
-        vec![("participants".to_string(), "builder".to_string())],
-    ));
+fn brainstorm_single_participant_refused() {
+    let mut rt = plan_runtime();
+    rt.config.modes.brainstorm = Some(BrainstormModeConfig {
+        participants: Some(vec![MemberId::new("builder")]),
+        ..BrainstormModeConfig::default()
+    });
+    let step = rt.on_ui_command(run_brainstorm("solo"));
     assert!(step.events.iter().any(|e| matches!(
         e,
         RuntimeEvent::Notice(text) if text.contains("at least two participants")
@@ -2457,11 +3589,91 @@ fn roundtable_single_participant_refused() {
 }
 
 #[test]
-fn lead_resume_after_abort_redispatches_leader() {
-    let mut rt = lead_runtime();
+fn brainstorm_resume_mid_generation_preserves_prior_ideas() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+    let start = rt.on_ui_command(run_brainstorm("resume generation"));
+    let run_id = find_run_id(&start);
+    complete_all(
+        &mut rt,
+        &[
+            (planner.clone(), "p seed"),
+            (builder.clone(), "b seed"),
+            (reviewer.clone(), "r seed"),
+        ],
+    );
+
+    rt.on_ui_command(UiCommand::Cancel { member: None });
+    for member in [&planner, &builder, &reviewer] {
+        let _ = rt.on_agent_event(
+            member,
+            AgentEvent::Exited {
+                code: None,
+                ok: false,
+            },
+        );
+    }
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
+
+    let resumed = rt.on_ui_command(UiCommand::ContinueRun {
+        run_id: Some(run_id),
+        note: None,
+    });
+    assert_eq!(resumed.actions.len(), 3);
+    assert!(resumed.actions.iter().all(|action| {
+        action.prompt.contains(BRAINSTORM_BUILD_HINT) && action.prompt.contains("seed")
+    }));
+}
+
+#[test]
+fn continue_refuses_legacy_roundtable_mode() {
+    let mut rt = plan_runtime();
+    let builder = MemberId::new("builder");
+    let run = rt
+        .store
+        .insert_run_with_raw_mode(
+            "old roundtable topic",
+            Some(&builder),
+            "roundtable",
+            Some(r#"{"phase":"rounds","round":1,"rounds":2}"#),
+            RunStatus::Done,
+        )
+        .unwrap();
+    assert_eq!(run.legacy_mode.as_deref(), Some("roundtable"));
+    assert!(run.mode.is_none());
+
+    let step = rt.on_ui_command(UiCommand::ContinueRun {
+        run_id: Some(run.id),
+        note: None,
+    });
+    assert!(
+        step.actions.is_empty(),
+        "legacy mode must not dispatch (got {} actions)",
+        step.actions.len()
+    );
+    assert!(
+        step.events.iter().any(|e| matches!(
+            e,
+            RuntimeEvent::Notice(text)
+                if text.contains(&run.id.to_string())
+                    && text.contains("older Asterline")
+                    && text.contains("roundtable")
+        )),
+        "expected legacy-mode notice: {:?}",
+        step.events
+    );
+    // Status must stay unchanged (no silent team continue).
+    assert_eq!(rt.store.run(run.id).unwrap().status, RunStatus::Done);
+}
+
+#[test]
+fn plan_resume_after_abort_redispatches_leader() {
+    let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
 
-    let step = rt.on_ui_command(run_lead("resume plan"));
+    let step = rt.on_ui_command(run_plan("resume plan"));
     let run_id = find_run_id(&step);
     rt.on_ui_command(UiCommand::Cancel { member: None });
     let _ = rt.on_agent_event(
@@ -2471,12 +3683,9 @@ fn lead_resume_after_abort_redispatches_leader() {
             ok: false,
         },
     );
-    assert_eq!(
-        rt.store.workflow_run(run_id).unwrap().status,
-        WorkflowRunStatus::Blocked
-    );
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
 
-    let step = rt.on_ui_command(UiCommand::ContinueWorkflow {
+    let step = rt.on_ui_command(UiCommand::ContinueRun {
         run_id: Some(run_id),
         note: None,
     });
@@ -2485,8 +3694,8 @@ fn lead_resume_after_abort_redispatches_leader() {
         "continue should re-dispatch the leader: {:?}",
         step.actions.iter().map(|a| &a.member).collect::<Vec<_>>()
     );
-    let run = rt.store.workflow_run(run_id).unwrap();
-    assert_eq!(run.status, WorkflowRunStatus::Running);
+    let run = rt.store.run(run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Running);
 }
 
 #[test]
@@ -2506,7 +3715,7 @@ fn continue_refuses_when_mode_member_left_roster() {
         default_target: None,
     });
 
-    let step = rt.on_ui_command(UiCommand::ContinueWorkflow {
+    let step = rt.on_ui_command(UiCommand::ContinueRun {
         run_id: Some(run_id),
         note: None,
     });
@@ -2517,8 +3726,8 @@ fn continue_refuses_when_mode_member_left_roster() {
     )));
     assert!(step.actions.is_empty(), "no dispatch to a missing member");
     assert_eq!(
-        rt.store.workflow_run(run_id).unwrap().status,
-        WorkflowRunStatus::Blocked,
+        rt.store.run(run_id).unwrap().status,
+        RunStatus::Blocked,
         "the run stays blocked instead of half-resuming"
     );
 }
@@ -2529,7 +3738,7 @@ fn manual_verify_on_active_mode_run_is_refused() {
     let step = rt.on_ui_command(run_mode("review this"));
     let run_id = find_run_id(&step);
 
-    let step = rt.on_ui_command(UiCommand::VerifyWorkflow {
+    let step = rt.on_ui_command(UiCommand::VerifyRun {
         run_id: Some(run_id),
         command: Some("true".to_string()),
     });

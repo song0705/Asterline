@@ -8,6 +8,7 @@
 //! ASTERLINE_SMOKE_CODEX=1  cargo test --test real_smoke real_codex_smoke  -- --ignored --nocapture
 //! ASTERLINE_SMOKE_CLAUDE=1 cargo test --test real_smoke real_claude_smoke -- --ignored --nocapture
 //! ASTERLINE_SMOKE_GROK=1   cargo test --test real_smoke real_grok_smoke   -- --ignored --nocapture
+//! ASTERLINE_SMOKE_GROK=1   cargo test --test real_smoke real_grok_tool_stream_smoke -- --ignored --nocapture
 //! ASTERLINE_SMOKE_AGY=1    cargo test --test real_smoke real_agy_smoke    -- --ignored --nocapture
 //! ```
 
@@ -18,7 +19,7 @@ use std::sync::mpsc;
 
 use asterline::adapter::{RunRequest, runner_for};
 use asterline::domain::event::AgentEvent;
-use asterline::domain::team::{BackendKind, TeamMember};
+use asterline::domain::team::{BackendKind, PermissionMode, TeamMember};
 
 fn run_once(member: &TeamMember, prompt: &str) -> Vec<AgentEvent> {
     let runner = runner_for(member, Path::new(env!("CARGO_MANIFEST_DIR")));
@@ -162,6 +163,38 @@ fn real_grok_smoke() {
     let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
     assert_healthy_turn("grok", &events);
     assert_completed_contains("grok", &events, "ASTERLINE_OK");
+}
+
+#[test]
+#[ignore = "calls the real grok CLI with a tool; opt in with ASTERLINE_SMOKE_GROK=1"]
+fn real_grok_tool_stream_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_GROK").as_deref() != Ok("1") {
+        return;
+    }
+    let mut member = TeamMember::new("grok", "Grok", BackendKind::Grok, "smoke");
+    member.permission_mode = Some(PermissionMode::Auto);
+    let cwd =
+        std::env::temp_dir().join(format!("asterline-grok-smoke-tool-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("fixture.txt"), "ASTERLINE_TOOL_FIXTURE\n").unwrap();
+    member.cwd = Some(cwd);
+    let events = run_once(
+        &member,
+        "Use a file-reading tool to read fixture.txt, then reply with its exact content.",
+    );
+    assert_healthy_turn("grok-tool", &events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStarted { .. })),
+        "grok-tool: expected ACP tool start"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCompleted { .. })),
+        "grok-tool: expected ACP tool completion"
+    );
 }
 
 #[test]

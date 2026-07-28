@@ -29,18 +29,18 @@ instruction may start, not what a running agent may execute.
 
 Once a member runs, tool-by-tool enforcement belongs to the backend CLI:
 
-| Backend | Controls passed through by Asterline                                        |
-| ------- | --------------------------------------------------------------------------- |
-| codex   | `sandbox` (`read-only` / `workspace-write` / `danger-full-access`)          |
-| claude  | `permission_mode`, `allowed_tools`, plus `.claude/settings.json` allowlists |
-| grok    | `sandbox`, `permission_mode`, `allowed_tools`                               |
-| agy     | `--sandbox` (unless `danger-full-access`), bypass only when configured      |
+| Backend | Controls passed through by Asterline                                              |
+| ------- | --------------------------------------------------------------------------------- |
+| codex   | `sandbox` (`read-only` / `workspace-write` / `danger-full-access`)                |
+| claude  | `permission_mode`, `allowed_tools`, plus `.claude/settings.json` allowlists       |
+| grok    | `sandbox`, `permission_mode`, and ACP permission responses; tool list is advisory |
+| agy     | `--sandbox`; `accept-edits`/`plan` modes; bypass only when configured             |
 
 Configure these per member in the Team editor (`/team`) or `team.json`. A
 member with `sandbox: read-only` cannot write regardless of what a prompt asks;
 a claude member with `allowed_tools: ["Read", "Grep"]` cannot run Bash at all.
 
-## Why no interactive per-tool approval yet
+## Interactive per-tool behavior
 
 We verified the Claude control protocol on claude 2.1.207 (2026-07): in
 headless `--print --input-format stream-json` mode, a Bash tool call executes
@@ -49,13 +49,15 @@ according to the CLI's own permission configuration and **no
 `--permission-mode manual` — and the former `--permission-prompt-tool` flag no
 longer exists. Codex `exec` is likewise non-interactive by design.
 
-Without a backend callback there is nothing for Asterline to intercept, so
-this release ships prompt-surface gating (layer 1) plus pass-through of every
-backend-native control (layer 2). If a headless approval callback returns to a
-backend CLI, interactive per-tool approval is a candidate for a future
-release — the runtime
-already models held approvals and per-member dispatch, so the missing piece is
-only the adapter round-trip.
+Grok is different: Asterline uses its bidirectional ACP server and answers
+`session/request_permission` callbacks. `auto` and `bypassPermissions` allow
+requests, `acceptEdits` allows edit/delete/move requests, and
+`default`/`dontAsk`/`plan` reject requests that reach the client. These are
+automatic policy responses, not a modal user prompt. The structured ACP stream
+also carries Grok tool starts, progress, completion, diffs, and thought chunks.
+
+For backends without a callback, this release uses prompt-surface gating
+(layer 1) plus their native non-interactive controls (layer 2).
 
 ## Practical recipes
 

@@ -12,20 +12,17 @@ use std::{io, result};
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::event::{
-    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel, MessageId,
-    ModeRunStatus, TurnId, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
-    WorkflowRunSummary, WorkflowStepStatus, WorkflowStepSummary, WorkflowVerification,
+    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary, LogEntry,
+    LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId, RunStatus, RunStepStatus,
+    RunStepSummary, RunSummary, RunVerification, TurnId,
 };
 use crate::domain::mode::{CollabMode, ModeStatusSummary};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
-
-/// Current event-source schema version. Bump this and add a migration arm in
-/// [`SqliteStore::migrate`] whenever the schema changes.
-const SCHEMA_VERSION: i64 = 9;
 
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +33,19 @@ pub struct StoredApproval {
     pub action: String,
     pub body: String,
     pub decision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredConversationSession {
+    pub member: MemberId,
+    pub backend: BackendKind,
+    pub session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationSnapshot {
+    pub team: TeamConfig,
+    pub sessions: Vec<StoredConversationSession>,
 }
 
 #[derive(Debug)]
@@ -67,151 +77,7 @@ impl SqliteStore {
 
     fn initialize(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < SCHEMA_VERSION {
-            self.migrate(version)?;
-            self.conn
-                .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-        }
-        Ok(())
-    }
-
-    /// Bring a database at schema `from` up to [`SCHEMA_VERSION`].
-    ///
-    /// The pre-v1 prototype wrote an incompatible `messages`/`approvals` schema
-    /// plus a handful of tables the event-source design replaced. Its rows are
-    /// not convertible to the new model, so when that schema is detected the
-    /// legacy tables are dropped and rebuilt. A brand-new database has no such
-    /// tables, so the same path simply creates the current schema.
-    fn migrate(&self, from: i64) -> Result<()> {
-        if from == 0 && self.has_legacy_schema()? {
-            self.conn.execute_batch(
-                r#"
-                DROP TABLE IF EXISTS messages;
-                DROP TABLE IF EXISTS approvals;
-                DROP TABLE IF EXISTS agents;
-                DROP TABLE IF EXISTS sessions;
-                DROP TABLE IF EXISTS inter_agent_messages;
-                DROP TABLE IF EXISTS terminal_events;
-                "#,
-            )?;
-        }
-        self.create_schema()?;
-        // v1 -> v2: introduce conversations so `/new` can start a clean chat.
-        // Backfill existing messages into a single conversation.
-        if from == 1 {
-            if !self.has_column("messages", "conversation_id")? {
-                self.conn
-                    .execute_batch("ALTER TABLE messages ADD COLUMN conversation_id INTEGER;")?;
-            }
-            self.conn
-                .execute("INSERT INTO conversations DEFAULT VALUES", [])?;
-            let id = self.conn.last_insert_rowid();
-            self.conn.execute(
-                "UPDATE messages SET conversation_id = ?1 WHERE conversation_id IS NULL",
-                params![id],
-            )?;
-        }
-        // v2 -> v3: Gemini CLI was replaced by Agy. Keep old transcripts,
-        // roster snapshots, and session rows readable under the new backend.
-        self.conn.execute_batch(
-            r#"
-            UPDATE messages SET backend = 'agy' WHERE backend = 'gemini';
-            UPDATE team_members SET backend = 'agy' WHERE backend = 'gemini';
-            UPDATE agent_sessions SET backend = 'agy' WHERE backend = 'gemini';
-            "#,
-        )?;
-        if !self.has_column("workflow_runs", "attempt")? {
-            self.conn.execute_batch(
-                "ALTER TABLE workflow_runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;",
-            )?;
-        }
-        if from < 6 {
-            self.conn.execute_batch(
-                r#"
-                INSERT INTO workflow_run_events (run_id, attempt, kind, title, detail, created_at)
-                SELECT id,
-                       attempt,
-                       'imported',
-                       'Imported existing run',
-                       status,
-                       updated_at
-                  FROM workflow_runs
-                 WHERE NOT EXISTS (
-                       SELECT 1 FROM workflow_run_events
-                        WHERE workflow_run_events.run_id = workflow_runs.id
-                 );
-                "#,
-            )?;
-        }
-        if from < 7 {
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS workflow_run_steps (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id     INTEGER NOT NULL,
-                    position   INTEGER NOT NULL,
-                    status     TEXT NOT NULL,
-                    owner      TEXT,
-                    title      TEXT NOT NULL,
-                    note       TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE INDEX IF NOT EXISTS workflow_run_steps_run_idx
-                    ON workflow_run_steps (run_id, position);
-                "#,
-            )?;
-        }
-        if from < 8 && !self.has_column("workflow_run_steps", "owner")? {
-            self.conn
-                .execute_batch("ALTER TABLE workflow_run_steps ADD COLUMN owner TEXT;")?;
-        }
-        // v8 -> v9: collaboration mode runs store mode name + JSON state.
-        if from < 9 {
-            if !self.has_column("workflow_runs", "mode")? {
-                self.conn
-                    .execute_batch("ALTER TABLE workflow_runs ADD COLUMN mode TEXT;")?;
-            }
-            if !self.has_column("workflow_runs", "mode_state")? {
-                self.conn
-                    .execute_batch("ALTER TABLE workflow_runs ADD COLUMN mode_state TEXT;")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let columns: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(columns.iter().any(|name| name == column))
-    }
-
-    /// True when the database holds the pre-v1 prototype schema, detected by a
-    /// `messages` table that predates the event-source `kind` column.
-    fn has_legacy_schema(&self) -> Result<bool> {
-        let messages_exists = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !messages_exists {
-            return Ok(false);
-        }
-        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let columns: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(!columns.iter().any(|name| name == "kind"))
+        self.create_schema()
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -248,6 +114,19 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS conversations (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_snapshots (
+                conversation_id INTEGER PRIMARY KEY,
+                team_json       TEXT NOT NULL,
+                sessions_json   TEXT NOT NULL,
+                updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id)
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -291,8 +170,9 @@ impl SqliteStore {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS workflow_runs (
+            CREATE TABLE IF NOT EXISTS runs (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id      INTEGER NOT NULL DEFAULT 0,
                 goal                 TEXT NOT NULL,
                 status               TEXT NOT NULL,
                 coordinator          TEXT,
@@ -306,7 +186,7 @@ impl SqliteStore {
                 mode_state           TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS workflow_run_events (
+            CREATE TABLE IF NOT EXISTS run_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id     INTEGER NOT NULL,
                 attempt    INTEGER NOT NULL,
@@ -316,10 +196,10 @@ impl SqliteStore {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE INDEX IF NOT EXISTS workflow_run_events_run_idx
-                ON workflow_run_events (run_id, id);
+            CREATE INDEX IF NOT EXISTS run_events_run_idx
+                ON run_events (run_id, id);
 
-            CREATE TABLE IF NOT EXISTS workflow_run_steps (
+            CREATE TABLE IF NOT EXISTS run_steps (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id     INTEGER NOT NULL,
                 position   INTEGER NOT NULL,
@@ -331,10 +211,28 @@ impl SqliteStore {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE INDEX IF NOT EXISTS workflow_run_steps_run_idx
-                ON workflow_run_steps (run_id, position);
+            CREATE INDEX IF NOT EXISTS run_steps_run_idx
+                ON run_steps (run_id, position);
             "#,
-        )
+        )?;
+        let columns = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(runs)")?;
+            stmt.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>>>()?
+        };
+        if !columns.iter().any(|column| column == "conversation_id") {
+            self.conn.execute(
+                "ALTER TABLE runs
+                 ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS runs_conversation_idx
+             ON runs (conversation_id, id)",
+            [],
+        )?;
+        Ok(())
     }
 
     // --- roster snapshot -------------------------------------------------
@@ -525,11 +423,16 @@ impl SqliteStore {
 
     /// Rebuild the current conversation's transcript in insertion order.
     pub fn replay_chat(&self) -> Result<Vec<ChatItem>> {
+        self.replay_chat_for(self.conversation.get())
+    }
+
+    /// Rebuild one saved conversation's transcript in insertion order.
+    pub fn replay_chat_for(&self, conversation: i64) -> Result<Vec<ChatItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
              FROM messages WHERE conversation_id = ?1 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(params![self.conversation.get()], map_chat_item)?;
+        let rows = stmt.query_map(params![conversation], map_chat_item)?;
         let mut items = Vec::new();
         for item in rows {
             if let Some(item) = item? {
@@ -543,6 +446,20 @@ impl SqliteStore {
 
     /// The active conversation (latest existing, creating one if none yet).
     pub fn current_conversation(&self) -> Result<i64> {
+        let selected: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT c.id
+                 FROM runtime_state s
+                 JOIN conversations c ON c.id = CAST(s.value AS INTEGER)
+                 WHERE s.key = 'active_conversation'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = selected {
+            return Ok(id);
+        }
         let latest: Option<i64> = self
             .conn
             .query_row(
@@ -567,6 +484,107 @@ impl SqliteStore {
     /// Set the conversation new rows are written to / replayed from.
     pub fn set_conversation(&self, id: i64) {
         self.conversation.set(id);
+        let _ = self.conn.execute(
+            "INSERT INTO runtime_state (key, value)
+             VALUES ('active_conversation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![id.to_string()],
+        );
+    }
+
+    pub fn active_conversation(&self) -> i64 {
+        self.conversation.get()
+    }
+
+    /// Save the roster and native backend sessions belonging to the active chat.
+    pub fn save_conversation_snapshot(
+        &self,
+        team: &TeamConfig,
+        sessions: &[StoredConversationSession],
+    ) -> Result<()> {
+        let team_json = serde_json::to_string(team)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let sessions_json = serde_json::to_string(sessions)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        self.conn.execute(
+            "INSERT INTO conversation_snapshots
+                (conversation_id, team_json, sessions_json, updated_at)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                team_json = excluded.team_json,
+                sessions_json = excluded.sessions_json,
+                updated_at = CURRENT_TIMESTAMP",
+            params![self.conversation.get(), team_json, sessions_json],
+        )?;
+        Ok(())
+    }
+
+    /// Load the roster and native backend sessions saved with one chat.
+    pub fn conversation_snapshot(&self, conversation: i64) -> Result<Option<ConversationSnapshot>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT team_json, sessions_json
+                 FROM conversation_snapshots WHERE conversation_id = ?1",
+                params![conversation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(team_json, sessions_json)| {
+            let team = serde_json::from_str(&team_json).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(err))
+            })?;
+            let sessions = serde_json::from_str(&sessions_json).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(err))
+            })?;
+            Ok(ConversationSnapshot { team, sessions })
+        })
+        .transpose()
+    }
+
+    /// Saved chats other than the active one, newest first.
+    ///
+    /// Only conversations with a roster/session snapshot are selectable:
+    /// restoring a transcript without its members would violate `/resume`.
+    pub fn resumable_conversations(&self) -> Result<Vec<ConversationSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id,
+                    c.created_at,
+                    COALESCE(
+                        (SELECT text FROM messages
+                         WHERE conversation_id = c.id AND kind = 'user'
+                         ORDER BY id ASC LIMIT 1),
+                        ''
+                    ),
+                    (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id),
+                    s.team_json
+             FROM conversations c
+             JOIN conversation_snapshots s ON s.conversation_id = c.id
+             WHERE c.id != ?1
+             ORDER BY c.id DESC",
+        )?;
+        let rows = stmt.query_map(params![self.conversation.get()], |row| {
+            let preview: String = row.get(2)?;
+            let team_json: String = row.get(4)?;
+            let member_count = serde_json::from_str::<TeamConfig>(&team_json)
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(err))
+                })?
+                .members
+                .len();
+            Ok(ConversationSummary {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                preview: if preview.trim().is_empty() {
+                    "(empty chat)".to_string()
+                } else {
+                    preview
+                },
+                message_count: row.get::<_, i64>(3)? as usize,
+                member_count,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn message_count(&self) -> Result<i64> {
@@ -654,6 +672,11 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn clear_sessions(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM agent_sessions", [])?;
+        Ok(())
+    }
+
     // --- approvals -------------------------------------------------------
 
     pub fn insert_approval(
@@ -693,69 +716,91 @@ impl SqliteStore {
         Ok(updated == 1)
     }
 
-    // --- workflow runs ---------------------------------------------------
+    // --- runs ---------------------------------------------------
 
-    pub fn create_workflow_run(
-        &self,
-        goal: &str,
-        coordinator: Option<&MemberId>,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn create_run(&self, goal: &str, coordinator: Option<&MemberId>) -> Result<RunSummary> {
         self.conn.execute(
-            "INSERT INTO workflow_runs (goal, status, coordinator)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO runs (conversation_id, goal, status, coordinator)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
+                self.active_conversation(),
                 goal,
-                WorkflowRunStatus::Running.as_str(),
+                RunStatus::Running.as_str(),
                 coordinator.map(MemberId::as_str)
             ],
         )?;
-        let id = WorkflowRunId(self.conn.last_insert_rowid() as u64);
-        self.record_workflow_event(id, "started", "Started workflow", Some(goal))?;
-        self.workflow_run(id)
+        let id = RunId(self.conn.last_insert_rowid() as u64);
+        self.record_run_event(id, "started", "Started run", Some(goal))?;
+        self.run(id)
     }
 
-    /// Start a collaboration-mode workflow run with initial `mode` + `mode_state`.
-    pub fn create_mode_workflow_run(
+    /// Start a collaboration-mode run with initial `mode` + `mode_state`.
+    pub fn create_mode_run(
         &self,
         goal: &str,
         coordinator: Option<&MemberId>,
         mode: CollabMode,
         mode_state: &str,
-    ) -> Result<WorkflowRunSummary> {
+    ) -> Result<RunSummary> {
         self.conn.execute(
-            "INSERT INTO workflow_runs (goal, status, coordinator, mode, mode_state)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO runs
+                (conversation_id, goal, status, coordinator, mode, mode_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
+                self.active_conversation(),
                 goal,
-                WorkflowRunStatus::Running.as_str(),
+                RunStatus::Running.as_str(),
                 coordinator.map(MemberId::as_str),
                 mode.as_str(),
                 mode_state
             ],
         )?;
-        let id = WorkflowRunId(self.conn.last_insert_rowid() as u64);
-        self.record_workflow_event(id, "started", "Started workflow", Some(goal))?;
-        self.workflow_run(id)
+        let id = RunId(self.conn.last_insert_rowid() as u64);
+        self.record_run_event(id, "started", "Started run", Some(goal))?;
+        self.run(id)
+    }
+
+    /// Test helper: write a raw `runs.mode` string that may not parse as [`CollabMode`].
+    #[cfg(test)]
+    pub(crate) fn insert_run_with_raw_mode(
+        &self,
+        goal: &str,
+        coordinator: Option<&MemberId>,
+        mode: &str,
+        mode_state: Option<&str>,
+        status: RunStatus,
+    ) -> Result<RunSummary> {
+        self.conn.execute(
+            "INSERT INTO runs
+                (conversation_id, goal, status, coordinator, mode, mode_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                self.active_conversation(),
+                goal,
+                status.as_str(),
+                coordinator.map(MemberId::as_str),
+                mode,
+                mode_state
+            ],
+        )?;
+        let id = RunId(self.conn.last_insert_rowid() as u64);
+        self.run(id)
     }
 
     /// Persist an updated `mode_state` blob without recording a timeline event.
-    pub fn update_workflow_mode_state(
-        &self,
-        id: WorkflowRunId,
-        mode_state: &str,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn update_run_mode_state(&self, id: RunId, mode_state: &str) -> Result<RunSummary> {
         self.conn.execute(
-            "UPDATE workflow_runs SET mode_state = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            "UPDATE runs SET mode_state = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![mode_state, id.0 as i64],
         )?;
-        self.workflow_run(id)
+        self.run(id)
     }
 
-    /// Raw `mode_state` JSON for a workflow run, if any.
-    pub fn workflow_mode_state(&self, id: WorkflowRunId) -> Result<Option<String>> {
+    /// Raw `mode_state` JSON for a run, if any.
+    pub fn run_mode_state(&self, id: RunId) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT mode_state FROM workflow_runs WHERE id = ?1",
+                "SELECT mode_state FROM runs WHERE id = ?1",
                 params![id.0 as i64],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -764,12 +809,7 @@ impl SqliteStore {
     }
 
     /// Record a verdict on a mode run's event timeline.
-    pub fn record_workflow_verdict_event(
-        &self,
-        id: WorkflowRunId,
-        approve: bool,
-        summary: &str,
-    ) -> Result<()> {
+    pub fn record_run_verdict_event(&self, id: RunId, approve: bool, summary: &str) -> Result<()> {
         let title = if approve {
             "Review approved"
         } else {
@@ -780,44 +820,58 @@ impl SqliteStore {
         } else {
             Some(summary)
         };
-        self.record_workflow_event(id, "verdict", title, detail)
+        self.record_run_event(id, "verdict", title, detail)
+    }
+
+    /// Record one accepted private brainstorm ballot in the run timeline.
+    pub fn record_brainstorm_vote_event(
+        &self,
+        id: RunId,
+        voter: &MemberId,
+        ranked: &[String],
+    ) -> Result<()> {
+        self.record_run_event(
+            id,
+            "vote",
+            "Brainstorm ballot",
+            Some(&format!("@{voter}: {}", ranked.join(" > "))),
+        )
     }
 
     /// Ids of in-flight mode runs (`running`/`verifying` with a non-null mode).
-    pub fn running_mode_runs(&self) -> Result<Vec<WorkflowRunId>> {
+    pub fn running_mode_runs(&self) -> Result<Vec<RunId>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM workflow_runs
-              WHERE status IN ('running', 'verifying')
+            "SELECT id FROM runs
+              WHERE conversation_id = ?1
+                AND status IN ('running', 'verifying')
                 AND mode IS NOT NULL
               ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map([], |row| Ok(WorkflowRunId(row.get::<_, i64>(0)? as u64)))?;
+        let rows = stmt.query_map(params![self.active_conversation()], |row| {
+            Ok(RunId(row.get::<_, i64>(0)? as u64))
+        })?;
         rows.collect()
     }
 
-    pub fn update_workflow_status(
-        &self,
-        id: WorkflowRunId,
-        status: WorkflowRunStatus,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn update_run_status(&self, id: RunId, status: RunStatus) -> Result<RunSummary> {
         self.conn.execute(
-            "UPDATE workflow_runs SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            "UPDATE runs SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![status.as_str(), id.0 as i64],
         )?;
-        let (kind, title) = workflow_status_event(status);
-        self.record_workflow_event(id, kind, title, None)?;
-        self.workflow_run(id)
+        let (kind, title) = run_status_event(status);
+        self.record_run_event(id, kind, title, None)?;
+        self.run(id)
     }
 
-    pub fn set_workflow_verification(
+    pub fn set_run_verification(
         &self,
-        id: WorkflowRunId,
+        id: RunId,
         command: &str,
         ok: bool,
         summary: &str,
-    ) -> Result<WorkflowRunSummary> {
+    ) -> Result<RunSummary> {
         self.conn.execute(
-            "UPDATE workflow_runs
+            "UPDATE runs
              SET status = ?1,
                  verification_command = ?2,
                  verification_ok = ?3,
@@ -826,9 +880,9 @@ impl SqliteStore {
              WHERE id = ?5",
             params![
                 if ok {
-                    WorkflowRunStatus::Done.as_str()
+                    RunStatus::Done.as_str()
                 } else {
-                    WorkflowRunStatus::Failed.as_str()
+                    RunStatus::Failed.as_str()
                 },
                 command,
                 ok as i64,
@@ -836,7 +890,7 @@ impl SqliteStore {
                 id.0 as i64
             ],
         )?;
-        self.record_workflow_event(
+        self.record_run_event(
             id,
             if ok {
                 "verification_passed"
@@ -850,16 +904,12 @@ impl SqliteStore {
             },
             Some(&format!("{command}\n{summary}")),
         )?;
-        self.workflow_run(id)
+        self.run(id)
     }
 
-    pub fn continue_workflow_run(
-        &self,
-        id: WorkflowRunId,
-        note: Option<&str>,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn continue_run(&self, id: RunId, note: Option<&str>) -> Result<RunSummary> {
         self.conn.execute(
-            "UPDATE workflow_runs
+            "UPDATE runs
              SET status = ?1,
                  attempt = attempt + 1,
                  verification_command = NULL,
@@ -867,59 +917,55 @@ impl SqliteStore {
                  verification_summary = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2",
-            params![WorkflowRunStatus::Running.as_str(), id.0 as i64],
+            params![RunStatus::Running.as_str(), id.0 as i64],
         )?;
-        self.record_workflow_event(id, "continued", "Continued workflow", note)?;
-        self.workflow_run(id)
+        self.record_run_event(id, "continued", "Continued run", note)?;
+        self.run(id)
     }
 
-    pub fn add_workflow_note(&self, id: WorkflowRunId, note: &str) -> Result<WorkflowRunSummary> {
+    pub fn add_run_note(&self, id: RunId, note: &str) -> Result<RunSummary> {
         self.conn.execute(
-            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id.0 as i64],
         )?;
-        self.record_workflow_event(id, "note", "User note", Some(note))?;
-        self.workflow_run(id)
+        self.record_run_event(id, "note", "User note", Some(note))?;
+        self.run(id)
     }
 
-    pub fn block_workflow_run(
-        &self,
-        id: WorkflowRunId,
-        reason: &str,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn block_run(&self, id: RunId, reason: &str) -> Result<RunSummary> {
         self.conn.execute(
-            "UPDATE workflow_runs
+            "UPDATE runs
              SET status = ?1,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2",
-            params![WorkflowRunStatus::Blocked.as_str(), id.0 as i64],
+            params![RunStatus::Blocked.as_str(), id.0 as i64],
         )?;
-        self.record_workflow_event(id, "blocked", "Workflow blocked", Some(reason))?;
-        self.workflow_run(id)
+        self.record_run_event(id, "blocked", "Run blocked", Some(reason))?;
+        self.run(id)
     }
 
-    pub fn add_workflow_step(
+    pub fn add_run_step(
         &self,
-        id: WorkflowRunId,
+        id: RunId,
         owner: Option<&MemberId>,
         title: &str,
-    ) -> Result<WorkflowRunSummary> {
+    ) -> Result<RunSummary> {
         let inserted = self.conn.execute(
-            "INSERT INTO workflow_run_steps (run_id, position, status, owner, title)
+            "INSERT INTO run_steps (run_id, position, status, owner, title)
              SELECT id,
                     (
                         SELECT COALESCE(MAX(position), 0) + 1
-                          FROM workflow_run_steps
+                          FROM run_steps
                          WHERE run_id = ?1
                     ),
                     ?2,
                     ?3,
                     ?4
-              FROM workflow_runs
+              FROM runs
              WHERE id = ?1",
             params![
                 id.0 as i64,
-                WorkflowStepStatus::Todo.as_str(),
+                RunStepStatus::Todo.as_str(),
                 owner.map(MemberId::as_str),
                 title
             ],
@@ -928,32 +974,32 @@ impl SqliteStore {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
         self.conn.execute(
-            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id.0 as i64],
         )?;
         let detail = match owner {
             Some(owner) => format!("@{owner}: {title}"),
             None => title.to_string(),
         };
-        self.record_workflow_event(id, "step_added", "Step added", Some(&detail))?;
-        self.workflow_run(id)
+        self.record_run_event(id, "step_added", "Step added", Some(&detail))?;
+        self.run(id)
     }
 
-    pub fn update_workflow_step(
+    pub fn update_run_step(
         &self,
-        id: WorkflowRunId,
+        id: RunId,
         number: u32,
-        status: WorkflowStepStatus,
+        status: RunStepStatus,
         note: Option<&str>,
-    ) -> Result<WorkflowRunSummary> {
+    ) -> Result<RunSummary> {
         let title: String = self.conn.query_row(
-            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
             params![id.0 as i64, number as i64],
             |row| row.get(0),
         )?;
         let note_value = note.filter(|note| !note.trim().is_empty());
         self.conn.execute(
-            "UPDATE workflow_run_steps
+            "UPDATE run_steps
              SET status = ?1,
                  note = ?2,
                  updated_at = CURRENT_TIMESTAMP
@@ -961,179 +1007,170 @@ impl SqliteStore {
             params![status.as_str(), note_value, id.0 as i64, number as i64],
         )?;
         self.conn.execute(
-            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id.0 as i64],
         )?;
         let detail = match note_value {
             Some(note) => format!("#{number} {}: {title}\n{note}", status.as_str()),
             None => format!("#{number} {}: {title}", status.as_str()),
         };
-        self.record_workflow_event(id, "step_updated", "Step updated", Some(&detail))?;
-        self.workflow_run(id)
+        self.record_run_event(id, "step_updated", "Step updated", Some(&detail))?;
+        self.run(id)
     }
 
-    pub fn rename_workflow_step(
-        &self,
-        id: WorkflowRunId,
-        number: u32,
-        title: &str,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn rename_run_step(&self, id: RunId, number: u32, title: &str) -> Result<RunSummary> {
         let old_title: String = self.conn.query_row(
-            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
             params![id.0 as i64, number as i64],
             |row| row.get(0),
         )?;
         self.conn.execute(
-            "UPDATE workflow_run_steps
+            "UPDATE run_steps
              SET title = ?1,
                  updated_at = CURRENT_TIMESTAMP
              WHERE run_id = ?2 AND position = ?3",
             params![title, id.0 as i64, number as i64],
         )?;
         self.conn.execute(
-            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id.0 as i64],
         )?;
-        self.record_workflow_event(
+        self.record_run_event(
             id,
             "step_renamed",
             "Step renamed",
             Some(&format!("#{number}: {old_title}\n{title}")),
         )?;
-        self.workflow_run(id)
+        self.run(id)
     }
 
-    pub fn remove_workflow_step(
-        &self,
-        id: WorkflowRunId,
-        number: u32,
-    ) -> Result<WorkflowRunSummary> {
+    pub fn remove_run_step(&self, id: RunId, number: u32) -> Result<RunSummary> {
         let title: String = self.conn.query_row(
-            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
             params![id.0 as i64, number as i64],
             |row| row.get(0),
         )?;
         self.conn.execute(
-            "DELETE FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            "DELETE FROM run_steps WHERE run_id = ?1 AND position = ?2",
             params![id.0 as i64, number as i64],
         )?;
         self.conn.execute(
-            "UPDATE workflow_run_steps
+            "UPDATE run_steps
              SET position = position - 1,
                  updated_at = CURRENT_TIMESTAMP
              WHERE run_id = ?1 AND position > ?2",
             params![id.0 as i64, number as i64],
         )?;
         self.conn.execute(
-            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id.0 as i64],
         )?;
-        self.record_workflow_event(
+        self.record_run_event(
             id,
             "step_removed",
             "Step removed",
             Some(&format!("#{number}: {title}")),
         )?;
-        self.workflow_run(id)
+        self.run(id)
     }
 
-    pub fn assign_workflow_step(
+    pub fn assign_run_step(
         &self,
-        id: WorkflowRunId,
+        id: RunId,
         number: u32,
         owner: Option<&MemberId>,
-    ) -> Result<WorkflowRunSummary> {
+    ) -> Result<RunSummary> {
         let title: String = self.conn.query_row(
-            "SELECT title FROM workflow_run_steps WHERE run_id = ?1 AND position = ?2",
+            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
             params![id.0 as i64, number as i64],
             |row| row.get(0),
         )?;
         self.conn.execute(
-            "UPDATE workflow_run_steps
+            "UPDATE run_steps
              SET owner = ?1,
                  updated_at = CURRENT_TIMESTAMP
              WHERE run_id = ?2 AND position = ?3",
             params![owner.map(MemberId::as_str), id.0 as i64, number as i64],
         )?;
         self.conn.execute(
-            "UPDATE workflow_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id.0 as i64],
         )?;
         let detail = match owner {
             Some(owner) => format!("#{number} @{owner}: {title}"),
             None => format!("#{number} unassigned: {title}"),
         };
-        self.record_workflow_event(id, "step_assigned", "Step assigned", Some(&detail))?;
-        self.workflow_run(id)
+        self.record_run_event(id, "step_assigned", "Step assigned", Some(&detail))?;
+        self.run(id)
     }
 
-    pub fn latest_workflow_run(&self) -> Result<Option<WorkflowRunSummary>> {
+    pub fn latest_run(&self) -> Result<Option<RunSummary>> {
         let run = self
             .conn
             .query_row(
                 "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
-                 FROM workflow_runs ORDER BY id DESC LIMIT 1",
-                [],
-                map_workflow_run,
+                 FROM runs
+                 WHERE conversation_id = ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![self.active_conversation()],
+                map_run,
             )
             .optional()?;
-        run.map(|run| self.with_workflow_events(run)).transpose()
+        run.map(|run| self.with_run_events(run)).transpose()
     }
 
-    pub fn recent_workflow_runs(&self, limit: usize) -> Result<Vec<WorkflowRunSummary>> {
+    pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
-             FROM workflow_runs ORDER BY id DESC LIMIT ?1",
+             FROM runs
+             WHERE conversation_id = ?1
+             ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64], map_workflow_run)?;
+        let rows = stmt.query_map(params![self.active_conversation(), limit as i64], map_run)?;
         let mut runs = rows.collect::<Result<Vec<_>>>()?;
         runs.reverse();
         runs.into_iter()
-            .map(|run| self.with_workflow_events(run))
+            .map(|run| self.with_run_events(run))
             .collect()
     }
 
-    pub fn workflow_run(&self, id: WorkflowRunId) -> Result<WorkflowRunSummary> {
+    pub fn run(&self, id: RunId) -> Result<RunSummary> {
         let run = self.conn.query_row(
             "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
-             FROM workflow_runs WHERE id = ?1",
+             FROM runs WHERE id = ?1",
             params![id.0 as i64],
-            map_workflow_run,
+            map_run,
         )?;
-        self.with_workflow_events(run)
+        self.with_run_events(run)
     }
 
-    fn record_workflow_event(
+    fn record_run_event(
         &self,
-        id: WorkflowRunId,
+        id: RunId,
         kind: &str,
         title: &str,
         detail: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO workflow_run_events (run_id, attempt, kind, title, detail)
-             SELECT id, attempt, ?2, ?3, ?4 FROM workflow_runs WHERE id = ?1",
+            "INSERT INTO run_events (run_id, attempt, kind, title, detail)
+             SELECT id, attempt, ?2, ?3, ?4 FROM runs WHERE id = ?1",
             params![id.0 as i64, kind, title, detail],
         )?;
         Ok(())
     }
 
-    fn with_workflow_events(&self, mut run: WorkflowRunSummary) -> Result<WorkflowRunSummary> {
-        run.events = self.workflow_run_events(run.id, 8)?;
-        run.steps = self.workflow_run_steps(run.id, 12)?;
+    fn with_run_events(&self, mut run: RunSummary) -> Result<RunSummary> {
+        run.events = self.run_events(run.id, 8)?;
+        run.steps = self.run_steps(run.id, 12)?;
         Ok(run)
     }
 
-    fn workflow_run_events(
-        &self,
-        id: WorkflowRunId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowRunEventSummary>> {
+    fn run_events(&self, id: RunId, limit: usize) -> Result<Vec<RunEventSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT kind, title, detail, created_at, attempt
              FROM (
                  SELECT id, kind, title, detail, created_at, attempt
-                   FROM workflow_run_events
+                   FROM run_events
                   WHERE run_id = ?1
                   ORDER BY id DESC
                   LIMIT ?2
@@ -1141,7 +1178,7 @@ impl SqliteStore {
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![id.0 as i64, limit as i64], |row| {
-            Ok(WorkflowRunEventSummary {
+            Ok(RunEventSummary {
                 kind: row.get(0)?,
                 title: row.get(1)?,
                 detail: row.get(2)?,
@@ -1152,22 +1189,18 @@ impl SqliteStore {
         rows.collect()
     }
 
-    fn workflow_run_steps(
-        &self,
-        id: WorkflowRunId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowStepSummary>> {
+    fn run_steps(&self, id: RunId, limit: usize) -> Result<Vec<RunStepSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT position, status, owner, title, note, updated_at
-               FROM workflow_run_steps
+               FROM run_steps
               WHERE run_id = ?1
               ORDER BY position ASC
               LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![id.0 as i64, limit as i64], |row| {
-            Ok(WorkflowStepSummary {
+            Ok(RunStepSummary {
                 number: row.get::<_, i64>(0)? as u32,
-                status: WorkflowStepStatus::parse(&row.get::<_, String>(1)?),
+                status: RunStepStatus::parse(&row.get::<_, String>(1)?),
                 owner: row.get::<_, Option<String>>(2)?.map(MemberId::new),
                 title: row.get(3)?,
                 note: row.get(4)?,
@@ -1178,17 +1211,17 @@ impl SqliteStore {
     }
 
     /// All checklist steps for a run (no LIMIT), ordered by position.
-    pub fn workflow_steps_all(&self, id: WorkflowRunId) -> Result<Vec<WorkflowStepSummary>> {
+    pub fn run_steps_all(&self, id: RunId) -> Result<Vec<RunStepSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT position, status, owner, title, note, updated_at
-               FROM workflow_run_steps
+               FROM run_steps
               WHERE run_id = ?1
               ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![id.0 as i64], |row| {
-            Ok(WorkflowStepSummary {
+            Ok(RunStepSummary {
                 number: row.get::<_, i64>(0)? as u32,
-                status: WorkflowStepStatus::parse(&row.get::<_, String>(1)?),
+                status: RunStepStatus::parse(&row.get::<_, String>(1)?),
                 owner: row.get::<_, Option<String>>(2)?.map(MemberId::new),
                 title: row.get(3)?,
                 note: row.get(4)?,
@@ -1311,27 +1344,32 @@ fn map_approval(row: &Row<'_>) -> rusqlite::Result<StoredApproval> {
     })
 }
 
-fn map_workflow_run(row: &Row<'_>) -> rusqlite::Result<WorkflowRunSummary> {
+fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
     let command: Option<String> = row.get(4)?;
     let ok: Option<i64> = row.get(5)?;
     let summary: Option<String> = row.get(6)?;
     let mode_col: Option<String> = row.get(10)?;
     let mode_state_col: Option<String> = row.get(11)?;
-    let mode = mode_col.and_then(|raw| {
-        let mode = CollabMode::parse(&raw)?;
-        let state = mode_state_col
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<ModeStatusSummary>(json).ok())
-            .unwrap_or_default();
-        Some(ModeRunStatus { mode, state })
-    });
-    Ok(WorkflowRunSummary {
-        id: WorkflowRunId(row.get::<_, i64>(0)? as u64),
+    let (mode, legacy_mode) = match mode_col {
+        Some(raw) => match CollabMode::parse(&raw) {
+            Some(mode) => {
+                let state = mode_state_col
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<ModeStatusSummary>(json).ok())
+                    .unwrap_or_default();
+                (Some(ModeRunStatus { mode, state }), None)
+            }
+            None => (None, Some(raw)),
+        },
+        None => (None, None),
+    };
+    Ok(RunSummary {
+        id: RunId(row.get::<_, i64>(0)? as u64),
         goal: row.get(1)?,
-        status: WorkflowRunStatus::parse(&row.get::<_, String>(2)?),
+        status: RunStatus::parse(&row.get::<_, String>(2)?),
         coordinator: row.get::<_, Option<String>>(3)?.map(MemberId::new),
         verification: match (command, ok, summary) {
-            (Some(command), Some(ok), Some(summary)) => Some(WorkflowVerification {
+            (Some(command), Some(ok), Some(summary)) => Some(RunVerification {
                 command,
                 ok: ok != 0,
                 summary,
@@ -1344,17 +1382,18 @@ fn map_workflow_run(row: &Row<'_>) -> rusqlite::Result<WorkflowRunSummary> {
         events: Vec::new(),
         steps: Vec::new(),
         mode,
+        legacy_mode,
     })
 }
 
-fn workflow_status_event(status: WorkflowRunStatus) -> (&'static str, &'static str) {
+fn run_status_event(status: RunStatus) -> (&'static str, &'static str) {
     match status {
-        WorkflowRunStatus::Planned => ("planned", "Workflow planned"),
-        WorkflowRunStatus::Running => ("running", "Workflow running"),
-        WorkflowRunStatus::Verifying => ("verifying", "Started verification"),
-        WorkflowRunStatus::Done => ("done", "Work finished"),
-        WorkflowRunStatus::Failed => ("failed", "Workflow failed"),
-        WorkflowRunStatus::Blocked => ("blocked", "Workflow blocked"),
+        RunStatus::Planned => ("planned", "Run planned"),
+        RunStatus::Running => ("running", "Run running"),
+        RunStatus::Verifying => ("verifying", "Started verification"),
+        RunStatus::Done => ("done", "Work finished"),
+        RunStatus::Failed => ("failed", "Run failed"),
+        RunStatus::Blocked => ("blocked", "Run blocked"),
     }
 }
 

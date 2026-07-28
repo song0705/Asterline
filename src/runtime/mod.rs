@@ -23,7 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
-use crate::domain::event::{AgentEvent, RuntimeEvent, UiCommand, WorkflowRunId};
+use crate::domain::event::{AgentEvent, RunId, RuntimeEvent, UiCommand};
 use crate::domain::team::{MemberId, TeamConfig, TeamMember};
 use crate::store::sqlite::SqliteStore;
 
@@ -97,7 +97,7 @@ fn run_loop(
     input_rx: Receiver<RuntimeInput>,
 ) {
     let mut runtime = TeamRuntime::new(config, store).with_approvals(options.approvals);
-    let mut active_verifications: HashMap<WorkflowRunId, Arc<AtomicBool>> = HashMap::new();
+    let mut active_verifications: HashMap<RunId, Arc<AtomicBool>> = HashMap::new();
     let _ = events.send(runtime.ready_event());
 
     while let Ok(input) = input_rx.recv() {
@@ -108,6 +108,17 @@ fn run_loop(
             _ => false,
         };
         let mut step = match input {
+            RuntimeInput::Ui(UiCommand::ResumeConversation { .. })
+                if !active_verifications.is_empty() =>
+            {
+                RuntimeStep {
+                    events: vec![RuntimeEvent::Notice(
+                        "cannot resume another chat while verification is active; use /abort first"
+                            .to_string(),
+                    )],
+                    ..RuntimeStep::default()
+                }
+            }
             RuntimeInput::Ui(command) => runtime.on_ui_command(command),
             RuntimeInput::Agent(member, event) => runtime.on_agent_event(&member, event),
             RuntimeInput::Verification(output) => {
@@ -272,7 +283,7 @@ mod tests {
     use super::*;
     use crate::adapter::FakeRunner;
     use crate::domain::event::MessageTarget;
-    use crate::domain::event::WorkflowRunStatus;
+    use crate::domain::event::RunStatus;
     use crate::domain::team::{BackendKind, TeamMember};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
@@ -389,12 +400,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_thread_runs_workflow_verification() {
+    fn runtime_thread_runs_run_verification() {
+        let mut runners: Runners = HashMap::new();
+        runners.insert(
+            MemberId::new("builder"),
+            Arc::new(FakeRunner::echo(BackendKind::Codex)),
+        );
         let (evt_tx, evt_rx) = mpsc::channel();
         let (handle, join) = spawn(
             single_codex_team(),
             SqliteStore::in_memory().unwrap(),
-            HashMap::new(),
+            runners,
             evt_tx,
             true,
             true,
@@ -402,19 +418,28 @@ mod tests {
         );
         let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
 
-        handle.send(UiCommand::RunWorkflow {
-            goal: "verify from runtime".to_string(),
+        handle.send(UiCommand::SetMode {
+            mode: crate::domain::mode::TerminalMode::Team,
+        });
+        handle.send(UiCommand::UserMessage {
+            target: crate::domain::event::MessageTarget::Default,
+            body: "verify from runtime".to_string(),
         });
         let mut saw_run = false;
+        let mut saw_team_done = false;
         while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
-            if matches!(event, RuntimeEvent::WorkflowRunUpdated { .. }) {
+            if let RuntimeEvent::RunUpdated { run } = event {
                 saw_run = true;
-                break;
+                if run.status == RunStatus::Done {
+                    saw_team_done = true;
+                    break;
+                }
             }
         }
-        assert!(saw_run, "workflow run was created");
+        assert!(saw_run, "team run was created");
+        assert!(saw_team_done, "team run finished before verification");
 
-        handle.send(UiCommand::VerifyWorkflow {
+        handle.send(UiCommand::VerifyRun {
             run_id: None,
             command: Some("printf runtime-verified".to_string()),
         });
@@ -423,13 +448,11 @@ mod tests {
         let mut saw_done = false;
         while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
             match event {
-                RuntimeEvent::WorkflowRunUpdated { run }
-                    if run.status == WorkflowRunStatus::Verifying =>
-                {
+                RuntimeEvent::RunUpdated { run } if run.status == RunStatus::Verifying => {
                     saw_verifying = true;
                 }
-                RuntimeEvent::WorkflowRunUpdated { run }
-                    if run.status == WorkflowRunStatus::Done
+                RuntimeEvent::RunUpdated { run }
+                    if run.status == RunStatus::Done
                         && run.verification.as_ref().is_some_and(|v| {
                             v.ok && v.command == "printf runtime-verified"
                                 && v.summary == "runtime-verified"
@@ -452,7 +475,7 @@ mod tests {
     fn verification_worker_can_be_cancelled() {
         let cancel = Arc::new(AtomicBool::new(false));
         let action = VerifyAction {
-            run_id: crate::domain::event::WorkflowRunId(1),
+            run_id: crate::domain::event::RunId(1),
             command: "sleep 5; printf done".to_string(),
             workspace: std::env::temp_dir(),
             cancel: Arc::clone(&cancel),

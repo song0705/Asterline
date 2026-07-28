@@ -61,6 +61,7 @@ impl StreamAdapter for ClaudeStreamAdapter {
             "stream-json".to_string(),
             "--verbose".to_string(),
             "--include-partial-messages".to_string(),
+            "--forward-subagent-text".to_string(),
         ];
         if let Some(session) = session {
             args.push("--resume".to_string());
@@ -185,6 +186,11 @@ impl ClaudeLineParser {
                         id: id.clone(),
                         delta: format!("{prefix}{partial}"),
                     });
+                } else if str_field(delta, "type") == Some("thinking_delta")
+                    && let Some(thinking) = str_field(delta, "thinking")
+                    && !thinking.is_empty()
+                {
+                    out.push(AgentEvent::Reasoning(thinking.to_string()));
                 }
             }
             Some("content_block_stop") => {
@@ -265,7 +271,34 @@ impl LineParser for ClaudeLineParser {
             }
             Some("stream_event") => self.handle_stream_event(&value["event"], &mut out),
             Some("user") => self.handle_user_message(&value["message"], &mut out),
-            Some("assistant") => {}
+            Some("assistant") => {
+                // Main-agent content is already represented by `stream_event`
+                // partials. `--forward-subagent-text` marks forwarded child
+                // blocks so their text/thinking can be surfaced without
+                // duplicating the main answer.
+                if value.get("parent_tool_use_id").is_some()
+                    || value["message"].get("parent_tool_use_id").is_some()
+                {
+                    let content = value["message"]["content"].as_array();
+                    for block in content.into_iter().flatten() {
+                        match str_field(block, "type") {
+                            Some("thinking") => {
+                                if let Some(thinking) = str_field(block, "thinking") {
+                                    out.push(AgentEvent::Reasoning(format!(
+                                        "[subagent] {thinking}"
+                                    )));
+                                }
+                            }
+                            Some("text") => {
+                                if let Some(text) = str_field(block, "text") {
+                                    out.push(AgentEvent::Log(format!("claude subagent: {text}")));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             Some("result") => {
                 if let Some(session) = str_field(&value, "session_id") {
                     out.push(AgentEvent::SessionDiscovered(AgentSessionId(
@@ -328,6 +361,11 @@ mod tests {
             command
                 .args
                 .contains(&"--include-partial-messages".to_string())
+        );
+        assert!(
+            command
+                .args
+                .contains(&"--forward-subagent-text".to_string())
         );
         assert!(command.args.windows(2).any(|w| w == ["--resume", "sess-1"]));
         assert!(command.args.windows(2).any(|w| w == ["--effort", "high"]));
@@ -429,6 +467,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn thinking_delta_is_forwarded_as_reasoning() {
+        let events = parse_all(&[
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking invariants"}}}"#,
+        ]);
+        assert!(events.contains(&AgentEvent::Reasoning("checking invariants".to_string())));
+    }
+
+    #[test]
+    fn forwarded_subagent_thinking_is_not_dropped() {
+        let events = parse_all(&[
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"content":[{"type":"thinking","thinking":"child analysis"},{"type":"text","text":"child result"}]}}"#,
+        ]);
+        assert!(events.contains(&AgentEvent::Reasoning(
+            "[subagent] child analysis".to_string()
+        )));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::Log(message) if message.contains("child result"))
+        ));
     }
 
     #[test]

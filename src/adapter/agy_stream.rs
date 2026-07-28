@@ -1,30 +1,33 @@
-//! Antigravity CLI (`agy`) adapter.
+//! Antigravity CLI (`agy`) stream adapter.
 //!
-//! Drives `agy --print <prompt>` non-interactively and treats stdout as the
-//! agent's reply. Agy prints plain text, so session discovery comes from the
-//! per-run log file (`Created conversation <uuid>`) or, as a fallback, Agy's
-//! workspace-to-conversation cache.
+//! Drives print mode with `--output-format stream-json`. The structured stream
+//! exposes the conversation id, agent response chunks, tool lifecycle, and
+//! final status directly; no log scraping or cache guessing is required.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+
+use crate::adapter::parser::{str_field, summarize, tool_detail, tool_value};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
+
+const TOOL_SUMMARY_MAX: usize = 160;
+const TOOL_OUTPUT_MAX: usize = 32_000;
 
 #[derive(Clone, Debug)]
 pub struct AgyStreamAdapter {
     binary: String,
     cwd: PathBuf,
-    workspace: PathBuf,
     member_id: String,
     log_dir: PathBuf,
     model: Option<String>,
     system_prompt: Option<String>,
     sandbox: SandboxPolicy,
     permission_mode: Option<PermissionMode>,
-    last_log_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl AgyStreamAdapter {
@@ -34,13 +37,11 @@ impl AgyStreamAdapter {
             binary: "agy".to_string(),
             cwd: member.resolved_cwd(&workspace),
             log_dir: workspace.join(".asterline").join("agy"),
-            workspace,
             member_id: member.id.as_str().to_string(),
             model: member.model.clone(),
             system_prompt: member.system_prompt.clone(),
             sandbox: member.sandbox,
             permission_mode: member.permission_mode,
-            last_log_path: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -59,11 +60,17 @@ impl AgyStreamAdapter {
     }
 
     fn prompt_with_system(&self, prompt: &str) -> String {
+        let workspace_hint = format!(
+            "The project workspace is `{}`. Work in that directory rather than the CLI scratch directory.",
+            self.cwd.display()
+        );
         match &self.system_prompt {
             Some(system_prompt) if !system_prompt.trim().is_empty() => {
-                format!("System instructions:\n{system_prompt}\n\nUser message:\n{prompt}")
+                format!(
+                    "System instructions:\n{system_prompt}\n\n{workspace_hint}\n\nUser message:\n{prompt}"
+                )
             }
-            _ => prompt.to_string(),
+            _ => format!("{workspace_hint}\n\nUser message:\n{prompt}"),
         }
     }
 }
@@ -77,20 +84,18 @@ impl StreamAdapter for AgyStreamAdapter {
         &self,
         prompt: &str,
         session: Option<&AgentSessionId>,
-        _effort: Option<Effort>,
+        effort: Option<Effort>,
     ) -> AdapterCommand {
         let _ = std::fs::create_dir_all(&self.log_dir);
-        let log_path = self.log_path();
-        if let Ok(mut slot) = self.last_log_path.lock() {
-            *slot = Some(log_path.clone());
-        }
-
         let mut args = vec![
-            "--print".to_string(),
             "--print-timeout".to_string(),
             "5m0s".to_string(),
             "--log-file".to_string(),
-            log_path.display().to_string(),
+            self.log_path().display().to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--add-dir".to_string(),
+            self.cwd.display().to_string(),
         ];
         if let Some(session) = session {
             args.push("--conversation".to_string());
@@ -100,146 +105,224 @@ impl StreamAdapter for AgyStreamAdapter {
             args.push("--model".to_string());
             args.push(model.clone());
         }
+        if let Some(effort) = effort {
+            args.push("--effort".to_string());
+            args.push(effort.as_str().to_string());
+        }
         if self.sandbox != SandboxPolicy::DangerFullAccess {
             args.push("--sandbox".to_string());
         }
-        if self.permission_mode == Some(PermissionMode::BypassPermissions) {
-            args.push("--dangerously-skip-permissions".to_string());
+        match self.permission_mode {
+            Some(PermissionMode::BypassPermissions) => {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
+            Some(PermissionMode::AcceptEdits) => {
+                args.push("--mode".to_string());
+                args.push("accept-edits".to_string());
+            }
+            Some(PermissionMode::Plan) => {
+                args.push("--mode".to_string());
+                args.push("plan".to_string());
+            }
+            _ => {}
         }
+        args.push("--print".to_string());
+        args.push(self.prompt_with_system(prompt));
         AdapterCommand {
             program: self.binary.clone(),
             args,
             cwd: self.cwd.clone(),
-            stdin: Some(self.prompt_with_system(prompt)),
+            stdin: None,
         }
     }
 
     fn parser(&self) -> Box<dyn LineParser> {
-        let log_path = self.last_log_path.lock().ok().and_then(|slot| slot.clone());
-        Box::new(AgyLineParser::new(log_path, self.workspace.clone()))
+        Box::new(AgyLineParser::default())
     }
 }
 
-/// Accumulates Agy's plain-text stdout into a single completed message.
+/// Parser for Agy's newline-delimited `stream-json` output.
+#[derive(Default)]
 pub struct AgyLineParser {
-    acc: String,
-    started: bool,
-    log_path: Option<PathBuf>,
-    workspace: PathBuf,
-    cache_path: Option<PathBuf>,
+    message_open: bool,
+    text_acc: String,
+    session_id: Option<String>,
+    active_tools: HashMap<u64, String>,
+    completed_tools: HashSet<u64>,
+    result_seen: bool,
 }
 
 impl AgyLineParser {
-    pub fn new(log_path: Option<PathBuf>, workspace: PathBuf) -> Self {
-        Self {
-            acc: String::new(),
-            started: false,
-            log_path,
-            workspace,
-            cache_path: default_cache_path(),
+    fn open_message(&mut self, out: &mut Vec<AgentEvent>) {
+        if !self.message_open {
+            self.message_open = true;
+            self.text_acc.clear();
+            out.push(AgentEvent::MessageStarted);
         }
     }
 
-    pub fn with_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.cache_path = Some(path.into());
-        self
+    fn close_message(&mut self, out: &mut Vec<AgentEvent>) {
+        if self.message_open {
+            self.message_open = false;
+            out.push(AgentEvent::MessageCompleted(std::mem::take(
+                &mut self.text_acc,
+            )));
+        }
     }
 
-    fn discover_session(&self) -> Option<AgentSessionId> {
-        self.log_path
-            .as_deref()
-            .and_then(session_from_log)
-            .or_else(|| {
-                self.cache_path
-                    .as_deref()
-                    .and_then(|path| session_from_cache(path, &self.workspace))
-            })
-            .map(AgentSessionId)
+    fn discover_session(&mut self, id: &str, out: &mut Vec<AgentEvent>) {
+        if self.session_id.as_deref() == Some(id) {
+            return;
+        }
+        self.session_id = Some(id.to_string());
+        out.push(AgentEvent::SessionDiscovered(AgentSessionId(
+            id.to_string(),
+        )));
+    }
+
+    fn handle_step(&mut self, step: &Value, out: &mut Vec<AgentEvent>) {
+        if let Some(thought) = ["thought_delta", "raw_thought", "thinking_delta"]
+            .into_iter()
+            .find_map(|field| str_field(step, field))
+            .filter(|value| !value.is_empty())
+        {
+            out.push(AgentEvent::Reasoning(thought.to_string()));
+        }
+
+        if str_field(step, "step_type") == Some("agent_response") {
+            if let Some(text) = str_field(step, "text_delta").filter(|value| !value.is_empty()) {
+                self.open_message(out);
+                self.text_acc.push_str(text);
+                out.push(AgentEvent::TextDelta(text.to_string()));
+            }
+            return;
+        }
+
+        if str_field(step, "step_type") != Some("tool") {
+            return;
+        }
+        let index = step.get("step_index").and_then(Value::as_u64).unwrap_or(0);
+        let id = format!("agy-step-{index}");
+        let tool = &step["tool_info"];
+        let name = str_field(step, "tool_name")
+            .or_else(|| str_field(tool, "name"))
+            .unwrap_or("tool")
+            .to_string();
+        let state = str_field(step, "state").unwrap_or_default();
+
+        if state == "ACTIVE" && !self.active_tools.contains_key(&index) {
+            self.active_tools.insert(index, name.clone());
+            out.push(AgentEvent::ToolStarted {
+                id,
+                name: name.clone(),
+                summary: tool
+                    .get("parameters")
+                    .map(|value| tool_value(value, TOOL_SUMMARY_MAX))
+                    .filter(|value| !value.is_empty())
+                    .map(|parameters| format!("{name}: {parameters}"))
+                    .map(|value| summarize(&value, TOOL_SUMMARY_MAX))
+                    .unwrap_or(name),
+            });
+            return;
+        }
+
+        if matches!(state, "DONE" | "ERROR" | "INTERRUPTED" | "CANCELLED")
+            && self.completed_tools.insert(index)
+        {
+            if !self.active_tools.contains_key(&index) {
+                out.push(AgentEvent::ToolStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    summary: name.clone(),
+                });
+            }
+            self.active_tools.remove(&index);
+            let summary = ["output", "error"]
+                .into_iter()
+                .find_map(|field| tool.get(field))
+                .or_else(|| step.get("error_details"))
+                .map(|value| tool_value(value, TOOL_OUTPUT_MAX))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| name.clone());
+            out.push(AgentEvent::ToolCompleted {
+                id,
+                ok: state == "DONE",
+                summary: tool_detail(&summary, TOOL_OUTPUT_MAX),
+            });
+        }
     }
 }
 
 impl LineParser for AgyLineParser {
     fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
-        if line.is_empty() && !self.started {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             return Vec::new();
         }
-        self.started = true;
-        if !self.acc.is_empty() {
-            self.acc.push('\n');
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(err) => {
+                return vec![AgentEvent::ParseWarning(format!(
+                    "agy: invalid JSON line: {err}"
+                ))];
+            }
+        };
+        let mut out = Vec::new();
+        match str_field(&value, "event") {
+            Some("init") => {
+                if let Some(id) = str_field(&value, "conversation_id") {
+                    self.discover_session(id, &mut out);
+                }
+            }
+            Some("step_update") => self.handle_step(&value["step_update"], &mut out),
+            Some("result") => {
+                self.result_seen = true;
+                let result = &value["result"];
+                if let Some(id) = str_field(result, "conversation_id") {
+                    self.discover_session(id, &mut out);
+                }
+                if let Some(response) =
+                    str_field(result, "response").filter(|value| !value.is_empty())
+                {
+                    if !self.message_open {
+                        self.open_message(&mut out);
+                        out.push(AgentEvent::TextDelta(response.to_string()));
+                    }
+                    // Agy's incremental text_delta may split a multi-byte UTF-8
+                    // character and contain U+FFFD. Its final response is the
+                    // authoritative, reassembled message, so always use it when
+                    // finalizing the cell.
+                    self.text_acc.clear();
+                    self.text_acc.push_str(response);
+                }
+                self.close_message(&mut out);
+                if str_field(result, "status") != Some("SUCCESS") {
+                    out.push(AgentEvent::Fatal(
+                        str_field(result, "error")
+                            .or_else(|| str_field(result, "status"))
+                            .unwrap_or("agy run failed")
+                            .to_string(),
+                    ));
+                }
+            }
+            Some(other) => out.push(AgentEvent::Log(format!("agy event: {other}"))),
+            None => out.push(AgentEvent::ParseWarning(format!(
+                "agy: event without type: {}",
+                summarize(trimmed, 120)
+            ))),
         }
-        self.acc.push_str(line);
-        vec![AgentEvent::TextDelta(format!("{line}\n"))]
+        out
     }
 
     fn finish(&mut self) -> Vec<AgentEvent> {
-        if !self.started {
-            return Vec::new();
+        if self.result_seen {
+            Vec::new()
+        } else {
+            let mut out = Vec::new();
+            self.close_message(&mut out);
+            out
         }
-        vec![AgentEvent::MessageCompleted(
-            self.acc.trim_end().to_string(),
-        )]
     }
-
-    fn finish_after_exit(&mut self, ok: bool) -> Vec<AgentEvent> {
-        if !ok {
-            return Vec::new();
-        }
-        self.discover_session()
-            .map(AgentEvent::SessionDiscovered)
-            .into_iter()
-            .collect()
-    }
-}
-
-fn default_cache_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".gemini")
-            .join("antigravity-cli")
-            .join("cache")
-            .join("last_conversations.json")
-    })
-}
-
-fn session_from_log(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    extract_created_conversation(&text)
-}
-
-fn extract_created_conversation(text: &str) -> Option<String> {
-    text.lines().rev().find_map(|line| {
-        let (_, rest) = line.split_once("Created conversation ")?;
-        rest.split_whitespace()
-            .next()
-            .filter(|candidate| is_conversation_id(candidate))
-            .map(str::to_string)
-    })
-}
-
-fn session_from_cache(path: &Path, workspace: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let object = value.as_object()?;
-    let workspace_display = workspace.display().to_string();
-    if let Some(session) = object
-        .get(&workspace_display)
-        .and_then(serde_json::Value::as_str)
-        .filter(|candidate| is_conversation_id(candidate))
-    {
-        return Some(session.to_string());
-    }
-
-    let canonical = workspace.canonicalize().ok()?;
-    let canonical_display = canonical.display().to_string();
-    object
-        .get(&canonical_display)
-        .and_then(serde_json::Value::as_str)
-        .filter(|candidate| is_conversation_id(candidate))
-        .map(str::to_string)
-}
-
-fn is_conversation_id(candidate: &str) -> bool {
-    candidate.len() == 36 && candidate.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 #[cfg(test)]
@@ -247,102 +330,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_uses_print_log_sandbox_and_model() {
+    fn command_uses_stream_json_effort_workspace_and_resume() {
         let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
         member.model = Some("model-x".to_string());
         let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
-        let command = adapter.build_command("hi there", None, None);
+        let session = AgentSessionId("1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d".to_string());
+        let command = adapter.build_command("hi there", Some(&session), Some(Effort::High));
 
         assert_eq!(command.program, "agy");
-        assert!(command.args.contains(&"--print".to_string()));
-        assert!(command.args.windows(2).any(|w| w == ["--model", "model-x"]));
-        assert!(command.args.contains(&"--sandbox".to_string()));
         assert!(
             command
                 .args
                 .windows(2)
-                .any(|w| w[0] == "--log-file" && w[1].contains(".asterline/agy/a-"))
+                .any(|w| w == ["--output-format", "stream-json"])
         );
-        assert_eq!(command.stdin.as_deref(), Some("hi there"));
-    }
-
-    #[test]
-    fn resume_command_uses_conversation_id() {
-        let member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
-        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
-        let command = adapter.build_command(
-            "again",
-            Some(&AgentSessionId(
-                "1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d".to_string(),
-            )),
-            None,
+        assert!(command.args.windows(2).any(|w| w == ["--effort", "high"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--add-dir", "/tmp/ws"])
         );
-
+        assert!(command.args.windows(2).any(|w| w == ["--model", "model-x"]));
         assert!(
             command
                 .args
                 .windows(2)
                 .any(|w| { w == ["--conversation", "1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d",] })
         );
+        assert!(command.args.contains(&"--sandbox".to_string()));
+        assert!(command.args[command.args.len() - 1].contains("hi there"));
+        assert_eq!(command.stdin, None);
     }
 
     #[test]
-    fn bypass_permissions_maps_to_agy_flag() {
+    fn exact_agy_modes_map_to_cli_flags() {
         let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
-        member.permission_mode = Some(PermissionMode::BypassPermissions);
-        member.sandbox = SandboxPolicy::DangerFullAccess;
+        member.permission_mode = Some(PermissionMode::AcceptEdits);
         let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
         let command = adapter.build_command("hi", None, None);
-
         assert!(
             command
                 .args
-                .contains(&"--dangerously-skip-permissions".to_string())
+                .windows(2)
+                .any(|w| w == ["--mode", "accept-edits"])
         );
-        assert!(!command.args.contains(&"--sandbox".to_string()));
     }
 
     #[test]
-    fn parser_accumulates_text_into_a_completed_message() {
-        let mut parser = AgyLineParser::new(None, PathBuf::from("/tmp/ws"));
+    fn parser_transmits_session_text_and_tool_events() {
+        let mut parser = AgyLineParser::default();
         let mut events = Vec::new();
-        events.extend(parser.parse_line("Hello"));
-        events.extend(parser.parse_line("world"));
-        events.extend(parser.finish());
+        for line in [
+            r#"{"event":"init","conversation_id":"2e7d0c67-f359-4cc6-ba40-dfeef04d80f8","init":{"cwd":"/tmp"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"pwd"}}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"pwd"},"output":"/tmp\n"}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response","text_delta":"OK\n"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"2e7d0c67-f359-4cc6-ba40-dfeef04d80f8","status":"SUCCESS","response":"OK\n"}}"#,
+        ] {
+            events.extend(parser.parse_line(line));
+        }
 
-        assert!(matches!(events[0], AgentEvent::TextDelta(_)));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            AgentEvent::MessageCompleted(text) if text == "Hello\nworld"
+        assert!(
+            events.contains(&AgentEvent::SessionDiscovered(AgentSessionId(
+                "2e7d0c67-f359-4cc6-ba40-dfeef04d80f8".to_string()
+            )))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::SessionDiscovered(_)))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStarted { id, name, .. }
+                if id == "agy-step-3" && name == "run_command"
         )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCompleted { id, ok: true, summary }
+                if id == "agy-step-3" && summary.contains("/tmp")
+        )));
+        assert!(events.contains(&AgentEvent::MessageCompleted("OK\n".to_string())));
     }
 
     #[test]
-    fn extracts_conversation_from_log() {
-        let text = "I0622 Created conversation 1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d\n";
-        assert_eq!(
-            extract_created_conversation(text),
-            Some("1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d".to_string())
+    fn failed_result_is_fatal() {
+        let mut parser = AgyLineParser::default();
+        let events = parser.parse_line(
+            r#"{"event":"result","result":{"conversation_id":"x","status":"ERROR","error":"rate limited"}}"#,
         );
+        assert!(events.contains(&AgentEvent::Fatal("rate limited".to_string())));
     }
 
     #[test]
-    fn discovers_session_from_cache_for_workspace() {
-        let dir = std::env::temp_dir().join(format!("asterline-agy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache = dir.join("last_conversations.json");
-        std::fs::write(
-            &cache,
-            r#"{"/tmp/ws":"1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d"}"#,
-        )
-        .unwrap();
-
-        let session = session_from_cache(&cache, Path::new("/tmp/ws"));
-        assert_eq!(
-            session,
-            Some("1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d".to_string())
+    fn final_response_repairs_replacement_characters_in_stream_deltas() {
+        let mut parser = AgyLineParser::default();
+        let mut events = parser.parse_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"拓扑���索"}}"#,
         );
+        events.extend(parser.parse_line(
+            r#"{"event":"result","result":{"conversation_id":"x","status":"SUCCESS","response":"拓扑检索"}}"#,
+        ));
 
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(events.contains(&AgentEvent::TextDelta("拓扑���索".to_string())));
+        assert!(events.contains(&AgentEvent::MessageCompleted("拓扑检索".to_string())));
     }
 }

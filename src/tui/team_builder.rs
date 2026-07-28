@@ -10,6 +10,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
 use crossterm::event::{self, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -22,6 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
+use crate::adapter::DiscoveredModel;
 use crate::domain::config::{DetectedBackends, default_member, default_team};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
@@ -31,8 +33,8 @@ use crate::tui::theme;
 
 #[derive(Debug)]
 enum ModelLoad {
-    Loading(Receiver<Result<Vec<String>, String>>),
-    Ready(Result<Vec<String>, String>),
+    Loading(Receiver<Result<Vec<DiscoveredModel>, String>>),
+    Ready(Result<Vec<DiscoveredModel>, String>),
 }
 
 #[derive(Debug, Default)]
@@ -42,11 +44,44 @@ pub(crate) struct ModelCatalog {
 
 pub(crate) enum ModelChoices {
     Loading,
-    Ready(Vec<String>),
+    Ready(Vec<DiscoveredModel>),
     Failed(String),
 }
 
 impl ModelCatalog {
+    pub(crate) fn preload(&mut self, backends: &[BackendKind], cwds: &[PathBuf]) {
+        for &backend in backends {
+            for cwd in cwds {
+                let _ = self.models(backend, cwd);
+            }
+        }
+    }
+
+    pub(crate) fn poll(&mut self) {
+        let keys = self.loads.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let result = match self.loads.get(&key) {
+                Some(ModelLoad::Loading(rx)) => match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err(
+                        "model discovery worker stopped unexpectedly".to_string(),
+                    )),
+                },
+                _ => None,
+            };
+            if let Some(result) = result {
+                self.loads.insert(key, ModelLoad::Ready(result));
+            }
+        }
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loads
+            .values()
+            .any(|load| matches!(load, ModelLoad::Loading(_)))
+    }
+
     pub(crate) fn models(&mut self, backend: BackendKind, cwd: &Path) -> ModelChoices {
         let key = (backend, cwd.to_path_buf());
         match self.loads.entry(key) {
@@ -79,12 +114,149 @@ impl ModelCatalog {
 
     #[cfg(test)]
     pub(crate) fn seed(&mut self, backend: BackendKind, cwd: &Path, models: Vec<String>) {
-        self.loads
-            .insert((backend, cwd.to_path_buf()), ModelLoad::Ready(Ok(models)));
+        self.loads.insert(
+            (backend, cwd.to_path_buf()),
+            ModelLoad::Ready(Ok(models
+                .into_iter()
+                .map(DiscoveredModel::simple)
+                .collect())),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, backend: BackendKind, cwd: &Path) -> bool {
+        self.loads.contains_key(&(backend, cwd.to_path_buf()))
+    }
+
+    fn is_loading_for(&self, backend: BackendKind, cwd: &Path) -> bool {
+        matches!(
+            self.loads.get(&(backend, cwd.to_path_buf())),
+            Some(ModelLoad::Loading(_))
+        )
+    }
+
+    fn discovered_model(
+        &self,
+        backend: BackendKind,
+        cwd: &Path,
+        selected: Option<&str>,
+    ) -> Option<&DiscoveredModel> {
+        let ModelLoad::Ready(Ok(models)) = self.loads.get(&(backend, cwd.to_path_buf()))? else {
+            return None;
+        };
+        match selected {
+            Some(id) => models.iter().find(|model| model.id == id),
+            None => models
+                .iter()
+                .find(|model| model.is_default)
+                .or_else(|| models.first()),
+        }
+    }
+
+    pub(crate) fn model_label(&self, member: &TeamMember, workspace: &Path) -> String {
+        let cwd = member.resolved_cwd(workspace);
+        let discovered = self.discovered_model(member.backend, &cwd, member.model.as_deref());
+        match (&member.model, discovered) {
+            (None, Some(model)) => model.name.clone(),
+            (None, None) if self.is_loading_for(member.backend, &cwd) => "loading…".to_string(),
+            (None, None) => "default".to_string(),
+            (Some(id), Some(model)) if model.name != *id => format!("{} · {id}", model.name),
+            (Some(id), _) => id.clone(),
+        }
+    }
+
+    pub(crate) fn efforts(&self, member: &TeamMember, workspace: &Path) -> Vec<Effort> {
+        let cwd = member.resolved_cwd(workspace);
+        let discovered = self.discovered_model(member.backend, &cwd, member.model.as_deref());
+        if let Some(model) = discovered
+            && !model.supported_efforts.is_empty()
+        {
+            return model.supported_efforts.clone();
+        }
+        backend_efforts(member.backend).to_vec()
+    }
+
+    pub(crate) fn effort_label(&self, member: &TeamMember, workspace: &Path) -> String {
+        if let Some(effort) = member.effort {
+            return effort.as_str().to_string();
+        }
+        let cwd = member.resolved_cwd(workspace);
+        if self.is_loading_for(member.backend, &cwd) {
+            return "loading…".to_string();
+        }
+        self.discovered_model(member.backend, &cwd, member.model.as_deref())
+            .and_then(|model| model.default_effort)
+            .map_or_else(
+                || "default".to_string(),
+                |effort| effort.as_str().to_string(),
+            )
+    }
+
+    pub(crate) fn backend_summary(&self, backend: BackendKind, cwd: &Path) -> String {
+        match self.loads.get(&(backend, cwd.to_path_buf())) {
+            None | Some(ModelLoad::Loading(_)) => "installed · loading models…".to_string(),
+            Some(ModelLoad::Ready(Err(err))) => {
+                format!("installed · model discovery failed: {}", one_line(err, 42))
+            }
+            Some(ModelLoad::Ready(Ok(models))) => {
+                let model_names = models
+                    .iter()
+                    .take(3)
+                    .map(|model| model.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let suffix = if models.len() > 3 { ", …" } else { "" };
+                let mut efforts = models
+                    .iter()
+                    .flat_map(|model| model.supported_efforts.iter().copied())
+                    .collect::<Vec<_>>();
+                if efforts.is_empty() {
+                    efforts.extend_from_slice(backend_efforts(backend));
+                } else {
+                    efforts.sort_by_key(|effort| effort_rank(*effort));
+                    efforts.dedup();
+                }
+                let efforts = efforts
+                    .iter()
+                    .map(|effort| effort.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                format!(
+                    "installed · {} model(s): {model_names}{suffix} · effort {efforts}",
+                    models.len()
+                )
+            }
+        }
     }
 }
 
-fn model_choices(result: &Result<Vec<String>, String>) -> ModelChoices {
+fn effort_rank(effort: Effort) -> usize {
+    match effort {
+        Effort::Low => 0,
+        Effort::Medium => 1,
+        Effort::High => 2,
+        Effort::Xhigh => 3,
+        Effort::Max => 4,
+        Effort::Ultra => 5,
+    }
+}
+
+fn one_line(value: &str, max: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= max {
+        value
+    } else {
+        format!(
+            "{}…",
+            value
+                .chars()
+                .take(max.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
+
+fn model_choices(result: &Result<Vec<DiscoveredModel>, String>) -> ModelChoices {
     match result {
         Ok(models) => ModelChoices::Ready(models.clone()),
         Err(err) => ModelChoices::Failed(err.clone()),
@@ -92,45 +264,354 @@ fn model_choices(result: &Result<Vec<String>, String>) -> ModelChoices {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ModelChoice {
+    value: Option<String>,
+    model: Option<DiscoveredModel>,
+}
+
+impl ModelChoice {
+    pub(crate) fn name(&self) -> &str {
+        if self.value.is_none() {
+            "default"
+        } else {
+            self.model
+                .as_ref()
+                .map_or("Custom model", |model| &model.name)
+        }
+    }
+
+    pub(crate) fn id(&self, backend: BackendKind) -> String {
+        match (&self.value, &self.model) {
+            (None, Some(model)) => format!("{} (CLI default)", model.id),
+            (None, None) => format!("{} CLI default", backend.as_str()),
+            (Some(value), _) => value.clone(),
+        }
+    }
+
+    fn supported_efforts(&self, backend: BackendKind) -> &[Effort] {
+        match &self.model {
+            Some(model) if !model.supported_efforts.is_empty() => &model.supported_efforts,
+            _ => backend_efforts(backend),
+        }
+    }
+
+    fn default_effort(&self) -> Option<Effort> {
+        self.model.as_ref().and_then(|model| model.default_effort)
+    }
+
+    fn default_effort_label(&self) -> String {
+        self.default_effort().map_or_else(
+            || "default".to_string(),
+            |effort| effort.as_str().to_string(),
+        )
+    }
+
+    fn effort_choices_label(&self, backend: BackendKind) -> String {
+        std::iter::once("default")
+            .chain(
+                self.supported_efforts(backend)
+                    .iter()
+                    .map(|effort| effort.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.model
+            .as_ref()
+            .and_then(|model| model.description.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelPicker {
-    options: Vec<Option<String>>,
+    backend: BackendKind,
+    options: Vec<ModelChoice>,
     selected: usize,
+    effort: Option<Effort>,
+    query: String,
 }
 
 impl ModelPicker {
-    pub(crate) fn new(current: Option<&str>, models: Vec<String>) -> Self {
-        let mut options = vec![None];
-        if let Some(current) = current
-            && !models.iter().any(|model| model == current)
-        {
-            options.push(Some(current.to_string()));
+    pub(crate) fn new(
+        backend: BackendKind,
+        current: Option<&str>,
+        current_effort: Option<Effort>,
+        models: Vec<DiscoveredModel>,
+    ) -> Self {
+        let has_discovered_models = !models.is_empty();
+        let mut options = Vec::new();
+        if !has_discovered_models {
+            options.push(ModelChoice {
+                value: None,
+                model: None,
+            });
         }
-        options.extend(models.into_iter().map(Some));
+        if let Some(current) = current
+            && !models.iter().any(|model| model.id == current)
+        {
+            options.push(ModelChoice {
+                value: Some(current.to_string()),
+                model: Some(DiscoveredModel::simple(current)),
+            });
+        }
+        options.extend(models.into_iter().map(|model| ModelChoice {
+            value: Some(model.id.clone()),
+            model: Some(model),
+        }));
         let selected = current
             .and_then(|current| {
                 options
                     .iter()
-                    .position(|model| model.as_deref() == Some(current))
+                    .position(|choice| choice.value.as_deref() == Some(current))
             })
+            .or_else(|| {
+                options
+                    .iter()
+                    .position(|choice| choice.model.as_ref().is_some_and(|model| model.is_default))
+            })
+            .unwrap_or(0);
+        let mut picker = Self {
+            backend,
+            options,
+            selected,
+            effort: current_effort,
+            query: String::new(),
+        };
+        picker.normalize_effort();
+        picker
+    }
+
+    pub(crate) fn backend(&self) -> BackendKind {
+        self.backend
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        &self.query
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        let query = self.query.trim().to_ascii_lowercase();
+        self.options
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| {
+                query.is_empty()
+                    || choice.name().to_ascii_lowercase().contains(&query)
+                    || choice
+                        .id(self.backend)
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                    || choice
+                        .description()
+                        .is_some_and(|text| text.to_ascii_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub(crate) fn window(&self, max: usize) -> (usize, Vec<&ModelChoice>) {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return (0, Vec::new());
+        }
+        let selected = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let max = max.max(1).min(visible.len());
+        let start = selected
+            .saturating_sub(max / 2)
+            .min(visible.len().saturating_sub(max));
+        (
+            start,
+            visible[start..start + max]
+                .iter()
+                .map(|index| &self.options[*index])
+                .collect(),
+        )
+    }
+
+    pub(crate) fn visible_len(&self) -> usize {
+        self.visible_indices().len()
+    }
+
+    pub(crate) fn selected_choice(&self) -> Option<&ModelChoice> {
+        self.options.get(self.selected)
+    }
+
+    pub(crate) fn up(&mut self) {
+        let visible = self.visible_indices();
+        let position = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        if let Some(index) = visible.get(position.saturating_sub(1)) {
+            self.selected = *index;
+            self.normalize_effort();
+        }
+    }
+
+    pub(crate) fn down(&mut self) {
+        let visible = self.visible_indices();
+        let position = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        if let Some(index) = visible.get(position + 1) {
+            self.selected = *index;
+            self.normalize_effort();
+        }
+    }
+
+    pub(crate) fn previous_effort(&mut self) {
+        let choices = self.selected_efforts().to_vec();
+        self.effort = match self
+            .effort
+            .and_then(|effort| choices.iter().position(|choice| *choice == effort))
+        {
+            None | Some(0) => None,
+            Some(index) => Some(choices[index - 1]),
+        };
+    }
+
+    pub(crate) fn next_effort(&mut self) {
+        let choices = self.selected_efforts().to_vec();
+        self.effort = match self
+            .effort
+            .and_then(|effort| choices.iter().position(|choice| *choice == effort))
+        {
+            None => choices.first().copied(),
+            Some(index) => choices
+                .get(index + 1)
+                .copied()
+                .or_else(|| choices.get(index).copied()),
+        };
+    }
+
+    pub(crate) fn push_query(&mut self, ch: char) {
+        self.query.push(ch);
+        self.select_first_visible();
+    }
+
+    pub(crate) fn pop_query(&mut self) {
+        self.query.pop();
+        self.select_first_visible();
+    }
+
+    pub(crate) fn clear_query(&mut self) {
+        self.query.clear();
+        self.select_first_visible();
+    }
+
+    fn select_first_visible(&mut self) {
+        if let Some(index) = self.visible_indices().first() {
+            self.selected = *index;
+            self.normalize_effort();
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<String> {
+        self.options
+            .get(self.selected)
+            .and_then(|choice| choice.value.clone())
+    }
+
+    fn selected_efforts(&self) -> &[Effort] {
+        self.selected_choice()
+            .map_or(&[], |choice| choice.supported_efforts(self.backend))
+    }
+
+    fn normalize_effort(&mut self) {
+        if self
+            .effort
+            .is_some_and(|effort| !self.selected_efforts().contains(&effort))
+        {
+            self.effort = None;
+        }
+        if self.effort.is_none()
+            && let Some(choice) = self.selected_choice()
+            && choice.value.is_some()
+            && let Some(effort) = choice.default_effort()
+            && choice.supported_efforts(self.backend).contains(&effort)
+        {
+            self.effort = Some(effort);
+        } else if self.effort.is_none()
+            && let Some(choice) = self.selected_choice()
+            && choice.value.is_some()
+            && let [only] = choice.supported_efforts(self.backend)
+        {
+            self.effort = Some(*only);
+        }
+    }
+
+    pub(crate) fn effort(&self) -> Option<Effort> {
+        self.effort
+    }
+
+    pub(crate) fn effort_label(&self) -> String {
+        self.effort.map_or_else(
+            || {
+                self.selected_choice()
+                    .map_or_else(|| "default".to_string(), ModelChoice::default_effort_label)
+            },
+            |effort| effort.as_str().to_string(),
+        )
+    }
+
+    pub(crate) fn effort_choices_label(&self) -> String {
+        self.selected_choice().map_or_else(
+            || "default".to_string(),
+            |choice| choice.effort_choices_label(self.backend),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackendChoice {
+    pub(crate) backend: BackendKind,
+    pub(crate) installed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendPicker {
+    options: Vec<BackendChoice>,
+    selected: usize,
+}
+
+impl BackendPicker {
+    pub(crate) fn new(current: BackendKind, detected: DetectedBackends) -> Self {
+        let options = [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ]
+        .into_iter()
+        .map(|backend| BackendChoice {
+            backend,
+            installed: detected.contains(backend),
+        })
+        .collect::<Vec<_>>();
+        let selected = options
+            .iter()
+            .position(|choice| choice.backend == current)
             .unwrap_or(0);
         Self { options, selected }
     }
 
-    pub(crate) fn options(&self) -> &[Option<String>] {
+    pub(crate) fn choices(&self) -> &[BackendChoice] {
         &self.options
     }
 
     pub(crate) fn selected(&self) -> usize {
         self.selected
-    }
-
-    pub(crate) fn window(&self, max: usize) -> (usize, &[Option<String>]) {
-        let max = max.max(1).min(self.options.len());
-        let start = self
-            .selected
-            .saturating_sub(max / 2)
-            .min(self.options.len().saturating_sub(max));
-        (start, &self.options[start..start + max])
     }
 
     pub(crate) fn up(&mut self) {
@@ -143,9 +624,187 @@ impl ModelPicker {
         }
     }
 
-    pub(crate) fn value(&self) -> Option<String> {
-        self.options.get(self.selected).cloned().flatten()
+    pub(crate) fn selected_choice(&self) -> Option<BackendChoice> {
+        self.options.get(self.selected).copied()
     }
+}
+
+pub(crate) fn backend_picker_lines(
+    picker: &BackendPicker,
+    catalog: &ModelCatalog,
+    cwd: &Path,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(" Agent CLI catalog", theme::accent_bold()),
+        Line::styled(
+            " Availability, models, and reasoning effort were loaded when Team opened.",
+            theme::muted(),
+        ),
+    ];
+    for (index, choice) in picker.choices().iter().enumerate() {
+        let selected = index == picker.selected();
+        let status = if choice.installed {
+            catalog.backend_summary(choice.backend, cwd)
+        } else {
+            "not installed on PATH".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ▶ " } else { "   " },
+                if selected {
+                    theme::warning_bold()
+                } else {
+                    theme::muted()
+                },
+            ),
+            Span::styled(
+                theme::pad_width(choice.backend.as_str(), 8),
+                if selected {
+                    theme::emphasis()
+                } else {
+                    Style::default().fg(theme::backend_color(choice.backend))
+                },
+            ),
+            Span::styled(
+                theme::clip_width(&status, width.saturating_sub(13)),
+                if choice.installed {
+                    theme::text()
+                } else {
+                    theme::muted()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::styled(
+        " ↑/↓ choose · Enter apply · Esc cancel",
+        theme::muted_italic(),
+    ));
+    lines
+}
+
+pub(crate) fn model_picker_lines(
+    picker: &ModelPicker,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(" Model catalog", theme::accent_bold()),
+        Line::from(vec![
+            Span::styled(" Search: ", theme::muted()),
+            Span::styled(
+                if picker.query().is_empty() {
+                    "type a model name or ID…".to_string()
+                } else {
+                    picker.query().to_string()
+                },
+                if picker.query().is_empty() {
+                    theme::muted_italic()
+                } else {
+                    theme::emphasis()
+                },
+            ),
+            Span::styled(
+                format!("  {} match(es)", picker.visible_len()),
+                theme::muted(),
+            ),
+        ]),
+    ];
+    if picker.visible_len() == 0 {
+        lines.push(Line::styled(" No matching models.", theme::muted()));
+        return lines;
+    }
+
+    let available = width.saturating_sub(7).max(30);
+    let name_width = (available * 24 / 100).max(10);
+    let id_width = (available * 43 / 100).max(12);
+    let effort_width = available.saturating_sub(name_width + id_width).max(8);
+    lines.push(Line::from(vec![
+        Span::styled("   Model", theme::muted()),
+        Span::styled(
+            theme::pad_width("", name_width.saturating_sub(5)),
+            theme::muted(),
+        ),
+        Span::styled("│ ID", theme::muted()),
+        Span::styled(
+            theme::pad_width("", id_width.saturating_sub(3)),
+            theme::muted(),
+        ),
+        Span::styled("│ Effort (←/→)", theme::muted()),
+    ]));
+
+    let (start, choices) = picker.window(max_rows);
+    if start > 0 {
+        lines.push(Line::styled("   …", theme::muted()));
+    }
+    for choice in choices {
+        let selected = picker
+            .selected_choice()
+            .is_some_and(|current| current == choice);
+        let row_style = if selected {
+            theme::emphasis()
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ▶ " } else { "   " },
+                if selected {
+                    theme::warning_bold()
+                } else {
+                    theme::muted()
+                },
+            ),
+            Span::styled(
+                theme::pad_width(&theme::clip_width(choice.name(), name_width), name_width),
+                row_style,
+            ),
+            Span::styled("│ ", theme::muted()),
+            Span::styled(
+                theme::pad_width(
+                    &theme::clip_width(&choice.id(picker.backend()), id_width.saturating_sub(2)),
+                    id_width.saturating_sub(2),
+                ),
+                row_style,
+            ),
+            Span::styled("│ ", theme::muted()),
+            Span::styled(
+                theme::clip_width(
+                    &if selected {
+                        picker.effort_label()
+                    } else {
+                        choice.default_effort_label()
+                    },
+                    effort_width.saturating_sub(2),
+                ),
+                if selected { row_style } else { theme::muted() },
+            ),
+        ]));
+    }
+    if start + max_rows.min(picker.visible_len()) < picker.visible_len() {
+        lines.push(Line::styled("   …", theme::muted()));
+    }
+    if let Some(description) = picker.selected_choice().and_then(ModelChoice::description) {
+        lines.push(Line::from(vec![
+            Span::styled(" About: ", theme::muted()),
+            Span::styled(
+                theme::clip_width(description, width.saturating_sub(8)),
+                theme::text(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(" Effort choices: ", theme::muted()),
+        Span::styled(
+            theme::clip_width(&picker.effort_choices_label(), width.saturating_sub(17)),
+            theme::text(),
+        ),
+    ]));
+    lines.push(Line::styled(
+        " Type to filter · ↑/↓ model · ←/→ effort · Enter apply both · Esc cancel",
+        theme::muted_italic(),
+    ));
+    lines
 }
 
 /// Pick a team interactively from the detected backends. Returns `None` if the
@@ -203,10 +862,15 @@ fn select_loop(
     available: &[BackendKind],
 ) -> io::Result<Option<TeamConfig>> {
     let mut state = BuilderState::new(workspace.to_path_buf(), available);
+    state.preload_agent_catalog();
 
     loop {
+        state.poll_agent_catalog();
         terminal.draw(|frame| render(frame, &state))?;
 
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if state.handle_key(key.code, key.modifiers) {
@@ -436,6 +1100,7 @@ impl EditState {
 
 struct BuilderState {
     workspace: PathBuf,
+    detected: DetectedBackends,
     available: Vec<BackendKind>,
     members: Vec<TeamMember>,
     selected: usize,
@@ -443,6 +1108,7 @@ struct BuilderState {
     field_mode: bool,
     editing: Option<EditState>,
     model_catalog: ModelCatalog,
+    backend_picker: Option<BackendPicker>,
     model_picker: Option<ModelPicker>,
     notice: Option<String>,
     cancelled: bool,
@@ -456,8 +1122,15 @@ impl BuilderState {
             member.id = MemberId::new(unique_member_id(member.id.as_str(), &members, None));
             members.push(member);
         }
+        let detected = DetectedBackends {
+            codex: available.contains(&BackendKind::Codex),
+            claude: available.contains(&BackendKind::Claude),
+            grok: available.contains(&BackendKind::Grok),
+            agy: available.contains(&BackendKind::Agy),
+        };
         Self {
             workspace,
+            detected,
             available: available.to_vec(),
             members,
             selected: 0,
@@ -465,15 +1138,46 @@ impl BuilderState {
             field_mode: false,
             editing: None,
             model_catalog: ModelCatalog::default(),
+            backend_picker: None,
             model_picker: None,
             notice: None,
             cancelled: false,
         }
     }
 
+    fn preload_agent_catalog(&mut self) {
+        self.model_catalog
+            .preload(&self.available, std::slice::from_ref(&self.workspace));
+        self.notice = Some("loading installed Agent model and effort catalogs…".to_string());
+    }
+
+    fn poll_agent_catalog(&mut self) {
+        self.model_catalog.poll();
+        if !self.model_catalog.is_loading()
+            && self
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("loading installed Agent"))
+        {
+            self.notice = Some("Agent model and effort catalogs loaded".to_string());
+        }
+    }
+
+    fn field_value(&self, member: &TeamMember, field: Field) -> String {
+        match field {
+            Field::Model => self.model_catalog.model_label(member, &self.workspace),
+            Field::Effort => self.model_catalog.effort_label(member, &self.workspace),
+            _ => field_value(member, field),
+        }
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self.backend_picker.is_some() {
+            self.handle_backend_picker_key(code);
+            return false;
+        }
         if self.model_picker.is_some() {
-            self.handle_model_picker_key(code);
+            self.handle_model_picker_key(code, modifiers);
             return false;
         }
         if self.editing.is_some() {
@@ -514,25 +1218,78 @@ impl BuilderState {
         false
     }
 
-    fn handle_model_picker_key(&mut self, code: KeyCode) {
+    fn handle_backend_picker_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => self.backend_picker.as_mut().unwrap().up(),
+            KeyCode::Down => self.backend_picker.as_mut().unwrap().down(),
+            KeyCode::Enter => {
+                let Some(choice) = self
+                    .backend_picker
+                    .as_ref()
+                    .and_then(BackendPicker::selected_choice)
+                else {
+                    return;
+                };
+                if !choice.installed {
+                    self.notice = Some(format!(
+                        "{} is not installed on PATH",
+                        choice.backend.as_str()
+                    ));
+                    return;
+                }
+                if self.selected_member().backend != choice.backend {
+                    let member = self.selected_member_mut();
+                    member.backend = choice.backend;
+                    member.session_id = None;
+                    member.model = None;
+                    member.effort = None;
+                }
+                self.backend_picker = None;
+                self.notice = Some("Agent CLI selected · press s to start".to_string());
+            }
+            KeyCode::Esc => self.backend_picker = None,
+            _ => {}
+        }
+    }
+
+    fn handle_model_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match code {
+            KeyCode::Up => {
                 if let Some(picker) = &mut self.model_picker {
                     picker.up();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Some(picker) = &mut self.model_picker {
                     picker.down();
                 }
             }
+            KeyCode::Left => self.model_picker.as_mut().unwrap().previous_effort(),
+            KeyCode::Right => self.model_picker.as_mut().unwrap().next_effort(),
             KeyCode::Enter => {
+                if self
+                    .model_picker
+                    .as_ref()
+                    .is_none_or(|picker| picker.visible_len() == 0)
+                {
+                    return;
+                }
                 let value = self.model_picker.as_ref().and_then(ModelPicker::value);
-                self.selected_member_mut().model = value;
+                let effort = self.model_picker.as_ref().and_then(ModelPicker::effort);
+                let member = self.selected_member_mut();
+                member.model = value;
+                member.effort = effort;
                 self.model_picker = None;
-                self.notice = Some("model selected · press s to start".to_string());
+                self.notice = Some("model and effort selected · press s to start".to_string());
             }
-            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            KeyCode::Backspace => self.model_picker.as_mut().unwrap().pop_query(),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.model_picker.as_mut().unwrap().clear_query();
+            }
+            KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.model_picker.as_mut().unwrap().push_query(ch);
+            }
+            KeyCode::Esc => self.model_picker = None,
             _ => {}
         }
     }
@@ -601,7 +1358,13 @@ impl BuilderState {
 
     fn activate_field(&mut self) {
         let field = self.selected_field();
-        if field == Field::Model {
+        if field == Field::Backend {
+            self.backend_picker = Some(BackendPicker::new(
+                self.selected_member().backend,
+                self.detected,
+            ));
+            self.notice = Some("↑/↓ choose an installed Agent CLI · Enter select".to_string());
+        } else if field == Field::Model {
             self.cycle_model();
         } else if field.is_text() {
             self.edit_selected_field();
@@ -613,10 +1376,12 @@ impl BuilderState {
     fn edit_selected_field(&mut self) {
         let field = self.selected_field();
         if field.is_text() {
-            self.editing = Some(EditState::new(
-                field,
-                field_value(self.selected_member(), field),
-            ));
+            let value = if field == Field::Model {
+                self.selected_member().model.clone().unwrap_or_default()
+            } else {
+                field_value(self.selected_member(), field)
+            };
+            self.editing = Some(EditState::new(field, value));
         }
     }
 
@@ -626,16 +1391,19 @@ impl BuilderState {
         match self.model_catalog.models(backend, &cwd) {
             ModelChoices::Loading => {
                 self.notice = Some(format!(
-                    "loading {} models in the background · press Enter again shortly",
+                    "{} model catalog is already loading automatically",
                     backend.as_str()
                 ));
             }
             ModelChoices::Ready(models) => {
                 self.model_picker = Some(ModelPicker::new(
+                    backend,
                     self.selected_member().model.as_deref(),
+                    self.selected_member().effort,
                     models,
                 ));
-                self.notice = Some("↑/↓ choose model · Enter select · Esc cancel".to_string());
+                self.notice =
+                    Some("↑/↓ choose model · ←/→ choose effort · Enter select".to_string());
             }
             ModelChoices::Failed(err) => self.notice = Some(err),
         }
@@ -643,16 +1411,18 @@ impl BuilderState {
 
     fn cycle_field(&mut self, field: Field) {
         match field {
-            Field::Backend => {
-                let current = self.selected_member().backend;
-                let next = cycle_backend(current, &self.available);
-                let member = self.selected_member_mut();
-                member.backend = next;
-                member.session_id = None;
-            }
             Field::Effort => {
-                let next = cycle_effort(self.selected_member().effort);
+                let choices = self
+                    .model_catalog
+                    .efforts(self.selected_member(), &self.workspace);
+                let next = cycle_effort(self.selected_member().effort, &choices);
                 self.selected_member_mut().effort = next;
+                if choices.is_empty() {
+                    self.notice = Some(format!(
+                        "{} does not support reasoning effort",
+                        self.selected_member().backend.as_str()
+                    ));
+                }
             }
             Field::Sandbox => {
                 let next = cycle_sandbox(self.selected_member().sandbox);
@@ -697,14 +1467,15 @@ impl BuilderState {
                 }
             }
             Field::Model => {
-                self.selected_member_mut().model = if value.is_empty() || value == "default" {
-                    None
-                } else {
-                    Some(value.to_string())
-                };
+                self.selected_member_mut().model =
+                    if value.is_empty() || value.eq_ignore_ascii_case("default") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
             }
             Field::SessionId => {
-                let session_id = if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                let session_id = if value.is_empty() || value.eq_ignore_ascii_case("default") {
                     None
                 } else {
                     Some(value.to_string())
@@ -743,11 +1514,13 @@ impl BuilderState {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
-    let picker_height = state
+    let model_picker_height = state
         .model_picker
         .as_ref()
-        .map(|picker| picker.window(8).1.len() as u16 + 3)
+        .map(|picker| picker.window(8).1.len() as u16 + 7)
         .unwrap_or(0);
+    let backend_picker_height = state.backend_picker.as_ref().map_or(0, |_| 8);
+    let picker_height = model_picker_height + backend_picker_height;
     let height = (state.members.len() as u16 + 22 + picker_height).min(frame.area().height);
     let area = centered(frame.area(), 92, height);
     let block = Block::default()
@@ -826,17 +1599,17 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
             Span::styled(
                 format!(
                     "model={} ",
-                    theme::clip_width(member.model.as_deref().unwrap_or("default"), model_w)
+                    theme::clip_width(
+                        &state.model_catalog.model_label(member, &state.workspace),
+                        model_w
+                    )
                 ),
                 muted_style,
             ),
             Span::styled(
                 format!(
                     "effort={}",
-                    member
-                        .effort
-                        .map(|effort| effort.as_str())
-                        .unwrap_or("default")
+                    state.model_catalog.effort_label(member, &state.workspace)
                 ),
                 muted_style,
             ),
@@ -853,7 +1626,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     lines.push(Line::from(vec![
         Span::styled("     handle: ", theme::muted()),
         Span::styled(format!("@{}", selected.id), theme::accent()),
-        Span::styled(" (auto)", theme::muted()),
+        Span::styled(" (generated)", theme::muted()),
     ]));
     for (idx, field) in Field::ALL.iter().enumerate() {
         let selected_field = state.field_mode && idx == state.field;
@@ -867,43 +1640,25 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
                 " {} {:>10}: {}",
                 if selected_field { "›" } else { " " },
                 field.label(),
-                field_value(selected, *field)
+                state.field_value(selected, *field)
             ),
             style,
         )));
     }
 
+    if let Some(picker) = &state.backend_picker {
+        lines.push(Line::raw(""));
+        lines.extend(backend_picker_lines(
+            picker,
+            &state.model_catalog,
+            &state.selected_member().resolved_cwd(&state.workspace),
+            avail,
+        ));
+    }
+
     if let Some(picker) = &state.model_picker {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(" Model choices", theme::accent_bold()));
-        let (start, options) = picker.window(8);
-        if start > 0 {
-            lines.push(Line::styled("    …", theme::muted()));
-        }
-        for (offset, model) in options.iter().enumerate() {
-            let selected = start + offset == picker.selected();
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if selected { "  › " } else { "    " },
-                    if selected {
-                        theme::editor_focus()
-                    } else {
-                        theme::muted()
-                    },
-                ),
-                Span::styled(
-                    model.as_deref().unwrap_or("default").to_string(),
-                    if selected {
-                        theme::emphasis()
-                    } else {
-                        theme::text()
-                    },
-                ),
-            ]));
-        }
-        if start + options.len() < picker.options().len() {
-            lines.push(Line::styled("    …", theme::muted()));
-        }
+        lines.extend(model_picker_lines(picker, avail, 8));
     }
 
     lines.push(Line::raw(""));
@@ -913,7 +1668,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     if state.editing.is_none() {
         lines.push(Line::from(Span::styled(
             if state.field_mode {
-                "↑/↓ field · Enter edit/cycle · e manual model · s start · Esc members"
+                "↑/↓ field · Enter edit/choose · e manual model · s start · Esc members"
             } else {
                 "↑/↓ member · Enter fields · a add · d delete · s start · Esc quit"
             },
@@ -1028,7 +1783,7 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
         Field::SessionId => member
             .session_id
             .clone()
-            .unwrap_or_else(|| "auto".to_string()),
+            .unwrap_or_else(|| "default".to_string()),
         Field::Cwd => member
             .cwd
             .as_ref()
@@ -1037,25 +1792,38 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
     }
 }
 
-pub(crate) fn cycle_backend(current: BackendKind, available: &[BackendKind]) -> BackendKind {
-    if available.is_empty() {
-        return current;
+pub(crate) fn backend_efforts(backend: BackendKind) -> &'static [Effort] {
+    const STANDARD: &[Effort] = &[
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ];
+    const CODEX: &[Effort] = &[
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+        Effort::Ultra,
+    ];
+    const AGY: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High];
+    match backend {
+        BackendKind::Codex => CODEX,
+        BackendKind::Claude | BackendKind::Grok => STANDARD,
+        BackendKind::Agy => AGY,
     }
-    let index = available
-        .iter()
-        .position(|backend| *backend == current)
-        .unwrap_or(0);
-    available[(index + 1) % available.len()]
 }
 
-pub(crate) fn cycle_effort(current: Option<Effort>) -> Option<Effort> {
-    match current {
-        None => Some(Effort::Low),
-        Some(Effort::Low) => Some(Effort::Medium),
-        Some(Effort::Medium) => Some(Effort::High),
-        Some(Effort::High) => Some(Effort::Xhigh),
-        Some(Effort::Xhigh) => Some(Effort::Max),
-        Some(Effort::Max) => None,
+pub(crate) fn cycle_effort(current: Option<Effort>, choices: &[Effort]) -> Option<Effort> {
+    if choices.is_empty() {
+        return None;
+    }
+    match current.and_then(|effort| choices.iter().position(|choice| *choice == effort)) {
+        None => Some(choices[0]),
+        Some(index) if index + 1 < choices.len() => Some(choices[index + 1]),
+        Some(_) => None,
     }
 }
 
@@ -1195,10 +1963,13 @@ mod tests {
 
         state.activate_field();
         assert!(state.model_picker.is_some());
-        state.handle_model_picker_key(KeyCode::Down);
-        state.handle_model_picker_key(KeyCode::Down);
-        state.handle_model_picker_key(KeyCode::Enter);
+        state.handle_model_picker_key(KeyCode::Down, KeyModifiers::NONE);
+        state.handle_model_picker_key(KeyCode::Down, KeyModifiers::NONE);
+        state.handle_model_picker_key(KeyCode::Right, KeyModifiers::NONE);
+        state.handle_model_picker_key(KeyCode::Right, KeyModifiers::NONE);
+        state.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(state.members[0].model.as_deref(), Some("grok-4.5"));
+        assert_eq!(state.members[0].effort, Some(Effort::Medium));
     }
 
     #[test]
@@ -1224,16 +1995,219 @@ mod tests {
             panic!("expected second project model");
         };
 
-        assert_eq!(one, vec!["project-one"]);
-        assert_eq!(two, vec!["project-two"]);
+        assert_eq!(one[0].id, "project-one");
+        assert_eq!(two[0].id, "project-two");
     }
 
     #[test]
     fn model_picker_preserves_a_current_custom_model() {
-        let picker = ModelPicker::new(Some("company-model"), vec!["sonnet".to_string()]);
+        let picker = ModelPicker::new(
+            BackendKind::Claude,
+            Some("company-model"),
+            Some(Effort::High),
+            vec![DiscoveredModel::simple("sonnet")],
+        );
 
         assert_eq!(picker.value().as_deref(), Some("company-model"));
-        assert_eq!(picker.selected(), 1);
+        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.effort(), Some(Effort::High));
+    }
+
+    #[test]
+    fn agy_effort_qualified_model_applies_model_and_effort_together() {
+        let mut model = DiscoveredModel::simple("gemini-3.6-flash-high");
+        model.default_effort = Some(Effort::High);
+        model.supported_efforts = vec![Effort::High];
+        let picker = ModelPicker::new(
+            BackendKind::Agy,
+            Some("gemini-3.6-flash-high"),
+            None,
+            vec![model],
+        );
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &[BackendKind::Agy]);
+        state.model_picker = Some(picker);
+
+        state.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            state.members[0].model.as_deref(),
+            Some("gemini-3.6-flash-high")
+        );
+        assert_eq!(state.members[0].effort, Some(Effort::High));
+    }
+
+    #[test]
+    fn backend_picker_shows_installation_models_and_effort() {
+        let detected = DetectedBackends {
+            codex: true,
+            claude: false,
+            grok: false,
+            agy: false,
+        };
+        let picker = BackendPicker::new(BackendKind::Codex, detected);
+        let mut catalog = ModelCatalog::default();
+        catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-test".to_string()],
+        );
+
+        let text = backend_picker_lines(&picker, &catalog, Path::new("/tmp/ws"), 120)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("codex"));
+        assert!(text.contains("installed · 1 model(s): gpt-test"));
+        assert!(text.contains("effort low/medium/high/xhigh/max/ultra"));
+        assert!(text.contains("claude"));
+        assert!(text.contains("not installed on PATH"));
+    }
+
+    #[test]
+    fn model_picker_filters_names_ids_and_descriptions() {
+        let mut sol = DiscoveredModel::simple("gpt-5.6-sol");
+        sol.name = "GPT-5.6-Sol".to_string();
+        sol.description = Some("Frontier coding model".to_string());
+        sol.is_default = true;
+        let mut picker = ModelPicker::new(
+            BackendKind::Codex,
+            None,
+            None,
+            vec![sol, DiscoveredModel::simple("gpt-5.4-mini")],
+        );
+
+        for ch in "frontier".chars() {
+            picker.push_query(ch);
+        }
+        assert_eq!(picker.visible_len(), 1);
+        assert_eq!(picker.value().as_deref(), Some("gpt-5.6-sol"));
+        picker.clear_query();
+        for ch in "mini".chars() {
+            picker.push_query(ch);
+        }
+        assert_eq!(picker.visible_len(), 1);
+        assert_eq!(picker.value().as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn catalog_shows_detected_model_and_effort_without_default_prefix() {
+        let mut model = DiscoveredModel::simple("gpt-5.6-sol");
+        model.name = "GPT-5.6-Sol".to_string();
+        model.default_effort = Some(Effort::Medium);
+        model.supported_efforts = vec![Effort::Low, Effort::Medium, Effort::High];
+        model.is_default = true;
+        let mut catalog = ModelCatalog::default();
+        catalog.loads.insert(
+            (BackendKind::Codex, PathBuf::from("/tmp/ws")),
+            ModelLoad::Ready(Ok(vec![model])),
+        );
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+
+        assert_eq!(
+            catalog.model_label(&member, Path::new("/tmp/ws")),
+            "GPT-5.6-Sol"
+        );
+        assert_eq!(
+            catalog.effort_label(&member, Path::new("/tmp/ws")),
+            "medium"
+        );
+        assert_eq!(
+            catalog.efforts(&member, Path::new("/tmp/ws")),
+            vec![Effort::Low, Effort::Medium, Effort::High]
+        );
+    }
+
+    #[test]
+    fn catalog_and_picker_use_first_detected_model_when_none_is_marked_default() {
+        let mut catalog = ModelCatalog::default();
+        catalog.seed(
+            BackendKind::Claude,
+            Path::new("/tmp/ws"),
+            vec![
+                "claude-sonnet-4-6".to_string(),
+                "claude-opus-4-6".to_string(),
+            ],
+        );
+        let member = TeamMember::new("builder", "Builder", BackendKind::Claude, "impl");
+        let ModelChoices::Ready(models) = catalog.models(BackendKind::Claude, Path::new("/tmp/ws"))
+        else {
+            panic!("expected detected models");
+        };
+        let picker = ModelPicker::new(BackendKind::Claude, None, None, models);
+
+        assert_eq!(
+            catalog.model_label(&member, Path::new("/tmp/ws")),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(picker.visible_len(), 2);
+        assert_eq!(picker.value().as_deref(), Some("claude-sonnet-4-6"));
+        assert_ne!(
+            picker.selected_choice().map(ModelChoice::name),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn model_picker_keeps_default_only_when_discovery_is_empty() {
+        let picker = ModelPicker::new(BackendKind::Claude, None, None, Vec::new());
+
+        assert_eq!(picker.visible_len(), 1);
+        assert_eq!(picker.value(), None);
+        assert_eq!(
+            picker.selected_choice().map(ModelChoice::name),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn catalog_shows_loading_instead_of_default_while_discovery_runs() {
+        let (_tx, rx) = mpsc::channel();
+        let mut catalog = ModelCatalog::default();
+        catalog.loads.insert(
+            (BackendKind::Codex, PathBuf::from("/tmp/ws")),
+            ModelLoad::Loading(rx),
+        );
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+
+        assert_eq!(
+            catalog.model_label(&member, Path::new("/tmp/ws")),
+            "loading…"
+        );
+        assert_eq!(
+            catalog.effort_label(&member, Path::new("/tmp/ws")),
+            "loading…"
+        );
+    }
+
+    #[test]
+    fn unset_model_effort_and_session_use_default_label() {
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+
+        assert_eq!(field_value(&member, Field::Model), "default");
+        assert_eq!(field_value(&member, Field::Effort), "default");
+        assert_eq!(field_value(&member, Field::SessionId), "default");
+    }
+
+    #[test]
+    fn effort_cycle_uses_only_available_levels() {
+        let choices = [Effort::Low, Effort::High];
+        assert_eq!(cycle_effort(None, &choices), Some(Effort::Low));
+        assert_eq!(
+            cycle_effort(Some(Effort::Low), &choices),
+            Some(Effort::High)
+        );
+        assert_eq!(cycle_effort(Some(Effort::High), &choices), None);
+        assert_eq!(
+            cycle_effort(Some(Effort::Ultra), &choices),
+            Some(Effort::Low)
+        );
+        assert_eq!(cycle_effort(None, &[]), None);
     }
 
     #[test]

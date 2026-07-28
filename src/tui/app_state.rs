@@ -9,21 +9,21 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::domain::event::{
-    ApprovalId, ChatItem, LogEntry, MemberStatus, MessageId, MessageTarget, RuntimeEvent,
-    WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepStatus,
+    ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId, MessageTarget,
+    RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
 };
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember,
 };
+use crate::run_support::suggested_verify_command;
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, AgentSkill, Completion};
 use crate::tui::composer::Composer;
 use crate::tui::drawers::Drawer;
 use crate::tui::skills::SkillInfo;
 use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
-use crate::workflow::suggested_verify_command;
 
 const MAX_LOGS: usize = 4000;
 
@@ -80,10 +80,10 @@ pub struct AppState {
     message_index: HashMap<MessageId, usize>,
     tool_index: HashMap<String, usize>,
     logs: Vec<LogEntry>,
-    workflow_runs: Vec<WorkflowRunSummary>,
-    selected_workflow_run: Option<WorkflowRunId>,
-    selected_workflow_step: Option<u32>,
-    workflow_runs_detail: bool,
+    runs: Vec<RunSummary>,
+    selected_run: Option<RunId>,
+    selected_run_step: Option<u32>,
+    runs_detail: bool,
     pending_approvals: Vec<PendingApproval>,
     paused_routes: usize,
     composer: Composer,
@@ -123,6 +123,8 @@ pub struct AppState {
     team_editor: Option<TeamEditor>,
     skills: Vec<SkillInfo>,
     selected_skill: usize,
+    resume_choices: Vec<ConversationSummary>,
+    selected_resume: usize,
 }
 
 impl AppState {
@@ -148,10 +150,10 @@ impl AppState {
             message_index: HashMap::new(),
             tool_index: HashMap::new(),
             logs: Vec::new(),
-            workflow_runs: Vec::new(),
-            selected_workflow_run: None,
-            selected_workflow_step: None,
-            workflow_runs_detail: false,
+            runs: Vec::new(),
+            selected_run: None,
+            selected_run_step: None,
+            runs_detail: false,
             pending_approvals: Vec::new(),
             paused_routes: 0,
             composer: Composer::new(),
@@ -178,6 +180,8 @@ impl AppState {
             team_editor: None,
             skills: Vec::new(),
             selected_skill: 0,
+            resume_choices: Vec::new(),
+            selected_resume: 0,
         }
     }
 
@@ -199,15 +203,15 @@ impl AppState {
                 workspace,
                 default_target,
                 members,
-                workflow_runs,
+                runs,
             } => {
                 self.team = team;
                 self.skills = crate::tui::skills::discover(Path::new(&workspace));
                 self.workspace = workspace;
                 self.default_target = default_target;
-                self.workflow_runs = workflow_runs;
-                self.ensure_selected_workflow_run();
-                self.ensure_selected_workflow_step();
+                self.runs = runs;
+                self.ensure_selected_run();
+                self.ensure_selected_run_step();
                 self.members = members
                     .into_iter()
                     .map(|m| MemberView {
@@ -408,14 +412,14 @@ impl AppState {
                     message,
                 });
             }
-            RuntimeEvent::WorkflowRunUpdated { run } => {
-                if let Some(existing) = self.workflow_runs.iter_mut().find(|r| r.id == run.id) {
+            RuntimeEvent::RunUpdated { run } => {
+                if let Some(existing) = self.runs.iter_mut().find(|r| r.id == run.id) {
                     *existing = run;
                 } else {
-                    self.workflow_runs.push(run);
+                    self.runs.push(run);
                 }
-                self.ensure_selected_workflow_run();
-                self.ensure_selected_workflow_step();
+                self.ensure_selected_run();
+                self.ensure_selected_run_step();
             }
             RuntimeEvent::Verdict {
                 member,
@@ -440,7 +444,9 @@ impl AppState {
             }
             RuntimeEvent::SessionReset => {
                 // Begin a fresh chat: clear the transcript and in-flight cells,
-                // but keep members, logs, and prompt history.
+                // but keep members, logs, and prompt history. Runs belong to
+                // the previous conversation and remain reachable via /resume.
+                self.active_mode = TerminalMode::Normal;
                 self.chat.clear();
                 self.message_index.clear();
                 self.tool_index.clear();
@@ -448,7 +454,33 @@ impl AppState {
                 self.pending_user_messages.clear();
                 self.last_message_target = None;
                 self.running_since.clear();
+                self.runs.clear();
+                self.selected_run = None;
+                self.selected_run_step = None;
+                self.runs_detail = false;
                 self.scroll = 0;
+            }
+            RuntimeEvent::ResumeChoices { conversations } => {
+                self.resume_choices = conversations;
+                self.selected_resume = 0;
+                self.drawer = Some(Drawer::Resume);
+                self.drawer_scroll = 0;
+                self.team_editor = None;
+            }
+            RuntimeEvent::ConversationResumed { chat, .. } => {
+                self.chat = chat;
+                self.message_index.clear();
+                self.tool_index.clear();
+                self.active_reasoning.clear();
+                self.pending_user_messages.clear();
+                self.pending_approvals.clear();
+                self.paused_routes = 0;
+                self.last_message_target = None;
+                self.running_since.clear();
+                self.find = None;
+                self.scroll = 0;
+                self.drawer = None;
+                self.drawer_scroll = 0;
             }
         }
     }
@@ -614,43 +646,43 @@ impl AppState {
     pub fn logs(&self) -> &[LogEntry] {
         &self.logs
     }
-    pub fn workflow_runs(&self) -> &[WorkflowRunSummary] {
-        &self.workflow_runs
+    pub fn runs(&self) -> &[RunSummary] {
+        &self.runs
     }
-    pub fn latest_workflow_run(&self) -> Option<&WorkflowRunSummary> {
-        self.workflow_runs.last()
+    pub fn latest_run(&self) -> Option<&RunSummary> {
+        self.runs.last()
     }
-    pub fn latest_workflow_action_command(&self) -> Option<String> {
-        self.latest_workflow_run()
-            .map(|run| workflow_action_command(run, &self.workspace, false))
+    pub fn latest_run_action_command(&self) -> Option<String> {
+        self.latest_run()
+            .map(|run| run_action_command(run, &self.workspace, false))
     }
-    pub fn selected_workflow_run(&self) -> Option<&WorkflowRunSummary> {
-        self.selected_workflow_run
-            .and_then(|id| self.workflow_runs.iter().find(|run| run.id == id))
-            .or_else(|| self.latest_workflow_run())
+    pub fn selected_run(&self) -> Option<&RunSummary> {
+        self.selected_run
+            .and_then(|id| self.runs.iter().find(|run| run.id == id))
+            .or_else(|| self.latest_run())
     }
-    pub fn selected_workflow_step(&self) -> Option<u32> {
-        let run = self.selected_workflow_run()?;
-        self.selected_workflow_step
+    pub fn selected_run_step(&self) -> Option<u32> {
+        let run = self.selected_run()?;
+        self.selected_run_step
             .filter(|step| run.steps.iter().any(|candidate| candidate.number == *step))
     }
-    pub fn selected_workflow_action_command(&self) -> Option<String> {
-        self.selected_workflow_run()
-            .map(|run| workflow_action_command(run, &self.workspace, true))
+    pub fn selected_run_action_command(&self) -> Option<String> {
+        self.selected_run()
+            .map(|run| run_action_command(run, &self.workspace, true))
     }
-    pub fn selected_workflow_stage_command(&self) -> Option<String> {
-        let run = self.selected_workflow_run()?;
-        self.selected_workflow_step()
-            .and_then(|step| workflow_step_action_command(run, step))
-            .or_else(|| Some(workflow_action_command(run, &self.workspace, true)))
+    pub fn selected_run_stage_command(&self) -> Option<String> {
+        let run = self.selected_run()?;
+        self.selected_run_step()
+            .and_then(|step| run_step_action_command(run, step))
+            .or_else(|| Some(run_action_command(run, &self.workspace, true)))
     }
-    pub fn selected_workflow_dispatch_command(&self) -> Option<String> {
-        let run = self.selected_workflow_run()?;
-        let step = self.selected_workflow_step()?;
-        workflow_step_dispatch_command(run, step)
+    pub fn selected_run_dispatch_command(&self) -> Option<String> {
+        let run = self.selected_run()?;
+        let step = self.selected_run_step()?;
+        run_step_dispatch_command(run, step)
     }
-    pub fn workflow_runs_detail(&self) -> bool {
-        self.workflow_runs_detail
+    pub fn runs_detail(&self) -> bool {
+        self.runs_detail
     }
     pub fn pending_approvals(&self) -> &[PendingApproval] {
         &self.pending_approvals
@@ -1160,7 +1192,7 @@ impl AppState {
                 Drawer::Team => self.open_team_editor(),
                 Drawer::Runs => {
                     self.team_editor = None;
-                    self.ensure_selected_workflow_run();
+                    self.ensure_selected_run();
                 }
                 _ => {
                     self.team_editor = None;
@@ -1178,6 +1210,35 @@ impl AppState {
 
     pub fn skills(&self) -> &[SkillInfo] {
         &self.skills
+    }
+
+    pub fn resume_choices(&self) -> &[ConversationSummary] {
+        &self.resume_choices
+    }
+
+    pub fn selected_resume(&self) -> usize {
+        self.selected_resume
+    }
+
+    pub fn select_previous_resume(&mut self) {
+        self.selected_resume = self.selected_resume.saturating_sub(1);
+        self.drawer_scroll = self.selected_resume.saturating_mul(3);
+    }
+
+    pub fn select_next_resume(&mut self) {
+        if self.selected_resume + 1 < self.resume_choices.len() {
+            self.selected_resume += 1;
+            self.drawer_scroll = self.selected_resume.saturating_mul(3);
+        }
+    }
+
+    pub fn selected_resume_command(&self) -> Option<UiCommand> {
+        (self.drawer == Some(Drawer::Resume))
+            .then(|| self.resume_choices.get(self.selected_resume))
+            .flatten()
+            .map(|conversation| UiCommand::ResumeConversation {
+                conversation: conversation.id,
+            })
     }
 
     pub fn selected_skill(&self) -> usize {
@@ -1223,11 +1284,11 @@ impl AppState {
         self.team_editor = None;
     }
 
-    pub fn stage_selected_workflow_action(&mut self) -> bool {
+    pub fn stage_selected_run_action(&mut self) -> bool {
         if self.drawer != Some(Drawer::Runs) || !self.composer.is_empty() {
             return false;
         }
-        let Some(command) = self.selected_workflow_stage_command() else {
+        let Some(command) = self.selected_run_stage_command() else {
             return false;
         };
         self.disarm_quit();
@@ -1239,11 +1300,11 @@ impl AppState {
         true
     }
 
-    pub fn stage_selected_workflow_dispatch(&mut self) -> bool {
+    pub fn stage_selected_run_dispatch(&mut self) -> bool {
         if self.drawer != Some(Drawer::Runs) || !self.composer.is_empty() {
             return false;
         }
-        let Some(command) = self.selected_workflow_dispatch_command() else {
+        let Some(command) = self.selected_run_dispatch_command() else {
             return false;
         };
         self.disarm_quit();
@@ -1255,66 +1316,66 @@ impl AppState {
         true
     }
 
-    pub fn toggle_workflow_runs_detail(&mut self) -> bool {
+    pub fn toggle_runs_detail(&mut self) -> bool {
         if self.drawer != Some(Drawer::Runs) || !self.composer.is_empty() {
             return false;
         }
         self.disarm_quit();
-        self.workflow_runs_detail = !self.workflow_runs_detail;
+        self.runs_detail = !self.runs_detail;
         self.drawer_scroll = 0;
         true
     }
 
-    pub fn select_newer_workflow_run(&mut self) {
+    pub fn select_newer_run(&mut self) {
         if self.drawer != Some(Drawer::Runs) {
             return;
         }
         self.disarm_quit();
-        self.selected_workflow_step = None;
-        self.ensure_selected_workflow_run();
-        let Some(id) = self.selected_workflow_run else {
+        self.selected_run_step = None;
+        self.ensure_selected_run();
+        let Some(id) = self.selected_run else {
             return;
         };
-        let Some(index) = self.workflow_run_index(id) else {
+        let Some(index) = self.run_index(id) else {
             return;
         };
-        if index + 1 < self.workflow_runs.len() {
-            self.selected_workflow_run = Some(self.workflow_runs[index + 1].id);
+        if index + 1 < self.runs.len() {
+            self.selected_run = Some(self.runs[index + 1].id);
         }
     }
 
-    pub fn select_older_workflow_run(&mut self) {
+    pub fn select_older_run(&mut self) {
         if self.drawer != Some(Drawer::Runs) {
             return;
         }
         self.disarm_quit();
-        self.selected_workflow_step = None;
-        self.ensure_selected_workflow_run();
-        let Some(id) = self.selected_workflow_run else {
+        self.selected_run_step = None;
+        self.ensure_selected_run();
+        let Some(id) = self.selected_run else {
             return;
         };
-        let Some(index) = self.workflow_run_index(id) else {
+        let Some(index) = self.run_index(id) else {
             return;
         };
         if index > 0 {
-            self.selected_workflow_run = Some(self.workflow_runs[index - 1].id);
+            self.selected_run = Some(self.runs[index - 1].id);
         }
     }
 
-    pub fn select_previous_workflow_step(&mut self) -> bool {
+    pub fn select_previous_run_step(&mut self) -> bool {
         if self.drawer != Some(Drawer::Runs) {
             return false;
         }
         self.disarm_quit();
-        let Some(run) = self.selected_workflow_run() else {
-            self.selected_workflow_step = None;
+        let Some(run) = self.selected_run() else {
+            self.selected_run_step = None;
             return false;
         };
         if run.steps.is_empty() {
-            self.selected_workflow_step = None;
+            self.selected_run_step = None;
             return false;
         }
-        let next = match self.selected_workflow_step() {
+        let next = match self.selected_run_step() {
             None => run.steps.last().map(|step| step.number),
             Some(number) => run
                 .steps
@@ -1325,24 +1386,24 @@ impl AppState {
                 .map(|step| step.number),
         }
         .or_else(|| run.steps.first().map(|step| step.number));
-        self.selected_workflow_step = next;
+        self.selected_run_step = next;
         true
     }
 
-    pub fn select_next_workflow_step(&mut self) -> bool {
+    pub fn select_next_run_step(&mut self) -> bool {
         if self.drawer != Some(Drawer::Runs) {
             return false;
         }
         self.disarm_quit();
-        let Some(run) = self.selected_workflow_run() else {
-            self.selected_workflow_step = None;
+        let Some(run) = self.selected_run() else {
+            self.selected_run_step = None;
             return false;
         };
         if run.steps.is_empty() {
-            self.selected_workflow_step = None;
+            self.selected_run_step = None;
             return false;
         }
-        let next = match self.selected_workflow_step() {
+        let next = match self.selected_run_step() {
             None => run.steps.first().map(|step| step.number),
             Some(number) => run
                 .steps
@@ -1352,34 +1413,34 @@ impl AppState {
                 .map(|step| step.number),
         }
         .or_else(|| run.steps.last().map(|step| step.number));
-        self.selected_workflow_step = next;
+        self.selected_run_step = next;
         true
     }
 
-    fn ensure_selected_workflow_run(&mut self) {
+    fn ensure_selected_run(&mut self) {
         let selected_is_valid = self
-            .selected_workflow_run
-            .is_some_and(|id| self.workflow_runs.iter().any(|run| run.id == id));
+            .selected_run
+            .is_some_and(|id| self.runs.iter().any(|run| run.id == id));
         if !selected_is_valid {
-            self.selected_workflow_run = self.workflow_runs.last().map(|run| run.id);
-            self.selected_workflow_step = None;
+            self.selected_run = self.runs.last().map(|run| run.id);
+            self.selected_run_step = None;
         }
     }
 
-    fn ensure_selected_workflow_step(&mut self) {
-        let Some(step) = self.selected_workflow_step else {
+    fn ensure_selected_run_step(&mut self) {
+        let Some(step) = self.selected_run_step else {
             return;
         };
         let step_is_valid = self
-            .selected_workflow_run()
+            .selected_run()
             .is_some_and(|run| run.steps.iter().any(|candidate| candidate.number == step));
         if !step_is_valid {
-            self.selected_workflow_step = None;
+            self.selected_run_step = None;
         }
     }
 
-    fn workflow_run_index(&self, id: WorkflowRunId) -> Option<usize> {
-        self.workflow_runs.iter().position(|run| run.id == id)
+    fn run_index(&self, id: RunId) -> Option<usize> {
+        self.runs.iter().position(|run| run.id == id)
     }
 
     /// The drawer's vertical scroll offset (top line to show).
@@ -1430,18 +1491,26 @@ impl AppState {
             .is_some_and(|editor| editor.insert_edit_text(text))
     }
 
+    pub(crate) fn poll_team_editor_catalog(&mut self) {
+        if let Some(editor) = self.team_editor.as_mut() {
+            editor.poll_agent_catalog();
+        }
+    }
+
     fn open_team_editor(&mut self) {
         let members = self
             .members
             .iter()
             .map(|view| self.view_to_member(view))
             .collect();
-        self.team_editor = Some(TeamEditor::new(
+        let mut editor = TeamEditor::new(
             self.team.clone(),
             PathBuf::from(self.workspace.clone()),
             self.default_target.clone(),
             members,
-        ));
+        );
+        editor.load_agent_catalog();
+        self.team_editor = Some(editor);
     }
 
     fn view_to_member(&self, view: &MemberView) -> TeamMember {
@@ -1559,14 +1628,14 @@ fn skill_invocation(backend: BackendKind, skill: &SkillInfo) -> String {
     }
 }
 
-pub(crate) fn workflow_action_command(
-    run: &WorkflowRunSummary,
+pub(crate) fn run_action_command(
+    run: &RunSummary,
     workspace: &str,
     include_run_id: bool,
 ) -> String {
     match run.status {
-        WorkflowRunStatus::Running | WorkflowRunStatus::Verifying => "/abort".to_string(),
-        WorkflowRunStatus::Done if run.verification.is_none() => {
+        RunStatus::Running | RunStatus::Verifying => "/abort".to_string(),
+        RunStatus::Done if run.verification.is_none() => {
             let workspace = if workspace.is_empty() {
                 Path::new(".")
             } else {
@@ -1579,23 +1648,27 @@ pub(crate) fn workflow_action_command(
             }
             command
         }
-        WorkflowRunStatus::Done => "/plan ".to_string(),
-        WorkflowRunStatus::Failed if run.verification.is_some() => {
+        RunStatus::Done => run
+            .mode
+            .as_ref()
+            .map(|mode| format!("/mode {}", mode.mode.as_str()))
+            .unwrap_or_else(|| "/mode plan".to_string()),
+        RunStatus::Failed if run.verification.is_some() => {
             let mut command = continue_command_prefix(run, include_run_id);
             command.push_str(" fix failing verification");
             command
         }
-        WorkflowRunStatus::Failed => continue_command_prefix(run, include_run_id),
-        WorkflowRunStatus::Blocked => {
+        RunStatus::Failed => continue_command_prefix(run, include_run_id),
+        RunStatus::Blocked => {
             let mut command = continue_command_prefix(run, include_run_id);
             command.push_str(" blocker resolved");
             command
         }
-        WorkflowRunStatus::Planned => "/retry".to_string(),
+        RunStatus::Planned => "/retry".to_string(),
     }
 }
 
-fn verify_command_prefix(run: &WorkflowRunSummary, include_run_id: bool) -> String {
+fn verify_command_prefix(run: &RunSummary, include_run_id: bool) -> String {
     if include_run_id {
         format!("/verify {}", run.id)
     } else {
@@ -1603,7 +1676,7 @@ fn verify_command_prefix(run: &WorkflowRunSummary, include_run_id: bool) -> Stri
     }
 }
 
-fn continue_command_prefix(run: &WorkflowRunSummary, include_run_id: bool) -> String {
+fn continue_command_prefix(run: &RunSummary, include_run_id: bool) -> String {
     if include_run_id {
         format!("/continue {}", run.id)
     } else {
@@ -1611,16 +1684,16 @@ fn continue_command_prefix(run: &WorkflowRunSummary, include_run_id: bool) -> St
     }
 }
 
-fn workflow_step_action_command(run: &WorkflowRunSummary, step: u32) -> Option<String> {
+fn run_step_action_command(run: &RunSummary, step: u32) -> Option<String> {
     let step = run
         .steps
         .iter()
         .find(|candidate| candidate.number == step)?;
     let (action, note) = match step.status {
-        WorkflowStepStatus::Todo => ("doing", None),
-        WorkflowStepStatus::Doing => ("done", None),
-        WorkflowStepStatus::Blocked => ("doing", Some("blocker resolved")),
-        WorkflowStepStatus::Done => ("todo", Some("reopen")),
+        RunStepStatus::Todo => ("doing", None),
+        RunStepStatus::Doing => ("done", None),
+        RunStepStatus::Blocked => ("doing", Some("blocker resolved")),
+        RunStepStatus::Done => ("todo", Some("reopen")),
     };
     let mut command = format!("/step {action} {} {}", run.id, step.number);
     if let Some(note) = note {
@@ -1630,7 +1703,7 @@ fn workflow_step_action_command(run: &WorkflowRunSummary, step: u32) -> Option<S
     Some(command)
 }
 
-fn workflow_step_dispatch_command(run: &WorkflowRunSummary, step: u32) -> Option<String> {
+fn run_step_dispatch_command(run: &RunSummary, step: u32) -> Option<String> {
     let step = run
         .steps
         .iter()
@@ -1640,10 +1713,10 @@ fn workflow_step_dispatch_command(run: &WorkflowRunSummary, step: u32) -> Option
     };
 
     let instruction = match step.status {
-        WorkflowStepStatus::Todo => "Start",
-        WorkflowStepStatus::Doing => "Continue",
-        WorkflowStepStatus::Blocked => "Revisit blocked",
-        WorkflowStepStatus::Done => "Review completed",
+        RunStepStatus::Todo => "Start",
+        RunStepStatus::Doing => "Continue",
+        RunStepStatus::Blocked => "Revisit blocked",
+        RunStepStatus::Done => "Review completed",
     };
     Some(format!(
         "@{owner} {}",

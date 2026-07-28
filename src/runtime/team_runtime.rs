@@ -6,7 +6,7 @@
 //! and child-process work lives in the transport layer (`agent_runner` / the
 //! `run` loop), so the core is fully unit-testable without spawning anything.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,33 +14,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::config::{
-    ASTERLINE_TEAM_SKILL_NAME, inject_team_protocol, strip_team_protocol, strip_team_protocols,
-    team_skill_hint,
+    ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_TEAM_SKILL_NAME, brainstorm_skill_text,
+    inject_team_protocol, strip_team_protocol, strip_team_protocols, team_skill_hint,
 };
 use crate::domain::event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ImportedMessage, LogEntry,
-    MemberStatus, MemberSummary, MessageId, MessageTarget, RuntimeEvent, TurnId, UiCommand,
-    WorkflowRunId, WorkflowRunStatus, WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus,
-    WorkflowStepSummary,
+    MemberStatus, MemberSummary, MessageId, MessageTarget, RunId, RunStatus, RunStepRequest,
+    RunStepStatus, RunStepSummary, RunSummary, RuntimeEvent, TurnId, UiCommand,
 };
 use crate::domain::mode::{
-    CollabMode, ReviewVerdict, ReviewVerdictKind, TerminalMode, resolve_mode_roles,
+    BrainstormCard, CollabMode, ModeStatusSummary, ReviewVerdict, ReviewVerdictKind, TerminalMode,
+    resolve_mode_roles, resolve_team_coordinator, resolve_team_limits, resolve_verify_command,
 };
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
     TeamMember,
 };
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
+use crate::run_support::suggested_verify_command;
 use crate::runtime::approval::ApprovalMatcher;
 use crate::runtime::mode_prompts::{
-    lead_iteration_prompt, lead_nudge_prompt, lead_plan_prompt, lead_progress_prompt,
-    lead_review_prompt, moderator_prompt, review_iteration_prompt, review_prompt,
-    review_task_prompt, roundtable_digest_prompt, roundtable_prompt, step_dispatch_prompt,
-    verdict_nudge_prompt,
+    brainstorm_build_prompt, brainstorm_propose_prompt, brainstorm_stretch_prompt,
+    brainstorm_synthesis_prompt, brainstorm_vote_prompt, plan_iteration_prompt, plan_nudge_prompt,
+    plan_plan_prompt, plan_progress_prompt, plan_review_prompt, plan_verify_failure_prompt,
+    review_iteration_prompt, review_prompt, review_task_prompt, step_dispatch_prompt,
+    verdict_nudge_prompt, verify_failure_prompt,
 };
 use crate::runtime::session_registry::SessionRegistry;
-use crate::store::sqlite::SqliteStore;
-use crate::workflow::suggested_verify_command;
+use crate::store::sqlite::{SqliteStore, StoredConversationSession};
 
 /// What the core wants the transport layer to do after handling an input.
 #[derive(Default)]
@@ -72,7 +73,7 @@ pub struct RunAction {
 
 /// A verification command the transport layer should run outside the core loop.
 pub struct VerifyAction {
-    pub run_id: WorkflowRunId,
+    pub run_id: RunId,
     pub command: String,
     pub workspace: PathBuf,
     pub cancel: Arc<AtomicBool>,
@@ -80,7 +81,7 @@ pub struct VerifyAction {
 
 /// Result of a completed verification command.
 pub struct VerifyOutput {
-    pub run_id: WorkflowRunId,
+    pub run_id: RunId,
     pub command: String,
     pub ok: bool,
     pub stdout: Vec<u8>,
@@ -132,7 +133,7 @@ struct PausedRoute {
     from: MemberId,
     to_members: Vec<MemberId>,
     to_labels: Vec<String>,
-    body: String,
+    prompt: String,
 }
 
 struct HeldApproval {
@@ -141,7 +142,7 @@ struct HeldApproval {
     /// The prompt actually enqueued on approve (relay-wrapped for relays).
     prompt: String,
     /// The mode run to block if this dispatch is rejected (set by the M3 engine).
-    mode_run: Option<WorkflowRunId>,
+    mode_run: Option<RunId>,
 }
 
 pub struct TeamRuntime {
@@ -153,11 +154,11 @@ pub struct TeamRuntime {
     relay_paused: bool,
     paused_routes: VecDeque<PausedRoute>,
     held_approvals: HashMap<ApprovalId, HeldApproval>,
-    workflow_turns: HashMap<TurnId, WorkflowRunId>,
-    failed_workflow_runs: HashSet<WorkflowRunId>,
-    mode_sessions: HashMap<WorkflowRunId, ModeSession>,
-    /// Selection for subsequent messages in this terminal process. It is not
-    /// reset by `/new`; only another `/mode` selection replaces it.
+    run_turns: HashMap<TurnId, RunId>,
+    failed_runs: HashSet<RunId>,
+    mode_sessions: HashMap<RunId, ModeSession>,
+    /// Selection for subsequent messages in the current chat. `/new` resets it
+    /// to normal; another `/mode` selection replaces it within the chat.
     active_mode: TerminalMode,
     last_user: Option<(MessageTarget, String)>,
     next_message_id: u64,
@@ -175,7 +176,7 @@ impl TeamRuntime {
         // In-flight mode runs cannot be resumed losslessly across process restarts.
         if let Ok(ids) = store.running_mode_runs() {
             for id in ids {
-                let _ = store.block_workflow_run(id, "interrupted by restart");
+                let _ = store.block_run(id, "interrupted by restart");
             }
         }
         let mut sessions = SessionRegistry::from_store(&store, &config.all_member_ids());
@@ -193,7 +194,7 @@ impl TeamRuntime {
             .collect();
         let relay = RelayGuard::new(config.max_auto_relays);
         let matcher = ApprovalMatcher::from_policy(&config.approvals);
-        Self {
+        let runtime = Self {
             config,
             store,
             relay,
@@ -202,15 +203,17 @@ impl TeamRuntime {
             relay_paused: false,
             paused_routes: VecDeque::new(),
             held_approvals: HashMap::new(),
-            workflow_turns: HashMap::new(),
-            failed_workflow_runs: HashSet::new(),
+            run_turns: HashMap::new(),
+            failed_runs: HashSet::new(),
             mode_sessions: HashMap::new(),
             active_mode: TerminalMode::Normal,
             last_user: None,
             next_message_id: 0,
             approvals_enabled: true,
             matcher,
-        }
+        };
+        runtime.persist_conversation_snapshot();
+        runtime
     }
 
     /// Disable the risky-action approval gate (used in tests and by `--debug`).
@@ -249,7 +252,7 @@ impl TeamRuntime {
             workspace: self.config.workspace.display().to_string(),
             default_target: self.config.default_target.clone(),
             members,
-            workflow_runs: self.store.recent_workflow_runs(50).unwrap_or_default(),
+            runs: self.store.recent_runs(50).unwrap_or_default(),
         }
     }
 
@@ -290,11 +293,38 @@ impl TeamRuntime {
                 self.resolve_next_paused_route(resume, &mut step)
             }
             UiCommand::SetEffort { member, effort } => {
-                match self.config.find(member.as_str()).map(|m| m.id.clone()) {
-                    Some(id) => {
+                match self
+                    .config
+                    .find(member.as_str())
+                    .map(|m| (m.id.clone(), m.backend))
+                {
+                    Some((id, BackendKind::Agy))
+                        if !matches!(effort, Effort::Low | Effort::Medium | Effort::High) =>
+                    {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} uses agy, which supports low, medium, or high effort"
+                        )));
+                    }
+                    Some((id, backend))
+                        if effort == Effort::Ultra && backend != BackendKind::Codex =>
+                    {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} uses {backend}, which does not support ultra effort"
+                        )));
+                    }
+                    Some((id, _)) => {
                         if let Some(state) = self.members.get_mut(&id) {
                             state.effort = Some(effort);
                         }
+                        if let Some(member) = self
+                            .config
+                            .members
+                            .iter_mut()
+                            .find(|member| member.id == id)
+                        {
+                            member.effort = Some(effort);
+                        }
+                        self.persist_conversation_snapshot();
                         step.events.push(RuntimeEvent::MemberEffort {
                             member: id.clone(),
                             effort,
@@ -314,54 +344,49 @@ impl TeamRuntime {
                 default_target,
             } => self.handle_replace_team(members, default_target, &mut step),
             UiCommand::NewSession => self.handle_new_session(&mut step),
+            UiCommand::RequestResume => self.handle_request_resume(&mut step),
+            UiCommand::ResumeConversation { conversation } => {
+                self.handle_resume_conversation(conversation, &mut step)
+            }
             UiCommand::ImportTranscript { member, items } => {
                 self.handle_import_transcript(member, items, &mut step)
             }
-            UiCommand::RunWorkflow { goal } => {
-                self.handle_run_workflow(goal, &mut step);
+            UiCommand::ContinueRun { run_id, note } => {
+                self.handle_continue_run(run_id, note, &mut step)
             }
-            UiCommand::ContinueWorkflow { run_id, note } => {
-                self.handle_continue_workflow(run_id, note, &mut step)
+            UiCommand::NoteRun { run_id, note } => self.handle_note_run(run_id, note, &mut step),
+            UiCommand::BlockRun { run_id, reason } => {
+                self.handle_block_run(run_id, reason, &mut step)
             }
-            UiCommand::NoteWorkflow { run_id, note } => {
-                self.handle_note_workflow(run_id, note, &mut step)
+            UiCommand::VerifyRun { run_id, command } => {
+                self.handle_verify_run(run_id, command, &mut step)
             }
-            UiCommand::BlockWorkflow { run_id, reason } => {
-                self.handle_block_workflow(run_id, reason, &mut step)
-            }
-            UiCommand::VerifyWorkflow { run_id, command } => {
-                self.handle_verify_workflow(run_id, command, &mut step)
-            }
-            UiCommand::AddWorkflowStep {
+            UiCommand::AddRunStep {
                 run_id,
                 owner,
                 title,
-            } => self.handle_add_workflow_step(run_id, owner, title, &mut step),
-            UiCommand::UpdateWorkflowStep {
+            } => self.handle_add_run_step(run_id, owner, title, &mut step),
+            UiCommand::UpdateRunStep {
                 run_id,
                 step: step_number,
                 status,
                 note,
-            } => self.handle_update_workflow_step(run_id, step_number, status, note, &mut step),
-            UiCommand::RenameWorkflowStep {
+            } => self.handle_update_run_step(run_id, step_number, status, note, &mut step),
+            UiCommand::RenameRunStep {
                 run_id,
                 step: step_number,
                 title,
-            } => self.handle_rename_workflow_step(run_id, step_number, title, &mut step),
-            UiCommand::RemoveWorkflowStep {
+            } => self.handle_rename_run_step(run_id, step_number, title, &mut step),
+            UiCommand::RemoveRunStep {
                 run_id,
                 step: step_number,
-            } => self.handle_remove_workflow_step(run_id, step_number, &mut step),
-            UiCommand::AssignWorkflowStep {
+            } => self.handle_remove_run_step(run_id, step_number, &mut step),
+            UiCommand::AssignRunStep {
                 run_id,
                 step: step_number,
                 owner,
-            } => self.handle_assign_workflow_step(run_id, step_number, owner, &mut step),
-            UiCommand::RunMode {
-                mode,
-                task,
-                overrides,
-            } => self.handle_run_mode(mode, task, overrides, &mut step),
+            } => self.handle_assign_run_step(run_id, step_number, owner, &mut step),
+            UiCommand::RunMode { mode, task } => self.handle_run_mode(mode, task, &mut step),
             UiCommand::Shutdown => self.handle_cancel(None, &mut step),
         }
         step
@@ -379,11 +404,10 @@ impl TeamRuntime {
             TerminalMode::Normal => {
                 self.handle_user_message(target, body, step);
             }
-            TerminalMode::Workflow => self.handle_run_workflow(task, step),
+            TerminalMode::Team => self.handle_run_team(task, step),
             mode => self.handle_run_mode(
                 mode.collab_mode().expect("collaboration terminal mode"),
                 task,
-                Vec::new(),
                 step,
             ),
         }
@@ -490,6 +514,21 @@ impl TeamRuntime {
             Some(m) => vec![m],
             None => {
                 self.block_all_mode_sessions("aborted by user", step);
+                let team_runs: HashSet<RunId> = self
+                    .run_turns
+                    .values()
+                    .copied()
+                    .filter(|run_id| {
+                        self.store.run(*run_id).is_ok_and(|run| {
+                            run.mode
+                                .as_ref()
+                                .is_some_and(|mode| mode.mode == CollabMode::Team)
+                        })
+                    })
+                    .collect();
+                for run_id in team_runs {
+                    self.block_mode_run(run_id, "aborted by user", step);
+                }
                 self.paused_routes.clear();
                 self.members.keys().cloned().collect()
             }
@@ -520,6 +559,13 @@ impl TeamRuntime {
 
     fn handle_new_session(&mut self, step: &mut RuntimeStep) {
         self.block_all_mode_sessions("superseded by /new", step);
+        if self.active_mode != TerminalMode::Normal {
+            self.active_mode = TerminalMode::Normal;
+            step.events.push(RuntimeEvent::ModeChanged {
+                mode: TerminalMode::Normal,
+            });
+        }
+        self.persist_conversation_snapshot();
         // A fresh chat: a new conversation (so the transcript starts clean and
         // restart shows only this chat) plus new backend sessions for everyone.
         if let Ok(conversation) = self.store.create_conversation() {
@@ -532,10 +578,144 @@ impl TeamRuntime {
         // Drop any in-flight turn state from the previous chat.
         self.paused_routes.clear();
         self.held_approvals.clear();
+        self.persist_conversation_snapshot();
         step.events.push(RuntimeEvent::SessionReset);
         step.events.push(RuntimeEvent::Notice(
-            "started a new chat — fresh session for all members".to_string(),
+            "started a new chat in normal mode — fresh session for all members".to_string(),
         ));
+    }
+
+    fn handle_request_resume(&self, step: &mut RuntimeStep) {
+        self.persist_conversation_snapshot();
+        match self.store.resumable_conversations() {
+            Ok(conversations) => step
+                .events
+                .push(RuntimeEvent::ResumeChoices { conversations }),
+            Err(err) => step.events.push(RuntimeEvent::Notice(format!(
+                "could not list saved chats: {err}"
+            ))),
+        }
+    }
+
+    fn handle_resume_conversation(&mut self, conversation: i64, step: &mut RuntimeStep) {
+        if self
+            .members
+            .values()
+            .any(|state| state.running.is_some() || !state.queue.is_empty())
+        {
+            step.events.push(RuntimeEvent::Notice(
+                "cannot resume another chat while members are active; use /abort first".to_string(),
+            ));
+            return;
+        }
+
+        self.persist_conversation_snapshot();
+        let snapshot = match self.store.conversation_snapshot(conversation) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "saved chat {conversation} is no longer available"
+                )));
+                return;
+            }
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "could not restore saved chat {conversation}: {err}"
+                )));
+                return;
+            }
+        };
+        let raw_config = strip_team_protocols(snapshot.team);
+        if let Err(err) = raw_config.validate() {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "saved chat {conversation} has an invalid team: {err}"
+            )));
+            return;
+        }
+        let chat = match self.store.replay_chat_for(conversation) {
+            Ok(chat) => chat,
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "could not replay saved chat {conversation}: {err}"
+                )));
+                return;
+            }
+        };
+
+        let old_ids: Vec<MemberId> = self.members.keys().cloned().collect();
+        for id in old_ids {
+            step.runner_changes.push(RunnerChange::Remove(id));
+        }
+
+        let mut operational_config = raw_config.clone();
+        inject_team_protocol(&mut operational_config);
+        self.config = operational_config;
+        self.members = self
+            .config
+            .members
+            .iter()
+            .map(|member| (member.id.clone(), MemberState::new(member.effort)))
+            .collect();
+        self.sessions = SessionRegistry::new();
+        let _ = self.store.clear_sessions();
+        for saved in snapshot.sessions {
+            if let Some(member) = self.config.find(saved.member.as_str())
+                && member.backend == saved.backend
+            {
+                let session = AgentSessionId(saved.session_id);
+                self.sessions.set(saved.member.clone(), session.clone());
+                let _ = self
+                    .store
+                    .upsert_session(&saved.member, saved.backend, &session);
+            }
+        }
+        self.matcher = ApprovalMatcher::from_policy(&self.config.approvals);
+        self.relay = RelayGuard::new(self.config.max_auto_relays);
+        self.paused_routes.clear();
+        self.held_approvals.clear();
+        self.run_turns.clear();
+        self.failed_runs.clear();
+        self.mode_sessions.clear();
+        self.last_user = None;
+        self.store.set_conversation(conversation);
+        let _ = self.store.upsert_team(&self.config);
+
+        for member in self.config.members.clone() {
+            step.runner_changes.push(RunnerChange::Upsert {
+                member,
+                workspace: self.config.workspace.clone(),
+            });
+        }
+        self.persist_conversation_snapshot();
+        step.persist_team = Some(raw_config);
+        step.events
+            .push(RuntimeEvent::ConversationResumed { conversation, chat });
+        step.events.push(self.ready_event());
+        step.events.push(RuntimeEvent::Notice(format!(
+            "resumed saved chat {conversation}"
+        )));
+    }
+
+    fn persist_conversation_snapshot(&self) {
+        if self.store.active_conversation() <= 0 {
+            return;
+        }
+        let team = strip_team_protocols(self.config.clone());
+        let sessions = self
+            .config
+            .members
+            .iter()
+            .filter_map(|member| {
+                self.sessions
+                    .get(&member.id)
+                    .map(|session| StoredConversationSession {
+                        member: member.id.clone(),
+                        backend: member.backend,
+                        session_id: session.0,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let _ = self.store.save_conversation_snapshot(&team, &sessions);
     }
 
     fn handle_replace_team(
@@ -784,14 +964,13 @@ impl TeamRuntime {
             return;
         };
         if resume {
-            let prompt = relay_prompt(&self.member_display(&route.from), &route.body);
             step.events.push(RuntimeEvent::Notice(format!(
                 "resumed route {} -> {}",
                 route.from,
                 route.to_labels.join(", ")
             )));
             for member in route.to_members {
-                self.enqueue_prompt(&member, route.turn, prompt.clone(), step);
+                self.enqueue_prompt(&member, route.turn, route.prompt.clone(), step);
             }
         } else {
             step.events.push(RuntimeEvent::Notice(format!(
@@ -910,6 +1089,7 @@ impl TeamRuntime {
                     let backend = self.member_backend(member);
                     self.sessions.set(member.clone(), session.clone());
                     let _ = self.store.upsert_session(member, backend, &session);
+                    self.persist_conversation_snapshot();
                     step.events.push(RuntimeEvent::SessionUpdated {
                         member: member.clone(),
                         session,
@@ -987,7 +1167,8 @@ impl TeamRuntime {
             );
         }
 
-        let visible_text = parsed.visible_text;
+        let visible_text =
+            render_brainstorm_response(&parsed.visible_text, &parsed.brainstorm_cards);
         if !visible_text.is_empty() {
             let display = self.member_display(member);
             let backend = self.member_backend(member);
@@ -1007,13 +1188,13 @@ impl TeamRuntime {
             running.text.clear();
         }
 
-        self.mode_record_message(member, turn, &visible_text, &parsed.reviews, step);
+        self.mode_record_message(member, turn, &visible_text, &parsed, step);
 
         for member_request in parsed.members {
             self.add_team_member_from_agent(member, member_request, step);
         }
-        for request in parsed.workflow_steps {
-            self.apply_workflow_step_from_agent(member, turn, request, step);
+        for request in parsed.run_steps {
+            self.apply_run_step_from_agent(member, turn, request, step);
         }
         for tmsg in parsed.messages {
             self.route_team_message(member, turn, tmsg, step);
@@ -1102,14 +1283,19 @@ impl TeamRuntime {
             return;
         }
 
-        let prompt = relay_prompt(&self.member_display(from), &tmsg.body);
+        let prompt = relay_prompt(
+            from,
+            &self.member_display(from),
+            tmsg.kind.as_deref(),
+            &tmsg.body,
+        );
         if self.relay_paused {
             self.pause_route(
                 turn,
                 from,
                 resolved.members,
                 to_labels,
-                tmsg.body,
+                prompt,
                 "relay paused by user",
                 step,
             );
@@ -1158,7 +1344,7 @@ impl TeamRuntime {
                     from,
                     resolved.members,
                     to_labels,
-                    tmsg.body,
+                    prompt,
                     &format!("auto-relay limit reached ({count})"),
                     step,
                 );
@@ -1166,61 +1352,61 @@ impl TeamRuntime {
         }
     }
 
-    fn apply_workflow_step_from_agent(
+    fn apply_run_step_from_agent(
         &mut self,
         from: &MemberId,
         turn: TurnId,
-        request: WorkflowStepRequest,
+        request: RunStepRequest,
         step: &mut RuntimeStep,
     ) {
-        let Some(run_id) = self.workflow_turns.get(&turn).copied() else {
+        let Some(run_id) = self.run_turns.get(&turn).copied() else {
             step.events.push(RuntimeEvent::Notice(format!(
-                "{from} ignored workflow step update: no active workflow run"
+                "{from} ignored run step update: no active run"
             )));
             return;
         };
 
         let result = match request {
-            WorkflowStepRequest::Add { owner, title } => {
-                self.store.add_workflow_step(run_id, owner.as_ref(), &title)
+            RunStepRequest::Add { owner, title } => {
+                self.store.add_run_step(run_id, owner.as_ref(), &title)
             }
-            WorkflowStepRequest::Update {
+            RunStepRequest::Update {
                 step: step_number,
                 status,
                 note,
             } => self
                 .store
-                .update_workflow_step(run_id, step_number, status, note.as_deref()),
-            WorkflowStepRequest::Rename {
+                .update_run_step(run_id, step_number, status, note.as_deref()),
+            RunStepRequest::Rename {
                 step: step_number,
                 title,
-            } => self.store.rename_workflow_step(run_id, step_number, &title),
-            WorkflowStepRequest::Remove { step: step_number } => {
-                self.store.remove_workflow_step(run_id, step_number)
+            } => self.store.rename_run_step(run_id, step_number, &title),
+            RunStepRequest::Remove { step: step_number } => {
+                self.store.remove_run_step(run_id, step_number)
             }
-            WorkflowStepRequest::Assign {
+            RunStepRequest::Assign {
                 step: step_number,
                 owner,
             } => self
                 .store
-                .assign_workflow_step(run_id, step_number, owner.as_ref()),
+                .assign_run_step(run_id, step_number, owner.as_ref()),
         };
 
         match result {
             Ok(run) => {
                 let id = run.id;
-                step.events.push(RuntimeEvent::WorkflowRunUpdated { run });
+                step.events.push(RuntimeEvent::RunUpdated { run });
                 step.events.push(RuntimeEvent::Notice(format!(
-                    "{from} updated workflow {id} checklist"
+                    "{from} updated run {id} checklist"
                 )));
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 step.events.push(RuntimeEvent::Notice(format!(
-                    "{from} could not update workflow {run_id}: step was not found"
+                    "{from} could not update run {run_id}: step was not found"
                 )));
             }
             Err(err) => step.events.push(RuntimeEvent::Notice(format!(
-                "{from} could not update workflow {run_id}: {err}"
+                "{from} could not update run {run_id}: {err}"
             ))),
         }
     }
@@ -1232,7 +1418,7 @@ impl TeamRuntime {
         from: &MemberId,
         to_members: Vec<MemberId>,
         to_labels: Vec<String>,
-        body: String,
+        prompt: String,
         reason: &str,
         step: &mut RuntimeStep,
     ) {
@@ -1241,7 +1427,7 @@ impl TeamRuntime {
             from: from.clone(),
             to_members,
             to_labels: to_labels.clone(),
-            body,
+            prompt,
         });
         step.events.push(RuntimeEvent::RoutePaused {
             turn,
@@ -1293,7 +1479,7 @@ impl TeamRuntime {
                 member: member.clone(),
                 message,
             });
-            self.mark_workflow_turn(turn, WorkflowRunStatus::Failed, step);
+            self.mark_run_turn(turn, RunStatus::Failed, step);
         }
 
         if let Some(state) = self.members.get_mut(member) {
@@ -1470,20 +1656,16 @@ impl TeamRuntime {
     fn check_turn_complete(&mut self, turn: TurnId, step: &mut RuntimeStep) {
         if !self.turn_active(turn) {
             self.relay.reset_turn(turn);
-            let run_id = self.workflow_turns.remove(&turn);
+            let run_id = self.run_turns.remove(&turn);
             match run_id {
                 Some(run_id) if self.mode_sessions.contains_key(&run_id) => {
                     step.events.push(RuntimeEvent::TurnFinished { turn });
                     self.mode_on_turn_complete(run_id, step);
                     return;
                 }
-                Some(run_id) if !self.failed_workflow_runs.contains(&run_id) => {
-                    if let Ok(run) = self
-                        .store
-                        .update_workflow_status(run_id, WorkflowRunStatus::Done)
-                    {
-                        step.events.push(RuntimeEvent::WorkflowRunUpdated { run });
-                    }
+                Some(run_id) if !self.failed_runs.contains(&run_id) => {
+                    // Team runs may auto-verify; plain/team Done otherwise.
+                    self.finish_plain_or_team_run(run_id, step);
                 }
                 _ => {}
             }
@@ -1491,20 +1673,15 @@ impl TeamRuntime {
         }
     }
 
-    fn mark_workflow_turn(
-        &mut self,
-        turn: TurnId,
-        status: WorkflowRunStatus,
-        step: &mut RuntimeStep,
-    ) {
-        let Some(run_id) = self.workflow_turns.get(&turn).copied() else {
+    fn mark_run_turn(&mut self, turn: TurnId, status: RunStatus, step: &mut RuntimeStep) {
+        let Some(run_id) = self.run_turns.get(&turn).copied() else {
             return;
         };
-        if status == WorkflowRunStatus::Failed {
-            self.failed_workflow_runs.insert(run_id);
+        if status == RunStatus::Failed {
+            self.failed_runs.insert(run_id);
         }
-        if let Ok(run) = self.store.update_workflow_status(run_id, status) {
-            step.events.push(RuntimeEvent::WorkflowRunUpdated { run });
+        if let Ok(run) = self.store.update_run_status(run_id, status) {
+            step.events.push(RuntimeEvent::RunUpdated { run });
         }
     }
 
@@ -1562,15 +1739,25 @@ impl TeamRuntime {
     }
 }
 
-// Workflow handlers (handle_run_workflow … on_verify_output), split out for
+// Team-run and shared run handlers (handle_run_team … on_verify_output), split out for
 // readability. Still inside this module so private fields are accessible.
-include!("team_runtime_workflow.inc.rs");
+include!("team_runtime_runs.inc.rs");
 
-// Collaboration-mode engine (review in M3; lead/roundtable in M4).
+// Collaboration-mode engine (review, plan, brainstorm, and team).
 include!("team_runtime_modes.inc.rs");
 
-fn relay_prompt(from_display: &str, body: &str) -> String {
-    format!("[relay from {from_display}]\n{body}")
+fn relay_prompt(from: &MemberId, from_display: &str, kind: Option<&str>, body: &str) -> String {
+    let reply_instruction = if kind == Some("reply") {
+        "This message is marked as a reply. Do not send another acknowledgement unless it contains a new question, request, correction, or blocker that requires an answer."
+            .to_string()
+    } else {
+        format!(
+            "Before ending your turn, you MUST answer the sender with exactly one control line:\n\
+             @@team_message {{\"to\":\"{from}\",\"kind\":\"reply\",\"body\":\"your substantive response\"}}\n\
+             Visible response text and run-step updates do not replace this reply."
+        )
+    };
+    format!("[relay from {from_display} ({from})]\n{reply_instruction}\n\n{body}")
 }
 
 fn session_policy_label(policy: SessionPolicy) -> &'static str {

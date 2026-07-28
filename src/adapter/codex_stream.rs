@@ -23,6 +23,7 @@ pub struct CodexStreamAdapter {
     cwd: std::path::PathBuf,
     sandbox: SandboxPolicy,
     model: Option<String>,
+    system_prompt: Option<String>,
 }
 
 impl CodexStreamAdapter {
@@ -32,6 +33,7 @@ impl CodexStreamAdapter {
             cwd: member.resolved_cwd(workspace),
             sandbox: member.sandbox,
             model: member.model.clone(),
+            system_prompt: member.system_prompt.clone(),
         }
     }
 
@@ -46,6 +48,19 @@ impl CodexStreamAdapter {
         if let Some(model) = &self.model {
             flags.push("-m".to_string());
             flags.push(model.clone());
+        }
+        if let Some(instructions) = self
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|instructions| !instructions.is_empty())
+        {
+            flags.push("-c".to_string());
+            flags.push(format!(
+                "developer_instructions={}",
+                serde_json::to_string(instructions)
+                    .expect("serializing a Rust string to JSON cannot fail")
+            ));
         }
         flags
     }
@@ -199,6 +214,28 @@ impl CodexLineParser {
                             .get("result")
                             .map(|result| tool_value(result, TOOL_OUTPUT_MAX))
                             .filter(|result| !result.is_empty())
+                            .or_else(|| str_field(&item["error"], "message").map(str::to_string))
+                            .unwrap_or(name),
+                    }],
+                }
+            }
+            Some("collab_tool_call") => {
+                let name = str_field(item, "tool").unwrap_or("collab").to_string();
+                match phase {
+                    Phase::Started => {
+                        let summary = str_field(item, "prompt")
+                            .map(|prompt| summarize(prompt, TOOL_SUMMARY_MAX))
+                            .filter(|prompt| !prompt.is_empty())
+                            .unwrap_or_else(|| name.clone());
+                        vec![AgentEvent::ToolStarted { id, name, summary }]
+                    }
+                    Phase::Completed => vec![AgentEvent::ToolCompleted {
+                        id,
+                        ok: status == "completed",
+                        summary: item
+                            .get("agents_states")
+                            .map(|states| tool_value(states, TOOL_OUTPUT_MAX))
+                            .filter(|states| !states.is_empty())
                             .unwrap_or(name),
                     }],
                 }
@@ -226,6 +263,13 @@ impl CodexLineParser {
                     }],
                 }
             }
+            Some("todo_list") => vec![AgentEvent::Log(format!(
+                "codex plan: {}",
+                summarize(
+                    &tool_value(&item["items"], TOOL_OUTPUT_MAX),
+                    TOOL_SUMMARY_MAX
+                )
+            ))],
             Some("error") => vec![AgentEvent::Log(format!(
                 "codex item error: {}",
                 str_field(item, "message").unwrap_or_default()
@@ -272,6 +316,9 @@ impl LineParser for CodexLineParser {
             Some("item.completed") => self.handle_item(&value["item"], Phase::Completed),
             Some("item.updated") => {
                 let item = &value["item"];
+                if str_field(item, "type") == Some("todo_list") {
+                    return self.handle_item(item, Phase::Started);
+                }
                 if str_field(item, "type") != Some("command_execution") {
                     return Vec::new();
                 }
@@ -330,7 +377,8 @@ mod tests {
 
     #[test]
     fn fresh_command_targets_exec_json() {
-        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+        let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+        member.system_prompt = Some("coordinate with the team".to_string());
         let adapter = CodexStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
         let command = adapter.build_command("do it", None, Some(Effort::Max));
 
@@ -344,7 +392,13 @@ mod tests {
             command
                 .args
                 .windows(2)
-                .any(|w| w == ["-c", "model_reasoning_effort=high"])
+                .any(|w| w == ["-c", "model_reasoning_effort=max"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| { w == ["-c", r#"developer_instructions="coordinate with the team""#,] })
         );
         // Never ephemeral on the product path.
         assert!(!command.args.iter().any(|a| a == "--ephemeral"));
@@ -421,6 +475,36 @@ mod tests {
     }
 
     #[test]
+    fn collab_tool_call_is_transmitted() {
+        let events = parse_all(&[
+            r#"{"type":"item.started","item":{"id":"a1","type":"collab_tool_call","tool":"spawn_agent","prompt":"audit adapters","status":"in_progress"}}"#,
+            r#"{"type":"item.completed","item":{"id":"a1","type":"collab_tool_call","tool":"spawn_agent","agents_states":{"thread-1":{"status":"completed","message":"done"}},"status":"completed"}}"#,
+        ]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStarted { id, name, summary }
+                if id == "a1" && name == "spawn_agent" && summary == "audit adapters"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCompleted { id, ok: true, summary }
+                if id == "a1" && summary.contains("thread-1")
+        )));
+    }
+
+    #[test]
+    fn failed_mcp_call_preserves_error_message() {
+        let events = parse_all(&[
+            r#"{"type":"item.completed","item":{"id":"m1","type":"mcp_tool_call","server":"docs","tool":"fetch","status":"failed","error":{"message":"not found"}}}"#,
+        ]);
+        assert!(events.contains(&AgentEvent::ToolCompleted {
+            id: "m1".to_string(),
+            ok: false,
+            summary: "not found".to_string(),
+        }));
+    }
+
+    #[test]
     fn command_output_streams_and_preserves_formatting() {
         let events = parse_all(&[
             r#"{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"cargo test","status":"in_progress"}}"#,
@@ -467,6 +551,18 @@ mod tests {
             r#"{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"thinking"}}"#,
         ]);
         assert_eq!(events, vec![AgentEvent::Reasoning("thinking".to_string())]);
+    }
+
+    #[test]
+    fn todo_updates_are_transmitted_as_plan_logs() {
+        let events = parse_all(&[
+            r#"{"type":"item.updated","item":{"id":"p1","type":"todo_list","items":[{"text":"audit adapters","completed":false}]}}"#,
+        ]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Log(text)
+                if text.contains("codex plan") && text.contains("audit adapters")
+        )));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Drawer overlays: logs, team roster/editor, command palette, diff, and
-//! member logs. The `/runs` drawer body lives in `workflow_view`.
+//! member logs. The `/runs` drawer body lives in `run_view`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -12,10 +12,11 @@ use crate::domain::team::MemberId;
 use crate::tui::app_state::AppState;
 use crate::tui::drawers::Drawer;
 use crate::tui::markdown;
-use crate::tui::team_builder::{Field, field_value};
+use crate::tui::runs_view::drawer_runs;
+use crate::tui::team_builder::Field;
+use crate::tui::team_builder::{backend_picker_lines, model_picker_lines};
 use crate::tui::theme;
 use crate::tui::theme::pad_width;
-use crate::tui::workflow_view::drawer_runs;
 
 pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &Drawer) {
     let popup = drawer_rect(area);
@@ -54,6 +55,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
         Drawer::Palette => drawer_palette(),
         Drawer::Diff => drawer_diff(state),
         Drawer::Skills => drawer_skills(state),
+        Drawer::Resume => drawer_resume(state, content.width as usize),
         Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
     };
     // Clamp the scroll offset so content can't be pushed entirely off-screen.
@@ -82,13 +84,14 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
 
     if let Some(hint_row) = hint_row {
         let hint = match drawer {
-            Drawer::Runs if state.workflow_runs_detail() => {
+            Drawer::Runs if state.runs_detail() => {
                 "x compact · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close"
             }
             Drawer::Runs => {
                 "x details · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close"
             }
             Drawer::Skills => "↑↓ choose · Enter/Tab use for next prompt · Esc close",
+            Drawer::Resume => "↑↓ choose · Enter resume · Esc close",
             Drawer::Team
                 if state
                     .team_editor()
@@ -99,9 +102,30 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             Drawer::Team
                 if state
                     .team_editor()
+                    .is_some_and(|editor| editor.backend_picker().is_some()) =>
+            {
+                "↑↓ choose Agent · Enter apply · Esc cancel"
+            }
+            Drawer::Team
+                if state
+                    .team_editor()
+                    .is_some_and(|editor| editor.model_picker().is_some()) =>
+            {
+                "↑↓ model · ←→ effort · type filter · Enter apply both · Esc cancel"
+            }
+            Drawer::Team
+                if state
+                    .team_editor()
+                    .is_some_and(|editor| editor.session_picker().is_some()) =>
+            {
+                "↑↓ choose session · type filter · Enter apply · Esc cancel"
+            }
+            Drawer::Team
+                if state
+                    .team_editor()
                     .is_some_and(|editor| editor.field_mode()) =>
             {
-                "↑↓ field · Enter edit/cycle · Esc members"
+                "↑↓ field · Enter edit/choose · Esc members"
             }
             Drawer::Team => "↑↓ member · Enter fields · Esc close",
             _ => "↑↓ scroll · Esc close",
@@ -154,6 +178,73 @@ fn drawer_logs(state: &AppState) -> Vec<Line<'static>> {
         return vec![Line::styled("no logs yet", theme::muted())];
     }
     log_lines(logs.iter().rev().take(200))
+}
+
+fn drawer_resume(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    if state.resume_choices().is_empty() {
+        return vec![
+            Line::styled(" no other saved chats", theme::muted()),
+            Line::styled(
+                " Start another chat with /new, then /resume can return to this one.",
+                theme::muted(),
+            ),
+        ];
+    }
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" Saved chats", theme::accent_bold()),
+            Span::styled(
+                format!("  {} available", state.resume_choices().len()),
+                theme::muted(),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    let preview_width = width.saturating_sub(8).max(20);
+    for (index, conversation) in state.resume_choices().iter().enumerate() {
+        let selected = index == state.selected_resume();
+        let marker = if selected { "› " } else { "  " };
+        let marker_style = if selected {
+            theme::accent_bold()
+        } else {
+            theme::muted()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, marker_style),
+            Span::styled(
+                format!("#{}  {}", conversation.id, conversation.created_at),
+                if selected {
+                    theme::accent_bold()
+                } else {
+                    theme::text()
+                },
+            ),
+            Span::styled(
+                format!(
+                    "  ·  {} messages  ·  {} members",
+                    conversation.message_count, conversation.member_count
+                ),
+                theme::muted(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                theme::clip_width(
+                    &conversation.preview.replace(['\n', '\r'], " "),
+                    preview_width,
+                ),
+                if selected {
+                    theme::text()
+                } else {
+                    theme::muted()
+                },
+            ),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    lines
 }
 
 fn drawer_member_logs(state: &AppState, member_id: &MemberId) -> Vec<Line<'static>> {
@@ -223,7 +314,10 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
         ]));
         // Detail line 1: session · model · effort
         let session = member.session.clone().unwrap_or_else(|| "—".to_string());
-        let model = member.model.as_deref().unwrap_or("default");
+        let model = member
+            .model
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         let effort = member
             .effort
             .map(|effort| effort.as_str().to_string())
@@ -283,7 +377,7 @@ fn drawer_team_editor(
     ]));
     lines.push(Line::styled(
         if editor.field_mode() {
-            " ↑/↓ field · Enter edit/cycle/pick session · e manual model/session · s apply · Esc members"
+            " ↑/↓ field · Enter edit/choose · e manual model/session · s apply · Esc members"
         } else {
             " ↑/↓ member · Enter fields · a add · d delete · t target · * all · s apply · Esc close"
         },
@@ -292,6 +386,10 @@ fn drawer_team_editor(
     lines.push(Line::styled(
         format!(" Default target: {}", editor.default_label()),
         theme::text(),
+    ));
+    lines.push(Line::styled(
+        format!(" Agent tools: {}", editor.agent_availability_label()),
+        theme::muted(),
     ));
     if let Some(notice) = editor.notice() {
         lines.push(Line::styled(format!(" {notice}"), theme::warning()));
@@ -313,7 +411,7 @@ fn drawer_team_editor(
         } else {
             Style::default().fg(color)
         };
-        let model = member.model.as_deref().unwrap_or("default");
+        let model = editor.field_value(member, Field::Model);
         let target = editor.default_marker(member);
         let status = state
             .members()
@@ -344,7 +442,7 @@ fn drawer_team_editor(
             sep.clone(),
             Span::styled(pad_width(&member.role, EDITOR_COLUMNS[2]), row_style),
             sep.clone(),
-            Span::styled(pad_width(model, EDITOR_COLUMNS[3]), row_style),
+            Span::styled(pad_width(&model, EDITOR_COLUMNS[3]), row_style),
             sep.clone(),
             Span::styled(pad_width(target, EDITOR_COLUMNS[4]), row_style),
             sep,
@@ -352,7 +450,8 @@ fn drawer_team_editor(
         ]));
     }
 
-    if editor.model_picker().is_none()
+    if editor.backend_picker().is_none()
+        && editor.model_picker().is_none()
         && editor.session_picker().is_none()
         && let Some(member) = editor.selected_member()
     {
@@ -364,7 +463,7 @@ fn drawer_team_editor(
         lines.push(Line::from(vec![
             Span::styled("     handle: ", theme::muted()),
             Span::styled(format!("@{}", member.id), theme::accent()),
-            Span::styled(" (auto)", theme::muted()),
+            Span::styled(" (generated)", theme::muted()),
         ]));
         for (idx, field) in Field::ALL.iter().enumerate() {
             let selected = editor.field_mode() && idx == editor.field_index();
@@ -378,44 +477,26 @@ fn drawer_team_editor(
                     " {} {:>10}: {}",
                     if selected { "›" } else { " " },
                     field.label(),
-                    field_value(member, *field)
+                    editor.field_value(member, *field)
                 ),
                 style,
             )));
         }
     }
 
+    if let Some(picker) = editor.backend_picker() {
+        lines.push(Line::raw(""));
+        lines.extend(backend_picker_lines(
+            picker,
+            editor.model_catalog(),
+            &editor.selected_cwd(),
+            width,
+        ));
+    }
+
     if let Some(picker) = editor.model_picker() {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(" Model choices", theme::accent_bold()));
-        let (start, options) = picker.window(8);
-        if start > 0 {
-            lines.push(Line::styled("    …", theme::muted()));
-        }
-        for (offset, model) in options.iter().enumerate() {
-            let selected = start + offset == picker.selected();
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if selected { "  › " } else { "    " },
-                    if selected {
-                        theme::editor_focus()
-                    } else {
-                        theme::muted()
-                    },
-                ),
-                Span::styled(
-                    model.as_deref().unwrap_or("default").to_string(),
-                    if selected {
-                        theme::emphasis()
-                    } else {
-                        theme::text()
-                    },
-                ),
-            ]));
-        }
-        if start + options.len() < picker.options().len() {
-            lines.push(Line::styled("    …", theme::muted()));
-        }
+        lines.extend(model_picker_lines(picker, width, 8));
     }
 
     if let Some(picker) = editor.session_picker() {
@@ -684,7 +765,7 @@ mod tests {
             team: "t".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            workflow_runs: Vec::new(),
+            runs: Vec::new(),
             members: vec![MemberSummary {
                 id: MemberId::new("builder"),
                 display_name: "Builder".to_string(),

@@ -32,10 +32,14 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("all", "send to everyone", true),
     ("abort", "cancel running members", false),
     ("approve", "approve first pending", false),
-    ("block", "mark a workflow blocked", true),
-    ("continue", "resume latest or selected workflow", true),
+    ("block", "mark a run blocked", true),
+    ("continue", "resume latest or selected run", true),
     ("diff", "show working-tree git diff", false),
-    ("effort", "set reasoning effort (low…max)", true),
+    (
+        "effort",
+        "set reasoning effort (low…ultra; model-dependent)",
+        true,
+    ),
     ("find", "search the transcript", true),
     ("focus", "view a member's logs", true),
     ("help", "show commands", false),
@@ -46,16 +50,15 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
         "start a fresh chat (new session, cleared transcript)",
         false,
     ),
-    ("note", "record a workflow checkpoint", true),
+    ("note", "record a run checkpoint", true),
     ("reject", "reject first pending", false),
-    ("retry", "resume paused route / re-run", false),
-    ("runs", "workflow status · next action", false),
-    ("sessions", "session ids", false),
+    ("resume", "choose and restore a saved chat", false),
+    ("retry", "re-send the latest user request", false),
+    ("runs", "run status · next action", false),
     ("skills", "choose a skill for the next prompt", false),
-    ("status", "team status", false),
-    ("step", "manage workflow checklist", true),
+    ("step", "manage run checklist", true),
     ("team", "edit roster · sessions · approvals", false),
-    ("verify", "verify latest or selected workflow", true),
+    ("verify", "verify latest or selected run", true),
 ];
 
 /// (name, hint) entries shown after `/mode `.
@@ -63,10 +66,13 @@ const MODES: &[(&str, &str)] = &[
     ("normal", "keep using direct messages until changed"),
     ("review", "keep using builder/reviewer runs until changed"),
     ("plan", "keep using leader/checklist runs until changed"),
-    ("roundtable", "keep using discussion rounds until changed"),
     (
-        "workflow",
-        "keep using prompt-driven workflows until changed",
+        "brainstorm",
+        "keep using multi-wave idea generation until changed",
+    ),
+    (
+        "team",
+        "keep using coordinator-driven team runs until changed",
     ),
 ];
 
@@ -95,7 +101,7 @@ pub fn compute_with_agent_skills(
                 let lower = prefix.to_lowercase();
                 let items: Vec<CompletionItem> = COMMANDS
                     .iter()
-                    .filter(|(name, _, _)| name.starts_with(&lower))
+                    .filter(|(name, _, _)| slash_command_matches(name, &lower))
                     .map(|(name, hint, takes_arg)| CompletionItem {
                         label: format!("/{name} — {hint}"),
                         insert: if *takes_arg {
@@ -172,6 +178,10 @@ pub fn compute_with_agent_skills(
     }
 
     None
+}
+
+fn slash_command_matches(name: &str, query: &str) -> bool {
+    name.starts_with(query) || (name == "new" && "clear".starts_with(query))
 }
 
 fn targeted_skill_completion(
@@ -277,6 +287,23 @@ mod tests {
     }
 
     #[test]
+    fn command_references_cover_every_palette_command() {
+        let english = include_str!("../../docs/commands.md");
+        let chinese = include_str!("../../docs/commands.zh-CN.md");
+        for (name, _, _) in COMMANDS {
+            let heading = format!("### `/{name}`");
+            assert!(
+                english.contains(&heading),
+                "English command reference is missing {heading}"
+            );
+            assert!(
+                chinese.contains(&heading),
+                "Chinese command reference is missing {heading}"
+            );
+        }
+    }
+
+    #[test]
     fn slash_prefix_filters() {
         assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
         assert_eq!(inserts("/mo"), vec!["/mode ".to_string()]);
@@ -288,8 +315,17 @@ mod tests {
         let a = inserts("/a");
         assert!(a.contains(&"/ask ".to_string()) && a.contains(&"/all ".to_string()));
         let re = inserts("/re");
-        assert_eq!(re, vec!["/reject".to_string(), "/retry".to_string()]);
+        assert_eq!(
+            re,
+            vec![
+                "/reject".to_string(),
+                "/resume".to_string(),
+                "/retry".to_string()
+            ]
+        );
         assert!(inserts("/find").contains(&"/find ".to_string()));
+        assert_eq!(inserts("/cl"), vec!["/new".to_string()]);
+        assert_eq!(inserts("/clear"), vec!["/new".to_string()]);
         assert!(inserts("/lead").is_empty());
         assert!(inserts("/round").is_empty());
     }
@@ -305,9 +341,9 @@ mod tests {
                 .iter()
                 .map(|item| item.insert.as_str())
                 .collect::<Vec<_>>(),
-            vec!["normal ", "review ", "plan ", "roundtable ", "workflow "]
+            vec!["normal ", "review ", "plan ", "brainstorm ", "team "]
         );
-        assert_eq!(inserts("/mode ro"), vec!["roundtable ".to_string()]);
+        assert_eq!(inserts("/mode br"), vec!["brainstorm ".to_string()]);
         assert!(compute("/mode review fix it", &members()).is_none());
     }
 

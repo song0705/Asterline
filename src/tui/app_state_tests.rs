@@ -1,7 +1,7 @@
 use super::*;
 use crate::domain::event::{
-    AgentSessionId, ApprovalDecision, MemberSummary, TurnId, WorkflowRunId, WorkflowRunStatus,
-    WorkflowRunSummary, WorkflowStepSummary, WorkflowVerification,
+    AgentSessionId, ApprovalDecision, ConversationSummary, MemberSummary, RunId, RunStatus,
+    RunStepSummary, RunSummary, RunVerification, TurnId,
 };
 
 fn ready() -> RuntimeEvent {
@@ -9,7 +9,7 @@ fn ready() -> RuntimeEvent {
         team: "mixed".to_string(),
         workspace: "/tmp/ws".to_string(),
         default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-        workflow_runs: Vec::new(),
+        runs: Vec::new(),
         members: vec![MemberSummary {
             id: MemberId::new("builder"),
             display_name: "Builder".to_string(),
@@ -36,6 +36,68 @@ fn ready_populates_header() {
 }
 
 #[test]
+fn new_chat_resets_visible_mode_to_normal() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::ModeChanged {
+        mode: TerminalMode::Brainstorm,
+    });
+
+    state.apply(RuntimeEvent::SessionReset);
+
+    assert_eq!(state.active_mode(), TerminalMode::Normal);
+}
+
+#[test]
+fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
+    let mut state = AppState::new(vec![ChatItem::User {
+        body: "current".to_string(),
+    }]);
+    state.apply(RuntimeEvent::ResumeChoices {
+        conversations: vec![
+            ConversationSummary {
+                id: 7,
+                created_at: "2026-07-28 12:00:00".to_string(),
+                preview: "newer saved question".to_string(),
+                message_count: 4,
+                member_count: 2,
+            },
+            ConversationSummary {
+                id: 3,
+                created_at: "2026-07-27 09:00:00".to_string(),
+                preview: "older saved question".to_string(),
+                message_count: 9,
+                member_count: 3,
+            },
+        ],
+    });
+
+    assert_eq!(state.drawer(), Some(Drawer::Resume));
+    assert_eq!(
+        state.selected_resume_command(),
+        Some(UiCommand::ResumeConversation { conversation: 7 })
+    );
+    state.select_next_resume();
+    assert_eq!(
+        state.selected_resume_command(),
+        Some(UiCommand::ResumeConversation { conversation: 3 })
+    );
+
+    state.apply(RuntimeEvent::ConversationResumed {
+        conversation: 3,
+        chat: vec![ChatItem::User {
+            body: "older saved question".to_string(),
+        }],
+    });
+    assert_eq!(state.drawer(), None);
+    assert_eq!(
+        state.chat(),
+        &[ChatItem::User {
+            body: "older saved question".to_string()
+        }]
+    );
+}
+
+#[test]
 fn team_field_paste_goes_to_the_focused_editor() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -55,12 +117,12 @@ fn team_field_paste_goes_to_the_focused_editor() {
 }
 
 #[test]
-fn workflow_run_updates_insert_then_replace() {
+fn run_updates_insert_then_replace() {
     let mut state = AppState::new(Vec::new());
-    let run = WorkflowRunSummary {
-        id: WorkflowRunId(1),
+    let run = RunSummary {
+        id: RunId(1),
         goal: "ship parser".to_string(),
-        status: WorkflowRunStatus::Running,
+        status: RunStatus::Running,
         coordinator: Some(MemberId::new("builder")),
         verification: None,
         created_at: "2026-06-28 10:00:00".to_string(),
@@ -69,38 +131,39 @@ fn workflow_run_updates_insert_then_replace() {
         events: Vec::new(),
         steps: Vec::new(),
         mode: None,
+        legacy_mode: None,
     };
 
-    state.apply(RuntimeEvent::WorkflowRunUpdated { run: run.clone() });
-    assert_eq!(state.workflow_runs(), std::slice::from_ref(&run));
-    assert_eq!(state.latest_workflow_run(), Some(&run));
+    state.apply(RuntimeEvent::RunUpdated { run: run.clone() });
+    assert_eq!(state.runs(), std::slice::from_ref(&run));
+    assert_eq!(state.latest_run(), Some(&run));
 
-    let updated = WorkflowRunSummary {
-        status: WorkflowRunStatus::Done,
-        verification: Some(WorkflowVerification {
+    let updated = RunSummary {
+        status: RunStatus::Done,
+        verification: Some(RunVerification {
             command: "cargo test".to_string(),
             ok: true,
             summary: "ok".to_string(),
         }),
         ..run
     };
-    state.apply(RuntimeEvent::WorkflowRunUpdated {
+    state.apply(RuntimeEvent::RunUpdated {
         run: updated.clone(),
     });
 
-    assert_eq!(state.workflow_runs(), std::slice::from_ref(&updated));
-    assert_eq!(state.latest_workflow_run(), Some(&updated));
+    assert_eq!(state.runs(), std::slice::from_ref(&updated));
+    assert_eq!(state.latest_run(), Some(&updated));
 }
 
 #[test]
-fn runs_drawer_stages_selected_workflow_action_without_overwriting_draft() {
+fn runs_drawer_stages_selected_run_action_without_overwriting_draft() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    state.apply(RuntimeEvent::WorkflowRunUpdated {
-        run: WorkflowRunSummary {
-            id: WorkflowRunId(1),
+    state.apply(RuntimeEvent::RunUpdated {
+        run: RunSummary {
+            id: RunId(1),
             goal: "ship parser".to_string(),
-            status: WorkflowRunStatus::Done,
+            status: RunStatus::Done,
             coordinator: Some(MemberId::new("builder")),
             verification: None,
             created_at: "2026-06-28 10:00:00".to_string(),
@@ -109,34 +172,35 @@ fn runs_drawer_stages_selected_workflow_action_without_overwriting_draft() {
             events: Vec::new(),
             steps: Vec::new(),
             mode: None,
+            legacy_mode: None,
         },
     });
 
     state.toggle_drawer(Drawer::Runs);
-    assert!(state.stage_selected_workflow_action());
+    assert!(state.stage_selected_run_action());
     assert_eq!(state.drawer(), None);
     assert_eq!(state.composer().text(), "/verify run-1");
 
     state.clear_composer();
     state.insert_char('x');
     state.toggle_drawer(Drawer::Runs);
-    assert!(!state.stage_selected_workflow_action());
+    assert!(!state.stage_selected_run_action());
     assert_eq!(state.drawer(), Some(Drawer::Runs));
     assert_eq!(state.composer().text(), "x");
 }
 
 #[test]
-fn runs_drawer_can_select_an_older_workflow_run() {
+fn runs_drawer_can_select_an_older_run() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
         team: "mixed".to_string(),
         workspace: "/tmp/ws".to_string(),
         default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-        workflow_runs: vec![
-            WorkflowRunSummary {
-                id: WorkflowRunId(1),
+        runs: vec![
+            RunSummary {
+                id: RunId(1),
                 goal: "ship parser".to_string(),
-                status: WorkflowRunStatus::Done,
+                status: RunStatus::Done,
                 coordinator: Some(MemberId::new("builder")),
                 verification: None,
                 created_at: "2026-06-28 10:00:00".to_string(),
@@ -145,11 +209,12 @@ fn runs_drawer_can_select_an_older_workflow_run() {
                 events: Vec::new(),
                 steps: Vec::new(),
                 mode: None,
+                legacy_mode: None,
             },
-            WorkflowRunSummary {
-                id: WorkflowRunId(2),
+            RunSummary {
+                id: RunId(2),
                 goal: "refactor ui".to_string(),
-                status: WorkflowRunStatus::Running,
+                status: RunStatus::Running,
                 coordinator: Some(MemberId::new("builder")),
                 verification: None,
                 created_at: "2026-06-28 10:10:00".to_string(),
@@ -158,26 +223,21 @@ fn runs_drawer_can_select_an_older_workflow_run() {
                 events: Vec::new(),
                 steps: Vec::new(),
                 mode: None,
+                legacy_mode: None,
             },
         ],
         members: Vec::new(),
     });
     state.toggle_drawer(Drawer::Runs);
 
+    assert_eq!(state.selected_run().map(|run| run.id), Some(RunId(2)));
+    state.select_older_run();
+    assert_eq!(state.selected_run().map(|run| run.id), Some(RunId(1)));
     assert_eq!(
-        state.selected_workflow_run().map(|run| run.id),
-        Some(WorkflowRunId(2))
-    );
-    state.select_older_workflow_run();
-    assert_eq!(
-        state.selected_workflow_run().map(|run| run.id),
-        Some(WorkflowRunId(1))
-    );
-    assert_eq!(
-        state.selected_workflow_action_command().as_deref(),
+        state.selected_run_action_command().as_deref(),
         Some("/verify run-1")
     );
-    assert!(state.stage_selected_workflow_action());
+    assert!(state.stage_selected_run_action());
     assert_eq!(state.composer().text(), "/verify run-1");
 }
 
@@ -185,11 +245,11 @@ fn runs_drawer_can_select_an_older_workflow_run() {
 fn runs_drawer_can_select_steps_and_stage_step_actions() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    state.apply(RuntimeEvent::WorkflowRunUpdated {
-        run: WorkflowRunSummary {
-            id: WorkflowRunId(1),
+    state.apply(RuntimeEvent::RunUpdated {
+        run: RunSummary {
+            id: RunId(1),
             goal: "ship checklist".to_string(),
-            status: WorkflowRunStatus::Running,
+            status: RunStatus::Running,
             coordinator: Some(MemberId::new("builder")),
             verification: None,
             created_at: "2026-06-28 10:00:00".to_string(),
@@ -197,33 +257,33 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
             attempt: 1,
             events: Vec::new(),
             steps: vec![
-                WorkflowStepSummary {
+                RunStepSummary {
                     number: 1,
-                    status: WorkflowStepStatus::Todo,
+                    status: RunStepStatus::Todo,
                     owner: Some(MemberId::new("builder")),
                     title: "Write parser tests".to_string(),
                     note: None,
                     updated_at: "2026-06-28 10:01:00".to_string(),
                 },
-                WorkflowStepSummary {
+                RunStepSummary {
                     number: 2,
-                    status: WorkflowStepStatus::Doing,
+                    status: RunStepStatus::Doing,
                     owner: None,
                     title: "Wire checklist UI".to_string(),
                     note: None,
                     updated_at: "2026-06-28 10:02:00".to_string(),
                 },
-                WorkflowStepSummary {
+                RunStepSummary {
                     number: 3,
-                    status: WorkflowStepStatus::Blocked,
+                    status: RunStepStatus::Blocked,
                     owner: None,
                     title: "Wait for credentials".to_string(),
                     note: None,
                     updated_at: "2026-06-28 10:03:00".to_string(),
                 },
-                WorkflowStepSummary {
+                RunStepSummary {
                     number: 4,
-                    status: WorkflowStepStatus::Done,
+                    status: RunStepStatus::Done,
                     owner: None,
                     title: "Document result".to_string(),
                     note: None,
@@ -231,66 +291,67 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
                 },
             ],
             mode: None,
+            legacy_mode: None,
         },
     });
     state.toggle_drawer(Drawer::Runs);
 
-    assert_eq!(state.selected_workflow_step(), None);
+    assert_eq!(state.selected_run_step(), None);
     assert_eq!(
-        state.selected_workflow_stage_command().as_deref(),
+        state.selected_run_stage_command().as_deref(),
         Some("/abort")
     );
 
-    assert!(state.select_next_workflow_step());
-    assert_eq!(state.selected_workflow_step(), Some(1));
+    assert!(state.select_next_run_step());
+    assert_eq!(state.selected_run_step(), Some(1));
     assert_eq!(
-        state.selected_workflow_stage_command().as_deref(),
+        state.selected_run_stage_command().as_deref(),
         Some("/step doing run-1 1")
     );
     assert_eq!(
-        state.selected_workflow_dispatch_command().as_deref(),
+        state.selected_run_dispatch_command().as_deref(),
         Some(
-            "@builder Start run-1 step #1: Write parser tests. Update the checklist with @@workflow_step as you progress."
+            "@builder Start run-1 step #1: Write parser tests. Update the checklist with @@run_step as you progress."
         )
     );
 
-    state.select_newer_workflow_run();
-    assert_eq!(state.selected_workflow_step(), None);
+    state.select_newer_run();
+    assert_eq!(state.selected_run_step(), None);
     assert_eq!(
-        state.selected_workflow_stage_command().as_deref(),
+        state.selected_run_stage_command().as_deref(),
         Some("/abort")
     );
 
-    assert!(state.select_next_workflow_step());
+    assert!(state.select_next_run_step());
 
-    assert!(state.select_next_workflow_step());
+    assert!(state.select_next_run_step());
     assert_eq!(
-        state.selected_workflow_stage_command().as_deref(),
+        state.selected_run_stage_command().as_deref(),
         Some("/step done run-1 2")
     );
     assert_eq!(
-        state.selected_workflow_dispatch_command().as_deref(),
+        state.selected_run_dispatch_command().as_deref(),
         Some("/step assign run-1 2 ")
     );
 
-    assert!(state.select_next_workflow_step());
+    assert!(state.select_next_run_step());
     assert_eq!(
-        state.selected_workflow_stage_command().as_deref(),
+        state.selected_run_stage_command().as_deref(),
         Some("/step doing run-1 3 blocker resolved")
     );
 
-    assert!(state.select_next_workflow_step());
+    assert!(state.select_next_run_step());
     assert_eq!(
-        state.selected_workflow_stage_command().as_deref(),
+        state.selected_run_stage_command().as_deref(),
         Some("/step todo run-1 4 reopen")
     );
 
-    assert!(state.stage_selected_workflow_action());
+    assert!(state.stage_selected_run_action());
     assert_eq!(state.composer().text(), "/step todo run-1 4 reopen");
 }
 
 #[test]
-fn workflow_action_previews_detected_verify_command() {
+fn run_action_previews_detected_verify_command() {
     let dir = std::env::temp_dir().join(format!("asterline-action-preview-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -300,14 +361,14 @@ fn workflow_action_previews_detected_verify_command() {
         team: "mixed".to_string(),
         workspace: dir.display().to_string(),
         default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-        workflow_runs: Vec::new(),
+        runs: Vec::new(),
         members: Vec::new(),
     });
-    state.apply(RuntimeEvent::WorkflowRunUpdated {
-        run: WorkflowRunSummary {
-            id: WorkflowRunId(1),
+    state.apply(RuntimeEvent::RunUpdated {
+        run: RunSummary {
+            id: RunId(1),
             goal: "ship parser".to_string(),
-            status: WorkflowRunStatus::Done,
+            status: RunStatus::Done,
             coordinator: Some(MemberId::new("builder")),
             verification: None,
             created_at: "2026-06-28 10:00:00".to_string(),
@@ -316,31 +377,32 @@ fn workflow_action_previews_detected_verify_command() {
             events: Vec::new(),
             steps: Vec::new(),
             mode: None,
+            legacy_mode: None,
         },
     });
 
     assert_eq!(
-        state.latest_workflow_action_command().as_deref(),
+        state.latest_run_action_command().as_deref(),
         Some("/verify cargo test")
     );
     state.toggle_drawer(Drawer::Runs);
-    assert!(state.stage_selected_workflow_action());
+    assert!(state.stage_selected_run_action());
     assert_eq!(state.composer().text(), "/verify run-1 cargo test");
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn workflow_action_continues_failed_and_blocked_runs() {
+fn run_action_continues_failed_and_blocked_runs() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    state.apply(RuntimeEvent::WorkflowRunUpdated {
-        run: WorkflowRunSummary {
-            id: WorkflowRunId(1),
+    state.apply(RuntimeEvent::RunUpdated {
+        run: RunSummary {
+            id: RunId(1),
             goal: "ship parser".to_string(),
-            status: WorkflowRunStatus::Failed,
+            status: RunStatus::Failed,
             coordinator: Some(MemberId::new("builder")),
-            verification: Some(WorkflowVerification {
+            verification: Some(RunVerification {
                 command: "cargo test".to_string(),
                 ok: false,
                 summary: "failed".to_string(),
@@ -351,25 +413,26 @@ fn workflow_action_continues_failed_and_blocked_runs() {
             events: Vec::new(),
             steps: Vec::new(),
             mode: None,
+            legacy_mode: None,
         },
     });
 
     assert_eq!(
-        state.latest_workflow_action_command().as_deref(),
+        state.latest_run_action_command().as_deref(),
         Some("/continue fix failing verification")
     );
     state.toggle_drawer(Drawer::Runs);
-    assert!(state.stage_selected_workflow_action());
+    assert!(state.stage_selected_run_action());
     assert_eq!(
         state.composer().text(),
         "/continue run-1 fix failing verification"
     );
 
-    state.apply(RuntimeEvent::WorkflowRunUpdated {
-        run: WorkflowRunSummary {
-            id: WorkflowRunId(2),
+    state.apply(RuntimeEvent::RunUpdated {
+        run: RunSummary {
+            id: RunId(2),
             goal: "unblock release".to_string(),
-            status: WorkflowRunStatus::Blocked,
+            status: RunStatus::Blocked,
             coordinator: Some(MemberId::new("builder")),
             verification: None,
             created_at: "2026-06-28 10:00:00".to_string(),
@@ -378,11 +441,12 @@ fn workflow_action_continues_failed_and_blocked_runs() {
             events: Vec::new(),
             steps: Vec::new(),
             mode: None,
+            legacy_mode: None,
         },
     });
 
     assert_eq!(
-        state.latest_workflow_action_command().as_deref(),
+        state.latest_run_action_command().as_deref(),
         Some("/continue blocker resolved")
     );
 }
@@ -645,7 +709,7 @@ fn default_target_all_marks_every_member_running_optimistically() {
         team: "mixed".to_string(),
         workspace: "/tmp/ws".to_string(),
         default_target: Some(DefaultTarget::All),
-        workflow_runs: Vec::new(),
+        runs: Vec::new(),
         members: vec![
             MemberSummary {
                 id: MemberId::new("builder"),

@@ -1,10 +1,10 @@
 //! Backend adapters.
 //!
 //! The product path runs each member through a [`MemberRunner`] that streams
-//! [`AgentEvent`]s. Real members use [`ProcessRunner`] over a [`StreamAdapter`]
-//! (`claude_stream` / `codex_stream` / `grok_stream` / `agy_stream`); tests and offline mode use
-//! [`fake::FakeRunner`]. `cli_pty` is retained as a raw-terminal/debug
-//! capability and is not part of the product path.
+//! [`AgentEvent`]s. Claude, Codex, and Agy use [`ProcessRunner`] over a
+//! [`StreamAdapter`]; Grok uses its bidirectional ACP stdio protocol. Tests and
+//! offline mode use [`fake::FakeRunner`]. `cli_pty` is retained as a
+//! raw-terminal/debug capability and is not part of the product path.
 
 pub mod agy_stream;
 pub mod claude_stream;
@@ -28,8 +28,8 @@ pub use agy_stream::AgyStreamAdapter;
 pub use claude_stream::ClaudeStreamAdapter;
 pub use codex_stream::CodexStreamAdapter;
 pub use fake::FakeRunner;
-pub use grok_stream::GrokStreamAdapter;
-pub use models::discover_models;
+pub use grok_stream::GrokAcpRunner;
+pub use models::{DiscoveredModel, discover_models};
 pub use process::{AdapterCommand, LineParser, ProcessRunner, StreamAdapter, run_streaming};
 
 /// Inputs for one member turn.
@@ -59,9 +59,7 @@ pub fn runner_for(member: &TeamMember, workspace: &Path) -> Box<dyn MemberRunner
         BackendKind::Codex => Box::new(ProcessRunner::new(CodexStreamAdapter::from_member(
             member, workspace,
         ))),
-        BackendKind::Grok => Box::new(ProcessRunner::new(GrokStreamAdapter::from_member(
-            member, workspace,
-        ))),
+        BackendKind::Grok => Box::new(GrokAcpRunner::from_member(member, workspace)),
         BackendKind::Agy => Box::new(ProcessRunner::new(AgyStreamAdapter::from_member(
             member, workspace,
         ))),

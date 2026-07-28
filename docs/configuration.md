@@ -16,8 +16,9 @@ At startup, Asterline chooses a roster in this order:
 4. If no saved team and no supported executable exists, startup stops with a
    setup message.
 
-Use `/team` to modify the live roster. Press `s` to apply the changes, replace
-member runners, and save the updated team.
+Use `/team` to modify the live roster. Opening it refreshes installed Agent
+CLIs and preloads their model and reasoning-effort catalogs. Press `s` to
+apply the changes, replace member runners, and save the updated team.
 
 ## Team file
 
@@ -56,16 +57,19 @@ member runners, and save the updated team.
       "reviewer": "reviewer",
       "max_iterations": 3
     },
-    "lead": {
+    "plan": {
       "leader": "builder",
       "reviewer": "reviewer",
       "max_iterations": 3,
       "auto_verify": true
     },
-    "roundtable": {
+    "brainstorm": {
       "participants": ["builder", "reviewer", "grok"],
-      "moderator": "reviewer",
-      "rounds": 2
+      "generation_rounds": 3,
+      "ideas_per_round": 4
+    },
+    "team": {
+      "coordinator": "builder"
     }
   },
   "approvals": {
@@ -92,27 +96,39 @@ member runners, and save the updated team.
 
 ### Collaboration modes (`modes`)
 
-Optional bindings for `/mode review`, `/mode plan`, and `/mode roundtable`. When a
+Optional bindings for `/mode review`, `/mode plan`, `/mode brainstorm`, and `/mode team`. When a
 field is omitted, Asterline derives it from member roles and `default_target`
 (builder ≈ default target or first non-reviewer; reviewer ≈ role contains
-"review"; leader/moderator ≈ role contains "plan" or "lead"; participants =
-full roster). Defaults for budgets: `max_iterations = 3`, `rounds = 2`,
+"review"; leader ≈ role contains "plan" or "lead", else first
+participant; participants = full roster). Defaults for budgets:
+`max_iterations = 3`, `generation_rounds = 3`, `ideas_per_round = 4`,
 `auto_verify = true`.
 
-| Field            | Modes              | Meaning                                            |
-| ---------------- | ------------------ | -------------------------------------------------- |
-| `builder`        | review, lead       | Member who implements changes                      |
-| `reviewer`       | review, lead       | Member who emits `@@review` verdicts               |
-| `leader`         | lead               | Member who writes the owned checklist              |
-| `moderator`      | roundtable         | Optional synthesizer after discussion rounds       |
-| `participants`   | roundtable         | Roster for discussion turns                        |
-| `max_iterations` | review, lead       | Builder↔reviewer loop budget before blocking       |
-| `rounds`         | roundtable         | Number of full discussion rounds                   |
-| `auto_verify`    | lead (and similar) | Run suggested verification after approve when true |
+Brainstorm separates divergence from convergence. The first wave collects independent
+seeds; later waves expose each participant to a rotating anonymous peer sample
+for building, combining, mutating, and stretching ideas. Earlier contributions
+remain in the persisted idea set. After the final generation wave, every
+participant privately ranks labeled ideas. Asterline aggregates ballots with a
+deterministic Borda tally and dispatches one neutral ranked synthesis.
+Each generated idea is extracted from an `@@brainstorm_card` envelope and
+assigned a canonical candidate ID, so ballots do not depend on model-specific
+Markdown numbering.
 
-Legacy one-shot `/review builder=@x max_iterations=5 …` overrides beat
-`team.json`, which beats role derivation. Persistent `/mode review` uses the
-configured/derived defaults for every subsequent message.
+| Field               | Mode             | Meaning                                                     |
+| ------------------- | ---------------- | ----------------------------------------------------------- |
+| `builder`           | review           | Member who implements changes                               |
+| `reviewer`          | review/plan      | Member who emits `@@review` verdicts                        |
+| `leader`            | plan             | Member who writes the owned checklist                       |
+| `participants`      | brainstorm       | Roster for all generation waves                             |
+| `generation_rounds` | brainstorm       | Seed/build/stretch wave budget (default 3, minimum 2)       |
+| `ideas_per_round`   | brainstorm       | Requested idea cards per member/wave (default 4, minimum 3) |
+| `coordinator`       | team             | Member who coordinates the whole-team run                   |
+| `max_iterations`    | review/plan/team | Loop budget before blocking or failing verify (def 3)       |
+| `auto_verify`       | review/plan/team | Run verification after approval/finish (default true)       |
+| `verify_command`    | review/plan/team | Explicit auto-verify shell command (else heuristic)         |
+
+Each mode has its own configuration shape; unrelated fields are rejected by
+Serde instead of being silently accepted and ignored.
 
 ### Approvals (`approvals`)
 
@@ -142,8 +158,8 @@ to backend-native sandbox and permission enforcement.
 | `role`            | Yes                         | Free-form team responsibility                           |
 | `id`              | No                          | Stable handle used by `@member` and routing             |
 | `cwd`             | No                          | Member-specific working directory                       |
-| `model`           | No                          | Backend model; omitted means backend default            |
-| `effort`          | No                          | `low`, `medium`, `high`, `xhigh`, or `max`              |
+| `model`           | No                          | Omitted delegates to the backend CLI                    |
+| `effort`          | No                          | Chosen with the model; `default` delegates to the CLI   |
 | `system_prompt`   | No                          | Additional member instructions                          |
 | `sandbox`         | No                          | `read-only`, `workspace-write`, or `danger-full-access` |
 | `permission_mode` | No                          | Backend-native permission mode                          |
@@ -160,13 +176,10 @@ conversation; that newly discovered ID is then reused for subsequent calls.
 Set `session_id` to bind a team member to a specific conversation from its
 native CLI history. Asterline passes it through the backend's native resume
 mechanism (`codex exec resume`, `claude --resume`, `grok --resume`, or Agy
-`--conversation`). In the Team editor, use `auto` to clear the explicit ID.
+`--conversation`). In the Team editor, use `default` to clear the explicit ID.
 
 Permission modes, sandbox mappings, and allowed-tool behavior depend on the
 backend. Do not assume a field has the same effect across all four CLIs.
-
-Legacy saved entries using `backend: "gemini"` are migrated to `agy` when the
-workspace team file is loaded.
 
 ## Backend setting support
 
@@ -174,17 +187,17 @@ This table describes what the current Asterline adapters actually pass to each
 CLI. It is intentionally narrower than the union of fields accepted by the
 Team editor.
 
-| Setting                | Codex                                                                          | Claude                                      | Grok                                          | Agy                                                               |
-| ---------------------- | ------------------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------- |
-| `cwd`                  | Process cwd and `-C` on a fresh session                                        | Process cwd                                 | Process cwd                                   | Process cwd                                                       |
-| `model`                | `-m`                                                                           | `--model`                                   | `--model`                                     | `--model`                                                         |
-| `effort`               | `model_reasoning_effort`; values above `high` clamp to `high`                  | `--effort`                                  | `--reasoning-effort`                          | Not passed                                                        |
-| `sandbox`              | `-s` on a fresh session; resumed session restores its own sandbox              | Not passed                                  | `--sandbox` with an Asterline profile mapping | `--sandbox` unless configured as `danger-full-access`             |
-| `permission_mode`      | Not passed                                                                     | `--permission-mode` (omitted for `default`) | `--permission-mode`                           | Only `bypassPermissions` maps to `--dangerously-skip-permissions` |
-| `allowed_tools`        | Not passed                                                                     | `--allowed-tools`                           | `--tools`                                     | Not passed                                                        |
-| custom `system_prompt` | Not passed as a backend system prompt; Asterline prepends current team context | `--append-system-prompt`                    | `--rules`                                     | Prepended to stdin text                                           |
-| `session_policy`       | Resume or fresh                                                                | Resume or fresh                             | Resume or fresh                               | Resume or fresh conversation                                      |
-| `session_id`           | `codex exec resume <id>`                                                       | `claude --resume <id>`                      | `grok --resume <id>`                          | `agy --conversation <id>`                                         |
+| Setting                | Codex                                                              | Claude                                      | Grok ACP                                                              | Agy                                                                          |
+| ---------------------- | ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `cwd`                  | Process cwd and `-C` on a fresh session                            | Process cwd                                 | ACP session `cwd`                                                     | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
+| `model`                | `-m`                                                               | `--model`                                   | Agent `--model`                                                       | `--model`                                                                    |
+| `effort`               | `model_reasoning_effort`; picker follows model metadata            | `--effort` (through `max`)                  | Agent `--reasoning-effort`                                            | `--effort` (`low`, `medium`, or `high`)                                      |
+| `sandbox`              | `-s` on fresh sessions; resumed sessions restore their own sandbox | Not passed                                  | Top-level `--sandbox` with an Asterline profile mapping               | `--sandbox` unless configured as `danger-full-access`                        |
+| `permission_mode`      | Not passed                                                         | `--permission-mode` (omitted for `default`) | Top-level mode plus ACP permission responses                          | `acceptEdits` → `--mode accept-edits`; `plan` → `--mode plan`; bypass → flag |
+| `allowed_tools`        | Not passed                                                         | `--allowed-tools`                           | Added to ACP session rules; not a hard protocol-level allowlist       | Not passed                                                                   |
+| custom `system_prompt` | `-c developer_instructions=…`                                      | `--append-system-prompt`                    | ACP session `rules`                                                   | Prepended to the print prompt                                                |
+| `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                                   | Resume or fresh conversation                                                 |
+| `session_id`           | `codex exec resume <id>`                                           | `claude --resume <id>`                      | ACP `session/load`                                                    | `agy --conversation <id>`                                                    |
 
 For Claude and Grok, choose only permission modes accepted by the installed CLI
 version. Asterline serializes the configured value but does not negotiate
@@ -203,10 +216,21 @@ Model choices are resolved in each member's effective working directory:
 | Grok    | `grok models`                                                   |
 | Agy     | `agy models`                                                    |
 
-Open the member's `model` field and press `Enter`. The first press may start a
-background query; press `Enter` again after the loading notice. The picker
-always includes `default` and preserves a currently configured custom value.
-Press `e` on the field to enter a model manually.
+The Team builder and `/team` editor start background discovery as soon as they
+open. The Agent field lists all four supported CLIs, includes installation
+status and discovered model/effort summaries, and disables missing CLIs. Open
+the member's `model` field to browse the already-loading catalog. Type to
+filter by display name, model ID, or description, use `↑`/`↓` for the model,
+and use `←`/`→` for that model's effort. `Enter` applies both values. The
+When discovery returns models, the picker selects the CLI-marked default or,
+if none is marked, the first discovered model. It shows only actual model
+entries in that case. `default` is available only when discovery returns no
+models. Press `e` on the field to enter a model ID manually.
+
+Reasoning effort is model-aware when discovery returns capability metadata.
+Unsupported levels are omitted and the model's reported default effort is
+shown directly when available. Agy exposes the three levels its CLI accepts:
+`low`, `medium`, and `high`.
 
 ## Runtime data
 
@@ -219,7 +243,7 @@ The default workspace state is:
 ```
 
 SQLite stores conversations, tool events, teammate routes, raw backend events,
-logs, approvals, session identifiers, workflow runs, checklists, timelines, and
+logs, approvals, session identifiers, runs, checklists, timelines, and
 verification outcomes.
 
 Protect this directory like any other development transcript. Most repositories
@@ -229,9 +253,13 @@ should ignore it:
 .asterline/
 ```
 
-`/new` creates a clean conversation and new backend sessions while retaining
-older database records. `--no-restore` skips startup replay without deleting
-data. `--db <PATH>` moves the database outside the workspace.
+`/new` creates a clean conversation in normal mode and new backend sessions
+while retaining older database records. `--no-restore` skips startup replay
+without deleting data. `--db <PATH>` moves the database outside the workspace.
+
+`/resume` opens the saved-chat picker. Restoring a chat also restores the
+roster, full member configuration, and each member's native backend session ID
+that belonged to that chat.
 
 ## Terminal color theme
 
@@ -274,6 +302,12 @@ and injects a compact skill hint into each member's system instructions. The
 full protocol remains in the workspace instead of being repeated in every
 prompt.
 
+It also creates `.agents/skills/asterline-brainstorm/SKILL.md` when missing.
+Brainstorm mode loads that file for every generation, vote, and synthesis
+dispatch. Existing copies are never upgraded or overwritten, so deployments
+can customize the method while retaining the `@@brainstorm_card` and
+`@@brainstorm_vote` schemas.
+
 ### Teammate messages
 
 ```text
@@ -298,17 +332,17 @@ Asterline validates duplicate IDs and names, starts the runner, saves the
 roster, and broadcasts the updated team. Agent envelopes can add members but
 cannot delete them; deletion remains a `/team` action.
 
-### Workflow checklist updates
+### Run checklist updates
 
-During an active workflow turn, an agent can add, update, assign, rename, or
+During an active run, an agent can add, update, assign, rename, or
 remove checklist steps:
 
 ```text
-@@workflow_step {"action":"add","owner":"builder","title":"Write tests"}
-@@workflow_step {"action":"doing","step":1,"note":"Implementing edge cases"}
-@@workflow_step {"action":"done","step":1,"note":"Tests pass"}
-@@workflow_step {"action":"block","step":2,"note":"Waiting for credentials"}
-@@workflow_step {"action":"assign","step":2,"owner":"reviewer"}
+@@run_step {"action":"add","owner":"builder","title":"Write tests"}
+@@run_step {"action":"doing","step":1,"note":"Implementing edge cases"}
+@@run_step {"action":"done","step":1,"note":"Tests pass"}
+@@run_step {"action":"block","step":2,"note":"Waiting for credentials"}
+@@run_step {"action":"assign","step":2,"owner":"reviewer"}
 ```
 
 These updates appear in `/runs` and are recorded in the run timeline.
@@ -345,9 +379,10 @@ authenticated, and on `PATH`. Alternatively, pass a valid file with `--team`.
 
 ### The model picker only shows `default`
 
-Press `Enter` on the `model` field to start discovery. If a loading notice
-appears, wait briefly and press `Enter` again. Press `e` to enter a model name
-manually.
+Wait for the automatic catalog-loading notice in the Team editor to finish,
+then reopen the `model` field. If discovery failed, verify the selected CLI is
+authenticated and can list models in the member's working directory. Press
+`e` to enter a model name manually.
 
 ### The wrong roster opens
 

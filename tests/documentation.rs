@@ -7,6 +7,10 @@ const DOCUMENTS: &[(&str, &str)] = &[
     ("README.zh-CN.md", include_str!("../README.zh-CN.md")),
     ("docs/commands.md", include_str!("../docs/commands.md")),
     (
+        "docs/commands.zh-CN.md",
+        include_str!("../docs/commands.zh-CN.md"),
+    ),
+    (
         "docs/configuration.md",
         include_str!("../docs/configuration.md"),
     ),
@@ -45,12 +49,12 @@ fn documented_team_json_is_valid_and_loadable() {
         "documented modes.review must be present"
     );
     assert!(
-        config.modes.lead.is_some(),
-        "documented modes.lead must be present"
+        config.modes.plan.is_some(),
+        "documented modes.plan must be present"
     );
     assert!(
-        config.modes.roundtable.is_some(),
-        "documented modes.roundtable must be present"
+        config.modes.brainstorm.is_some(),
+        "documented modes.brainstorm must be present"
     );
     assert_eq!(
         config.approvals.apply_to,

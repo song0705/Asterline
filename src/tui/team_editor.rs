@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::domain::config::default_member;
+use crate::domain::config::{DetectedBackends, default_member, detect_backends};
 use crate::domain::event::UiCommand;
 use crate::domain::team::{BackendKind, DefaultTarget, MemberId, TeamConfig, TeamMember};
 use crate::tui::session_picker::SessionPicker;
 use crate::tui::team_builder::{
-    EditState, Field, ModelCatalog, ModelChoices, ModelPicker, cycle_backend, cycle_effort,
+    BackendPicker, EditState, Field, ModelCatalog, ModelChoices, ModelPicker, cycle_effort,
     cycle_permission, cycle_sandbox, field_value, normalize_member_id, unique_display_name,
     unique_display_name_except, unique_member_id,
 };
@@ -27,12 +27,14 @@ pub(crate) struct TeamEditor {
     workspace: PathBuf,
     default_target: Option<DefaultTarget>,
     members: Vec<TeamMember>,
+    detected: DetectedBackends,
     available: Vec<BackendKind>,
     selected: usize,
     field: usize,
     field_mode: bool,
     editing: Option<EditState>,
     model_catalog: ModelCatalog,
+    backend_picker: Option<BackendPicker>,
     model_picker: Option<ModelPicker>,
     session_picker: Option<SessionPicker>,
     dirty: bool,
@@ -51,17 +53,19 @@ impl TeamEditor {
             workspace: workspace.into(),
             default_target,
             members,
-            available: vec![
-                BackendKind::Codex,
-                BackendKind::Claude,
-                BackendKind::Grok,
-                BackendKind::Agy,
-            ],
+            detected: DetectedBackends {
+                codex: false,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+            available: Vec::new(),
             selected: 0,
             field: 0,
             field_mode: false,
             editing: None,
             model_catalog: ModelCatalog::default(),
+            backend_picker: None,
             model_picker: None,
             session_picker: None,
             dirty: false,
@@ -109,6 +113,95 @@ impl TeamEditor {
         self.model_picker.as_ref()
     }
 
+    pub(crate) fn backend_picker(&self) -> Option<&BackendPicker> {
+        self.backend_picker.as_ref()
+    }
+
+    pub(crate) fn model_catalog(&self) -> &ModelCatalog {
+        &self.model_catalog
+    }
+
+    pub(crate) fn selected_cwd(&self) -> PathBuf {
+        self.selected_member()
+            .map(|member| member.resolved_cwd(&self.workspace))
+            .unwrap_or_else(|| self.workspace.clone())
+    }
+
+    pub(crate) fn agent_availability_label(&self) -> String {
+        [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ]
+        .into_iter()
+        .map(|backend| {
+            format!(
+                "{} {}",
+                backend.as_str(),
+                if self.detected.contains(backend) {
+                    "✓"
+                } else {
+                    "✕"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
+    pub(crate) fn load_agent_catalog(&mut self) {
+        self.detected = detect_backends();
+        self.available = [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ]
+        .into_iter()
+        .filter(|backend| self.detected.contains(*backend))
+        .collect();
+        let mut cwds = self
+            .members
+            .iter()
+            .map(|member| member.resolved_cwd(&self.workspace))
+            .collect::<Vec<_>>();
+        cwds.push(self.workspace.clone());
+        cwds.sort();
+        cwds.dedup();
+        self.model_catalog.preload(&self.available, &cwds);
+        self.preload_member_catalogs();
+        self.notice = Some("loading installed Agent model and effort catalogs…".to_string());
+    }
+
+    pub(crate) fn poll_agent_catalog(&mut self) {
+        self.preload_member_catalogs();
+        self.model_catalog.poll();
+        if !self.model_catalog.is_loading()
+            && self
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("loading installed Agent"))
+        {
+            self.notice = Some(if self.available.is_empty() {
+                "no supported Agent CLI found on PATH".to_string()
+            } else {
+                "Agent model and effort catalogs loaded".to_string()
+            });
+        }
+    }
+
+    fn preload_member_catalogs(&mut self) {
+        let targets = self
+            .members
+            .iter()
+            .map(|member| (member.backend, member.resolved_cwd(&self.workspace)))
+            .collect::<Vec<_>>();
+        for (backend, cwd) in targets {
+            let _ = self.model_catalog.models(backend, &cwd);
+        }
+    }
+
     pub(crate) fn session_picker(&self) -> Option<&SessionPicker> {
         self.session_picker.as_ref()
     }
@@ -137,17 +230,29 @@ impl TeamEditor {
         self.members.get(self.selected)
     }
 
+    pub(crate) fn field_value(&self, member: &TeamMember, field: Field) -> String {
+        match field {
+            Field::Model => self.model_catalog.model_label(member, &self.workspace),
+            Field::Effort => self.model_catalog.effort_label(member, &self.workspace),
+            _ => field_value(member, field),
+        }
+    }
+
     pub(crate) fn handle_key(
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> TeamEditorOutcome {
+        if self.backend_picker.is_some() {
+            self.handle_backend_picker_key(code);
+            return TeamEditorOutcome::Consumed(None);
+        }
         if self.session_picker.is_some() {
             self.handle_session_picker_key(code, modifiers);
             return TeamEditorOutcome::Consumed(None);
         }
         if self.model_picker.is_some() {
-            self.handle_model_picker_key(code);
+            self.handle_model_picker_key(code, modifiers);
             return TeamEditorOutcome::Consumed(None);
         }
         if self.editing.is_some() {
@@ -226,28 +331,85 @@ impl TeamEditor {
         }
     }
 
-    fn handle_model_picker_key(&mut self, code: KeyCode) {
+    fn handle_backend_picker_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => self.backend_picker.as_mut().unwrap().up(),
+            KeyCode::Down => self.backend_picker.as_mut().unwrap().down(),
+            KeyCode::Enter => {
+                let Some(choice) = self
+                    .backend_picker
+                    .as_ref()
+                    .and_then(BackendPicker::selected_choice)
+                else {
+                    return;
+                };
+                if !choice.installed {
+                    self.notice = Some(format!(
+                        "{} is not installed on PATH",
+                        choice.backend.as_str()
+                    ));
+                    return;
+                }
+                let changed = self
+                    .selected_member()
+                    .is_some_and(|member| member.backend != choice.backend);
+                if changed && let Some(member) = self.selected_member_mut() {
+                    member.backend = choice.backend;
+                    member.session_id = None;
+                    member.model = None;
+                    member.effort = None;
+                }
+                self.backend_picker = None;
+                if changed {
+                    self.dirty = true;
+                    self.notice = Some("Agent CLI selected · press s to apply".to_string());
+                }
+            }
+            KeyCode::Esc => self.backend_picker = None,
+            _ => {}
+        }
+    }
+
+    fn handle_model_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match code {
+            KeyCode::Up => {
                 if let Some(picker) = &mut self.model_picker {
                     picker.up();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Some(picker) = &mut self.model_picker {
                     picker.down();
                 }
             }
+            KeyCode::Left => self.model_picker.as_mut().unwrap().previous_effort(),
+            KeyCode::Right => self.model_picker.as_mut().unwrap().next_effort(),
             KeyCode::Enter => {
+                if self
+                    .model_picker
+                    .as_ref()
+                    .is_none_or(|picker| picker.visible_len() == 0)
+                {
+                    return;
+                }
                 let value = self.model_picker.as_ref().and_then(ModelPicker::value);
+                let effort = self.model_picker.as_ref().and_then(ModelPicker::effort);
                 if let Some(member) = self.selected_member_mut() {
                     member.model = value;
+                    member.effort = effort;
                 }
                 self.model_picker = None;
                 self.dirty = true;
-                self.notice = Some("model selected · press s to apply".to_string());
+                self.notice = Some("model and effort selected · press s to apply".to_string());
             }
-            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            KeyCode::Backspace => self.model_picker.as_mut().unwrap().pop_query(),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.model_picker.as_mut().unwrap().clear_query();
+            }
+            KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.model_picker.as_mut().unwrap().push_query(ch);
+            }
+            KeyCode::Esc => self.model_picker = None,
             _ => {}
         }
     }
@@ -358,7 +520,13 @@ impl TeamEditor {
 
     fn activate_field(&mut self) {
         let field = self.selected_field();
-        if field == Field::Model {
+        if field == Field::Backend {
+            let Some(member) = self.selected_member() else {
+                return;
+            };
+            self.backend_picker = Some(BackendPicker::new(member.backend, self.detected));
+            self.notice = Some("↑/↓ choose an installed Agent CLI · Enter select".to_string());
+        } else if field == Field::Model {
             self.cycle_model();
         } else if field == Field::SessionId {
             let Some(member) = self.selected_member() else {
@@ -401,7 +569,12 @@ impl TeamEditor {
         let Some(member) = self.selected_member() else {
             return;
         };
-        self.editing = Some(EditState::new(field, field_value(member, field)));
+        let value = if field == Field::Model {
+            member.model.clone().unwrap_or_default()
+        } else {
+            field_value(member, field)
+        };
+        self.editing = Some(EditState::new(field, value));
     }
 
     fn cycle_model(&mut self) {
@@ -410,17 +583,24 @@ impl TeamEditor {
         };
         let backend = member.backend;
         let current = member.model.clone();
+        let current_effort = member.effort;
         let cwd = member.resolved_cwd(&self.workspace);
         match self.model_catalog.models(backend, &cwd) {
             ModelChoices::Loading => {
                 self.notice = Some(format!(
-                    "loading {} models in the background · press Enter again shortly",
+                    "{} model catalog is already loading automatically",
                     backend.as_str()
                 ));
             }
             ModelChoices::Ready(models) => {
-                self.model_picker = Some(ModelPicker::new(current.as_deref(), models));
-                self.notice = Some("↑/↓ choose model · Enter select · Esc cancel".to_string());
+                self.model_picker = Some(ModelPicker::new(
+                    backend,
+                    current.as_deref(),
+                    current_effort,
+                    models,
+                ));
+                self.notice =
+                    Some("↑/↓ choose model · ←/→ choose effort · Enter select".to_string());
             }
             ModelChoices::Failed(err) => self.notice = Some(err),
         }
@@ -428,19 +608,21 @@ impl TeamEditor {
 
     fn cycle_field(&mut self, field: Field) {
         match field {
-            Field::Backend => {
-                let current = self.selected_member().map(|m| m.backend);
-                if let Some(current) = current {
-                    let next = cycle_backend(current, &self.available);
-                    if let Some(member) = self.selected_member_mut() {
-                        member.backend = next;
-                        member.session_id = None;
-                    }
-                }
-            }
             Field::Effort => {
+                let choices = self
+                    .selected_member()
+                    .map(|member| self.model_catalog.efforts(member, &self.workspace))
+                    .unwrap_or_default();
                 if let Some(member) = self.selected_member_mut() {
-                    member.effort = cycle_effort(member.effort);
+                    member.effort = cycle_effort(member.effort, &choices);
+                }
+                if choices.is_empty() {
+                    self.notice = self.selected_member().map(|member| {
+                        format!(
+                            "{} does not support reasoning effort",
+                            member.backend.as_str()
+                        )
+                    });
                 }
             }
             Field::Sandbox => {
@@ -510,7 +692,7 @@ impl TeamEditor {
             }
             Field::Model => {
                 if let Some(member) = self.selected_member_mut() {
-                    member.model = if value.is_empty() || value == "default" {
+                    member.model = if value.is_empty() || value.eq_ignore_ascii_case("default") {
                         None
                     } else {
                         Some(value.to_string())
@@ -518,7 +700,7 @@ impl TeamEditor {
                 }
             }
             Field::SessionId => {
-                let session_id = if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                let session_id = if value.is_empty() || value.eq_ignore_ascii_case("default") {
                     None
                 } else {
                     Some(value.to_string())
@@ -593,6 +775,7 @@ fn cwd_value(value: &str, workspace: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::team::Effort;
 
     fn editor() -> TeamEditor {
         TeamEditor::new(
@@ -631,6 +814,33 @@ mod tests {
         assert_eq!(
             editor.normalized_default_target(),
             Some(DefaultTarget::Member(MemberId::new("lead-engineer")))
+        );
+    }
+
+    #[test]
+    fn member_model_catalog_is_preloaded_without_opening_model_field() {
+        let mut editor = TeamEditor::new(
+            "t",
+            "/tmp/ws",
+            None,
+            vec![TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Claude,
+                "impl",
+            )],
+        );
+
+        editor.preload_member_catalogs();
+
+        assert!(
+            editor
+                .model_catalog
+                .contains(BackendKind::Claude, Path::new("/tmp/ws"))
+        );
+        assert_eq!(
+            editor.field_value(&editor.members[0], Field::Model),
+            "loading…"
         );
     }
 
@@ -684,6 +894,67 @@ mod tests {
     }
 
     #[test]
+    fn backend_field_opens_agent_list_and_rejects_missing_cli() {
+        let mut editor = editor();
+        editor.detected = DetectedBackends {
+            codex: true,
+            claude: false,
+            grok: true,
+            agy: false,
+        };
+        editor.field_mode = true;
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Backend)
+            .unwrap();
+
+        editor.activate_field();
+        let picker = editor.backend_picker().expect("backend picker");
+        assert_eq!(picker.choices().len(), 4);
+        assert!(picker.choices()[0].installed);
+        assert!(!picker.choices()[1].installed);
+
+        editor.handle_backend_picker_key(KeyCode::Down);
+        editor.handle_backend_picker_key(KeyCode::Enter);
+        assert_eq!(editor.members[0].backend, BackendKind::Codex);
+        assert!(editor.backend_picker().is_some());
+        assert!(
+            editor
+                .notice()
+                .is_some_and(|notice| notice.contains("not installed"))
+        );
+    }
+
+    #[test]
+    fn backend_list_selection_replaces_agent_and_resets_capabilities() {
+        let mut editor = editor();
+        editor.detected = DetectedBackends {
+            codex: true,
+            claude: true,
+            grok: false,
+            agy: false,
+        };
+        editor.members[0].model = Some("gpt-old".to_string());
+        editor.members[0].effort = Some(crate::domain::team::Effort::High);
+        editor.members[0].session_id = Some("old-session".to_string());
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Backend)
+            .unwrap();
+
+        editor.activate_field();
+        editor.handle_backend_picker_key(KeyCode::Down);
+        editor.handle_backend_picker_key(KeyCode::Enter);
+
+        assert_eq!(editor.members[0].backend, BackendKind::Claude);
+        assert_eq!(editor.members[0].model, None);
+        assert_eq!(editor.members[0].effort, None);
+        assert_eq!(editor.members[0].session_id, None);
+        assert!(editor.backend_picker().is_none());
+        assert!(editor.dirty());
+    }
+
+    #[test]
     fn apply_returns_replace_team_command() {
         let mut editor = editor();
         editor.add_member();
@@ -711,7 +982,7 @@ mod tests {
             crate::domain::team::SessionPolicy::Resume
         );
 
-        editor.commit_edit(EditState::new(Field::SessionId, "auto".to_string()));
+        editor.commit_edit(EditState::new(Field::SessionId, "default".to_string()));
         assert_eq!(editor.members[0].session_id, None);
     }
 
@@ -782,9 +1053,11 @@ mod tests {
 
         editor.activate_field();
         assert!(editor.model_picker().is_some());
-        editor.handle_model_picker_key(KeyCode::Down);
-        editor.handle_model_picker_key(KeyCode::Enter);
+        editor.handle_model_picker_key(KeyCode::Down, KeyModifiers::NONE);
+        editor.handle_model_picker_key(KeyCode::Right, KeyModifiers::NONE);
+        editor.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(editor.members[0].model.as_deref(), Some("grok-build"));
+        assert_eq!(editor.members[0].effort, Some(Effort::Low));
     }
 
     #[test]
@@ -802,8 +1075,8 @@ mod tests {
         );
 
         editor.activate_field();
-        editor.handle_model_picker_key(KeyCode::Down);
-        editor.handle_model_picker_key(KeyCode::Enter);
+        editor.handle_model_picker_key(KeyCode::Down, KeyModifiers::NONE);
+        editor.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(editor.members[0].model.as_deref(), Some("gpt-5.6-sol"));
     }

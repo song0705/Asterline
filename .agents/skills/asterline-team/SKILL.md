@@ -1,8 +1,8 @@
 ---
 name: asterline-team
-description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update workflow steps, or request that Asterline add a teammate to the live roster. A visible roster only lists available members and does not by itself trigger messaging or delegation.
+description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster. A visible roster only lists available members and does not by itself trigger messaging or delegation.
 metadata:
-  version: 5
+  version: 12
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -17,10 +17,22 @@ The roster is an availability directory, not an assignment or an instruction to 
 Do not send a teammate message merely because teammates are listed, because another member has a relevant role, or because the task involves search, research, review, or planning. Send a message only when at least one of these conditions holds:
 
 - The user explicitly requests collaboration, delegation, or a teammate's input.
-- The active Asterline workflow explicitly requires a handoff or coordinated multi-member work.
+- The active Asterline run explicitly requires a handoff or coordinated multi-member work.
 - You are blocked on information or action that a specific teammate must provide and you cannot complete the task independently.
 
 If you can complete the request yourself, do not emit `@@team_message`. Do not send unsolicited status updates or FYI messages.
+
+## Every Received Message Must Be Answered
+
+When you receive an Asterline relay from another member, remember the sender. Before ending your turn, you MUST emit exactly one `@@team_message` back to that sender with a substantive answer, result, question, or blocker. This rule applies in normal chat and every collaboration mode.
+
+```text
+@@team_message {"to":"original-sender","kind":"reply","body":"Result, decision, question, or blocker"}
+```
+
+Visible response text, checklist updates, and tool output do not count as replying to the sender. For delegated work, update every owned run step to `done` or `block`, then send the reply with results, changed files, checks run, and blockers.
+
+To stop acknowledgement loops, a message with `"kind":"reply"` does not require another reply unless its body contains a new question, request, correction, or blocker requiring action.
 
 ## Message Teammates
 
@@ -65,19 +77,27 @@ When asked to review work, you MUST end your reply with exactly one control line
 - `summary` is optional free-text explaining the decision.
 - `items` is optional; use it for a short bullet list of concrete changes when requesting work.
 
-## Update Workflow Steps
+## Brainstorm Generation and Voting
+
+For `/mode brainstorm`, follow the deployed `$asterline-brainstorm` skill and
+the current phase prompt. That separate skill defines the structured
+`@@brainstorm_card` schema, judgment-free generation waves, private
+`@@brainstorm_vote` ballot, and final synthesis. Do not substitute a free-form
+card format.
+
+## Update Run Steps
 
 During `/mode plan` or `/continue` work, keep the run checklist current:
 
 ```text
-@@workflow_step {"action":"add","owner":"builder","title":"Write parser tests"}
-@@workflow_step {"action":"doing","step":1,"note":"Implementing lexer edge cases"}
-@@workflow_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
-@@workflow_step {"action":"block","step":2,"note":"Waiting for API credentials"}
-@@workflow_step {"action":"assign","step":2,"owner":"reviewer"}
-@@workflow_step {"action":"unassign","step":2}
-@@workflow_step {"action":"rename","step":2,"title":"Document API credential setup"}
-@@workflow_step {"action":"remove","step":3}
+@@run_step {"action":"add","owner":"builder","title":"Write parser tests"}
+@@run_step {"action":"doing","step":1,"note":"Implementing lexer edge cases"}
+@@run_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
+@@run_step {"action":"block","step":2,"note":"Waiting for API credentials"}
+@@run_step {"action":"assign","step":2,"owner":"reviewer"}
+@@run_step {"action":"unassign","step":2}
+@@run_step {"action":"rename","step":2,"title":"Document API credential setup"}
+@@run_step {"action":"remove","step":3}
 ```
 
 Use `add` for new checklist items. Use `todo`, `doing`, `done`, or `block` with

@@ -7,15 +7,16 @@ pub mod mode;
 pub mod team;
 
 pub use event::{
-    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, LogEntry, LogLevel,
-    MemberStatus, MemberSummary, MessageId, MessageTarget, ModeRunStatus, RouteTo, RuntimeEvent,
-    TeamMessage, TurnId, UiCommand, WorkflowRunEventSummary, WorkflowRunId, WorkflowRunStatus,
-    WorkflowRunSummary, WorkflowStepRequest, WorkflowStepStatus, WorkflowStepSummary,
-    WorkflowVerification,
+    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary,
+    LogEntry, LogLevel, MemberStatus, MemberSummary, MessageId, MessageTarget, ModeRunStatus,
+    RouteTo, RunEventSummary, RunId, RunStatus, RunStepRequest, RunStepStatus, RunStepSummary,
+    RunSummary, RunVerification, RuntimeEvent, TeamMessage, TurnId, UiCommand,
 };
 pub use mode::{
-    CollabMode, ModeBinding, ModeLimits, ModeStatusSummary, ModesConfig, ResolvedModeRoles,
-    ReviewVerdict, ReviewVerdictKind, TerminalMode, resolve_mode_roles,
+    BrainstormModeConfig, CollabMode, ModeLimits, ModeStatusSummary, ModesConfig, PlanModeConfig,
+    ResolvedModeRoles, ReviewModeConfig, ReviewVerdict, ReviewVerdictKind, TeamLimits,
+    TeamModeConfig, TerminalMode, resolve_mode_roles, resolve_team_coordinator,
+    resolve_team_limits, resolve_verify_command,
 };
 pub use team::{
     ApprovalPolicy, ApprovalSurface, BackendKind, DEFAULT_MAX_AUTO_RELAYS, DefaultTarget, MemberId,

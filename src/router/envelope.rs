@@ -9,18 +9,19 @@
 //! @@team_message {"to":["builder","reviewer"],"body":"implement and review"}
 //! @@team_message {"to":"all","body":"let's agree on the data model first"}
 //! @@team_member {"display_name":"QA","backend":"codex","role":"tests"}
-//! @@workflow_step {"action":"add","owner":"builder","title":"Write parser tests"}
-//! @@workflow_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
-//! @@workflow_step {"action":"assign","step":2,"owner":"reviewer"}
+//! @@run_step {"action":"add","owner":"builder","title":"Write parser tests"}
+//! @@run_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
+//! @@run_step {"action":"assign","step":2,"owner":"reviewer"}
 //! @@review {"verdict":"approve","summary":"Looks good"}
+//! @@brainstorm_card {"title":"Fast probe","proposal":"Test a narrow path","mechanism":"Run a small experiment","operation":"SEED","sources":[]}
 //! ```
 
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::domain::event::{RouteTo, TeamMessage, WorkflowStepRequest, WorkflowStepStatus};
-use crate::domain::mode::{ReviewVerdict, ReviewVerdictKind};
+use crate::domain::event::{RouteTo, RunStepRequest, RunStepStatus, TeamMessage};
+use crate::domain::mode::{BrainstormCard, BrainstormVote, ReviewVerdict, ReviewVerdictKind};
 use crate::domain::team::{
     BackendKind, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy, TeamMember,
     derived_member_id,
@@ -28,8 +29,10 @@ use crate::domain::team::{
 
 const TEAM_MESSAGE_PREFIX: &str = "@@team_message";
 const TEAM_MEMBER_PREFIX: &str = "@@team_member";
-const WORKFLOW_STEP_PREFIX: &str = "@@workflow_step";
+const RUN_STEP_PREFIX: &str = "@@run_step";
 const REVIEW_PREFIX: &str = "@@review";
+const BRAINSTORM_CARD_PREFIX: &str = "@@brainstorm_card";
+const BRAINSTORM_VOTE_PREFIX: &str = "@@brainstorm_vote";
 
 /// The result of scanning one agent message for envelopes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -40,13 +43,17 @@ pub struct ParsedAgentOutput {
     pub messages: Vec<TeamMessage>,
     /// New teammate requests parsed from the output, in order.
     pub members: Vec<TeamMember>,
-    /// Workflow checklist mutations parsed from the output, in order.
-    pub workflow_steps: Vec<WorkflowStepRequest>,
+    /// Run checklist mutations parsed from the output, in order.
+    pub run_steps: Vec<RunStepRequest>,
     /// Review verdicts parsed from the output, in order.
     ///
     /// The collaboration engine consumes the **last** verdict when multiple
     /// `@@review` lines appear in one agent message.
     pub reviews: Vec<ReviewVerdict>,
+    /// Private ranked ballots emitted during the brainstorm voting phase.
+    pub brainstorm_votes: Vec<BrainstormVote>,
+    /// Structured cards emitted during brainstorm generation waves.
+    pub brainstorm_cards: Vec<BrainstormCard>,
     /// Human-readable warnings for malformed envelopes (kept in the logs drawer).
     pub warnings: Vec<String>,
 }
@@ -90,7 +97,7 @@ struct TeamMemberRaw {
 }
 
 #[derive(Deserialize)]
-struct WorkflowStepRaw {
+struct RunStepRaw {
     action: String,
     #[serde(default)]
     step: Option<u32>,
@@ -109,6 +116,22 @@ struct ReviewRaw {
     summary: Option<String>,
     #[serde(default)]
     items: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct BrainstormVoteRaw {
+    ranked: Vec<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BrainstormCardRaw {
+    title: String,
+    proposal: String,
+    mechanism: String,
+    operation: String,
+    sources: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -140,8 +163,10 @@ impl ToField {
 enum EnvelopeValue {
     Message(TeamMessage),
     Member(TeamMember),
-    Workflow(WorkflowStepRequest),
+    Run(RunStepRequest),
     Review(ReviewVerdict),
+    BrainstormCard(BrainstormCard),
+    BrainstormVote(BrainstormVote),
 }
 
 type EnvelopeParser = fn(&str) -> Result<EnvelopeValue, String>;
@@ -154,12 +179,20 @@ fn parse_member_envelope(payload: &str) -> Result<EnvelopeValue, String> {
     parse_team_member(payload).map(EnvelopeValue::Member)
 }
 
-fn parse_workflow_envelope(payload: &str) -> Result<EnvelopeValue, String> {
-    parse_workflow_step(payload).map(EnvelopeValue::Workflow)
+fn parse_run_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_run_step(payload).map(EnvelopeValue::Run)
 }
 
 fn parse_review_envelope(payload: &str) -> Result<EnvelopeValue, String> {
     parse_review(payload).map(EnvelopeValue::Review)
+}
+
+fn parse_brainstorm_vote_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_brainstorm_vote(payload).map(EnvelopeValue::BrainstormVote)
+}
+
+fn parse_brainstorm_card_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_brainstorm_card(payload).map(EnvelopeValue::BrainstormCard)
 }
 
 /// Flat prefix table: first matching prefix wins. Keeps behavior identical to the
@@ -167,8 +200,10 @@ fn parse_review_envelope(payload: &str) -> Result<EnvelopeValue, String> {
 const ENVELOPE_PARSERS: &[(&str, EnvelopeParser)] = &[
     (TEAM_MESSAGE_PREFIX, parse_message_envelope),
     (TEAM_MEMBER_PREFIX, parse_member_envelope),
-    (WORKFLOW_STEP_PREFIX, parse_workflow_envelope),
+    (RUN_STEP_PREFIX, parse_run_envelope),
     (REVIEW_PREFIX, parse_review_envelope),
+    (BRAINSTORM_CARD_PREFIX, parse_brainstorm_card_envelope),
+    (BRAINSTORM_VOTE_PREFIX, parse_brainstorm_vote_envelope),
 ];
 
 /// Scan one agent message for control envelopes (`@@team_message`, …).
@@ -176,8 +211,10 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut kept_lines = Vec::new();
     let mut messages = Vec::new();
     let mut members = Vec::new();
-    let mut workflow_steps = Vec::new();
+    let mut run_steps = Vec::new();
     let mut reviews = Vec::new();
+    let mut brainstorm_cards = Vec::new();
+    let mut brainstorm_votes = Vec::new();
     let mut warnings = Vec::new();
 
     for line in text.lines() {
@@ -188,8 +225,10 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
                 match parse_fn(payload) {
                     Ok(EnvelopeValue::Message(message)) => messages.push(message),
                     Ok(EnvelopeValue::Member(member)) => members.push(member),
-                    Ok(EnvelopeValue::Workflow(request)) => workflow_steps.push(request),
+                    Ok(EnvelopeValue::Run(request)) => run_steps.push(request),
                     Ok(EnvelopeValue::Review(review)) => reviews.push(review),
+                    Ok(EnvelopeValue::BrainstormCard(card)) => brainstorm_cards.push(card),
+                    Ok(EnvelopeValue::BrainstormVote(vote)) => brainstorm_votes.push(vote),
                     Err(warning) => {
                         warnings.push(warning);
                         kept_lines.push(line);
@@ -207,8 +246,10 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         visible_text: kept_lines.join("\n").trim().to_string(),
         messages,
         members,
-        workflow_steps,
+        run_steps,
         reviews,
+        brainstorm_cards,
+        brainstorm_votes,
         warnings,
     }
 }
@@ -293,63 +334,63 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
     })
 }
 
-fn parse_workflow_step(payload: &str) -> Result<WorkflowStepRequest, String> {
-    let raw: WorkflowStepRaw = serde_json::from_str(payload)
-        .map_err(|err| format!("invalid @@workflow_step envelope: {err}"))?;
+fn parse_run_step(payload: &str) -> Result<RunStepRequest, String> {
+    let raw: RunStepRaw = serde_json::from_str(payload)
+        .map_err(|err| format!("invalid @@run_step envelope: {err}"))?;
     match raw.action.as_str() {
         "add" => {
             let title = raw
                 .title
                 .map(|title| title.trim().to_string())
                 .filter(|title| !title.is_empty())
-                .ok_or_else(|| "@@workflow_step add needs title".to_string())?;
+                .ok_or_else(|| "@@run_step add needs title".to_string())?;
             let owner = parse_optional_step_owner(raw.owner)?;
-            Ok(WorkflowStepRequest::Add { owner, title })
+            Ok(RunStepRequest::Add { owner, title })
         }
         "todo" | "doing" | "done" | "block" | "blocked" => {
             let step = raw
                 .step
                 .filter(|step| *step > 0)
-                .ok_or_else(|| "@@workflow_step update needs positive step".to_string())?;
+                .ok_or_else(|| "@@run_step update needs positive step".to_string())?;
             let status = match raw.action.as_str() {
-                "todo" => WorkflowStepStatus::Todo,
-                "doing" => WorkflowStepStatus::Doing,
-                "done" => WorkflowStepStatus::Done,
-                "block" | "blocked" => WorkflowStepStatus::Blocked,
+                "todo" => RunStepStatus::Todo,
+                "doing" => RunStepStatus::Doing,
+                "done" => RunStepStatus::Done,
+                "block" | "blocked" => RunStepStatus::Blocked,
                 _ => unreachable!(),
             };
             let note = raw
                 .note
                 .map(|note| note.trim().to_string())
                 .filter(|note| !note.is_empty());
-            Ok(WorkflowStepRequest::Update { step, status, note })
+            Ok(RunStepRequest::Update { step, status, note })
         }
         "rename" | "edit" => {
             let step = raw
                 .step
                 .filter(|step| *step > 0)
-                .ok_or_else(|| "@@workflow_step rename needs positive step".to_string())?;
+                .ok_or_else(|| "@@run_step rename needs positive step".to_string())?;
             let title = raw
                 .title
                 .map(|title| title.trim().to_string())
                 .filter(|title| !title.is_empty())
-                .ok_or_else(|| "@@workflow_step rename needs title".to_string())?;
-            Ok(WorkflowStepRequest::Rename { step, title })
+                .ok_or_else(|| "@@run_step rename needs title".to_string())?;
+            Ok(RunStepRequest::Rename { step, title })
         }
         "remove" | "delete" | "drop" => {
             let step = raw
                 .step
                 .filter(|step| *step > 0)
-                .ok_or_else(|| "@@workflow_step remove needs positive step".to_string())?;
-            Ok(WorkflowStepRequest::Remove { step })
+                .ok_or_else(|| "@@run_step remove needs positive step".to_string())?;
+            Ok(RunStepRequest::Remove { step })
         }
         "assign" => {
             let step = raw
                 .step
                 .filter(|step| *step > 0)
-                .ok_or_else(|| "@@workflow_step assign needs positive step".to_string())?;
+                .ok_or_else(|| "@@run_step assign needs positive step".to_string())?;
             let owner = parse_required_step_owner(raw.owner)?;
-            Ok(WorkflowStepRequest::Assign {
+            Ok(RunStepRequest::Assign {
                 step,
                 owner: Some(owner),
             })
@@ -358,11 +399,11 @@ fn parse_workflow_step(payload: &str) -> Result<WorkflowStepRequest, String> {
             let step = raw
                 .step
                 .filter(|step| *step > 0)
-                .ok_or_else(|| "@@workflow_step unassign needs positive step".to_string())?;
-            Ok(WorkflowStepRequest::Assign { step, owner: None })
+                .ok_or_else(|| "@@run_step unassign needs positive step".to_string())?;
+            Ok(RunStepRequest::Assign { step, owner: None })
         }
         action => Err(format!(
-            "unsupported @@workflow_step action: {action} (use add, todo, doing, done, block, rename, remove, assign, or unassign)"
+            "unsupported @@run_step action: {action} (use add, todo, doing, done, block, rename, remove, assign, or unassign)"
         )),
     }
 }
@@ -373,7 +414,7 @@ fn parse_optional_step_owner(owner: Option<String>) -> Result<Option<MemberId>, 
 
 fn parse_required_step_owner(owner: Option<String>) -> Result<MemberId, String> {
     let Some(owner) = owner else {
-        return Err("@@workflow_step assign needs owner".to_string());
+        return Err("@@run_step assign needs owner".to_string());
     };
     parse_step_owner(owner)
 }
@@ -381,7 +422,7 @@ fn parse_required_step_owner(owner: Option<String>) -> Result<MemberId, String> 
 fn parse_step_owner(owner: String) -> Result<MemberId, String> {
     let owner = owner.trim().trim_start_matches('@');
     if owner.is_empty() || owner.chars().any(char::is_whitespace) {
-        return Err("@@workflow_step owner must be a non-empty member token".to_string());
+        return Err("@@run_step owner must be a non-empty member token".to_string());
     }
     Ok(MemberId::new(owner))
 }
@@ -419,6 +460,86 @@ fn parse_review(payload: &str) -> Result<ReviewVerdict, String> {
     };
 
     Ok(ReviewVerdict { verdict, summary })
+}
+
+fn parse_brainstorm_card(payload: &str) -> Result<BrainstormCard, String> {
+    let raw: BrainstormCardRaw = serde_json::from_str(payload)
+        .map_err(|err| format!("invalid @@brainstorm_card envelope: {err}"))?;
+    let required = |field: &'static str, value: String| {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            Err(format!("@@brainstorm_card `{field}` must not be empty"))
+        } else {
+            Ok(value)
+        }
+    };
+    let title = required("title", raw.title)?;
+    let proposal = required("proposal", raw.proposal)?;
+    let mechanism = required("mechanism", raw.mechanism)?;
+    let operation = required("operation", raw.operation)?.to_ascii_uppercase();
+    let mut sources = Vec::new();
+    for source in raw.sources {
+        let source = source.trim().to_ascii_uppercase();
+        if !valid_brainstorm_candidate_ref(&source) {
+            return Err(format!(
+                "invalid @@brainstorm_card source `{source}` (use R<round>-<batch>#<item>)"
+            ));
+        }
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    Ok(BrainstormCard {
+        title,
+        proposal,
+        mechanism,
+        operation,
+        sources,
+    })
+}
+
+fn parse_brainstorm_vote(payload: &str) -> Result<BrainstormVote, String> {
+    let raw: BrainstormVoteRaw = serde_json::from_str(payload)
+        .map_err(|err| format!("invalid @@brainstorm_vote envelope: {err}"))?;
+    let mut ranked = Vec::new();
+    for candidate in raw.ranked {
+        let candidate = candidate.trim().to_ascii_uppercase();
+        if !valid_brainstorm_candidate_ref(&candidate) {
+            return Err(format!(
+                "invalid @@brainstorm_vote candidate `{candidate}` (use R<round>-<batch>#<item>)"
+            ));
+        }
+        if !ranked.contains(&candidate) {
+            ranked.push(candidate);
+        }
+    }
+    if ranked.is_empty() {
+        return Err("@@brainstorm_vote ranked list must not be empty".to_string());
+    }
+    let summary = raw
+        .summary
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(BrainstormVote { ranked, summary })
+}
+
+fn valid_brainstorm_candidate_ref(candidate: &str) -> bool {
+    let Some((batch, item)) = candidate.split_once('#') else {
+        return false;
+    };
+    let Some(batch) = batch.strip_prefix('R') else {
+        return false;
+    };
+    let Some((round, label)) = batch.split_once('-') else {
+        return false;
+    };
+    !round.is_empty()
+        && round.chars().all(|ch| ch.is_ascii_digit())
+        && !label.is_empty()
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        && item.parse::<u32>().is_ok_and(|number| number > 0)
 }
 
 fn normalize_review_verdict(raw: &str) -> Option<ReviewVerdictKind> {
@@ -546,15 +667,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_workflow_step_add_request() {
+    fn parses_run_step_add_request() {
         let parsed =
-            parse_agent_output(r#"@@workflow_step {"action":"add","title":"Write parser tests"}"#);
+            parse_agent_output(r#"@@run_step {"action":"add","title":"Write parser tests"}"#);
 
         assert!(parsed.messages.is_empty());
         assert!(parsed.members.is_empty());
         assert_eq!(
-            parsed.workflow_steps,
-            vec![WorkflowStepRequest::Add {
+            parsed.run_steps,
+            vec![RunStepRequest::Add {
                 owner: None,
                 title: "Write parser tests".to_string()
             }]
@@ -564,23 +685,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_workflow_step_owner_requests() {
+    fn parses_run_step_owner_requests() {
         let parsed = parse_agent_output(
-            "@@workflow_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Write parser tests\"}\n@@workflow_step {\"action\":\"assign\",\"step\":2,\"owner\":\"@reviewer\"}\n@@workflow_step {\"action\":\"unassign\",\"step\":3}",
+            "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Write parser tests\"}\n@@run_step {\"action\":\"assign\",\"step\":2,\"owner\":\"@reviewer\"}\n@@run_step {\"action\":\"unassign\",\"step\":3}",
         );
 
         assert_eq!(
-            parsed.workflow_steps,
+            parsed.run_steps,
             vec![
-                WorkflowStepRequest::Add {
+                RunStepRequest::Add {
                     owner: Some(MemberId::new("builder")),
                     title: "Write parser tests".to_string()
                 },
-                WorkflowStepRequest::Assign {
+                RunStepRequest::Assign {
                     step: 2,
                     owner: Some(MemberId::new("reviewer"))
                 },
-                WorkflowStepRequest::Assign {
+                RunStepRequest::Assign {
                     step: 3,
                     owner: None
                 }
@@ -590,16 +711,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_workflow_step_update_request() {
+    fn parses_run_step_update_request() {
         let parsed = parse_agent_output(
-            r#"@@workflow_step {"action":"done","step":2,"note":"Covered edge cases"}"#,
+            r#"@@run_step {"action":"done","step":2,"note":"Covered edge cases"}"#,
         );
 
         assert_eq!(
-            parsed.workflow_steps,
-            vec![WorkflowStepRequest::Update {
+            parsed.run_steps,
+            vec![RunStepRequest::Update {
                 step: 2,
-                status: WorkflowStepStatus::Done,
+                status: RunStepStatus::Done,
                 note: Some("Covered edge cases".to_string())
             }]
         );
@@ -607,31 +728,31 @@ mod tests {
     }
 
     #[test]
-    fn parses_workflow_step_rename_and_remove_requests() {
+    fn parses_run_step_rename_and_remove_requests() {
         let parsed = parse_agent_output(
-            "@@workflow_step {\"action\":\"rename\",\"step\":2,\"title\":\"Document setup\"}\n@@workflow_step {\"action\":\"remove\",\"step\":3}",
+            "@@run_step {\"action\":\"rename\",\"step\":2,\"title\":\"Document setup\"}\n@@run_step {\"action\":\"remove\",\"step\":3}",
         );
 
         assert_eq!(
-            parsed.workflow_steps,
+            parsed.run_steps,
             vec![
-                WorkflowStepRequest::Rename {
+                RunStepRequest::Rename {
                     step: 2,
                     title: "Document setup".to_string()
                 },
-                WorkflowStepRequest::Remove { step: 3 }
+                RunStepRequest::Remove { step: 3 }
             ]
         );
         assert!(parsed.warnings.is_empty());
     }
 
     #[test]
-    fn malformed_workflow_step_warns_and_keeps_line() {
-        let parsed = parse_agent_output(r#"@@workflow_step {"action":"done","step":0}"#);
+    fn malformed_run_step_warns_and_keeps_line() {
+        let parsed = parse_agent_output(r#"@@run_step {"action":"done","step":0}"#);
 
-        assert!(parsed.workflow_steps.is_empty());
+        assert!(parsed.run_steps.is_empty());
         assert_eq!(parsed.warnings.len(), 1);
-        assert!(parsed.visible_text.contains("@@workflow_step"));
+        assert!(parsed.visible_text.contains("@@run_step"));
     }
 
     #[test]
@@ -705,6 +826,69 @@ mod tests {
             }]
         );
         assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_brainstorm_private_vote() {
+        let parsed = parse_agent_output(
+            "My ranking rationale.\n@@brainstorm_vote {\"ranked\":[\"r2-b#3\",\"R1-A#1\",\"R2-B#3\"],\"summary\":\"best balance\"}",
+        );
+
+        assert_eq!(
+            parsed.brainstorm_votes,
+            vec![BrainstormVote {
+                ranked: vec!["R2-B#3".to_string(), "R1-A#1".to_string()],
+                summary: Some("best balance".to_string()),
+            }]
+        );
+        assert_eq!(parsed.visible_text, "My ranking rationale.");
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_and_hides_structured_brainstorm_cards() {
+        let parsed = parse_agent_output(
+            "seed preface\n@@brainstorm_card {\"title\":\"Local index\",\"proposal\":\"Retrieve nearby structures\",\"mechanism\":\"Use WL fingerprints\",\"operation\":\"seed\",\"sources\":[]}\n@@brainstorm_card {\"title\":\"Build it\",\"proposal\":\"Extend the index\",\"mechanism\":\"Add path context\",\"operation\":\"build\",\"sources\":[\"r1-a#1\",\"R1-A#1\"]}",
+        );
+
+        assert_eq!(parsed.visible_text, "seed preface");
+        assert_eq!(
+            parsed.brainstorm_cards,
+            vec![
+                BrainstormCard {
+                    title: "Local index".to_string(),
+                    proposal: "Retrieve nearby structures".to_string(),
+                    mechanism: "Use WL fingerprints".to_string(),
+                    operation: "SEED".to_string(),
+                    sources: vec![],
+                },
+                BrainstormCard {
+                    title: "Build it".to_string(),
+                    proposal: "Extend the index".to_string(),
+                    mechanism: "Add path context".to_string(),
+                    operation: "BUILD".to_string(),
+                    sources: vec!["R1-A#1".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_brainstorm_card_warns_and_stays_visible() {
+        let line = r#"@@brainstorm_card {"title":"","proposal":"x","mechanism":"y","operation":"SEED","sources":[]}"#;
+        let parsed = parse_agent_output(line);
+        assert!(parsed.brainstorm_cards.is_empty());
+        assert!(parsed.visible_text.contains("@@brainstorm_card"));
+        assert!(parsed.warnings[0].contains("title"));
+    }
+
+    #[test]
+    fn empty_brainstorm_vote_warns_and_stays_visible() {
+        let parsed = parse_agent_output(r#"@@brainstorm_vote {"ranked":[]}"#);
+
+        assert!(parsed.brainstorm_votes.is_empty());
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.visible_text.contains("@@brainstorm_vote"));
     }
 
     #[test]

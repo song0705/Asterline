@@ -108,8 +108,12 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.text(&text),
             Event::Code(code) => {
-                let style = self.inline_style().fg(Color::Yellow);
-                self.push_units(&code, style);
+                if let Mode::Table(table) = &mut self.mode {
+                    table.cell.push_str(&code);
+                } else {
+                    let style = self.inline_style().fg(Color::Yellow);
+                    self.push_units(&code, style);
+                }
             }
             Event::SoftBreak => self.push_units(" ", self.inline_style()),
             Event::HardBreak => self.flush_block(),
@@ -758,5 +762,33 @@ mod tests {
         assert!(t.iter().any(|l| l.contains('a') && l.contains('b')));
         assert!(t.iter().any(|l| l.contains('│')));
         assert!(t.iter().any(|l| l.contains('┼')));
+    }
+
+    #[test]
+    fn inline_code_stays_inside_table_cells() {
+        let lines = render(
+            "| access | claude | codex |\n|---|---|---|\n| `read-only` | `plan` | `-s read-only` |\n| `edit` | `acceptEdits` | `-s workspace-write` |",
+            80,
+        );
+        let t = texts(&lines);
+
+        assert_eq!(
+            t.len(),
+            4,
+            "table code must not leak into a trailing paragraph"
+        );
+        assert!(t.iter().any(|line| {
+            line.contains("read-only") && line.contains("plan") && line.contains("-s read-only")
+        }));
+        assert!(t.iter().any(|line| {
+            line.contains("edit")
+                && line.contains("acceptEdits")
+                && line.contains("-s workspace-write")
+        }));
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.style.fg != Some(Color::Yellow))
+        }));
     }
 }

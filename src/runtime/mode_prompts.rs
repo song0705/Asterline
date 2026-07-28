@@ -3,7 +3,8 @@
 //! These templates are shared with the fake team runner so unit tests and
 //! `--fake` stay in sync with the real engine. Keep them pure (no I/O).
 
-use crate::domain::event::WorkflowRunId;
+use crate::domain::event::RunId;
+use crate::domain::team::MemberId;
 
 /// Marker + instruction block embedded in every reviewer prompt. The fake team
 /// runner keys on this constant, so never inline the text elsewhere.
@@ -13,21 +14,27 @@ pub const REVIEW_PROTOCOL_HINT: &str = "End your reply with exactly one control 
      @@review {\"verdict\":\"request_changes\",\"summary\":\"what to fix\",\"items\":[\"...\"]}";
 
 /// Marker for the leader planning prompt; the fake team runner keys on it.
-pub const LEAD_PLAN_HINT: &str = "Plan the work as a checklist now: emit one \
-`@@workflow_step {\"action\":\"add\",\"owner\":\"<member-id>\",\"title\":\"...\"}` line per step. \
+pub const PLAN_MODE_HINT: &str = "Plan the work as a checklist now: emit one \
+`@@run_step {\"action\":\"add\",\"owner\":\"<member-id>\",\"title\":\"...\"}` line per step. \
 Assign every step an owner from the teammate list. Do not do the work yourself.";
 
-/// Marker for roundtable prompts; the fake team runner keys on it.
-pub const ROUNDTABLE_HINT: &str = "Share your own perspective directly in your reply. \
-Do not message teammates; the moderator will synthesize.";
+/// Markers for brainstorm generation waves; the fake runner keys on them.
+pub const BRAINSTORM_PROPOSE_HINT: &str = "BRAINSTORM_WAVE: SEED";
+pub const BRAINSTORM_BUILD_HINT: &str = "BRAINSTORM_WAVE: BUILD";
+pub const BRAINSTORM_STRETCH_HINT: &str = "BRAINSTORM_WAVE: STRETCH";
+pub const BRAINSTORM_VOTE_HINT: &str = "BRAINSTORM_PHASE: PRIVATE_VOTE";
+pub const BRAINSTORM_SYNTHESIS_HINT: &str = "BRAINSTORM_PHASE: SYNTHESIZE_RANKING";
 
-/// Marker for the moderator synthesis prompt.
-pub const MODERATOR_HINT: &str = "Synthesize the discussion into a single recommendation.";
+const BRAINSTORM_GENERATION_RULES: &str = "Generation rules:\n\
+- Suspend judgment: do not critique, rank, reject, vote, or choose a winner.\n\
+- Prefer quantity and variety over polished feasibility.\n\
+- Welcome bold, surprising, and temporarily impractical ideas.\n\
+- Build on and combine ideas without turning the response into an evaluation.";
 
 /// Prompt sent to the builder on the first iteration of a review run.
 pub fn review_task_prompt(task: &str) -> String {
     format!(
-        "You are the builder in a review workflow.\n\n\
+        "You are the builder in review mode.\n\n\
          Task:\n{task}\n\n\
          Implement the task in the working tree and report what you changed. \
          Be concrete about files and decisions so a reviewer can assess the work."
@@ -35,19 +42,50 @@ pub fn review_task_prompt(task: &str) -> String {
 }
 
 /// Prompt sent to the reviewer after a builder turn completes.
-pub fn review_prompt(task: &str, builder_display: &str, builder_output: &str) -> String {
+pub fn review_prompt(
+    task: &str,
+    builder_display: &str,
+    builder_output: &str,
+    verify_command: Option<&str>,
+) -> String {
     let report = if builder_output.trim().is_empty() {
         "(no report text)"
     } else {
         builder_output
     };
+    let gate = match verify_command.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(cmd) => format!(
+            "The project verification gate is `{cmd}` — run it (or the equivalent checks) yourself.\n\n"
+        ),
+        None => String::new(),
+    };
     format!(
-        "You are the reviewer in a review workflow.\n\n\
+        "You are the reviewer in review mode.\n\n\
          Task:\n{task}\n\n\
          {builder_display} reported:\n{report}\n\n\
-         Inspect the working tree and the report above. Decide whether the work \
-         is ready or needs changes.\n\n\
+         Inspect the actual changes (`git status` / `git diff`) and run the project's checks \
+         yourself rather than trusting the report text. {gate}\
+         Judge the work on substance — do not be swayed by how confident or polished the report sounds. \
+         Decide whether the work is ready or needs changes.\n\n\
          {REVIEW_PROTOCOL_HINT}"
+    )
+}
+
+/// Prompt sent to the builder when auto-verify fails in review mode.
+pub fn verify_failure_prompt(
+    task: &str,
+    command: &str,
+    summary: &str,
+    iteration: u32,
+    max_iterations: u32,
+) -> String {
+    format!(
+        "You are the builder in review mode (iteration {iteration}/{max_iterations}).\n\n\
+         Task:\n{task}\n\n\
+         Automatic verification failed.\n\
+         Command: {command}\n\
+         Output:\n{summary}\n\n\
+         Fix the failures in the working tree and report what you changed so the reviewer can reassess."
     )
 }
 
@@ -60,7 +98,7 @@ pub fn review_iteration_prompt(
     max_iterations: u32,
 ) -> String {
     format!(
-        "You are the builder in a review workflow (iteration {iteration}/{max_iterations}).\n\n\
+        "You are the builder in review mode (iteration {iteration}/{max_iterations}).\n\n\
          Task:\n{task}\n\n\
          {reviewer_display} requested changes:\n{feedback}\n\n\
          Address the feedback in the working tree and report what you fixed."
@@ -76,8 +114,8 @@ pub fn verdict_nudge_prompt() -> String {
     )
 }
 
-/// Leader planning prompt for Lead mode. `teammates` are `(id, role)` pairs.
-pub fn lead_plan_prompt(task: &str, teammates: &[(String, String)]) -> String {
+/// Leader planning prompt for Plan mode. `teammates` are `(id, role)` pairs.
+pub fn plan_plan_prompt(task: &str, teammates: &[(String, String)]) -> String {
     let ids: Vec<&str> = teammates.iter().map(|(id, _)| id.as_str()).collect();
     let roles: Vec<String> = teammates
         .iter()
@@ -88,23 +126,23 @@ pub fn lead_plan_prompt(task: &str, teammates: &[(String, String)]) -> String {
          Task:\n{task}\n\n\
          Teammates: {}\n\
          Roles: {}\n\n\
-         {LEAD_PLAN_HINT}",
+         {PLAN_MODE_HINT}",
         ids.join(", "),
         roles.join(", ")
     )
 }
 
 /// Re-ask the leader for an owned checklist after an empty plan turn.
-pub fn lead_nudge_prompt() -> String {
+pub fn plan_nudge_prompt() -> String {
     format!(
         "Your previous reply did not produce an actionable owned checklist. \
-         Emit owned @@workflow_step add lines now — every step needs an owner.\n\n\
-         {LEAD_PLAN_HINT}"
+         Emit owned @@run_step add lines now — every step needs an owner.\n\n\
+         {PLAN_MODE_HINT}"
     )
 }
 
 /// Per-owner dispatch covering all of their owned todo steps.
-pub fn step_dispatch_prompt(run_id: WorkflowRunId, steps: &[(u32, String)]) -> String {
+pub fn step_dispatch_prompt(run_id: RunId, leader: &MemberId, steps: &[(u32, String)]) -> String {
     let list: Vec<String> = steps
         .iter()
         .map(|(n, title)| format!("  - step #{n}: {title}"))
@@ -112,30 +150,61 @@ pub fn step_dispatch_prompt(run_id: WorkflowRunId, steps: &[(u32, String)]) -> S
     format!(
         "You own these steps of {run_id}:\n{}\n\n\
          Work through them in the working tree and mark each done with \
-         @@workflow_step {{\"action\":\"done\",\"step\":N}} as you finish.",
+         @@run_step {{\"action\":\"done\",\"step\":N}} as you finish. \
+         Before ending your turn, send exactly one completion handoff to the planning lead with \
+         @@team_message {{\"to\":\"{leader}\",\"kind\":\"reply\",\"body\":\"summary of results, checks, and blockers\"}}. \
+         Updating the checklist does not replace this handoff.",
         list.join("\n")
     )
 }
 
 /// Leader prompt after an execution round left unfinished steps.
-pub fn lead_progress_prompt(task: &str, unfinished: &[String], iteration: u32, max: u32) -> String {
+pub fn plan_progress_prompt(
+    task: &str,
+    unfinished: &[String],
+    iteration: u32,
+    max: u32,
+    extra_note: Option<&str>,
+) -> String {
     let list = if unfinished.is_empty() {
         "(none listed)".to_string()
     } else {
         unfinished.join("\n")
     };
+    let extra = extra_note.map(|s| format!("{s}\n\n")).unwrap_or_default();
     format!(
         "You are the planning lead (iteration {iteration}/{max}).\n\n\
          Task:\n{task}\n\n\
          Unfinished checklist steps:\n{list}\n\n\
+         {extra}\
          Re-assess the plan: add, reassign, or clarify steps as needed, then \
-         the engine will re-dispatch owners. Do not do the work yourself.\n\n\
-         {LEAD_PLAN_HINT}"
+         the engine will re-dispatch owners. Do not do the work yourself.\n\
+         Steps without an owner are never dispatched — assign an owner to every actionable step.\n\n\
+         {PLAN_MODE_HINT}"
     )
 }
 
-/// Leader prompt when the reviewer requests changes on a lead run.
-pub fn lead_iteration_prompt(
+/// Leader prompt when auto-verify fails after plan review approve.
+pub fn plan_verify_failure_prompt(
+    task: &str,
+    command: &str,
+    summary: &str,
+    iteration: u32,
+    max: u32,
+) -> String {
+    format!(
+        "You are the planning lead (iteration {iteration}/{max}).\n\n\
+         Task:\n{task}\n\n\
+         Automatic verification failed.\n\
+         Command: {command}\n\
+         Output:\n{summary}\n\n\
+         Re-plan the owned checklist so owners can fix the failures. Do not do the work yourself.\n\n\
+         {PLAN_MODE_HINT}"
+    )
+}
+
+/// Leader prompt when the reviewer requests changes on a plan run.
+pub fn plan_iteration_prompt(
     task: &str,
     reviewer_display: &str,
     feedback: &str,
@@ -148,75 +217,148 @@ pub fn lead_iteration_prompt(
          {reviewer_display} requested changes:\n{feedback}\n\n\
          Update the checklist and plan so owners can address the feedback. \
          Do not do the work yourself.\n\n\
-         {LEAD_PLAN_HINT}"
+         {PLAN_MODE_HINT}"
     )
 }
 
-/// Reviewer prompt after all lead-mode steps are Done.
-pub fn lead_review_prompt(task: &str, steps_summary: &str) -> String {
+/// Reviewer prompt after all plan-mode steps are Done.
+pub fn plan_review_prompt(task: &str, steps_summary: &str, verify_command: Option<&str>) -> String {
     let summary = if steps_summary.trim().is_empty() {
         "(no steps recorded)"
     } else {
         steps_summary
     };
+    let gate = match verify_command.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(cmd) => format!(
+            "The project verification gate is `{cmd}` — run it (or the equivalent checks) yourself.\n\n"
+        ),
+        None => String::new(),
+    };
     format!(
-        "You are the reviewer in a lead workflow.\n\n\
+        "You are the reviewer in plan mode.\n\n\
          Task:\n{task}\n\n\
          Completed checklist:\n{summary}\n\n\
-         Inspect the working tree and the completed steps. Decide whether the \
-         work is ready or needs changes.\n\n\
+         Inspect the actual changes (`git status` / `git diff`) and run the project's checks \
+         yourself rather than trusting the checklist text. {gate}\
+         Judge the work on substance — do not be swayed by how confident or polished the report sounds. \
+         Decide whether the work is ready or needs changes.\n\n\
          {REVIEW_PROTOCOL_HINT}"
     )
 }
 
 /// Body text for a manual `@owner` step dispatch from the TUI (after `@{owner} `).
 pub fn manual_step_dispatch_text(
-    run_id: WorkflowRunId,
+    run_id: RunId,
     instruction: &str,
     number: u32,
     title: &str,
 ) -> String {
     format!(
-        "{instruction} {run_id} step #{number}: {title}. Update the checklist with @@workflow_step as you progress."
+        "{instruction} {run_id} step #{number}: {title}. Update the checklist with @@run_step as you progress."
     )
 }
 
-/// Roundtable participant prompt for a discussion round.
-pub fn roundtable_prompt(topic: &str, round: u32, rounds: u32) -> String {
+/// First generation wave: each participant creates independent seeds.
+pub fn brainstorm_propose_prompt(
+    topic: &str,
+    n_participants: usize,
+    ideas_per_round: u32,
+) -> String {
     format!(
-        "You are a participant in a roundtable discussion (round {round}/{rounds}).\n\n\
+        "You are 1 of {n_participants} equal contributors in the first wave of a brainstorm.\n\n\
          Topic:\n{topic}\n\n\
-         {ROUNDTABLE_HINT}"
+         {BRAINSTORM_GENERATION_RULES}\n\n\
+         Generate at least {ideas_per_round} short, distinct idea cards. Include at least one \
+         deliberately wild idea. Keep each card atomic and emit it using the deployed skill's \
+         `@@brainstorm_card` schema. You are not shown other contributors' ideas in this seed wave.\n\n\
+         {BRAINSTORM_PROPOSE_HINT}"
     )
 }
 
-/// Roundtable participant prompt with digests of other participants' prior replies.
-pub fn roundtable_digest_prompt(topic: &str, round: u32, rounds: u32, others: &str) -> String {
-    let others = if others.trim().is_empty() {
-        "(no other replies yet)"
-    } else {
-        others
-    };
+/// Middle generation waves: use a limited peer sample for cross-pollination.
+pub fn brainstorm_build_prompt(
+    topic: &str,
+    round: u32,
+    rounds: u32,
+    ideas_per_round: u32,
+    context: &str,
+) -> String {
     format!(
-        "You are a participant in a roundtable discussion (round {round}/{rounds}).\n\n\
+        "You are in generation wave {round}/{rounds} of a brainstorm. Continue expanding the \
+         idea space; this is not a review round.\n\n\
          Topic:\n{topic}\n\n\
-         Other participants said last round:\n{others}\n\n\
-         Respond to the discussion. {ROUNDTABLE_HINT}"
+         {BRAINSTORM_GENERATION_RULES}\n\n\
+         Prior idea batches for inspiration:\n{context}\n\n\
+         Generate at least {ideas_per_round} new atomic idea cards. Include: one independent \
+         NEW direction, one BUILD that extends a prior idea, and one COMBINE or MUTATE idea. \
+         Emit every card with `@@brainstorm_card`; state the operation and canonical source IDs \
+         on each derived card. Do not discuss \
+         strengths, risks, trade-offs, or feasibility.\n\n\
+         {BRAINSTORM_BUILD_HINT}"
     )
 }
 
-/// Moderator synthesis prompt after all discussion rounds.
-pub fn moderator_prompt(topic: &str, transcript: &str) -> String {
-    let transcript = if transcript.trim().is_empty() {
-        "(no discussion recorded)"
-    } else {
-        transcript
-    };
+/// Final generation wave: force movement away from the most obvious categories.
+pub fn brainstorm_stretch_prompt(
+    topic: &str,
+    round: u32,
+    rounds: u32,
+    ideas_per_round: u32,
+    context: &str,
+) -> String {
     format!(
-        "You are the moderator of a roundtable discussion.\n\n\
+        "You are in the final generation wave {round}/{rounds} of a brainstorm. Stretch the \
+         idea space before the idea set closes; this is still not evaluation or decision-making.\n\n\
          Topic:\n{topic}\n\n\
-         Discussion:\n{transcript}\n\n\
-         {MODERATOR_HINT}"
+         {BRAINSTORM_GENERATION_RULES}\n\n\
+         Prior idea batches for inspiration:\n{context}\n\n\
+         Generate at least {ideas_per_round} new atomic idea cards using different moves: \
+         invert an assumption, remove a constraint, borrow an analogy from another domain, \
+         and bridge two previously separate directions. Emit every card with `@@brainstorm_card`, \
+         label each move, and cite canonical source IDs. Preserve strange but relevant \
+         possibilities; do not select a preferred option.\n\n\
+         {BRAINSTORM_STRETCH_HINT}"
+    )
+}
+
+/// Independent post-generation ballot. Participants do not see peer votes.
+pub fn brainstorm_vote_prompt(topic: &str, idea_set: &str, top_k: usize) -> String {
+    format!(
+        "The judgment-free generation waves are complete. You are now an independent voter.\n\n\
+         Original topic:\n{topic}\n\n\
+         Canonical IdeaSet batches:\n{idea_set}\n\n\
+         Rank exactly your top {top_k} individual ideas. Identify each idea as \
+         <batch>#<item>, for example R2-B#3 means item 3 from batch R2-B. Judge against the \
+         original topic using relevance, novelty, feasibility, expected leverage, and how \
+         testable the idea is. Do not copy another participant's preferences; you have not \
+         been shown their ballot.\n\n\
+         Briefly explain your ranking, then end with exactly one control line:\n\
+         @@brainstorm_vote {{\"ranked\":[\"R2-B#3\",\"R1-A#1\"],\"summary\":\"short rationale\"}}\n\n\
+         {BRAINSTORM_VOTE_HINT}"
+    )
+}
+
+/// Neutral final report after deterministic ballot aggregation.
+pub fn brainstorm_synthesis_prompt(
+    topic: &str,
+    idea_set: &str,
+    tally: &str,
+    ballots: &str,
+) -> String {
+    format!(
+        "Act as the neutral facilitator for the completed brainstorm. Generation and private \
+         voting are finished.\n\n\
+         Original topic:\n{topic}\n\n\
+         Canonical IdeaSet batches:\n{idea_set}\n\n\
+         Deterministic Borda tally (do not change this order or invent votes):\n{tally}\n\n\
+         Private ballot rationales:\n{ballots}\n\n\
+         Produce the final decision report in the user's language:\n\
+         1. a ranked top-5 table with candidate ID, idea title, score, and why it ranked there;\n\
+         2. areas of agreement and disagreement across voters;\n\
+         3. one primary recommendation and one backup;\n\
+         4. the smallest concrete experiment for the primary recommendation.\n\
+         Preserve minority insights and flag ties explicitly.\n\n\
+         {BRAINSTORM_SYNTHESIS_HINT}"
     )
 }
 
@@ -233,12 +375,28 @@ mod tests {
 
     #[test]
     fn review_prompt_contains_task_output_and_protocol() {
-        let prompt = review_prompt("ship feature", "Builder", "implemented foo");
+        let prompt = review_prompt(
+            "ship feature",
+            "Builder",
+            "implemented foo",
+            Some("just check"),
+        );
         assert!(prompt.contains("ship feature"));
         assert!(prompt.contains("Builder"));
         assert!(prompt.contains("implemented foo"));
+        assert!(prompt.contains("just check"));
+        assert!(prompt.contains("git diff"));
+        assert!(prompt.contains("substance"));
         assert!(prompt.contains(REVIEW_PROTOCOL_HINT));
         assert!(prompt.contains("@@review"));
+    }
+
+    #[test]
+    fn verify_failure_prompt_includes_command_and_summary() {
+        let prompt = verify_failure_prompt("task", "cargo test", "assertion failed", 2, 3);
+        assert!(prompt.contains("cargo test"));
+        assert!(prompt.contains("assertion failed"));
+        assert!(prompt.contains("2/3"));
     }
 
     #[test]
@@ -258,54 +416,96 @@ mod tests {
     }
 
     #[test]
-    fn lead_plan_prompt_lists_teammates_and_hint() {
+    fn plan_plan_prompt_lists_teammates_and_hint() {
         let teammates = vec![
             ("builder".into(), "impl".into()),
             ("reviewer".into(), "review".into()),
         ];
-        let prompt = lead_plan_prompt("ship the release", &teammates);
+        let prompt = plan_plan_prompt("ship the release", &teammates);
         assert!(prompt.contains("ship the release"));
         assert!(prompt.contains("Teammates: builder, reviewer"));
         assert!(prompt.contains("builder (impl)"));
-        assert!(prompt.contains(LEAD_PLAN_HINT));
+        assert!(prompt.contains(PLAN_MODE_HINT));
     }
 
     #[test]
-    fn lead_nudge_includes_plan_hint() {
-        assert!(lead_nudge_prompt().contains(LEAD_PLAN_HINT));
+    fn plan_nudge_includes_plan_hint() {
+        assert!(plan_nudge_prompt().contains(PLAN_MODE_HINT));
     }
 
     #[test]
     fn step_dispatch_prompt_lists_step_numbers() {
-        let prompt = step_dispatch_prompt(WorkflowRunId(7), &[(1, "a".into()), (3, "b".into())]);
+        let prompt = step_dispatch_prompt(
+            RunId(7),
+            &MemberId::new("planner"),
+            &[(1, "a".into()), (3, "b".into())],
+        );
         assert!(prompt.contains("run-7"));
         assert!(prompt.contains("step #1"));
         assert!(prompt.contains("step #3"));
         assert!(prompt.contains("a"));
         assert!(prompt.contains("b"));
+        assert!(prompt.contains(r#"@@team_message {"to":"planner","kind":"reply""#));
+        assert!(prompt.contains("checklist does not replace this handoff"));
     }
 
     #[test]
-    fn lead_review_prompt_ends_with_protocol() {
-        let prompt = lead_review_prompt("task", "#1 [builder] foo — ok");
+    fn plan_review_prompt_ends_with_protocol() {
+        let prompt = plan_review_prompt("task", "#1 [builder] foo — ok", None);
         assert!(prompt.contains("task"));
         assert!(prompt.contains("#1 [builder] foo"));
+        assert!(prompt.contains("substance"));
         assert!(prompt.ends_with(REVIEW_PROTOCOL_HINT) || prompt.contains(REVIEW_PROTOCOL_HINT));
     }
 
     #[test]
-    fn roundtable_prompts_include_hints() {
-        assert!(roundtable_prompt("topic", 1, 2).contains(ROUNDTABLE_HINT));
-        assert!(roundtable_digest_prompt("topic", 2, 2, "A: hi").contains(ROUNDTABLE_HINT));
-        assert!(moderator_prompt("topic", "A: hi").contains(MODERATOR_HINT));
+    fn plan_progress_prompt_mentions_unowned_steps() {
+        let prompt = plan_progress_prompt(
+            "task",
+            &["#1 [?] blocked Wire UI — waiting for secret".into()],
+            2,
+            3,
+            Some("a member run failed this round — reassign or adjust the plan"),
+        );
+        assert!(prompt.contains("waiting for secret"));
+        assert!(prompt.contains("assign an owner"));
+        assert!(prompt.contains("member run failed"));
+        assert!(prompt.contains(PLAN_MODE_HINT));
     }
 
     #[test]
-    fn manual_step_dispatch_text_matches_legacy_wording() {
-        let text = manual_step_dispatch_text(WorkflowRunId(3), "Start", 2, "wire tests");
+    fn plan_verify_failure_includes_plan_hint() {
+        let prompt = plan_verify_failure_prompt("task", "just check", "clippy boom", 2, 3);
+        assert!(prompt.contains("just check"));
+        assert!(prompt.contains("clippy boom"));
+        assert!(prompt.contains(PLAN_MODE_HINT));
+    }
+
+    #[test]
+    fn brainstorm_prompts_include_hints() {
+        assert!(brainstorm_propose_prompt("topic", 3, 4).contains(BRAINSTORM_PROPOSE_HINT));
+        assert!(
+            brainstorm_build_prompt("topic", 2, 3, 4, "R1-A: seed").contains(BRAINSTORM_BUILD_HINT)
+        );
+        assert!(
+            brainstorm_stretch_prompt("topic", 3, 3, 4, "R2-B: build")
+                .contains(BRAINSTORM_STRETCH_HINT)
+        );
+        assert!(
+            brainstorm_vote_prompt("topic", "[R1-A]\n1. seed", 5).contains(BRAINSTORM_VOTE_HINT)
+        );
+        assert!(
+            brainstorm_synthesis_prompt("topic", "ideas", "tally", "ballots")
+                .contains(BRAINSTORM_SYNTHESIS_HINT)
+        );
+    }
+
+    #[test]
+    fn manual_step_dispatch_text_matches_expected_wording() {
+        let text = manual_step_dispatch_text(RunId(3), "Start", 2, "wire tests");
         assert!(text.contains("Start"));
         assert!(text.contains("step #2"));
         assert!(text.contains("wire tests"));
-        assert!(text.contains("@@workflow_step"));
+        assert!(text.contains("@@run_step"));
     }
 }
