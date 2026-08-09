@@ -9,7 +9,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::adapter::parser::{str_field, summarize, tool_detail, tool_value};
+use crate::adapter::parser::{
+    MAX_MESSAGE_TEXT_BYTES, bounded_text, str_field, summarize, tool_detail, tool_value,
+};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, SandboxPolicy, TeamMember};
@@ -99,13 +101,16 @@ impl StreamAdapter for CodexStreamAdapter {
             args.push("-c".to_string());
             args.push(format!("model_reasoning_effort={}", effort.codex_value()));
         }
-        args.push(prompt.to_string());
+        // Codex documents `-` as the prompt sentinel for both fresh and
+        // resumed exec runs. Keeping user text on stdin also avoids exposing it
+        // to Windows batch-wrapper command-line parsing.
+        args.push("-".to_string());
 
         AdapterCommand {
             program: self.binary.clone(),
             args,
             cwd: self.cwd.clone(),
-            stdin: None,
+            stdin: Some(prompt.to_string()),
         }
     }
 
@@ -124,6 +129,7 @@ enum Phase {
 #[derive(Default)]
 pub struct CodexLineParser {
     command_output: HashMap<String, String>,
+    turn_completed: bool,
 }
 
 impl CodexLineParser {
@@ -132,9 +138,10 @@ impl CodexLineParser {
         let status = str_field(item, "status").unwrap_or_default();
         match str_field(item, "type") {
             Some("agent_message") if phase == Phase::Completed => {
-                vec![AgentEvent::MessageCompleted(
-                    str_field(item, "text").unwrap_or_default().to_string(),
-                )]
+                vec![AgentEvent::MessageCompleted(bounded_text(
+                    str_field(item, "text").unwrap_or_default(),
+                    MAX_MESSAGE_TEXT_BYTES,
+                ))]
             }
             Some("reasoning") if phase == Phase::Completed => {
                 vec![AgentEvent::Reasoning(
@@ -301,7 +308,11 @@ impl LineParser for CodexLineParser {
                 ))],
                 None => Vec::new(),
             },
-            Some("turn.started") | Some("turn.completed") => Vec::new(),
+            Some("turn.started") => Vec::new(),
+            Some("turn.completed") => {
+                self.turn_completed = true;
+                Vec::new()
+            }
             Some("turn.failed") => vec![AgentEvent::Fatal(
                 str_field(&value["error"], "message")
                     .unwrap_or("codex turn failed")
@@ -341,6 +352,16 @@ impl LineParser for CodexLineParser {
                 "codex: event without type: {}",
                 summarize(trimmed, 120)
             ))],
+        }
+    }
+
+    fn finish_after_exit(&mut self, ok: bool) -> Vec<AgentEvent> {
+        if ok && !self.turn_completed {
+            vec![AgentEvent::Fatal(
+                "codex exited without a terminal turn.completed event".to_string(),
+            )]
+        } else {
+            Vec::new()
         }
     }
 }
@@ -387,7 +408,8 @@ mod tests {
         assert!(command.args.contains(&"--json".to_string()));
         assert!(command.args.windows(2).any(|w| w == ["-C", "/tmp/ws"]));
         assert!(command.args.windows(2).any(|w| w == ["-s", "read-only"]));
-        assert_eq!(command.args.last().unwrap(), "do it");
+        assert_eq!(command.args.last().unwrap(), "-");
+        assert_eq!(command.stdin.as_deref(), Some("do it"));
         assert!(
             command
                 .args
@@ -416,12 +438,28 @@ mod tests {
             &["exec".to_string(), "resume".to_string()]
         );
         assert!(command.args.contains(&"thread-9".to_string()));
-        assert_eq!(command.args.last().unwrap(), "again");
+        assert_eq!(command.args.last().unwrap(), "-");
+        assert_eq!(command.stdin.as_deref(), Some("again"));
         // `codex exec resume` rejects these exec-only flags — never send them.
         assert!(command.args.contains(&"--json".to_string()));
         assert!(!command.args.iter().any(|a| a == "--color"));
         assert!(!command.args.iter().any(|a| a == "-C"));
         assert!(!command.args.iter().any(|a| a == "-s"));
+    }
+
+    #[test]
+    fn user_prompt_is_never_part_of_the_command_line() {
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+        let adapter = CodexStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+
+        for session in [None, Some(AgentSessionId("thread-9".to_string()))] {
+            for prompt in ["& whoami", "--version"] {
+                let command = adapter.build_command(prompt, session.as_ref(), None);
+                assert!(!command.args.iter().any(|arg| arg == prompt));
+                assert_eq!(command.args.last().map(String::as_str), Some("-"));
+                assert_eq!(command.stdin.as_deref(), Some(prompt));
+            }
+        }
     }
 
     #[test]
@@ -543,6 +581,18 @@ mod tests {
     fn turn_failed_is_fatal() {
         let events = parse_all(&[r#"{"type":"turn.failed","error":{"message":"model error"}}"#]);
         assert_eq!(events, vec![AgentEvent::Fatal("model error".to_string())]);
+    }
+
+    #[test]
+    fn successful_exit_requires_turn_completed() {
+        let mut parser = CodexLineParser::default();
+        assert!(matches!(
+            parser.finish_after_exit(true).as_slice(),
+            [AgentEvent::Fatal(message)] if message.contains("turn.completed")
+        ));
+
+        parser.parse_line(r#"{"type":"turn.completed"}"#);
+        assert!(parser.finish_after_exit(true).is_empty());
     }
 
     #[test]

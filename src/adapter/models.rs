@@ -1,11 +1,21 @@
 //! Backend model catalog discovery.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::adapter::process::{
+    ChildProcessTree, MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_LINE_BYTES, configure_process_tree,
+};
+use crate::domain::config::resolve_binary_on_path;
 use crate::domain::team::{BackendKind, Effort};
+
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredModel {
@@ -100,7 +110,7 @@ fn parse_codex_models(output: &[u8]) -> Result<Vec<DiscoveredModel>, String> {
 }
 
 fn discover_grok_models(cwd: &Path) -> Result<Vec<DiscoveredModel>, String> {
-    let output = run("grok", &["models"], cwd)?;
+    let output = run("grok", &["--no-auto-update", "models"], cwd)?;
     non_empty("grok models", parse_grok_models(&text(&output)))
 }
 
@@ -120,6 +130,7 @@ fn claude_models_from_settings(paths: &[PathBuf], custom: Option<&str>) -> Vec<D
         "best",
         "sonnet",
         "opus",
+        "fable",
         "haiku",
         "sonnet[1m]",
         "opus[1m]",
@@ -164,17 +175,140 @@ fn claude_settings_paths(cwd: &Path) -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         paths.push(PathBuf::from(home).join(".claude/settings.json"));
     }
-    paths.push(cwd.join(".claude/settings.json"));
-    paths.push(cwd.join(".claude/settings.local.json"));
+    let project_root = git_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    paths.push(project_root.join(".claude/settings.json"));
+    paths.push(project_root.join(".claude/settings.local.json"));
+    // Claude still reads local settings left in the launch directory by older
+    // releases, while current releases resolve them from the repository root.
+    if project_root != cwd {
+        paths.push(cwd.join(".claude/settings.local.json"));
+    }
     paths
 }
 
+fn git_project_root(cwd: &Path) -> Option<PathBuf> {
+    if let Ok(output) = run("git", &["rev-parse", "--show-toplevel"], cwd)
+        && output.status.success()
+        && let Ok(root) = std::str::from_utf8(&output.stdout)
+    {
+        let root = root.trim();
+        if !root.is_empty() {
+            return Some(PathBuf::from(root));
+        }
+    }
+
+    // Git is not guaranteed to be installed in every packaged environment
+    // (notably a clean Windows PATH). The repository marker is sufficient for
+    // locating Claude's project settings even when `git rev-parse` cannot run.
+    cwd.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .and_then(|root| std::fs::canonicalize(root).ok())
+}
+
 fn run(program: &str, args: &[&str], cwd: &Path) -> Result<Output, String> {
-    let output = Command::new(program)
+    run_with_timeout(program, args, cwd, MODEL_DISCOVERY_TIMEOUT)
+}
+
+fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let label = command_label(program, args);
+    let resolved_program =
+        resolve_binary_on_path(program).unwrap_or_else(|| PathBuf::from(program));
+    let mut builder = Command::new(resolved_program);
+    builder
         .args(args)
         .current_dir(cwd)
-        .output()
-        .map_err(|err| format!("could not run `{}`: {err}", command_label(program, args)))?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_tree(&mut builder);
+    let mut child = builder
+        .spawn()
+        .map_err(|err| format!("could not run `{label}`: {err}"))?;
+    let process_tree = match ChildProcessTree::attach(&mut child) {
+        Ok(tree) => Arc::new(tree),
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("could not isolate `{label}` process tree: {err}"));
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout was configured as a pipe");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr was configured as a pipe");
+    let stdout_thread = read_bounded_pipe(
+        stdout,
+        MAX_PROTOCOL_LINE_BYTES,
+        "stdout",
+        Arc::clone(&process_tree),
+    );
+    let stderr_thread = read_bounded_pipe(
+        stderr,
+        MAX_STDERR_LINE_BYTES,
+        "stderr",
+        Arc::clone(&process_tree),
+    );
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = process_tree.terminate_with_fallback(&mut child);
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!(
+                    "`{label}` timed out after {}ms",
+                    timeout.as_millis()
+                ));
+            }
+            Err(err) => {
+                let _ = process_tree.terminate_with_fallback(&mut child);
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!("could not wait for `{label}`: {err}"));
+            }
+        }
+    };
+    while !stdout_thread.is_finished() || !stderr_thread.is_finished() {
+        if started.elapsed() >= timeout {
+            let _ = process_tree.terminate();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(format!(
+                "`{label}` timed out after {}ms while draining output",
+                timeout.as_millis()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| format!("failed to collect `{label}` stdout"))?
+        .map_err(|err| format!("failed to read `{label}` stdout: {err}"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| format!("failed to collect `{label}` stderr"))?
+        .map_err(|err| format!("failed to read `{label}` stderr: {err}"))?;
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
     if output.status.success() {
         return Ok(output);
     }
@@ -188,6 +322,35 @@ fn run(program: &str, args: &[&str], cwd: &Path) -> Result<Output, String> {
         )
     } else {
         format!("`{}` failed: {detail}", command_label(program, args))
+    })
+}
+
+fn read_bounded_pipe(
+    reader: impl Read + Send + 'static,
+    max_bytes: usize,
+    stream: &'static str,
+    process_tree: Arc<ChildProcessTree>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(max_bytes.min(8192));
+        let result = reader
+            .take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .and_then(|_| {
+                if bytes.len() > max_bytes {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{stream} exceeded {max_bytes} bytes"),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(err) = result {
+            let _ = process_tree.terminate();
+            return Err(err);
+        }
+        Ok(bytes)
     })
 }
 
@@ -332,6 +495,7 @@ mod tests {
     fn claude_uses_documented_aliases_without_restrictions() {
         let models = claude_models_from_settings(&[], None);
         assert!(ids(&models).contains(&"sonnet"));
+        assert!(ids(&models).contains(&"fable"));
         assert!(ids(&models).contains(&"opusplan"));
     }
 
@@ -357,5 +521,79 @@ mod tests {
             vec!["company-sonnet", "company-opus", "company-custom"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_discovers_repository_root_settings_from_nested_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "asterline-claude-git-root-settings-{}",
+            std::process::id()
+        ));
+        let nested = root.join("crates/member");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            r#"{"availableModels":["root-managed-model"]}"#,
+        )
+        .unwrap();
+
+        let paths = claude_settings_paths(&nested);
+        let models = claude_models_from_settings(&paths, None);
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+        assert!(paths.contains(&canonical_root.join(".claude/settings.json")));
+        assert!(paths.contains(&canonical_root.join(".claude/settings.local.json")));
+        assert!(ids(&models).contains(&"root-managed-model"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_discovery_times_out_and_kills_the_child_tree() {
+        let started = Instant::now();
+        let error = run_with_timeout(
+            "/bin/sh",
+            &["-c", "sleep 30"],
+            Path::new("/tmp"),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out after 100ms"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_discovery_timeout_covers_descendants_holding_output_pipes() {
+        let error = run_with_timeout(
+            "/bin/sh",
+            &["-c", "sleep 30 & exit 0"],
+            Path::new("/tmp"),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out after 100ms"), "{error}");
+        assert!(error.contains("draining output"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_discovery_rejects_oversized_output_without_hanging() {
+        let started = Instant::now();
+        let error = run_with_timeout(
+            "/bin/sh",
+            &["-c", "yes x | tr -d '\\n'"],
+            Path::new("/tmp"),
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("stdout exceeded"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

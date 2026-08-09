@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
 
-/// Mode selected for the lifetime of the current terminal session.
+/// Mode selected for the lifetime of the current conversation.
 ///
 /// Unlike [`CollabMode`], this includes ordinary chat and team dispatch.
 /// A selection remains active until another `SetMode` command replaces it.
@@ -395,6 +395,12 @@ pub fn resolve_mode_roles(
     if mode == CollabMode::Review && roles.builder == roles.reviewer {
         return Err("review mode needs two distinct members (builder and reviewer)".to_string());
     }
+    if mode == CollabMode::Brainstorm && roles.participants.len() < 2 {
+        return Err(
+            "brainstorm mode needs at least two participants with distinct member identities"
+                .to_string(),
+        );
+    }
     Ok((roles, limits))
 }
 
@@ -424,8 +430,15 @@ fn resolve_bound_participants(
 ) -> Result<Vec<MemberId>, String> {
     if let Some(ids) = binding {
         let mut out = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
         for id in ids {
-            out.push(resolve_bound_member(config, id)?);
+            let resolved = resolve_bound_member(config, id)?;
+            if !seen.insert(resolved.clone()) {
+                return Err(format!(
+                    "brainstorm participant resolves more than once: {resolved}"
+                ));
+            }
+            out.push(resolved);
         }
         return Ok(out);
     }
@@ -643,6 +656,27 @@ mod tests {
         );
         assert_eq!(limits.rounds, 4);
         assert_eq!(limits.ideas_per_round, 6);
+    }
+
+    #[test]
+    fn brainstorm_rejects_duplicate_and_single_participants() {
+        let mut duplicate = mixed_roster();
+        duplicate.members[1].display_name = "Builder Bot".to_string();
+        duplicate.modes.brainstorm = Some(BrainstormModeConfig {
+            participants: Some(vec![MemberId::new("builder"), MemberId::new("Builder Bot")]),
+            ..BrainstormModeConfig::default()
+        });
+        assert_eq!(
+            resolve_mode_roles(&duplicate, CollabMode::Brainstorm).unwrap_err(),
+            "brainstorm participant resolves more than once: builder"
+        );
+
+        let single =
+            TeamConfig::new("solo", "/tmp/ws").with_member(member("builder", "implementation"));
+        assert_eq!(
+            resolve_mode_roles(&single, CollabMode::Brainstorm).unwrap_err(),
+            "brainstorm mode needs at least two participants with distinct member identities"
+        );
     }
 
     #[test]

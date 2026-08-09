@@ -216,8 +216,28 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut brainstorm_cards = Vec::new();
     let mut brainstorm_votes = Vec::new();
     let mut warnings = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
 
     for line in text.lines() {
+        if let Some((marker, minimum)) = fence {
+            kept_lines.push(line);
+            if is_closing_fence(line, marker, minimum) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opening) = opening_fence(line) {
+            fence = Some(opening);
+            kept_lines.push(line);
+            continue;
+        }
+        // Four-space and tab-indented Markdown code is display content, not a
+        // protocol instruction. Requiring controls to be outside code blocks
+        // prevents examples from being executed as real team actions.
+        if line.starts_with('\t') || line.starts_with("    ") {
+            kept_lines.push(line);
+            continue;
+        }
         let mut matched = false;
         for &(prefix, parse_fn) in ENVELOPE_PARSERS {
             if let Some(payload) = envelope_payload(line, prefix) {
@@ -252,6 +272,30 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         brainstorm_votes,
         warnings,
     }
+}
+
+fn opening_fence(line: &str) -> Option<(char, usize)> {
+    let spaces = line.chars().take_while(|ch| *ch == ' ').count();
+    if spaces > 3 {
+        return None;
+    }
+    let trimmed = &line[spaces..];
+    let marker = trimmed
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '`' | '~'))?;
+    let count = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (count >= 3).then_some((marker, count))
+}
+
+fn is_closing_fence(line: &str, marker: char, minimum: usize) -> bool {
+    let spaces = line.chars().take_while(|ch| *ch == ' ').count();
+    if spaces > 3 {
+        return false;
+    }
+    let trimmed = &line[spaces..];
+    let count = trimmed.chars().take_while(|ch| *ch == marker).count();
+    count >= minimum && trimmed.chars().skip(count).all(char::is_whitespace)
 }
 
 /// If `line` is an envelope, return the JSON payload after the prefix.
@@ -612,6 +656,46 @@ mod tests {
         );
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(parsed.messages[1].body, "two");
+    }
+
+    #[test]
+    fn ignores_control_examples_inside_markdown_code() {
+        let text = concat!(
+            "Example:\n```text\n",
+            "@@team_message {\"to\":\"reviewer\",\"body\":\"example only\"}\n",
+            "```\n",
+            "    @@team_member {\"display_name\":\"Example\",\"backend\":\"codex\",\"role\":\"demo\"}\n",
+            "@@team_message {\"to\":\"builder\",\"body\":\"real action\"}"
+        );
+
+        let parsed = parse_agent_output(text);
+
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].body, "real action");
+        assert!(parsed.members.is_empty());
+        assert!(parsed.visible_text.contains("example only"));
+        assert!(parsed.visible_text.contains("Example"));
+        assert!(!parsed.visible_text.contains("real action"));
+    }
+
+    #[test]
+    fn tilde_fences_keep_protocol_lines_visible() {
+        let parsed = parse_agent_output(
+            "~~~\n@@review {\"verdict\":\"approve\",\"summary\":\"example\"}\n~~~",
+        );
+
+        assert!(parsed.reviews.is_empty());
+        assert!(parsed.visible_text.contains("@@review"));
+    }
+
+    #[test]
+    fn indented_fence_marker_does_not_close_a_code_block() {
+        let parsed = parse_agent_output(
+            "```text\n    ```\n@@team_message {\"to\":\"builder\",\"body\":\"still example\"}\n```",
+        );
+
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.visible_text.contains("still example"));
     }
 
     #[test]

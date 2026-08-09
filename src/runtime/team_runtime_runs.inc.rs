@@ -58,13 +58,19 @@ impl TeamRuntime {
             Err(err) => {
                 step.events
                     .push(RuntimeEvent::Notice(format!("store error: {err}")));
+                self.block_mode_run(run_id, "could not create the team turn", step);
                 return;
             }
         };
         let display_body = format!("[team {run_id}] → {id}: {goal}");
-        let _ = self
-            .store
-            .record_user(turn, std::slice::from_ref(&id), &display_body);
+        if let Err(err) =
+            self.store
+                .record_user(turn, std::slice::from_ref(&id), &display_body)
+        {
+            self.report_store_error("save a team dispatch", err, step);
+            self.block_mode_run(run_id, "could not persist the team dispatch", step);
+            return;
+        }
         step.events.push(RuntimeEvent::TurnStarted { turn });
         step.events.push(RuntimeEvent::UserMessage {
             turn,
@@ -82,22 +88,34 @@ impl TeamRuntime {
         self.run_turns.insert(turn, run_id);
         let gate = self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Mode);
         if gate && let Some(kind) = self.matcher.classify(&prompt) {
-            if let Ok(approval_id) = self.store.insert_approval(Some(turn), None, &kind, &prompt) {
-                self.held_approvals.insert(
-                    approval_id,
-                    HeldApproval {
-                        turn,
-                        targets: vec![id],
-                        prompt: prompt.clone(),
-                        mode_run: Some(run_id),
-                    },
-                );
-                step.events.push(RuntimeEvent::ApprovalRequested {
-                    id: approval_id,
-                    member: None,
-                    action: kind,
-                    body: prompt,
-                });
+            match self.store.insert_approval(Some(turn), None, &kind, &prompt) {
+                Ok(approval_id) => {
+                    self.held_approvals.insert(
+                        approval_id,
+                        HeldApproval {
+                            turn,
+                            targets: vec![id],
+                            prompt: prompt.clone(),
+                            mode_run: Some(run_id),
+                            member_request: None,
+                        },
+                    );
+                    step.events.push(RuntimeEvent::ApprovalRequested {
+                        id: approval_id,
+                        member: None,
+                        action: kind,
+                        body: prompt,
+                    });
+                }
+                Err(err) => {
+                    self.report_store_error("save a team approval request", err, step);
+                    self.block_mode_run(
+                        run_id,
+                        "could not persist the team approval request",
+                        step,
+                    );
+                    self.check_turn_complete(turn, step);
+                }
             }
         } else {
             self.enqueue_prompt(&id, turn, prompt, step);
@@ -161,9 +179,14 @@ impl TeamRuntime {
                 return;
             }
         };
-        if let Ok(updated) = self.store.continue_run(run.id, note.as_deref()) {
-            step.events
-                .push(RuntimeEvent::RunUpdated { run: updated });
+        match self.store.continue_run(run.id, note.as_deref()) {
+            Ok(updated) => step
+                .events
+                .push(RuntimeEvent::RunUpdated { run: updated }),
+            Err(err) => {
+                self.report_store_error("continue the team run", err, step);
+                return;
+            }
         }
         self.failed_runs.remove(&run.id);
 
@@ -171,9 +194,14 @@ impl TeamRuntime {
             Some(note) => format!("/continue {} {note}", run.id),
             None => format!("/continue {}", run.id),
         };
-        let _ = self
-            .store
-            .record_user(turn, std::slice::from_ref(&id), &display_body);
+        if let Err(err) =
+            self.store
+                .record_user(turn, std::slice::from_ref(&id), &display_body)
+        {
+            self.report_store_error("save a continued team dispatch", err, step);
+            self.block_mode_run(run.id, "could not persist the continued dispatch", step);
+            return;
+        }
         step.events.push(RuntimeEvent::TurnStarted { turn });
         step.events.push(RuntimeEvent::UserMessage {
             turn,
@@ -222,8 +250,12 @@ impl TeamRuntime {
 
     /// Finish a non-mode-session run turn: team runs may auto-verify; others Done.
     fn finish_plain_or_team_run(&mut self, run_id: RunId, step: &mut RuntimeStep) {
-        let Ok(run) = self.store.run(run_id) else {
-            return;
+        let run = match self.store.run(run_id) {
+            Ok(run) => run,
+            Err(err) => {
+                self.report_store_error("load the finishing run", err, step);
+                return;
+            }
         };
         let is_team = run
             .mode
@@ -250,18 +282,35 @@ impl TeamRuntime {
                     status.max_iterations = limits.max_iterations;
                 }
                 status.phase = "verifying".to_string();
-                if let Ok(json) = serde_json::to_string(&status)
-                    && let Ok(updated) = self.store.update_run_mode_state(run_id, &json)
-                {
-                    step.events
-                        .push(RuntimeEvent::RunUpdated { run: updated });
+                let json = match serde_json::to_string(&status) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "could not encode team verification state: {err}"
+                        )));
+                        return;
+                    }
+                };
+                match self.store.update_run_mode_state(run_id, &json) {
+                    Ok(updated) => step
+                        .events
+                        .push(RuntimeEvent::RunUpdated { run: updated }),
+                    Err(err) => {
+                        self.report_store_error("save team verification state", err, step);
+                        return;
+                    }
                 }
-                if let Ok(updated) = self
+                match self
                     .store
                     .update_run_status(run_id, RunStatus::Verifying)
                 {
-                    step.events
-                        .push(RuntimeEvent::RunUpdated { run: updated });
+                    Ok(updated) => step
+                        .events
+                        .push(RuntimeEvent::RunUpdated { run: updated }),
+                    Err(err) => {
+                        self.report_store_error("save team verification status", err, step);
+                        return;
+                    }
                 }
                 step.events
                     .push(RuntimeEvent::Notice(format!("verifying {run_id}: {cmd}")));
@@ -274,9 +323,11 @@ impl TeamRuntime {
                 return;
             }
         }
-        if let Ok(updated) = self.store.update_run_status(run_id, RunStatus::Done) {
-            step.events
-                .push(RuntimeEvent::RunUpdated { run: updated });
+        match self.store.update_run_status(run_id, RunStatus::Done) {
+            Ok(updated) => step
+                .events
+                .push(RuntimeEvent::RunUpdated { run: updated }),
+            Err(err) => self.report_store_error("finish the run", err, step),
         }
     }
 
@@ -317,8 +368,11 @@ impl TeamRuntime {
         status.iteration = iteration;
         status.max_iterations = max_iterations;
         status.phase = "coordinating".to_string();
-        if let Ok(json) = serde_json::to_string(&status) {
-            let _ = self.store.update_run_mode_state(run.id, &json);
+        if let Ok(json) = serde_json::to_string(&status)
+            && let Err(err) = self.store.update_run_mode_state(run.id, &json)
+        {
+            self.report_store_error("save team verification state", err, step);
+            return;
         }
 
         let coordinator = run
@@ -343,15 +397,25 @@ impl TeamRuntime {
 
         // continue_run clears verification columns and bumps attempt; store first.
         self.failed_runs.remove(&run.id);
-        if let Ok(updated) = self.store.continue_run(run.id, None) {
-            step.events
-                .push(RuntimeEvent::RunUpdated { run: updated });
+        match self.store.continue_run(run.id, None) {
+            Ok(updated) => step
+                .events
+                .push(RuntimeEvent::RunUpdated { run: updated }),
+            Err(err) => {
+                self.report_store_error("continue the failed team run", err, step);
+                return;
+            }
         }
 
         let display_body = format!("[team {}] auto-continue after verify failure", run.id);
-        let _ = self
-            .store
-            .record_user(turn, std::slice::from_ref(&id), &display_body);
+        if let Err(err) =
+            self.store
+                .record_user(turn, std::slice::from_ref(&id), &display_body)
+        {
+            self.report_store_error("save a verification repair dispatch", err, step);
+            self.block_mode_run(run.id, "could not persist the repair dispatch", step);
+            return;
+        }
         step.events.push(RuntimeEvent::TurnStarted { turn });
         step.events.push(RuntimeEvent::UserMessage {
             turn,
@@ -463,18 +527,24 @@ impl TeamRuntime {
             return;
         };
 
-        if let Ok(run) = self
+        let run_id = run.id;
+        let updated = match self
             .store
-            .update_run_status(run.id, RunStatus::Verifying)
+            .update_run_status(run_id, RunStatus::Verifying)
         {
-            step.events.push(RuntimeEvent::RunUpdated { run });
-        }
+            Ok(run) => run,
+            Err(err) => {
+                self.report_store_error("start verification", err, step);
+                return;
+            }
+        };
+        step.events.push(RuntimeEvent::RunUpdated { run: updated });
         step.events.push(RuntimeEvent::Notice(format!(
             "verifying {}: {command}",
-            run.id
+            run_id
         )));
         step.verify_actions.push(VerifyAction {
-            run_id: run.id,
+            run_id,
             command,
             workspace: self.config.workspace.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -488,6 +558,13 @@ impl TeamRuntime {
         title: String,
         step: &mut RuntimeStep,
     ) {
+        if let Some(owner) = &owner
+            && self.config.member(owner).is_none()
+        {
+            step.events
+                .push(RuntimeEvent::Notice(format!("unknown step owner: {owner}")));
+            return;
+        }
         let Some(run) = self.run_or_latest(run_id, "add a step to", step) else {
             return;
         };
@@ -610,6 +687,13 @@ impl TeamRuntime {
         owner: Option<MemberId>,
         step: &mut RuntimeStep,
     ) {
+        if let Some(owner) = &owner
+            && self.config.member(owner).is_none()
+        {
+            step.events
+                .push(RuntimeEvent::Notice(format!("unknown step owner: {owner}")));
+            return;
+        }
         let Some(run) = self.run_or_latest(run_id, "assign a step on", step) else {
             return;
         };
@@ -647,7 +731,7 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) -> Option<RunSummary> {
         match run_id {
-            Some(id) => match self.store.run(id) {
+            Some(id) => match self.store.active_run(id) {
                 Ok(run) => Some(run),
                 Err(_) => {
                     step.events
@@ -656,12 +740,20 @@ impl TeamRuntime {
                 }
             },
             None => {
-                let run = self.store.latest_run().unwrap_or_default();
-                if run.is_none() {
-                    step.events
-                        .push(RuntimeEvent::Notice(format!("no run to {verb}")));
+                match self.store.latest_run() {
+                    Ok(Some(run)) => Some(run),
+                    Ok(None) => {
+                        step.events
+                            .push(RuntimeEvent::Notice(format!("no run to {verb}")));
+                        None
+                    }
+                    Err(err) => {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "could not load the latest run: {err}"
+                        )));
+                        None
+                    }
                 }
-                run
             }
         }
     }
@@ -677,20 +769,30 @@ impl TeamRuntime {
         } else {
             summarize_verify_output(&output.stdout, &output.stderr)
         };
-        if ok {
+        if ok || cancelled {
             self.failed_runs.remove(&output.run_id);
         } else {
             self.failed_runs.insert(output.run_id);
         }
-        match self
-            .store
-            .set_run_verification(output.run_id, &output.command, ok, &summary)
-        {
+        let saved = if cancelled {
+            self.store
+                .cancel_run_verification(output.run_id, &output.command, &summary)
+        } else {
+            self.store
+                .set_run_verification(output.run_id, &output.command, ok, &summary)
+        };
+        match saved {
             Ok(run) => {
                 step.events.push(RuntimeEvent::RunUpdated { run });
                 step.events.push(RuntimeEvent::Notice(format!(
                     "verification {}: {}",
-                    if ok { "passed" } else { "failed" },
+                    if cancelled {
+                        "cancelled"
+                    } else if ok {
+                        "passed"
+                    } else {
+                        "failed"
+                    },
                     summary
                 )));
             }
@@ -759,13 +861,22 @@ impl TeamRuntime {
             }
 
             // Store already wrote Failed; write Running before the UI event.
-            if let Ok(run) = self
+            let run = match self
                 .store
                 .update_run_status(output.run_id, RunStatus::Running)
             {
-                step.events.push(RuntimeEvent::RunUpdated { run });
+                Ok(run) => run,
+                Err(err) => {
+                    self.report_store_error("resume after failed verification", err, &mut step);
+                    self.failed_runs.insert(output.run_id);
+                    return step;
+                }
+            };
+            step.events.push(RuntimeEvent::RunUpdated { run });
+            if !self.persist_mode_state(output.run_id, &mut step) {
+                self.failed_runs.insert(output.run_id);
+                return step;
             }
-            self.persist_mode_state(output.run_id, &mut step);
 
             let (target, prompt, label) = match mode {
                 CollabMode::Plan => (

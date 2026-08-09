@@ -196,8 +196,8 @@ Broadcast the message to every enabled member.
 
 Persist the current conversation, create a new conversation, clear the visible
 transcript and current run list, create fresh backend session IDs, and reset
-the terminal mode to `normal`. Any active collaboration run is recorded as
-superseded.
+the terminal mode to `normal`. If a member, collaboration run, or verification
+is active, `/new` is rejected; use `/abort` and wait for cancellation first.
 
 `/clear` is intentionally not a separate command. Typing `/cl` or `/clear`
 offers `/new` in completion, so accepting it performs the full new-conversation
@@ -653,7 +653,8 @@ mouse drag and copied using the terminal's normal copy shortcut.
 
 Press `Ctrl+N` or `Ctrl+B` to focus the roster, move with `←` or `→`, and press
 `Enter`. Asterline suspends its TUI and opens that member's native interactive
-CLI. Exit the CLI with `/exit` or `Ctrl+D` to return.
+CLI. Exit with `/exit` or `Ctrl+D` on Unix; on Windows, use `/exit` or press
+`Ctrl+Z` followed by `Enter`.
 
 Messages created while attached to Codex or Claude are imported into the
 Asterline transcript. Grok and Agy resume their native sessions but attached

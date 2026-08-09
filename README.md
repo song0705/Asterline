@@ -40,11 +40,9 @@ workspace through an Asterline cloud service.
 ### Requirements
 
 - Rust 1.85 or newer when building from source
-- Linux or macOS and a terminal with color and alternate-screen support
+- Linux, macOS, or Windows 10/11 and a terminal with color and alternate-screen support
 - At least one installed and authenticated CLI: `codex`, `claude`, `grok`, or `agy`
 - Git is recommended for diffs and verification commands
-
-Prebuilt Windows binaries are not currently published.
 
 ### Install and launch
 
@@ -58,9 +56,17 @@ install -m 755 ast ~/.local/bin/ast
 ast --help
 ```
 
-Release archives are published for Linux x86-64, Linux ARM64, macOS Intel, and
-macOS Apple silicon. Every release includes `SHA256SUMS` and signed GitHub build
-provenance.
+On Windows PowerShell, extract the `.zip` archive and install either `.exe`:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
+Copy-Item .\ast.exe "$HOME\bin\ast.exe"
+& "$HOME\bin\ast.exe" --help
+```
+
+Release archives are published for Linux x86-64, Linux ARM64, macOS Intel,
+macOS Apple silicon, and Windows x86-64. Every release includes `SHA256SUMS`
+and signed GitHub build provenance.
 
 To install from source instead, clone this repository and run:
 
@@ -76,7 +82,9 @@ result in `<workspace>/.asterline/team.json`.
 
 If `ast` is not found after installing a release archive, add
 `$HOME/.local/bin` to `PATH` and start a new shell. A source installation uses
-Cargo's binary directory, normally `$HOME/.cargo/bin`.
+Cargo's binary directory, normally `$HOME/.cargo/bin`. On Windows, add
+`$HOME\bin` (or Cargo's `%USERPROFILE%\.cargo\bin`) to `PATH`; Asterline honors
+`PATHEXT` when locating backend launchers such as `.exe`, `.cmd`, and `.bat`.
 
 In the Team builder:
 
@@ -179,12 +187,12 @@ different `cwd`, but Asterline does not currently create or merge worktrees.
 
 ## Supported backends
 
-| Backend | Executable | Streaming                         | Resume | Model choices                 |
-| ------- | ---------- | --------------------------------- | ------ | ----------------------------- |
-| Codex   | `codex`    | `codex exec --json`               | Yes    | `codex debug models`          |
-| Claude  | `claude`   | stream JSON with partial messages | Yes    | aliases and `availableModels` |
-| Grok    | `grok`     | ACP over `grok agent stdio`       | Yes    | `grok models`                 |
-| Agy     | `agy`      | `stream-json` print events        | Yes    | `agy models`                  |
+| Backend | Executable | Streaming                         | Resume | Model choices                  |
+| ------- | ---------- | --------------------------------- | ------ | ------------------------------ |
+| Codex   | `codex`    | `codex exec --json`               | Yes    | `codex debug models`           |
+| Claude  | `claude`   | stream JSON with partial messages | Yes    | aliases and `availableModels`  |
+| Grok    | `grok`     | ACP over `grok agent stdio`       | Yes    | `grok --no-auto-update models` |
+| Agy     | `agy`      | `stream-json` print events        | Yes    | `agy models`                   |
 
 Asterline does not install, authenticate, or bill for these products. Backend
 availability, model access, and usage limits remain properties of the
@@ -241,13 +249,13 @@ with the current conversation until another `/mode` replaces it. `/new`
 creates a conversation in normal mode; `/resume` restores the selected
 conversation's mode.
 
-| Mode         | Use it for                         | What Asterline does                                      |
-| ------------ | ---------------------------------- | -------------------------------------------------------- |
-| `normal`     | Direct work with one/all members   | Routes ordinary messages and remembers the last target   |
-| `review`     | Implementation with a quality gate | Loops builder → structured reviewer verdict → revision   |
-| `plan`       | Multi-step owned work              | Plans a checklist, dispatches owners, then reviews       |
-| `brainstorm` | Broad exploration before judgment  | Runs seed/build/stretch, private vote, rank, synthesis   |
-| `team`       | End-to-end coordinated delivery    | Lets a coordinator own steps, integrate, and verify      |
+| Mode         | Use it for                         | What Asterline does                                    |
+| ------------ | ---------------------------------- | ------------------------------------------------------ |
+| `normal`     | Direct work with one/all members   | Routes ordinary messages and remembers the last target |
+| `review`     | Implementation with a quality gate | Loops builder → structured reviewer verdict → revision |
+| `plan`       | Multi-step owned work              | Plans a checklist, dispatches owners, then reviews     |
+| `brainstorm` | Broad exploration before judgment  | Runs seed/build/stretch, private vote, rank, synthesis |
+| `team`       | End-to-end coordinated delivery    | Lets a coordinator own steps, integrate, and verify    |
 
 Review mode requires a structured `@@review` verdict. `approve` finishes the
 run and can trigger verification; `request_changes` returns feedback to the
@@ -371,7 +379,7 @@ process beyond the controls supported by that backend.
 
 Members may use backend-native sandbox and permission settings. Asterline also
 gates requests it classifies as risky — user messages, agent-to-agent relays,
-and collaboration-mode dispatches — with a configurable policy (see
+collaboration-mode dispatches, and agent-originated roster additions — with a configurable policy (see
 [approvals and tool-level control](docs/approvals.md)). `--debug` disables the
 Asterline approval gate and is intended only for controlled development
 environments.
@@ -398,7 +406,9 @@ mode configuration.
 ### Why did the previous mode disappear—or remain?
 
 `/mode` belongs to a conversation. `/new` creates a new conversation in
-`normal`; `/resume` restores the selected conversation's saved mode.
+`normal`; `/resume` restores the selected conversation's saved mode. Both
+commands require active members, runs, and verification to be stopped with
+`/abort` first.
 
 ### Is `/clear` supported?
 
@@ -424,6 +434,7 @@ working-tree result independently of the chat presentation.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration, local data, permissions, and troubleshooting](docs/configuration.md)
 - [Approval layers and tool-level control](docs/approvals.md)
+- [v0.2.1 release notes](docs/releases/v0.2.1.md)
 - [v0.2.0 release notes](docs/releases/v0.2.0.md)
 - Built-in command palette: `/help`
 - Command-line help: `asterline --help`
@@ -440,8 +451,8 @@ Run the full local quality gate:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked --no-fail-fast
 ```
 
 If `just` is installed, `just run --fake`, `just install`, and `just check`
@@ -460,10 +471,10 @@ src/
 
 ## Project status
 
-Asterline is currently version `0.2.0` and under active development. Tagged
-versions are published as prebuilt Linux and macOS archives through GitHub
-Actions. Before a stable release, configuration, persisted data, commands, and
-UI details may change without backward compatibility.
+Asterline is currently version `0.2.1` and under active development. Tagged
+versions are published as prebuilt Linux, macOS, and Windows archives through
+GitHub Actions. Before a stable release, configuration, persisted data,
+commands, and UI details may change without backward compatibility.
 
 Release maintainers should follow the [release guide](docs/releasing.md).
 

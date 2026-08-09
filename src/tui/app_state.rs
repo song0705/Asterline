@@ -8,6 +8,9 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
+use crate::adapter::parser::{
+    MAX_MESSAGE_TEXT_BYTES, MAX_TOOL_DETAIL_BYTES, append_bounded_text, bounded_text,
+};
 use crate::domain::event::{
     ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId, MessageTarget,
     RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
@@ -93,9 +96,9 @@ pub struct AppState {
     popup_dismissed: bool,
     should_quit: bool,
     quit_armed: bool,
+    runtime_available: bool,
     tools_expanded: bool,
     active_reasoning: HashMap<MemberId, String>,
-    pending_user_messages: Vec<String>,
     last_message_target: Option<MessageTarget>,
     header_selected: Option<usize>,
     attach_request: Option<AttachRequest>,
@@ -163,9 +166,9 @@ impl AppState {
             popup_dismissed: false,
             should_quit: false,
             quit_armed: false,
+            runtime_available: true,
             tools_expanded: false,
             active_reasoning: HashMap::new(),
-            pending_user_messages: Vec::new(),
             last_message_target: None,
             header_selected: None,
             attach_request: None,
@@ -256,11 +259,7 @@ impl AppState {
                 self.active_reasoning.clear();
             }
             RuntimeEvent::UserMessage { body, .. } => {
-                if let Some(pos) = self.pending_user_messages.iter().position(|m| m == &body) {
-                    self.pending_user_messages.remove(pos);
-                } else {
-                    self.push(ChatItem::User { body });
-                }
+                self.push(ChatItem::User { body });
             }
             RuntimeEvent::MemberStatus { member, status } => self.set_status(&member, status),
             RuntimeEvent::MemberEffort { member, effort } => {
@@ -282,7 +281,7 @@ impl AppState {
                 if let Some(&idx) = self.message_index.get(&msg)
                     && let Some(ChatItem::Agent { text: body, .. }) = self.chat.get_mut(idx)
                 {
-                    body.push_str(&text);
+                    let _ = append_bounded_text(body, &text, MAX_MESSAGE_TEXT_BYTES);
                 }
             }
             RuntimeEvent::MessageCompleted { msg, text } => {
@@ -291,7 +290,7 @@ impl AppState {
                         text: body, member, ..
                     }) = self.chat.get_mut(idx)
                 {
-                    *body = text;
+                    *body = bounded_text(&text, MAX_MESSAGE_TEXT_BYTES);
                     let m = member.clone();
                     self.active_reasoning.remove(&m);
                     self.set_status(&m, MemberStatus::Idle);
@@ -299,7 +298,8 @@ impl AppState {
                 self.message_index.remove(&msg);
             }
             RuntimeEvent::Reasoning { member, text } => {
-                self.active_reasoning.insert(member, text);
+                self.active_reasoning
+                    .insert(member, bounded_text(&text, MAX_MESSAGE_TEXT_BYTES));
             }
             RuntimeEvent::ToolStarted {
                 member,
@@ -320,7 +320,7 @@ impl AppState {
                 if let Some(idx) = self.tool_index.get(&tool_id).copied()
                     && let Some(ChatItem::Tool { detail, .. }) = self.chat.get_mut(idx)
                 {
-                    detail.push_str(&delta);
+                    let _ = append_bounded_text(detail, &delta, MAX_TOOL_DETAIL_BYTES);
                 }
             }
             RuntimeEvent::ToolCompleted {
@@ -338,14 +338,14 @@ impl AppState {
                 {
                     *cell_ok = Some(ok);
                     if !output.is_empty() {
-                        *detail = output;
+                        *detail = bounded_text(&output, MAX_TOOL_DETAIL_BYTES);
                     }
                 } else {
                     self.push(ChatItem::Tool {
                         member,
                         name: "tool".to_string(),
                         summary: String::new(),
-                        detail: output,
+                        detail: bounded_text(&output, MAX_TOOL_DETAIL_BYTES),
                         ok: Some(ok),
                     });
                 }
@@ -451,7 +451,6 @@ impl AppState {
                 self.message_index.clear();
                 self.tool_index.clear();
                 self.active_reasoning.clear();
-                self.pending_user_messages.clear();
                 self.last_message_target = None;
                 self.running_since.clear();
                 self.runs.clear();
@@ -472,7 +471,6 @@ impl AppState {
                 self.message_index.clear();
                 self.tool_index.clear();
                 self.active_reasoning.clear();
-                self.pending_user_messages.clear();
                 self.pending_approvals.clear();
                 self.paused_routes = 0;
                 self.last_message_target = None;
@@ -546,14 +544,8 @@ impl AppState {
         })
     }
 
-    pub fn handle_user_message_submitted(&mut self, target: &MessageTarget, body: String) {
+    pub fn remember_user_message_target(&mut self, target: &MessageTarget) {
         self.remember_message_target(target);
-        self.pending_user_messages.push(body.clone());
-        self.push(ChatItem::User { body });
-        let targets = self.resolve_local_targets(target);
-        for member_id in targets {
-            self.set_status(&member_id, MemberStatus::Running);
-        }
     }
 
     pub fn inherited_user_message(&self, text: &str) -> Option<(MessageTarget, String)> {
@@ -706,11 +698,33 @@ impl AppState {
         self.should_quit
     }
 
+    pub fn runtime_available(&self) -> bool {
+        self.runtime_available
+    }
+
+    pub fn mark_runtime_unavailable(&mut self) {
+        if !self.runtime_available {
+            return;
+        }
+        self.runtime_available = false;
+        self.attach_request = None;
+        self.push(ChatItem::Error {
+            member: None,
+            message: "runtime stopped — input is disabled; press Ctrl+C to quit".to_string(),
+        });
+    }
+
     pub fn running_count(&self) -> usize {
         self.members
             .iter()
             .filter(|m| m.status == MemberStatus::Running)
             .count()
+    }
+
+    pub fn verification_active(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| run.status == crate::domain::event::RunStatus::Verifying)
     }
 
     pub fn first_pending_approval(&self) -> Option<ApprovalId> {

@@ -59,9 +59,19 @@ where
         print_startup_banner();
     }
 
-    tui::run(handle, events, state)?;
-    let _ = join.join();
-    Ok(())
+    // Keep an independent shutdown handle so terminal-initialization errors
+    // inside `tui::run` cannot leave the runtime waiting forever. The TUI also
+    // sends Shutdown on its normal cleanup path; a duplicate send is harmless.
+    let shutdown_handle = handle.clone();
+    let tui_result = tui::run(handle, events, state);
+    shutdown_handle.send(crate::domain::event::UiCommand::Shutdown);
+    let runtime_result = join_runtime(join);
+    tui_result.and(runtime_result)
+}
+
+fn join_runtime(join: JoinHandle<()>) -> io::Result<()> {
+    join.join()
+        .map_err(|_| io::Error::other("Asterline runtime thread panicked"))
 }
 
 fn print_startup_banner() {
@@ -79,12 +89,12 @@ struct Prepared {
 /// Build the team, store, runners, and runtime. Returns `None` if no team can
 /// be resolved (no config and no detected backends).
 fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
-    let workspace = config
+    let requested_workspace = config
         .workspace
         .clone()
         .unwrap_or_else(|| cwd.to_path_buf());
 
-    let saved_team = workspace.join(".asterline").join("team.json");
+    let saved_team = requested_workspace.join(".asterline").join("team.json");
     let mut team = match &config.team_path {
         Some(path) => load_team_config(path)?,
         // Reuse a previously-built roster so the builder doesn't nag every
@@ -98,21 +108,26 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             // Let the user choose the roster from the detected backends instead
             // of silently applying a fixed default (falls back to the default
             // roster when headless / on cancel).
-            match crate::tui::team_builder::run(detected, &workspace)? {
+            match crate::tui::team_builder::run(detected, &requested_workspace)? {
                 Some(team) => {
                     // Persist the choice for next time (before protocol injection).
                     if let Some(parent) = saved_team.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                        std::fs::create_dir_all(parent)?;
                     }
-                    if let Ok(json) = serde_json::to_string_pretty(&team) {
-                        let _ = std::fs::write(&saved_team, json);
-                    }
+                    runtime::save_team_config(&saved_team, &team)?;
                     team
                 }
                 None => return Ok(None),
             }
         }
     };
+    // A CLI workspace is an explicit launch-time override. Without one, the
+    // team file's workspace is canonical for runners, skills, and the default
+    // database location.
+    if let Some(workspace) = &config.workspace {
+        team.workspace = workspace.clone();
+    }
+    let workspace = team.workspace.clone();
     ensure_team_skill(&team.workspace)?;
     ensure_brainstorm_skill(&team.workspace)?;
     inject_team_protocol(&mut team);
@@ -132,7 +147,9 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     } else {
         // Replay only the current conversation (the latest, or a fresh one).
         if let Ok(conversation) = store.current_conversation() {
-            store.set_conversation(conversation);
+            store
+                .set_conversation(conversation)
+                .map_err(|err| io::Error::other(err.to_string()))?;
         }
         // A replay failure must be visible, not a silently-blank transcript:
         // surface it as the first chat item so a schema/store problem is
@@ -151,9 +168,11 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     let mut state = AppState::new(chat);
     state.seed_logs(logs);
 
-    let (events_tx, events_rx) = mpsc::channel();
+    // Bound the runtime-to-TUI stream so a fast or malformed backend cannot
+    // turn a slow terminal renderer into an unbounded in-memory queue.
+    let (events_tx, events_rx) = mpsc::sync_channel(2_048);
     let team_save_path = config.team_path.clone().unwrap_or(saved_team);
-    let (handle, join) = runtime::spawn(
+    let (handle, join) = runtime::spawn_bounded(
         team,
         store,
         runners,
@@ -322,6 +341,17 @@ mod tests {
     }
 
     #[test]
+    fn runtime_thread_panic_is_reported_as_an_io_error() {
+        let join = std::thread::spawn(|| panic!("runtime failure"));
+        let result = join_runtime(join);
+
+        assert_eq!(
+            result.expect_err("panic must be visible").to_string(),
+            "Asterline runtime thread panicked"
+        );
+    }
+
+    #[test]
     fn inject_protocol_lists_teammates() {
         let mut team = crate::domain::config::default_team(
             "/tmp/ws",
@@ -407,5 +437,111 @@ mod tests {
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn team_workspace_is_canonical_for_the_default_database() {
+        let root = std::env::temp_dir().join(format!(
+            "asterline-app-team-workspace-{}",
+            std::process::id()
+        ));
+        let invocation = root.join("invocation");
+        let team_workspace = root.join("team-workspace");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&invocation).unwrap();
+        std::fs::create_dir_all(&team_workspace).unwrap();
+
+        let team = crate::domain::config::default_team(
+            &team_workspace,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+        let team_path = root.join("team.json");
+        std::fs::write(&team_path, serde_json::to_string(&team).unwrap()).unwrap();
+        let config = AppConfig::parse([
+            "--team",
+            team_path.to_str().unwrap(),
+            "--fake",
+            "--no-restore",
+        ])
+        .unwrap();
+
+        let prepared = prepare(&config, &invocation).unwrap().expect("prepared");
+        assert!(
+            team_workspace
+                .join(".asterline/asterline.sqlite3")
+                .is_file()
+        );
+        assert!(!invocation.join(".asterline/asterline.sqlite3").exists());
+        let ready = prepared
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        assert!(matches!(
+            ready,
+            RuntimeEvent::Ready { workspace, .. }
+                if workspace == team_workspace.display().to_string()
+        ));
+
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cli_workspace_overrides_the_team_file_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "asterline-app-cli-workspace-{}",
+            std::process::id()
+        ));
+        let declared_workspace = root.join("declared-workspace");
+        let cli_workspace = root.join("cli-workspace");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&declared_workspace).unwrap();
+        std::fs::create_dir_all(&cli_workspace).unwrap();
+
+        let team = crate::domain::config::default_team(
+            &declared_workspace,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+        let team_path = root.join("team.json");
+        std::fs::write(&team_path, serde_json::to_string(&team).unwrap()).unwrap();
+        let config = AppConfig::parse([
+            "--team",
+            team_path.to_str().unwrap(),
+            "--workspace",
+            cli_workspace.to_str().unwrap(),
+            "--fake",
+            "--no-restore",
+        ])
+        .unwrap();
+
+        let prepared = prepare(&config, &root).unwrap().expect("prepared");
+        assert!(cli_workspace.join(".asterline/asterline.sqlite3").is_file());
+        assert!(!declared_workspace.join(".asterline").exists());
+        let ready = prepared
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        assert!(matches!(
+            ready,
+            RuntimeEvent::Ready { workspace, .. }
+                if workspace == cli_workspace.display().to_string()
+        ));
+
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

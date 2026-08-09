@@ -20,6 +20,20 @@ Use `/team` to modify the live roster. Opening it refreshes installed Agent
 CLIs and preloads their model and reasoning-effort catalogs. Press `s` to
 apply the changes, replace member runners, and save the updated team.
 
+### Platform paths and backend history
+
+On Unix, Asterline uses `HOME` for user-level configuration; on Windows it
+prefers `USERPROFILE`. Each platform accepts the other variable as a fallback.
+`CODEX_HOME` overrides the default `.codex` directory for both session picking,
+post-attach transcript import, and global Codex skill/plugin discovery.
+
+Default history roots are `<Codex home>/sessions`, `<user home>/.claude/projects`,
+and `<user home>/.grok/sessions`. Windows project matching treats drive-letter
+case and `/` versus `\` separators as equivalent. Backend discovery uses the
+platform `PATH`; on Windows it also honors `PATHEXT` and launches the resolved
+`.exe`, `.cmd`, or `.bat` path. When leaving an attached CLI, use `Ctrl+D` on
+Unix or `Ctrl+Z` followed by `Enter` on Windows (or type `/exit`).
+
 ## Team file
 
 ```json
@@ -81,6 +95,9 @@ apply the changes, replace member runners, and save the updated team.
 
 `id` is optional. Asterline derives a stable handle from `display_name`, so
 `QA Lead` becomes `qa-lead`. Set `id` only when a custom `@handle` is required.
+Explicit IDs may contain only ASCII letters, digits, `-`, and `_`. IDs and
+display names must be unique for routing, and `all` is reserved for broadcast
+targets (case-insensitive).
 
 ### Team fields
 
@@ -103,6 +120,9 @@ field is omitted, Asterline derives it from member roles and `default_target`
 participant; participants = full roster). Defaults for budgets:
 `max_iterations = 3`, `generation_rounds = 3`, `ideas_per_round = 4`,
 `auto_verify = true`.
+Brainstorm requires at least two distinct resolved participants; repeating an
+ID or referring to the same member once by ID and once by display name is
+rejected.
 
 Brainstorm separates divergence from convergence. The first wave collects independent
 seeds; later waves expose each participant to a rotating anonymous peer sample
@@ -141,10 +161,12 @@ categories and all surfaces are enabled.
 | `keywords` | Custom categories: name → keyword list (case-insensitive match)         |
 | `apply_to` | Surfaces: `user`, `relay`, `mode`. Omit for all surfaces                |
 
-`user` is ordinary user messages; `relay` is agent-to-agent routes; `mode` is
-engine dispatches for collaboration modes. Set `ASTERLINE_NO_BELL=1` to disable
-terminal BEL/OSC 9 notifications on approval, paused route, blocked run, and
-member error events.
+`user` is ordinary user messages; `relay` is agent-to-agent routes and
+agent-requested roster additions; `mode` is engine dispatches for collaboration
+modes. Roster additions are always held when the `relay` surface is enabled,
+independent of keyword categories. Set `ASTERLINE_NO_BELL=1` to disable terminal
+BEL/OSC 9 notifications on approval, paused route, blocked run, and member error
+events.
 
 See [approvals and tool-level control](approvals.md) for how this gate relates
 to backend-native sandbox and permission enforcement.
@@ -187,17 +209,17 @@ This table describes what the current Asterline adapters actually pass to each
 CLI. It is intentionally narrower than the union of fields accepted by the
 Team editor.
 
-| Setting                | Codex                                                              | Claude                                      | Grok ACP                                                              | Agy                                                                          |
-| ---------------------- | ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `cwd`                  | Process cwd and `-C` on a fresh session                            | Process cwd                                 | ACP session `cwd`                                                     | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
-| `model`                | `-m`                                                               | `--model`                                   | Agent `--model`                                                       | `--model`                                                                    |
-| `effort`               | `model_reasoning_effort`; picker follows model metadata            | `--effort` (through `max`)                  | Agent `--reasoning-effort`                                            | `--effort` (`low`, `medium`, or `high`)                                      |
-| `sandbox`              | `-s` on fresh sessions; resumed sessions restore their own sandbox | Not passed                                  | Top-level `--sandbox` with an Asterline profile mapping               | `--sandbox` unless configured as `danger-full-access`                        |
-| `permission_mode`      | Not passed                                                         | `--permission-mode` (omitted for `default`) | Top-level mode plus ACP permission responses                          | `acceptEdits` → `--mode accept-edits`; `plan` → `--mode plan`; bypass → flag |
-| `allowed_tools`        | Not passed                                                         | `--allowed-tools`                           | Added to ACP session rules; not a hard protocol-level allowlist       | Not passed                                                                   |
-| custom `system_prompt` | `-c developer_instructions=…`                                      | `--append-system-prompt`                    | ACP session `rules`                                                   | Prepended to the print prompt                                                |
-| `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                                   | Resume or fresh conversation                                                 |
-| `session_id`           | `codex exec resume <id>`                                           | `claude --resume <id>`                      | ACP `session/load`                                                    | `agy --conversation <id>`                                                    |
+| Setting                | Codex                                                              | Claude                                      | Grok ACP                                                        | Agy                                                                          |
+| ---------------------- | ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `cwd`                  | Process cwd and `-C` on a fresh session                            | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
+| `model`                | `-m`                                                               | `--model`                                   | Agent `--model`                                                 | `--model`                                                                    |
+| `effort`               | `model_reasoning_effort`; picker follows model metadata            | `--effort` (through `max`)                  | Agent `--reasoning-effort`                                      | `--effort` (`low`, `medium`, or `high`)                                      |
+| `sandbox`              | `-s` on fresh sessions; resumed sessions restore their own sandbox | Not passed                                  | Top-level `--sandbox` with an Asterline profile mapping         | `--sandbox` unless configured as `danger-full-access`                        |
+| `permission_mode`      | Not passed                                                         | `--permission-mode` (omitted for `default`) | Top-level mode plus ACP permission responses                    | `acceptEdits` → `--mode accept-edits`; `plan` → `--mode plan`; bypass → flag |
+| `allowed_tools`        | Not passed                                                         | `--allowed-tools`                           | Added to ACP session rules; not a hard protocol-level allowlist | Not passed                                                                   |
+| custom `system_prompt` | `-c developer_instructions=…`                                      | `--append-system-prompt`                    | ACP session `rules`                                             | Prepended to the print prompt                                                |
+| `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                             | Resume or fresh conversation                                                 |
+| `session_id`           | `codex exec resume <id>`                                           | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
 
 For Claude and Grok, choose only permission modes accepted by the installed CLI
 version. Asterline serializes the configured value but does not negotiate
@@ -213,7 +235,7 @@ Model choices are resolved in each member's effective working directory:
 | ------- | --------------------------------------------------------------- |
 | Codex   | `codex debug models`                                            |
 | Claude  | documented aliases plus project/user `availableModels` settings |
-| Grok    | `grok models`                                                   |
+| Grok    | `grok --no-auto-update models`                                  |
 | Agy     | `agy models`                                                    |
 
 The Team builder and `/team` editor start background discovery as soon as they
@@ -222,7 +244,7 @@ status and discovered model/effort summaries, and disables missing CLIs. Open
 the member's `model` field to browse the already-loading catalog. Type to
 filter by display name, model ID, or description, use `↑`/`↓` for the model,
 and use `←`/`→` for that model's effort. `Enter` applies both values. The
-When discovery returns models, the picker selects the CLI-marked default or,
+picker selects the CLI-marked default when discovery returns models or,
 if none is marked, the first discovered model. It shows only actual model
 entries in that case. `default` is available only when discovery returns no
 models. Press `e` on the field to enter a model ID manually.
@@ -231,6 +253,27 @@ Reasoning effort is model-aware when discovery returns capability metadata.
 Unsupported levels are omitted and the model's reported default effort is
 shown directly when available. Agy exposes the three levels its CLI accepts:
 `low`, `medium`, and `high`.
+
+## Streaming and resource limits
+
+Asterline applies explicit limits at process, adapter, runtime, import, and UI
+boundaries so a malformed or excessively verbose backend cannot grow memory
+without bound:
+
+- JSON protocol records are limited to 8 MiB; stderr records are limited to
+  1 MiB.
+- A visible assistant message is limited to 4 MiB and one tool detail to
+  1 MiB. PTY output retains at most 4 MiB of unread data.
+- Verification output retains at most 1 MiB, preserving useful data from both
+  the beginning and end of the stream.
+- The product runtime-to-TUI queue holds 2,048 events and applies backpressure.
+  Abort and shutdown use a separate control channel so they remain responsive
+  while stream traffic is saturated.
+- Imported JSONL records are limited to 8 MiB and an imported message to
+  1 MiB.
+
+When content is shortened, Asterline inserts an explicit truncation marker
+instead of presenting the shortened value as complete.
 
 ## Runtime data
 
@@ -254,8 +297,10 @@ should ignore it:
 ```
 
 `/new` creates a clean conversation in normal mode and new backend sessions
-while retaining older database records. `--no-restore` skips startup replay
-without deleting data. `--db <PATH>` moves the database outside the workspace.
+while retaining older database records. It is rejected while members, runs, or
+verification are active; use `/abort` and wait for cancellation first.
+`--no-restore` skips startup replay without deleting data. `--db <PATH>` moves
+the database outside the workspace.
 
 `/resume` opens the saved-chat picker. Restoring a chat also restores the
 roster, full member configuration, and each member's native backend session ID

@@ -818,6 +818,20 @@ mod tests {
     }
 
     #[test]
+    fn rename_avoids_reserved_all_target() {
+        let mut editor = editor();
+
+        editor.commit_edit(EditState::new(Field::Name, "All".to_string()));
+
+        assert_eq!(editor.members[0].display_name, "All 2");
+        assert_eq!(editor.members[0].id, MemberId::new("all-2"));
+        let Some(UiCommand::ReplaceTeam { members, .. }) = editor.apply_command() else {
+            panic!("expected replace command");
+        };
+        assert_eq!(members[0].display_name, "All 2");
+    }
+
+    #[test]
     fn member_model_catalog_is_preloaded_without_opening_model_field() {
         let mut editor = TeamEditor::new(
             "t",

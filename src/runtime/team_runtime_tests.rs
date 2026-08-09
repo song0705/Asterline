@@ -6,6 +6,7 @@ use crate::domain::mode::{
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, SessionPolicy, TeamMember,
 };
+use rusqlite::Connection;
 
 fn team() -> TeamConfig {
     let mut config = TeamConfig::new("mixed", "/tmp/ws")
@@ -45,6 +46,13 @@ fn runtime_in_workspace(workspace: impl Into<PathBuf>) -> TeamRuntime {
         ));
     config.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
     TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false)
+}
+
+fn remove_sqlite_test_files(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }
 
 #[test]
@@ -97,6 +105,36 @@ fn user_message_starts_a_run_for_default_member() {
 }
 
 #[test]
+fn user_message_is_not_dispatched_when_persistence_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-store-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let store = SqliteStore::open(&path).unwrap();
+    let mut rt = TeamRuntime::new(team(), store).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    external.execute("DROP TABLE messages", []).unwrap();
+
+    let step = rt.on_ui_command(user("must be durable"));
+
+    assert!(step.actions.is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::UserMessage { .. }))
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save the user message")
+    )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
 fn selected_terminal_mode_dispatches_subsequent_plain_messages() {
     let mut rt = runtime();
     let changed = rt.on_ui_command(UiCommand::SetMode {
@@ -141,6 +179,79 @@ fn new_chat_resets_selected_terminal_mode_to_normal() {
         event,
         RuntimeEvent::RunUpdated { run }
             if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
+    )));
+}
+
+#[test]
+fn selected_terminal_mode_is_restored_with_its_conversation() {
+    let mut rt = runtime();
+    let original = rt.store.active_conversation();
+    rt.on_ui_command(UiCommand::SetMode {
+        mode: TerminalMode::Review,
+    });
+
+    rt.on_ui_command(UiCommand::NewSession);
+    assert_eq!(rt.active_mode(), TerminalMode::Normal);
+
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: original,
+    });
+    assert_eq!(rt.active_mode(), TerminalMode::Review);
+    assert!(resumed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Review
+        }
+    )));
+
+    let dispatched = rt.on_ui_command(user("fix parser"));
+    assert!(dispatched.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::RunUpdated { run }
+            if run.mode.as_ref().is_some_and(|mode| mode.mode == CollabMode::Review)
+    )));
+}
+
+#[test]
+fn selected_terminal_mode_survives_runtime_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-conversation-mode-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    {
+        let store = SqliteStore::open(&path).unwrap();
+        let mut rt = TeamRuntime::new(team(), store).with_approvals(false);
+        rt.on_ui_command(UiCommand::SetMode {
+            mode: TerminalMode::Plan,
+        });
+    }
+
+    let restored = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap());
+    assert_eq!(restored.active_mode(), TerminalMode::Plan);
+    drop(restored);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn new_chat_is_rejected_while_a_member_is_active() {
+    let mut rt = runtime();
+    let original = rt.store.active_conversation();
+    rt.on_ui_command(user("keep working"));
+
+    let rejected = rt.on_ui_command(UiCommand::NewSession);
+
+    assert_eq!(rt.store.active_conversation(), original);
+    assert!(
+        !rejected
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset))
+    );
+    assert!(rejected.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("cannot start a new chat") && text.contains("/abort")
     )));
 }
 
@@ -443,6 +554,47 @@ fn agent_can_add_teammate_with_team_member_envelope() {
 }
 
 #[test]
+fn agent_teammate_addition_requires_relay_approval() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
+    rt.on_ui_command(user("plan it"));
+    let builder = MemberId::new("builder");
+
+    let requested = rt.on_agent_event(
+        &builder,
+        AgentEvent::MessageCompleted(
+            r#"@@team_member {"id":"qa","display_name":"QA","backend":"codex","role":"tests","sandbox":"danger-full-access"}"#
+                .to_string(),
+        ),
+    );
+
+    assert!(rt.config.member(&MemberId::new("qa")).is_none());
+    assert!(requested.runner_changes.is_empty());
+    let approval_id = requested
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequested {
+                id,
+                member: Some(from),
+                action,
+                ..
+            } if from == &builder && action == "team_member" => Some(*id),
+            _ => None,
+        })
+        .expect("teammate approval requested");
+
+    let approved = rt.on_ui_command(UiCommand::Approve {
+        id: approval_id,
+        decision: ApprovalDecision::Approve,
+    });
+    assert!(rt.config.member(&MemberId::new("qa")).is_some());
+    assert!(approved.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. } if member.id == MemberId::new("qa")
+    )));
+}
+
+#[test]
 fn agent_cannot_add_duplicate_teammate() {
     let mut rt = runtime();
     rt.on_ui_command(user("plan it"));
@@ -535,6 +687,52 @@ fn relay_can_be_paused_by_user() {
         step.actions
             .iter()
             .any(|a| a.member == MemberId::new("reviewer"))
+    );
+}
+
+#[test]
+fn abort_finishes_a_turn_held_only_by_a_paused_route() {
+    let mut rt = runtime();
+    rt.on_ui_command(UiCommand::SetRelayPaused(true));
+    rt.on_ui_command(user("plan"));
+    let builder = MemberId::new("builder");
+
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::MessageCompleted(
+            r#"@@team_message {"to":"reviewer","body":"check"}"#.to_string(),
+        ),
+    );
+    let exited = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    assert!(
+        !exited
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. })),
+        "the paused route must keep the turn open before abort"
+    );
+
+    let aborted = rt.on_ui_command(UiCommand::Cancel { member: None });
+    assert!(
+        aborted
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. })),
+        "dropping the paused route must finish its turn"
+    );
+    let new_chat = rt.on_ui_command(UiCommand::NewSession);
+    assert!(
+        new_chat
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset)),
+        "a cancelled paused route must not permanently block /new"
     );
 }
 
@@ -725,6 +923,25 @@ fn risky_request_is_gated_until_approved() {
 }
 
 #[test]
+fn restart_rejects_approvals_that_cannot_be_reconstructed() {
+    let store = SqliteStore::in_memory().unwrap();
+    let conversation = store.current_conversation().unwrap();
+    store.set_conversation(conversation).unwrap();
+    store
+        .insert_approval(None, None, "git", "git push origin main")
+        .unwrap();
+
+    let mut rt = TeamRuntime::new(team(), store);
+    assert!(rt.store.pending_approvals().unwrap().is_empty());
+    assert!(rt.take_startup_events().iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("rejected 1 approval request")
+                && text.contains("interrupted by restart")
+    )));
+}
+
+#[test]
 fn streaming_text_deltas_build_a_message() {
     let mut rt = runtime();
     rt.on_ui_command(user("hi"));
@@ -757,6 +974,17 @@ fn cancelled_run_is_not_reported_as_error() {
     rt.on_ui_command(UiCommand::Cancel {
         member: Some(builder.clone()),
     });
+    let fatal = rt.on_agent_event(
+        &builder,
+        AgentEvent::Fatal("process ended while being killed".to_string()),
+    );
+    assert!(
+        !fatal
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::MemberError { .. })),
+        "a cancellation-side transport error must remain diagnostic"
+    );
     // The killed process exits unsuccessfully with no exit code.
     let step = rt.on_agent_event(
         &builder,
@@ -776,6 +1004,39 @@ fn cancelled_run_is_not_reported_as_error() {
     assert!(step.events.iter().any(|e| matches!(
         e,
         RuntimeEvent::Notice(text) if text.contains("cancelled")
+    )));
+}
+
+#[test]
+fn fatal_backend_event_cannot_be_overridden_by_a_zero_exit() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+    let started = start_team(&mut rt, "build it");
+    let run_id = find_run_id(&started);
+
+    let fatal = rt.on_agent_event(
+        &builder,
+        AgentEvent::Fatal("backend rejected the turn".to_string()),
+    );
+    assert!(fatal.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MemberError { message, .. }
+            if message == "backend rejected the turn"
+    )));
+
+    let exited = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
+    assert!(!exited.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MemberError { message, .. }
+            if message.contains("exited without success")
     )));
 }
 
@@ -938,6 +1199,90 @@ fn replace_team_removes_idle_member_and_runner() {
 }
 
 #[test]
+fn replace_team_keeps_runtime_unchanged_when_atomic_store_write_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-team-atomic-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let store = SqliteStore::open(&path).unwrap();
+    let mut rt = TeamRuntime::new(team(), store).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_team_snapshot
+             BEFORE UPDATE ON conversation_snapshots
+             BEGIN SELECT RAISE(ABORT, 'snapshot unavailable'); END;",
+        )
+        .unwrap();
+    let mut members = team().members;
+    members.push(TeamMember::new(
+        "researcher",
+        "Researcher",
+        BackendKind::Agy,
+        "research",
+    ));
+
+    let failed = rt.on_ui_command(UiCommand::ReplaceTeam {
+        members,
+        default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+    });
+
+    assert!(failed.runner_changes.is_empty());
+    assert!(failed.persist_team.is_none());
+    assert!(rt.config.member(&MemberId::new("researcher")).is_none());
+    assert!(failed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("save the updated team atomically")
+    )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn replace_team_resolves_approval_held_for_removed_member() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
+    let gated = rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(MemberId::new("reviewer")),
+        body: "run git status".to_string(),
+    });
+    let approval_id = gated
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("approval held for reviewer");
+
+    let replaced = rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: vec![TeamMember::new(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "impl",
+        )],
+        default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+    });
+
+    assert!(replaced.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalResolved {
+            id,
+            decision: ApprovalDecision::Reject,
+        } if *id == approval_id
+    )));
+    assert!(
+        replaced
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
+    );
+    assert!(rt.store.pending_approvals().unwrap().is_empty());
+}
+
+#[test]
 fn replace_team_rejects_removing_active_member() {
     let mut rt = runtime();
     rt.on_ui_command(user("go"));
@@ -959,6 +1304,33 @@ fn replace_team_rejects_removing_active_member() {
     )));
     assert!(step.runner_changes.is_empty());
     assert!(rt.config.member(&MemberId::new("builder")).is_some());
+}
+
+#[test]
+fn replace_team_rejects_changing_an_active_member_backend() {
+    let mut rt = runtime();
+    rt.on_ui_command(user("go"));
+    let mut members = team().members;
+    let builder = members
+        .iter_mut()
+        .find(|member| member.id == MemberId::new("builder"))
+        .unwrap();
+    builder.backend = BackendKind::Claude;
+
+    let step = rt.on_ui_command(UiCommand::ReplaceTeam {
+        members,
+        default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("cannot update builder")
+    )));
+    assert!(step.runner_changes.is_empty());
+    assert_eq!(
+        rt.config.member(&MemberId::new("builder")).unwrap().backend,
+        BackendKind::Codex
+    );
 }
 
 #[test]
@@ -1234,7 +1606,7 @@ fn team_verify_cancelled_no_auto_continue() {
         step.actions.is_empty(),
         "cancelled verification must not auto-continue"
     );
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1288,6 +1660,48 @@ fn abort_blocks_team_run_and_continue_resumes_it() {
     let run = rt.store.run(run_id).unwrap();
     assert_eq!(run.status, RunStatus::Running);
     assert_eq!(run.attempt, 2);
+}
+
+#[test]
+fn explicit_run_id_cannot_modify_another_conversation() {
+    let mut rt = runtime();
+    let old_run = rt.store.create_run("old chat", None).unwrap();
+    let reset = rt.on_ui_command(UiCommand::NewSession);
+    assert!(
+        reset
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset))
+    );
+
+    let step = rt.on_ui_command(UiCommand::BlockRun {
+        run_id: Some(old_run.id),
+        reason: "must stay scoped".to_string(),
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(message) if message.contains("was not found")
+    )));
+    assert_eq!(rt.store.run(old_run.id).unwrap().status, RunStatus::Running);
+}
+
+#[test]
+fn checklist_rejects_an_owner_outside_the_roster() {
+    let mut rt = runtime();
+    let run = rt.store.create_run("scoped checklist", None).unwrap();
+
+    let step = rt.on_ui_command(UiCommand::AddRunStep {
+        run_id: Some(run.id),
+        owner: Some(MemberId::new("ghost")),
+        title: "cannot execute".to_string(),
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(message) if message.contains("unknown step owner: ghost")
+    )));
+    assert!(rt.store.run(run.id).unwrap().steps.is_empty());
 }
 
 #[test]
@@ -2168,6 +2582,84 @@ fn review_approve_flow_completes_run() {
 }
 
 #[test]
+fn mode_transition_does_not_dispatch_when_state_persistence_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-mode-state-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+    let started = rt.on_ui_command(run_mode("persist every transition"));
+    let run_id = find_run_id(&started);
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_mode_state
+             BEFORE UPDATE OF mode_state ON runs
+             BEGIN SELECT RAISE(ABORT, 'mode state unavailable'); END;",
+        )
+        .unwrap();
+
+    let completed = complete_ok(&mut rt, &builder, "implementation done");
+
+    assert!(
+        !completed
+            .actions
+            .iter()
+            .any(|action| action.member == reviewer),
+        "review dispatch must wait for durable mode state"
+    );
+    assert!(completed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save mode state")
+    )));
+    assert_eq!(
+        rt.store.run(run_id).unwrap().mode.unwrap().state.phase,
+        "building"
+    );
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn manual_verification_is_not_dispatched_when_status_write_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-manual-verify-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    let run = rt.store.create_run("verify durably", None).unwrap();
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_verifying_event
+             BEFORE INSERT ON run_events
+             WHEN NEW.kind = 'verifying'
+             BEGIN SELECT RAISE(ABORT, 'verification event unavailable'); END;",
+        )
+        .unwrap();
+
+    let verify = rt.on_ui_command(UiCommand::VerifyRun {
+        run_id: Some(run.id),
+        command: Some("true".to_string()),
+    });
+
+    assert!(verify.verify_actions.is_empty());
+    assert!(verify.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not start verification")
+    )));
+    assert_eq!(rt.store.run(run.id).unwrap().status, RunStatus::Running);
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
 fn review_auto_verify_runs_on_approve() {
     let dir = std::env::temp_dir().join(format!("asterline-review-verify-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2397,7 +2889,7 @@ fn review_verify_cancelled_no_loopback() {
         step.actions.is_empty(),
         "cancelled verification must not loop back"
     );
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2838,6 +3330,85 @@ fn mode_dispatch_hits_approval_gate_and_reject_blocks() {
     );
 }
 
+fn brainstorm_approval_runtime() -> TeamRuntime {
+    let mut config = plan_team();
+    config.approvals.gate = Some(Vec::new());
+    config.approvals.keywords.insert(
+        "brainstorm_protocol".to_string(),
+        vec!["deployed $asterline-brainstorm".to_string()],
+    );
+    config.approvals.apply_to = Some(vec![ApprovalSurface::Mode]);
+    TeamRuntime::new(config, SqliteStore::in_memory().unwrap())
+}
+
+#[test]
+fn rejecting_one_mode_approval_rejects_all_run_siblings() {
+    let mut rt = brainstorm_approval_runtime();
+    let started = rt.on_ui_command(run_brainstorm("generate release ideas"));
+    let run_id = find_run_id(&started);
+    let ids: Vec<ApprovalId> = started
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 3);
+
+    let rejected = rt.on_ui_command(UiCommand::Approve {
+        id: ids[0],
+        decision: ApprovalDecision::Reject,
+    });
+
+    assert_eq!(
+        rejected
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RuntimeEvent::ApprovalResolved {
+                    decision: ApprovalDecision::Reject,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+    assert!(rt.store.pending_approvals().unwrap().is_empty());
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
+}
+
+#[test]
+fn approving_mode_dispatch_rejects_it_when_run_is_no_longer_active() {
+    let mut rt = brainstorm_approval_runtime();
+    let started = rt.on_ui_command(run_brainstorm("generate release ideas"));
+    let run_id = find_run_id(&started);
+    let id = started
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("mode approval");
+    rt.store.block_run(run_id, "external stop").unwrap();
+
+    let approval = rt.on_ui_command(UiCommand::Approve {
+        id,
+        decision: ApprovalDecision::Approve,
+    });
+
+    assert!(approval.actions.is_empty());
+    assert!(approval.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("no longer active") && text.contains(&run_id.to_string())
+    )));
+    assert!(rt.store.pending_approvals().unwrap().is_empty());
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
+}
+
 #[test]
 fn restart_blocks_running_mode_run() {
     let dir = std::env::temp_dir().join(format!("asterline-mode-restart-{}", std::process::id()));
@@ -3096,6 +3667,61 @@ fn plan_dispatches_owned_todo_steps() {
         "owned todos should be Doing: {:?}",
         run.steps
     );
+}
+
+#[test]
+fn plan_does_not_dispatch_when_its_checklist_cannot_be_loaded() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-plan-store-error-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let store = SqliteStore::open(&path).unwrap();
+    let mut rt = TeamRuntime::new(plan_team(), store).with_approvals(false);
+    let planner = MemberId::new("planner");
+    let started = rt.on_ui_command(run_plan("ship safely"));
+    let run_id = find_run_id(&started);
+
+    rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted(
+            "plan\n@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Implement\"}"
+                .to_string(),
+        ),
+    );
+    let external = Connection::open(&path).unwrap();
+    external.execute("DROP TABLE run_steps", []).unwrap();
+
+    let step = rt.on_agent_event(
+        &planner,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    assert!(step.actions.is_empty());
+    let status: String = external
+        .query_row(
+            "SELECT status FROM runs WHERE id = ?1",
+            [run_id.0 as i64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status,
+        RunStatus::Blocked.as_str(),
+        "events: {:?}",
+        step.events
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(message) if message.contains("load the plan checklist")
+    )));
+
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
 }
 
 #[test]

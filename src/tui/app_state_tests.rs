@@ -36,6 +36,23 @@ fn ready_populates_header() {
 }
 
 #[test]
+fn runtime_unavailable_is_visible_and_idempotent() {
+    let mut state = AppState::new(Vec::new());
+
+    state.mark_runtime_unavailable();
+
+    assert!(!state.runtime_available());
+    assert!(matches!(
+        state.chat().last(),
+        Some(ChatItem::Error { member: None, message })
+            if message.contains("input is disabled")
+    ));
+    let chat_len = state.chat().len();
+    state.mark_runtime_unavailable();
+    assert_eq!(state.chat().len(), chat_len);
+}
+
+#[test]
 fn new_chat_resets_visible_mode_to_normal() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::ModeChanged {
@@ -481,6 +498,56 @@ fn streaming_message_builds_agent_cell() {
 }
 
 #[test]
+fn streamed_message_and_tool_detail_have_total_memory_bounds() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    let builder = MemberId::new("builder");
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(9),
+        turn: TurnId(1),
+        member: builder.clone(),
+    });
+    state.apply(RuntimeEvent::MessageDelta {
+        msg: MessageId(9),
+        text: "你".repeat(MAX_MESSAGE_TEXT_BYTES),
+    });
+    state.apply(RuntimeEvent::ToolStarted {
+        member: builder.clone(),
+        tool_id: "large-tool".to_string(),
+        name: "shell".to_string(),
+        summary: "large output".to_string(),
+    });
+    state.apply(RuntimeEvent::ToolProgress {
+        member: builder,
+        tool_id: "large-tool".to_string(),
+        delta: "x".repeat(MAX_TOOL_DETAIL_BYTES + 1),
+    });
+
+    let message = state
+        .chat()
+        .iter()
+        .find_map(|item| match item {
+            ChatItem::Agent { text, .. } => Some(text),
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.len() <= MAX_MESSAGE_TEXT_BYTES);
+    assert!(message.contains("output truncated"));
+    assert!(message.is_char_boundary(message.len()));
+
+    let detail = state
+        .chat()
+        .iter()
+        .find_map(|item| match item {
+            ChatItem::Tool { detail, .. } => Some(detail),
+            _ => None,
+        })
+        .unwrap();
+    assert!(detail.len() <= MAX_TOOL_DETAIL_BYTES);
+    assert!(detail.contains("output truncated"));
+}
+
+#[test]
 fn tool_completion_updates_existing_cell() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -703,7 +770,7 @@ fn member_status_drives_running_count() {
 }
 
 #[test]
-fn default_target_all_marks_every_member_running_optimistically() {
+fn accepted_runtime_events_drive_user_message_and_member_status() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
         team: "mixed".to_string(),
@@ -742,7 +809,27 @@ fn default_target_all_marks_every_member_running_optimistically() {
         ],
     });
 
-    state.handle_user_message_submitted(&MessageTarget::Default, "go".to_string());
+    state.remember_user_message_target(&MessageTarget::Default);
+    assert_eq!(state.running_count(), 0);
+    assert!(state.chat().is_empty());
+
+    state.apply(RuntimeEvent::UserMessage {
+        turn: TurnId(1),
+        targets: vec![MemberId::new("builder"), MemberId::new("reviewer")],
+        body: "go".to_string(),
+    });
+    assert!(matches!(
+        state.chat().last(),
+        Some(ChatItem::User { body }) if body == "go"
+    ));
+    assert_eq!(state.running_count(), 0);
+
+    for member in [MemberId::new("builder"), MemberId::new("reviewer")] {
+        state.apply(RuntimeEvent::MemberStatus {
+            member,
+            status: MemberStatus::Running,
+        });
+    }
 
     assert_eq!(state.running_count(), 2);
 }

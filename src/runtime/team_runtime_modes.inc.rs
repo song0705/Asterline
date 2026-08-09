@@ -115,7 +115,10 @@ impl TeamRuntime {
             CollabMode::Brainstorm => session.participants.clone(),
             CollabMode::Team => unreachable!("team runs do not use ModeSession"),
         };
-        self.record_mode_task_message(&task_targets, &task, step);
+        if !self.record_mode_task_message(&task_targets, &task, step) {
+            self.block_mode_run(run_id, "could not persist the mode task", step);
+            return;
+        }
 
         match mode {
             CollabMode::Review => {
@@ -192,11 +195,18 @@ impl TeamRuntime {
         targets: &[MemberId],
         task: &str,
         step: &mut RuntimeStep,
-    ) {
-        let Ok(turn) = self.store.create_turn() else {
-            return;
+    ) -> bool {
+        let turn = match self.store.create_turn() {
+            Ok(turn) => turn,
+            Err(err) => {
+                self.report_store_error("create a mode task turn", err, step);
+                return false;
+            }
         };
-        let _ = self.store.record_user(turn, targets, task);
+        if let Err(err) = self.store.record_user(turn, targets, task) {
+            self.report_store_error("save a mode task", err, step);
+            return false;
+        }
         step.events.push(RuntimeEvent::TurnStarted { turn });
         step.events.push(RuntimeEvent::UserMessage {
             turn,
@@ -204,6 +214,7 @@ impl TeamRuntime {
             body: task.to_string(),
         });
         step.events.push(RuntimeEvent::TurnFinished { turn });
+        true
     }
 
     fn plan_teammate_list(&self) -> Vec<(String, String)> {
@@ -246,12 +257,16 @@ impl TeamRuntime {
         let turn = match self.store.create_turn() {
             Ok(turn) => turn,
             Err(err) => {
-                step.events
-                    .push(RuntimeEvent::Notice(format!("store error: {err}")));
+                self.report_store_error("create a mode dispatch turn", err, step);
+                self.block_mode_run(run_id, "could not create a mode dispatch turn", step);
                 return;
             }
         };
-        let _ = self.store.record_user(turn, &targets, &display);
+        if let Err(err) = self.store.record_user(turn, &targets, &display) {
+            self.report_store_error("save a mode dispatch", err, step);
+            self.block_mode_run(run_id, "could not persist a mode dispatch", step);
+            return;
+        }
         step.events.push(RuntimeEvent::TurnStarted { turn });
         step.events.push(RuntimeEvent::UserMessage {
             turn,
@@ -263,22 +278,35 @@ impl TeamRuntime {
         let gate = self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Mode);
         for (member, prompt) in dispatches {
             if gate && let Some(kind) = self.matcher.classify(&prompt) {
-                if let Ok(id) = self.store.insert_approval(Some(turn), None, &kind, &prompt) {
-                    self.held_approvals.insert(
-                        id,
-                        HeldApproval {
-                            turn,
-                            targets: vec![member],
-                            prompt: prompt.clone(),
-                            mode_run: Some(run_id),
-                        },
-                    );
-                    step.events.push(RuntimeEvent::ApprovalRequested {
-                        id,
-                        member: None,
-                        action: kind,
-                        body: prompt,
-                    });
+                match self.store.insert_approval(Some(turn), None, &kind, &prompt) {
+                    Ok(id) => {
+                        self.held_approvals.insert(
+                            id,
+                            HeldApproval {
+                                turn,
+                                targets: vec![member],
+                                prompt: prompt.clone(),
+                                mode_run: Some(run_id),
+                                member_request: None,
+                            },
+                        );
+                        step.events.push(RuntimeEvent::ApprovalRequested {
+                            id,
+                            member: None,
+                            action: kind,
+                            body: prompt,
+                        });
+                    }
+                    Err(err) => {
+                        self.report_store_error("save a mode approval request", err, step);
+                        self.block_mode_run(
+                            run_id,
+                            "could not persist a mode approval request",
+                            step,
+                        );
+                        self.check_turn_complete(turn, step);
+                        return;
+                    }
                 }
                 continue;
             }
@@ -330,7 +358,9 @@ impl TeamRuntime {
                     session.pending_verdict = None;
                     session.reviewer_last_text.clear();
                 }
-                self.persist_mode_state(run_id, step);
+                if !self.persist_mode_state(run_id, step) {
+                    return;
+                }
                 let (reviewer, max_iterations, iteration, mode) = {
                     let s = &self.mode_sessions[&run_id];
                     (s.reviewer.clone(), s.max_iterations, s.iteration, s.mode)
@@ -371,7 +401,9 @@ impl TeamRuntime {
                 verdict: ReviewVerdictKind::Approve,
                 summary: _,
             }) => {
-                self.persist_mode_state(run_id, step);
+                if !self.persist_mode_state(run_id, step) {
+                    return;
+                }
                 let (auto_verify, configured) = self
                     .mode_sessions
                     .get(&run_id)
@@ -386,12 +418,18 @@ impl TeamRuntime {
                     if let Some(session) = self.mode_sessions.get_mut(&run_id) {
                         session.phase = ModePhase::Verifying;
                     }
-                    self.persist_mode_state(run_id, step);
-                    if let Ok(run) = self
+                    if !self.persist_mode_state(run_id, step) {
+                        return;
+                    }
+                    match self
                         .store
                         .update_run_status(run_id, RunStatus::Verifying)
                     {
-                        step.events.push(RuntimeEvent::RunUpdated { run });
+                        Ok(run) => step.events.push(RuntimeEvent::RunUpdated { run }),
+                        Err(err) => {
+                            self.report_store_error("start mode verification", err, step);
+                            return;
+                        }
                     }
                     step.events.push(RuntimeEvent::Notice(format!(
                         "verifying {run_id}: {cmd}"
@@ -420,7 +458,9 @@ impl TeamRuntime {
                     s.reviewer_nudged = true;
                     s.phase = ModePhase::AwaitingVerdict;
                 }
-                self.persist_mode_state(run_id, step);
+                if !self.persist_mode_state(run_id, step) {
+                    return;
+                }
                 let (reviewer, max_iterations, iteration, mode) = {
                     let s = &self.mode_sessions[&run_id];
                     (s.reviewer.clone(), s.max_iterations, s.iteration, s.mode)
@@ -504,7 +544,14 @@ impl TeamRuntime {
 
         self.failed_runs.remove(&run_id);
 
-        let steps = self.store.run_steps_all(run_id).unwrap_or_default();
+        let steps = match self.store.run_steps_all(run_id) {
+            Ok(steps) => steps,
+            Err(err) => {
+                self.report_store_error("load the plan checklist", err, step);
+                self.block_mode_run(run_id, "plan checklist is unavailable", step);
+                return;
+            }
+        };
         let unfinished_lines = format_unfinished_step_lines(
             &steps
                 .iter()
@@ -519,10 +566,17 @@ impl TeamRuntime {
             s.pending_verdict = None;
         }
         // mark_run_turn already wrote Failed; restore Running before UI events.
-        if let Ok(run) = self.store.update_run_status(run_id, RunStatus::Running) {
-            step.events.push(RuntimeEvent::RunUpdated { run });
+        match self.store.update_run_status(run_id, RunStatus::Running) {
+            Ok(run) => step.events.push(RuntimeEvent::RunUpdated { run }),
+            Err(err) => {
+                self.report_store_error("restore the plan run status", err, step);
+                self.block_mode_run(run_id, "could not persist plan recovery", step);
+                return;
+            }
         }
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
 
         let task = session.task.clone();
         let max_iterations = session.max_iterations;
@@ -555,12 +609,23 @@ impl TeamRuntime {
         let steps = match self.store.run_steps_all(run_id) {
             Ok(steps) => steps,
             Err(err) => {
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "could not load checklist for {run_id}: {err}"
-                )));
+                self.report_store_error("load the plan checklist", err, step);
+                self.block_mode_run(run_id, "plan checklist is unavailable", step);
                 return;
             }
         };
+
+        if let Some(owner) = steps
+            .iter()
+            .filter_map(|step| step.owner.as_ref())
+            .find(|owner| self.config.member(owner).is_none())
+        {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "plan checklist contains unknown owner {owner}"
+            )));
+            self.block_mode_run(run_id, "plan checklist has an unknown owner", step);
+            return;
+        }
 
         let owned_todos: Vec<&RunStepSummary> = steps
             .iter()
@@ -572,7 +637,9 @@ impl TeamRuntime {
                 if let Some(s) = self.mode_sessions.get_mut(&run_id) {
                     s.reviewer_nudged = true;
                 }
-                self.persist_mode_state(run_id, step);
+                if !self.persist_mode_state(run_id, step) {
+                    return;
+                }
                 let (leader, max_iterations, iteration, mode) = {
                     let s = &self.mode_sessions[&run_id];
                     (s.leader.clone(), s.max_iterations, s.iteration, s.mode)
@@ -595,11 +662,16 @@ impl TeamRuntime {
         // Mark owned todos as Doing; emit only the last RunUpdated.
         let mut last_run = None;
         for s in &owned_todos {
-            if let Ok(run) =
-                self.store
-                    .update_run_step(run_id, s.number, RunStepStatus::Doing, None)
+            match self
+                .store
+                .update_run_step(run_id, s.number, RunStepStatus::Doing, None)
             {
-                last_run = Some(run);
+                Ok(run) => last_run = Some(run),
+                Err(err) => {
+                    self.report_store_error("start a plan checklist step", err, step);
+                    self.block_mode_run(run_id, "could not persist checklist progress", step);
+                    return;
+                }
             }
         }
         if let Some(run) = last_run {
@@ -620,7 +692,9 @@ impl TeamRuntime {
         if let Some(s) = self.mode_sessions.get_mut(&run_id) {
             s.phase = ModePhase::Executing;
         }
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
 
         let (max_iterations, iteration, mode) = {
             let s = &self.mode_sessions[&run_id];
@@ -655,9 +729,8 @@ impl TeamRuntime {
         let steps = match self.store.run_steps_all(run_id) {
             Ok(steps) => steps,
             Err(err) => {
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "could not load checklist for {run_id}: {err}"
-                )));
+                self.report_store_error("load the plan checklist", err, step);
+                self.block_mode_run(run_id, "plan checklist is unavailable", step);
                 return;
             }
         };
@@ -674,7 +747,9 @@ impl TeamRuntime {
                 s.pending_verdict = None;
                 s.reviewer_last_text.clear();
             }
-            self.persist_mode_state(run_id, step);
+            if !self.persist_mode_state(run_id, step) {
+                return;
+            }
 
             let steps_summary = format_lead_steps_summary(&steps);
             let task = session.task.clone();
@@ -718,7 +793,9 @@ impl TeamRuntime {
             s.phase = ModePhase::Planning;
             s.reviewer_nudged = false;
         }
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
 
         let task = session.task.clone();
         let max_iterations = session.max_iterations;
@@ -791,7 +868,9 @@ impl TeamRuntime {
             session.phase = ModePhase::Diverging;
             session.round = round;
         }
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
         let session = self.mode_sessions.get(&run_id).cloned().expect("session");
         let dispatches = self.brainstorm_generation_dispatches(&session);
         let stage = if round == session.rounds {
@@ -862,7 +941,9 @@ impl TeamRuntime {
             session.votes.clear();
             session.vote_count = 0;
         }
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
         let Some(session) = self.mode_sessions.get(&run_id).cloned() else {
             return;
         };
@@ -899,7 +980,9 @@ impl TeamRuntime {
             session.phase = ModePhase::Synthesizing;
             session.brainstorm_summary.clear();
         }
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
         let prompt = self.with_brainstorm_skill(brainstorm_synthesis_prompt(
             &snapshot.task,
             &idea_set,
@@ -984,7 +1067,9 @@ impl TeamRuntime {
                 max_iterations,
             ),
         };
-        self.persist_mode_state(run_id, step);
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
         self.mode_dispatch(
             run_id,
             std::slice::from_ref(&target),
@@ -998,14 +1083,19 @@ impl TeamRuntime {
     }
 
     fn finish_mode_run_approved(&mut self, run_id: RunId, step: &mut RuntimeStep) {
-        self.mode_sessions.remove(&run_id);
-        self.failed_runs.remove(&run_id);
-        if let Ok(run) = self
+        let run = match self
             .store
             .update_run_status(run_id, RunStatus::Done)
         {
-            step.events.push(RuntimeEvent::RunUpdated { run });
-        }
+            Ok(run) => run,
+            Err(err) => {
+                self.report_store_error("finish a mode run", err, step);
+                return;
+            }
+        };
+        self.mode_sessions.remove(&run_id);
+        self.failed_runs.remove(&run_id);
+        step.events.push(RuntimeEvent::RunUpdated { run });
         step.events.push(RuntimeEvent::Notice(format!(
             "{run_id} approved — done"
         )));
@@ -1028,15 +1118,22 @@ impl TeamRuntime {
         if let Some(session) = self.mode_sessions.get_mut(&run_id) {
             session.phase = ModePhase::Done;
         }
-        self.persist_mode_state_silent(run_id);
-        self.mode_sessions.remove(&run_id);
-        self.failed_runs.remove(&run_id);
-        if let Ok(run) = self
+        if !self.persist_mode_state_quiet(run_id, step) {
+            return;
+        }
+        let run = match self
             .store
             .update_run_status(run_id, RunStatus::Done)
         {
-            step.events.push(RuntimeEvent::RunUpdated { run });
-        }
+            Ok(run) => run,
+            Err(err) => {
+                self.report_store_error("finish a brainstorm run", err, step);
+                return;
+            }
+        };
+        self.mode_sessions.remove(&run_id);
+        self.failed_runs.remove(&run_id);
+        step.events.push(RuntimeEvent::RunUpdated { run });
         let notice = format!(
             "brainstorm {run_id} ranked result ready · {card_count} idea cards from {batch_count} \
              contributions across {rounds} \
@@ -1044,7 +1141,9 @@ impl TeamRuntime {
              type a new topic to brainstorm again · /mode normal for regular chat · /runs for \
              details"
         );
-        let _ = self.store.record_notice(None, &notice);
+        if let Err(err) = self.store.record_notice(None, &notice) {
+            self.report_store_error("save the brainstorm completion notice", err, step);
+        }
         step.events.push(RuntimeEvent::Notice(notice));
     }
 
@@ -1074,16 +1173,49 @@ impl TeamRuntime {
         }
     }
 
-    fn persist_mode_state(&mut self, run_id: RunId, step: &mut RuntimeStep) {
+    fn persist_mode_state(&mut self, run_id: RunId, step: &mut RuntimeStep) -> bool {
         let Some(session) = self.mode_sessions.get(&run_id) else {
-            return;
+            return false;
         };
-        let Ok(json) = serde_json::to_string(session) else {
-            return;
+        let json = match serde_json::to_string(session) {
+            Ok(json) => json,
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "could not serialize mode state for {run_id}: {err}"
+                )));
+                return false;
+            }
         };
-        if let Ok(run) = self.store.update_run_mode_state(run_id, &json) {
-            step.events.push(RuntimeEvent::RunUpdated { run });
+        match self.store.update_run_mode_state(run_id, &json) {
+            Ok(run) => {
+                step.events.push(RuntimeEvent::RunUpdated { run });
+                true
+            }
+            Err(err) => {
+                self.report_store_error("save mode state", err, step);
+                false
+            }
         }
+    }
+
+    fn persist_mode_state_quiet(&self, run_id: RunId, step: &mut RuntimeStep) -> bool {
+        let Some(session) = self.mode_sessions.get(&run_id) else {
+            return false;
+        };
+        let json = match serde_json::to_string(session) {
+            Ok(json) => json,
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "could not serialize mode state for {run_id}: {err}"
+                )));
+                return false;
+            }
+        };
+        if let Err(err) = self.store.update_run_mode_state(run_id, &json) {
+            self.report_store_error("save mode state", err, step);
+            return false;
+        }
+        true
     }
 
     /// Record mode-relevant envelopes and text after a member message completes.
@@ -1129,10 +1261,15 @@ impl TeamRuntime {
                 if let Some(session) = self.mode_sessions.get_mut(&run_id) {
                     session.pending_verdict = Some(last);
                 }
-                let _ = self.store.record_verdict(turn, member, approve, &summary);
-                let _ = self
-                    .store
-                    .record_run_verdict_event(run_id, approve, &summary);
+                if let Err(err) = self.store.record_verdict(turn, member, approve, &summary) {
+                    self.report_store_error("save a review verdict", err, step);
+                }
+                if let Err(err) =
+                    self.store
+                        .record_run_verdict_event(run_id, approve, &summary)
+                {
+                    self.report_store_error("save a run verdict event", err, step);
+                }
                 step.events.push(RuntimeEvent::Verdict {
                     run: run_id,
                     member: member.clone(),
@@ -1177,7 +1314,7 @@ impl TeamRuntime {
                     }
                     session.idea_count = brainstorm_card_count(session);
                 }
-                self.persist_mode_state_silent(run_id);
+                self.persist_mode_state_quiet(run_id, step);
             } else if phase == ModePhase::Voting && participants.iter().any(|p| p == member) {
                 let accepted = parsed.brainstorm_votes.last().is_some_and(|vote| {
                     let Some(session) = self.mode_sessions.get_mut(&run_id) else {
@@ -1202,31 +1339,20 @@ impl TeamRuntime {
                 });
                 if accepted
                     && let Some(vote) = parsed.brainstorm_votes.last()
+                    && let Err(err) =
+                        self.store
+                            .record_brainstorm_vote_event(run_id, member, &vote.ranked)
                 {
-                    let _ = self.store.record_brainstorm_vote_event(
-                        run_id,
-                        member,
-                        &vote.ranked,
-                    );
+                    self.report_store_error("save a brainstorm vote", err, step);
                 }
-                self.persist_mode_state_silent(run_id);
+                self.persist_mode_state_quiet(run_id, step);
             } else if phase == ModePhase::Synthesizing {
                 if let Some(session) = self.mode_sessions.get_mut(&run_id) {
                     session.brainstorm_summary = truncate_mode_text(visible_text);
                 }
-                self.persist_mode_state_silent(run_id);
+                self.persist_mode_state_quiet(run_id, step);
             }
         }
-    }
-
-    fn persist_mode_state_silent(&mut self, run_id: RunId) {
-        let Some(session) = self.mode_sessions.get(&run_id) else {
-            return;
-        };
-        let Ok(json) = serde_json::to_string(session) else {
-            return;
-        };
-        let _ = self.store.update_run_mode_state(run_id, &json);
     }
 
     fn mode_mark_turn_cancelled(&mut self, turn: TurnId) {
@@ -1282,9 +1408,14 @@ impl TeamRuntime {
             return;
         }
 
-        if let Ok(updated) = self.store.continue_run(run.id, note.as_deref()) {
-            step.events
-                .push(RuntimeEvent::RunUpdated { run: updated });
+        match self.store.continue_run(run.id, note.as_deref()) {
+            Ok(updated) => step
+                .events
+                .push(RuntimeEvent::RunUpdated { run: updated }),
+            Err(err) => {
+                self.report_store_error("continue the mode run", err, step);
+                return;
+            }
         }
         self.failed_runs.remove(&run.id);
         session.cancelled = false;
@@ -1338,7 +1469,14 @@ impl TeamRuntime {
                 self.mode_resume_planning(run.id, step);
             }
             ModePhase::Executing => {
-                let steps = self.store.run_steps_all(run.id).unwrap_or_default();
+                let steps = match self.store.run_steps_all(run.id) {
+                    Ok(steps) => steps,
+                    Err(err) => {
+                        self.report_store_error("load the plan checklist", err, step);
+                        self.block_mode_run(run.id, "plan checklist is unavailable", step);
+                        return;
+                    }
+                };
                 let owned: Vec<&RunStepSummary> = steps
                     .iter()
                     .filter(|s| {
@@ -1431,13 +1569,22 @@ impl TeamRuntime {
                     s.phase = ModePhase::Reviewing;
                     s.reviewer_nudged = false;
                 }
-                self.persist_mode_state(run.id, step);
+                if !self.persist_mode_state(run.id, step) {
+                    return;
+                }
                 let verify_cmd = self
                     .mode_sessions
                     .get(&run.id)
                     .and_then(|s| s.verify_command.clone());
                 let prompt = if mode == CollabMode::Plan {
-                    let steps = self.store.run_steps_all(run.id).unwrap_or_default();
+                    let steps = match self.store.run_steps_all(run.id) {
+                        Ok(steps) => steps,
+                        Err(err) => {
+                            self.report_store_error("load the plan checklist", err, step);
+                            self.block_mode_run(run.id, "plan checklist is unavailable", step);
+                            return;
+                        }
+                    };
                     let summary = format_lead_steps_summary(&steps);
                     plan_review_prompt(&task, &summary, verify_cmd.as_deref())
                 } else {
@@ -1469,13 +1616,18 @@ impl TeamRuntime {
                     configured.as_deref(),
                     suggested_verify_command(&self.config.workspace),
                 ) {
-                    if let Ok(updated) = self
+                    let updated = match self
                         .store
                         .update_run_status(run.id, RunStatus::Verifying)
                     {
-                        step.events
-                            .push(RuntimeEvent::RunUpdated { run: updated });
-                    }
+                        Ok(updated) => updated,
+                        Err(err) => {
+                            self.report_store_error("resume mode verification", err, step);
+                            return;
+                        }
+                    };
+                    step.events
+                        .push(RuntimeEvent::RunUpdated { run: updated });
                     step.events
                         .push(RuntimeEvent::Notice(format!("verifying {}: {cmd}", run.id)));
                     step.verify_actions.push(VerifyAction {

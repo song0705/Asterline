@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::domain::event::AgentSessionId;
-use crate::domain::team::MemberId;
+use crate::domain::team::{MemberId, TeamMember};
 use crate::store::sqlite::SqliteStore;
 
 #[derive(Debug, Default)]
@@ -18,11 +18,11 @@ impl SessionRegistry {
     }
 
     /// Load any persisted sessions for the given members.
-    pub fn from_store(store: &SqliteStore, members: &[MemberId]) -> Self {
+    pub fn from_store(store: &SqliteStore, members: &[TeamMember]) -> Self {
         let mut sessions = HashMap::new();
         for member in members {
-            if let Ok(Some(session)) = store.session_for(member) {
-                sessions.insert(member.clone(), session);
+            if let Ok(Some(session)) = store.session_for_backend(&member.id, member.backend) {
+                sessions.insert(member.id.clone(), session);
             }
         }
         Self { sessions }
@@ -58,7 +58,13 @@ mod tests {
             )
             .unwrap();
 
-        let mut registry = SessionRegistry::from_store(&store, std::slice::from_ref(&builder));
+        let member = TeamMember::new(
+            builder.clone(),
+            "Builder",
+            BackendKind::Codex,
+            "implementation",
+        );
+        let mut registry = SessionRegistry::from_store(&store, &[member]);
         assert_eq!(
             registry.get(&builder),
             Some(AgentSessionId("t-1".to_string()))
@@ -71,6 +77,29 @@ mod tests {
         );
 
         registry.clear(&builder);
+        assert_eq!(registry.get(&builder), None);
+    }
+
+    #[test]
+    fn does_not_reuse_a_session_from_another_backend() {
+        let store = SqliteStore::in_memory().unwrap();
+        let builder = MemberId::new("builder");
+        store
+            .upsert_session(
+                &builder,
+                BackendKind::Codex,
+                &AgentSessionId("codex-thread".to_string()),
+            )
+            .unwrap();
+        let member = TeamMember::new(
+            builder.clone(),
+            "Builder",
+            BackendKind::Claude,
+            "implementation",
+        );
+
+        let registry = SessionRegistry::from_store(&store, &[member]);
+
         assert_eq!(registry.get(&builder), None);
     }
 }

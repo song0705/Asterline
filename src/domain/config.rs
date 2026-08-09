@@ -1,7 +1,8 @@
 //! Loading and synthesizing [`TeamConfig`]: read a config file, detect which
 //! backends are installed, and build a default in-memory roster.
 
-use std::path::{Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 use std::{env, fs, io};
 
 use crate::domain::team::{
@@ -78,9 +79,9 @@ fn skill_version(text: &str) -> u32 {
     1
 }
 
-/// True for files Asterline wrote (managed marker or the historical name line).
+/// True only for files that explicitly opt into Asterline-managed upgrades.
 fn is_managed_skill(text: &str) -> bool {
-    text.contains(MANAGED_SKILL_MARKER) || text.contains("name: asterline-team")
+    text.contains(MANAGED_SKILL_MARKER)
 }
 
 pub fn team_skill_hint() -> String {
@@ -147,7 +148,173 @@ pub fn detect_backends() -> DetectedBackends {
 }
 
 fn binary_in_dirs(dirs: &[PathBuf], name: &str) -> bool {
-    dirs.iter().any(|dir| dir.join(name).is_file())
+    resolve_binary_in_dirs(dirs, name, env::var_os("PATHEXT").as_deref(), cfg!(windows)).is_some()
+}
+
+/// Resolve a runnable program exactly as Asterline will launch it. On Windows,
+/// bare names honor `PATHEXT`; returning the concrete path is important because
+/// Rust only appends `.exe` when `Command` is given an extensionless name.
+pub(crate) fn resolve_binary_on_path(name: &str) -> Option<PathBuf> {
+    let requested = Path::new(name);
+    let has_path = requested.is_absolute()
+        || requested.components().count() != 1
+        || requested
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)));
+    let path_ext = env::var_os("PATHEXT");
+    if has_path {
+        return resolve_binary_candidate(requested, path_ext.as_deref(), cfg!(windows));
+    }
+    let paths = env::var_os("PATH")?;
+    let dirs = env::split_paths(&paths).collect::<Vec<_>>();
+    resolve_binary_in_dirs(&dirs, name, path_ext.as_deref(), cfg!(windows))
+}
+
+fn resolve_binary_in_dirs(
+    dirs: &[PathBuf],
+    name: &str,
+    path_ext: Option<&OsStr>,
+    windows: bool,
+) -> Option<PathBuf> {
+    dirs.iter()
+        .find_map(|dir| resolve_binary_candidate(&dir.join(name), path_ext, windows))
+}
+
+fn resolve_binary_candidate(
+    requested: &Path,
+    path_ext: Option<&OsStr>,
+    windows: bool,
+) -> Option<PathBuf> {
+    executable_candidates(requested, path_ext, windows)
+        .into_iter()
+        .find(|candidate| candidate_is_executable(candidate, windows))
+}
+
+fn executable_candidates(
+    requested: &Path,
+    path_ext: Option<&OsStr>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    if !windows || requested.extension().is_some() {
+        return vec![requested.to_path_buf()];
+    }
+    windows_executable_extensions(path_ext)
+        .into_iter()
+        .map(|extension| requested.with_extension(extension))
+        .collect()
+}
+
+fn windows_executable_extensions(path_ext: Option<&OsStr>) -> Vec<OsString> {
+    let raw = path_ext
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsStr::new(".COM;.EXE;.BAT;.CMD"));
+    let mut extensions = Vec::new();
+    for extension in raw.to_string_lossy().split(';') {
+        let extension = extension.trim();
+        if extension.len() <= 1
+            || !extension.starts_with('.')
+            || extension.contains('/')
+            || extension.contains('\\')
+        {
+            continue;
+        }
+        let extension = OsString::from(&extension[1..]);
+        if !extensions.iter().any(|known: &OsString| {
+            known
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&extension.to_string_lossy())
+        }) {
+            extensions.push(extension);
+        }
+    }
+    extensions
+}
+
+fn candidate_is_executable(path: &Path, windows: bool) -> bool {
+    if windows {
+        path.is_file()
+    } else {
+        is_executable(path)
+    }
+}
+
+/// User profile used for backend history and global skills. Native Windows
+/// shells expose `USERPROFILE`; Unix shells expose `HOME`. Each platform also
+/// accepts the other variable as a compatibility fallback.
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    user_home_dir_from_values(
+        env::var_os("HOME"),
+        env::var_os("USERPROFILE"),
+        cfg!(windows),
+    )
+}
+
+fn user_home_dir_from_values(
+    home: Option<OsString>,
+    user_profile: Option<OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let usable = |value: Option<OsString>| value.filter(|value| !value.is_empty());
+    let selected = if windows {
+        usable(user_profile).or_else(|| usable(home))
+    } else {
+        usable(home).or_else(|| usable(user_profile))
+    }?;
+    Some(PathBuf::from(selected))
+}
+
+pub(crate) fn codex_home_dir() -> Option<PathBuf> {
+    codex_home_dir_from_values(env::var_os("CODEX_HOME"), user_home_dir())
+}
+
+fn codex_home_dir_from_values(
+    codex_home: Option<OsString>,
+    user_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    codex_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| user_home.map(|home| home.join(".codex")))
+}
+
+pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    paths_equivalent_for_platform(&left, &right, cfg!(windows))
+}
+
+fn paths_equivalent_for_platform(left: &Path, right: &Path, windows: bool) -> bool {
+    if windows {
+        windows_path_key(left) == windows_path_key(right)
+    } else {
+        left == right
+    }
+}
+
+fn windows_path_key(path: &Path) -> String {
+    let mut value = path.as_os_str().to_string_lossy().replace('/', "\\");
+    if let Some(rest) = value.strip_prefix("\\\\?\\UNC\\") {
+        value = format!("\\\\{rest}");
+    } else if let Some(rest) = value.strip_prefix("\\\\?\\") {
+        value = rest.to_string();
+    }
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_lowercase()
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Build a default in-memory roster from the detected backends:
@@ -416,15 +583,128 @@ mod tests {
     #[test]
     fn binary_in_dirs_finds_existing_file() {
         let dir = std::env::temp_dir().join(format!("asterline-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("faux-backend");
+        let bin = if cfg!(windows) {
+            dir.join("faux-backend.EXE")
+        } else {
+            dir.join("faux-backend")
+        };
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&bin, permissions).unwrap();
+        }
 
         let dirs = vec![dir.clone()];
         assert!(binary_in_dirs(&dirs, "faux-backend"));
         assert!(!binary_in_dirs(&dirs, "nope-backend"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn windows_pathext_resolves_script_shims_without_global_env_mutation() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-cfg-pathext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("faux-backend.CMD");
+        std::fs::write(&shim, b"@echo off\r\n").unwrap();
+
+        let resolved = resolve_binary_in_dirs(
+            std::slice::from_ref(&dir),
+            "faux-backend",
+            Some(OsStr::new(".EXE;.CMD;.cmd")),
+            true,
+        );
+
+        assert_eq!(resolved, Some(shim));
+        assert_eq!(
+            windows_executable_extensions(Some(OsStr::new(".EXE;.CMD;.cmd"))),
+            vec![OsString::from("EXE"), OsString::from("CMD")]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn home_selection_covers_windows_userprofile_and_shell_fallbacks() {
+        assert_eq!(
+            user_home_dir_from_values(
+                Some(OsString::from("/shell/home")),
+                Some(OsString::from(r"C:\Users\Ada")),
+                true,
+            ),
+            Some(PathBuf::from(r"C:\Users\Ada"))
+        );
+        assert_eq!(
+            user_home_dir_from_values(
+                Some(OsString::from("/shell/home")),
+                Some(OsString::from(r"C:\Users\Ada")),
+                false,
+            ),
+            Some(PathBuf::from("/shell/home"))
+        );
+        assert_eq!(
+            user_home_dir_from_values(None, Some(OsString::from(r"C:\Users\Ada")), false),
+            Some(PathBuf::from(r"C:\Users\Ada"))
+        );
+        assert_eq!(
+            user_home_dir_from_values(Some(OsString::new()), Some(OsString::new()), true),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_home_prefers_explicit_override_without_requiring_user_home() {
+        assert_eq!(
+            codex_home_dir_from_values(Some(OsString::from("/custom/codex")), None),
+            Some(PathBuf::from("/custom/codex"))
+        );
+        assert_eq!(
+            codex_home_dir_from_values(Some(OsString::new()), Some(PathBuf::from("/shell/home")),),
+            Some(PathBuf::from("/shell/home/.codex"))
+        );
+    }
+
+    #[test]
+    fn windows_project_paths_ignore_separator_case_and_verbatim_prefix() {
+        assert!(paths_equivalent_for_platform(
+            Path::new(r"C:\Work\Repo\"),
+            Path::new("c:/work/repo"),
+            true,
+        ));
+        assert!(paths_equivalent_for_platform(
+            Path::new(r"\\?\C:\Work\Repo"),
+            Path::new(r"c:\work\repo"),
+            true,
+        ));
+        assert!(!paths_equivalent_for_platform(
+            Path::new(r"C:\Work\Repo"),
+            Path::new(r"C:\Work\Other"),
+            true,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_in_dirs_rejects_non_executable_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-cfg-non-executable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("faux-backend"), b"#!/bin/sh\n").unwrap();
+
+        assert!(!binary_in_dirs(std::slice::from_ref(&dir), "faux-backend"));
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -558,6 +838,24 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, custom);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_team_skill_preserves_valid_custom_skill_without_managed_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-skill-custom-frontmatter-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let custom = "---\nname: asterline-team\nmetadata:\n  version: 1\n---\n# Custom protocol\n";
+        std::fs::write(&path, custom).unwrap();
+
+        ensure_team_skill(&dir).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
         std::fs::remove_dir_all(&dir).ok();
     }
 

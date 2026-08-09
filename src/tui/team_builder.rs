@@ -21,7 +21,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::adapter::DiscoveredModel;
 use crate::domain::config::{DetectedBackends, default_member, default_team};
@@ -945,7 +946,7 @@ impl Field {
 pub(crate) struct EditState {
     pub(crate) field: Field,
     pub(crate) buffer: String,
-    /// Cursor as a Unicode scalar index, so movement never splits UTF-8.
+    /// Unicode scalar index kept on a user-visible grapheme boundary.
     pub(crate) cursor: usize,
 }
 
@@ -968,6 +969,7 @@ impl EditState {
         chars.splice(insert_at..insert_at, inserted);
         self.cursor = insert_at.saturating_add(count);
         self.buffer = chars.into_iter().collect();
+        self.cursor = self.grapheme_boundary_at_or_after(self.cursor);
     }
 
     pub(crate) fn apply_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -1001,27 +1003,27 @@ impl EditState {
         if width == 0 {
             return (String::new(), 0);
         }
-        let chars = self.buffer.chars().collect::<Vec<_>>();
-        let cursor = self.cursor.min(chars.len());
+        let graphemes = self.buffer.graphemes(true).collect::<Vec<_>>();
+        let cursor = self.grapheme_index_at_or_after(self.cursor);
         let mut start = cursor;
         let mut cursor_width = 0;
         while start > 0 {
-            let char_width = UnicodeWidthChar::width(chars[start - 1]).unwrap_or(0);
-            if char_width > 0 && cursor_width + char_width > width.saturating_sub(1) {
+            let grapheme_width = UnicodeWidthStr::width(graphemes[start - 1]);
+            if grapheme_width > 0 && cursor_width + grapheme_width > width.saturating_sub(1) {
                 break;
             }
             start -= 1;
-            cursor_width += char_width;
+            cursor_width += grapheme_width;
         }
         let mut visible = String::new();
         let mut visible_width = 0;
-        for ch in &chars[start..] {
-            let char_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
-            if char_width > 0 && visible_width + char_width > width {
+        for grapheme in &graphemes[start..] {
+            let grapheme_width = UnicodeWidthStr::width(*grapheme);
+            if grapheme_width > 0 && visible_width + grapheme_width > width {
                 break;
             }
-            visible.push(*ch);
-            visible_width += char_width;
+            visible.push_str(grapheme);
+            visible_width += grapheme_width;
         }
         (visible, cursor_width.min(width) as u16)
     }
@@ -1031,31 +1033,41 @@ impl EditState {
     }
 
     fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = self.previous_grapheme_boundary(self.cursor);
     }
 
     fn move_right(&mut self) {
-        self.cursor = self.cursor.saturating_add(1).min(self.char_len());
+        self.cursor = self.next_grapheme_boundary(self.cursor);
     }
 
     fn move_word_left(&mut self) {
-        let chars = self.buffer.chars().collect::<Vec<_>>();
-        while self.cursor > 0 && chars[self.cursor - 1].is_whitespace() {
-            self.cursor -= 1;
+        let graphemes = self.buffer.graphemes(true).collect::<Vec<_>>();
+        let mut index = self.grapheme_index_at_or_after(self.cursor);
+        while index > 0 && graphemes[index - 1].chars().all(char::is_whitespace) {
+            index -= 1;
         }
-        while self.cursor > 0 && !chars[self.cursor - 1].is_whitespace() {
-            self.cursor -= 1;
+        while index > 0 && !graphemes[index - 1].chars().all(char::is_whitespace) {
+            index -= 1;
         }
+        self.cursor = graphemes[..index]
+            .iter()
+            .map(|grapheme| grapheme.chars().count())
+            .sum();
     }
 
     fn move_word_right(&mut self) {
-        let chars = self.buffer.chars().collect::<Vec<_>>();
-        while self.cursor < chars.len() && !chars[self.cursor].is_whitespace() {
-            self.cursor += 1;
+        let graphemes = self.buffer.graphemes(true).collect::<Vec<_>>();
+        let mut index = self.grapheme_index_at_or_after(self.cursor);
+        while index < graphemes.len() && !graphemes[index].chars().all(char::is_whitespace) {
+            index += 1;
         }
-        while self.cursor < chars.len() && chars[self.cursor].is_whitespace() {
-            self.cursor += 1;
+        while index < graphemes.len() && graphemes[index].chars().all(char::is_whitespace) {
+            index += 1;
         }
+        self.cursor = graphemes[..index]
+            .iter()
+            .map(|grapheme| grapheme.chars().count())
+            .sum();
     }
 
     fn delete_backward(&mut self) {
@@ -1063,15 +1075,17 @@ impl EditState {
             return;
         }
         let mut chars = self.buffer.chars().collect::<Vec<_>>();
-        self.cursor -= 1;
-        chars.remove(self.cursor);
+        let start = self.previous_grapheme_boundary(self.cursor);
+        chars.drain(start..self.cursor);
+        self.cursor = start;
         self.buffer = chars.into_iter().collect();
     }
 
     fn delete_forward(&mut self) {
         let mut chars = self.buffer.chars().collect::<Vec<_>>();
         if self.cursor < chars.len() {
-            chars.remove(self.cursor);
+            let end = self.next_grapheme_boundary(self.cursor);
+            chars.drain(self.cursor..end);
             self.buffer = chars.into_iter().collect();
         }
     }
@@ -1095,6 +1109,45 @@ impl EditState {
         let mut chars = self.buffer.chars().collect::<Vec<_>>();
         chars.drain(self.cursor..end.min(chars.len()));
         self.buffer = chars.into_iter().collect();
+    }
+
+    fn grapheme_boundaries(&self) -> Vec<usize> {
+        let mut scalar = 0;
+        let mut boundaries = vec![0];
+        for grapheme in self.buffer.graphemes(true) {
+            scalar += grapheme.chars().count();
+            boundaries.push(scalar);
+        }
+        boundaries
+    }
+
+    fn previous_grapheme_boundary(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .take_while(|boundary| *boundary < cursor)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn next_grapheme_boundary(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .find(|boundary| *boundary > cursor)
+            .unwrap_or(self.char_len())
+    }
+
+    fn grapheme_boundary_at_or_after(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .find(|boundary| *boundary >= cursor)
+            .unwrap_or(self.char_len())
+    }
+
+    fn grapheme_index_at_or_after(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .position(|boundary| boundary >= cursor)
+            .unwrap_or_else(|| self.buffer.graphemes(true).count())
     }
 }
 
@@ -1855,10 +1908,11 @@ pub(crate) fn unique_member_id(base: &str, members: &[TeamMember], skip: Option<
     let base = normalize_member_id(base, "member");
     let mut candidate = base.clone();
     let mut suffix = 2usize;
-    while members
-        .iter()
-        .enumerate()
-        .any(|(idx, member)| Some(idx) != skip && member.id.as_str() == candidate.as_str())
+    while candidate.eq_ignore_ascii_case("all")
+        || members
+            .iter()
+            .enumerate()
+            .any(|(idx, member)| Some(idx) != skip && member.id.as_str() == candidate.as_str())
     {
         candidate = format!("{base}-{suffix}");
         suffix += 1;
@@ -1877,9 +1931,11 @@ pub(crate) fn unique_display_name_except(
 ) -> String {
     let mut candidate = base.to_string();
     let mut suffix = 2usize;
-    while members.iter().enumerate().any(|(idx, member)| {
-        Some(idx) != skip && member.display_name.eq_ignore_ascii_case(&candidate)
-    }) {
+    while candidate.eq_ignore_ascii_case("all")
+        || members.iter().enumerate().any(|(idx, member)| {
+            Some(idx) != skip && member.display_name.eq_ignore_ascii_case(&candidate)
+        })
+    {
         candidate = format!("{base} {suffix}");
         suffix += 1;
     }
@@ -1921,6 +1977,18 @@ mod tests {
 
         assert_eq!(state.members[1].id, MemberId::new("builder-2"));
         assert_eq!(state.members[1].display_name, "Builder 2");
+    }
+
+    #[test]
+    fn name_commit_avoids_reserved_all_target() {
+        let available = [BackendKind::Codex];
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &available);
+
+        state.commit_edit(EditState::new(Field::Name, "ALL".to_string()));
+
+        assert_eq!(state.members[0].display_name, "ALL 2");
+        assert_eq!(state.members[0].id, MemberId::new("all-2"));
+        assert!(state.finish().expect("valid team").validate().is_ok());
     }
 
     #[test]
@@ -2233,5 +2301,21 @@ mod tests {
         let (visible, cursor) = edit.visible_window(8);
         assert!(theme::display_width(&visible) <= 8);
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn edit_state_moves_and_deletes_complete_graphemes() {
+        let mut combining = EditState::new(Field::Role, "e\u{301}".to_string());
+        combining.apply_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(combining.cursor, 0);
+        combining.apply_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(combining.cursor, 2);
+        combining.apply_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(combining.buffer.is_empty());
+
+        let mut family = EditState::new(Field::Role, "👨‍👩‍👧‍👦".to_string());
+        family.apply_key(KeyCode::Home, KeyModifiers::NONE);
+        family.apply_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert!(family.buffer.is_empty());
     }
 }

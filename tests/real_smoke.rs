@@ -7,7 +7,9 @@
 //! ```bash
 //! ASTERLINE_SMOKE_CODEX=1  cargo test --test real_smoke real_codex_smoke  -- --ignored --nocapture
 //! ASTERLINE_SMOKE_CLAUDE=1 cargo test --test real_smoke real_claude_smoke -- --ignored --nocapture
+//! ASTERLINE_SMOKE_CLAUDE=1 cargo test --test real_smoke real_claude_resume_smoke -- --ignored --nocapture
 //! ASTERLINE_SMOKE_GROK=1   cargo test --test real_smoke real_grok_smoke   -- --ignored --nocapture
+//! ASTERLINE_SMOKE_GROK=1   cargo test --test real_smoke real_grok_resume_smoke -- --ignored --nocapture
 //! ASTERLINE_SMOKE_GROK=1   cargo test --test real_smoke real_grok_tool_stream_smoke -- --ignored --nocapture
 //! ASTERLINE_SMOKE_AGY=1    cargo test --test real_smoke real_agy_smoke    -- --ignored --nocapture
 //! ```
@@ -23,7 +25,7 @@ use asterline::domain::team::{BackendKind, PermissionMode, TeamMember};
 
 fn run_once(member: &TeamMember, prompt: &str) -> Vec<AgentEvent> {
     let runner = runner_for(member, Path::new(env!("CARGO_MANIFEST_DIR")));
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
             prompt: prompt.to_string(),
@@ -57,6 +59,12 @@ fn report(label: &str, events: &[AgentEvent]) {
 
 fn assert_healthy_turn(label: &str, events: &[AgentEvent]) {
     report(label, events);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Fatal(_) | AgentEvent::ParseWarning(_))),
+        "{label}: fatal or parse warning in an otherwise successful turn"
+    );
     assert!(
         events
             .iter()
@@ -128,7 +136,7 @@ fn real_codex_resume_smoke() {
     // Resume the same session — this is the path that previously sent
     // exec-only flags to `codex exec resume` and exited with code 2.
     let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
             prompt: "Reply with the word you were asked to remember.".to_string(),
@@ -154,6 +162,39 @@ fn real_claude_smoke() {
 }
 
 #[test]
+#[ignore = "calls the real claude CLI twice (fresh + resume); opt in with ASTERLINE_SMOKE_CLAUDE=1"]
+fn real_claude_resume_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_CLAUDE").as_deref() != Ok("1") {
+        return;
+    }
+    let member = TeamMember::new("claude", "Claude", BackendKind::Claude, "smoke");
+    let first = run_once(&member, "Remember the word ORANGE. Reply with: READY");
+    assert_healthy_turn("claude-fresh", &first);
+    let session = first
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionDiscovered(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a session id to resume");
+
+    let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
+    let (tx, rx) = mpsc::sync_channel(65_536);
+    runner.run(
+        RunRequest {
+            prompt: "Reply with the word you were asked to remember.".to_string(),
+            session: Some(session),
+            cancel: Arc::new(AtomicBool::new(false)),
+            effort: None,
+        },
+        tx,
+    );
+    let resumed: Vec<AgentEvent> = rx.iter().collect();
+    assert_healthy_turn("claude-resume", &resumed);
+    assert_completed_contains("claude-resume", &resumed, "ORANGE");
+}
+
+#[test]
 #[ignore = "calls the real grok CLI; opt in with ASTERLINE_SMOKE_GROK=1"]
 fn real_grok_smoke() {
     if std::env::var("ASTERLINE_SMOKE_GROK").as_deref() != Ok("1") {
@@ -163,6 +204,39 @@ fn real_grok_smoke() {
     let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
     assert_healthy_turn("grok", &events);
     assert_completed_contains("grok", &events, "ASTERLINE_OK");
+}
+
+#[test]
+#[ignore = "calls the real grok CLI twice (fresh + loadSession); opt in with ASTERLINE_SMOKE_GROK=1"]
+fn real_grok_resume_smoke() {
+    if std::env::var("ASTERLINE_SMOKE_GROK").as_deref() != Ok("1") {
+        return;
+    }
+    let member = TeamMember::new("grok", "Grok", BackendKind::Grok, "smoke");
+    let first = run_once(&member, "Remember the word ORANGE. Reply with: READY");
+    assert_healthy_turn("grok-fresh", &first);
+    let session = first
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionDiscovered(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a session id to load");
+
+    let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
+    let (tx, rx) = mpsc::sync_channel(65_536);
+    runner.run(
+        RunRequest {
+            prompt: "Reply with the word you were asked to remember.".to_string(),
+            session: Some(session),
+            cancel: Arc::new(AtomicBool::new(false)),
+            effort: None,
+        },
+        tx,
+    );
+    let resumed: Vec<AgentEvent> = rx.iter().collect();
+    assert_healthy_turn("grok-load-session", &resumed);
+    assert_completed_contains("grok-load-session", &resumed, "ORANGE");
 }
 
 #[test]
@@ -234,7 +308,7 @@ fn real_agy_resume_smoke() {
         .expect("a session id to resume");
 
     let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
             prompt: "Reply with the word you were asked to remember.".to_string(),

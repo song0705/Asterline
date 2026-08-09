@@ -13,7 +13,11 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::domain::event::ImportedMessage;
+use crate::domain::{config, event::ImportedMessage};
+use crate::tui::import_io;
+
+const MAX_ROLLOUT_FILES: usize = 10_000;
+const MAX_ROLLOUT_SCAN_ENTRIES: usize = 50_000;
 
 /// A snapshot taken before launching the interactive session, used to import
 /// only the messages added while attached.
@@ -74,10 +78,13 @@ fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> Ve
         .collect()
 }
 
-/// `~/.codex/sessions`, if `HOME` is set.
+/// `$CODEX_HOME/sessions`, or the platform user profile's `.codex/sessions`.
 fn sessions_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let dir = Path::new(&home).join(".codex").join("sessions");
+    sessions_dir_from_codex_home(config::codex_home_dir())
+}
+
+fn sessions_dir_from_codex_home(codex_home: Option<PathBuf>) -> Option<PathBuf> {
+    let dir = codex_home?.join("sessions");
     dir.is_dir().then_some(dir)
 }
 
@@ -90,26 +97,32 @@ fn all_rollouts() -> Vec<PathBuf> {
 
 fn collect_rollouts(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    collect_jsonl(dir, &mut out, 0);
+    let mut entries_remaining = MAX_ROLLOUT_SCAN_ENTRIES;
+    collect_jsonl(dir, &mut out, &mut entries_remaining, 0);
     out
 }
 
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 6 {
+fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, entries_remaining: &mut usize, depth: usize) {
+    if depth > 6 || out.len() >= MAX_ROLLOUT_FILES || *entries_remaining == 0 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if out.len() >= MAX_ROLLOUT_FILES || *entries_remaining == 0 {
+            break;
+        }
+        *entries_remaining -= 1;
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl(&path, out, depth + 1);
-        } else if path.extension().is_some_and(|e| e == "jsonl")
+            collect_jsonl(&path, out, entries_remaining, depth + 1);
+        } else if path
+            .extension()
+            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
             && path
                 .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-"))
+                .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
         {
             out.push(path);
         }
@@ -149,8 +162,7 @@ fn newest_rollout_for_session_since(
 
 fn rollout_matches_session(path: &Path, session_id: &str) -> bool {
     path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.contains(session_id))
+        .is_some_and(|n| n.to_string_lossy().contains(session_id))
 }
 
 fn newest_rollout_for_cwd_since(
@@ -160,7 +172,10 @@ fn newest_rollout_for_cwd_since(
 ) -> Option<PathBuf> {
     rollouts
         .iter()
-        .filter(|p| rollout_cwd(p).as_deref() == Some(cwd))
+        .filter(|p| {
+            rollout_cwd(p)
+                .is_some_and(|actual| config::paths_equivalent(Path::new(&actual), Path::new(cwd)))
+        })
         .filter_map(|p| modified(p).map(|m| (m, p.clone())))
         .filter(|(m, _)| *m >= since)
         .max_by_key(|(m, _)| *m)
@@ -168,24 +183,23 @@ fn newest_rollout_for_cwd_since(
 }
 
 fn rollout_cwd(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    let mut found = None;
+    import_io::for_each_json_value(path, |value| {
         let event_type = value.get("type").and_then(Value::as_str);
         if event_type != Some("session_meta") && event_type != Some("turn_context") {
-            continue;
+            return true;
         }
         if let Some(cwd) = value
             .get("payload")
             .and_then(|payload| payload.get("cwd"))
             .and_then(Value::as_str)
         {
-            return Some(cwd.to_string());
+            found = Some(cwd.to_string());
+            return false;
         }
-    }
-    None
+        true
+    });
+    found
 }
 
 /// One parsed `message` response item from the rollout.
@@ -199,23 +213,17 @@ fn count_messages(path: &Path) -> usize {
 }
 
 fn parse_messages(path: &Path) -> Vec<RolloutMessage> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    import_io::for_each_json_value(path, |value| {
         if value.get("type").and_then(Value::as_str) != Some("response_item") {
-            continue;
+            return true;
         }
         let payload = match value.get("payload") {
             Some(p) => p,
-            None => continue,
+            None => return true,
         };
         if payload.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
+            return true;
         }
         let role = payload
             .get("role")
@@ -228,7 +236,8 @@ fn parse_messages(path: &Path) -> Vec<RolloutMessage> {
             .map(|items| join_text(items))
             .unwrap_or_default();
         out.push(RolloutMessage { role, text });
-    }
+        true
+    });
     out
 }
 
@@ -263,7 +272,7 @@ fn to_imported(msg: RolloutMessage) -> Option<ImportedMessage> {
         // developer / system / tool messages are not part of the chat.
         _ => return None,
     };
-    let text = msg.text.trim().to_string();
+    let text = import_io::imported_text(msg.text.trim().to_string())?;
     if text.is_empty() {
         return None;
     }
@@ -273,6 +282,22 @@ fn to_imported(msg: RolloutMessage) -> Option<ImportedMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_directory_honors_custom_codex_home_without_environment_mutation() {
+        let root =
+            std::env::temp_dir().join(format!("ast-rollout-custom-home-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        assert_eq!(
+            sessions_dir_from_codex_home(Some(root.clone())),
+            Some(sessions)
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn parses_and_filters_rollout_messages() {
@@ -314,6 +339,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parser_drains_oversized_rows_and_skips_oversized_messages() {
+        let dir =
+            std::env::temp_dir().join(format!("ast-rollout-large-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-large.jsonl");
+        let mut fixture = "x".repeat(import_io::MAX_JSONL_LINE_BYTES + 1);
+        fixture.push('\n');
+        fixture.push_str(&message_line(
+            "assistant",
+            &"y".repeat(import_io::MAX_IMPORTED_MESSAGE_BYTES + 1),
+        ));
+        fixture.push('\n');
+        fixture.push_str(&message_line("assistant", "still parsed"));
+        std::fs::write(&path, fixture).unwrap();
+
+        let parsed = parse_messages(&path)
+            .into_iter()
+            .filter_map(to_imported)
+            .collect::<Vec<_>>();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, "still parsed");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -402,6 +453,38 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fresh_attach_matches_windows_cwd_case_and_separators() {
+        let dir =
+            std::env::temp_dir().join(format!("ast-rollout-windows-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let attached = dir.join("rollout-2026-session-new.jsonl");
+        std::fs::write(
+            &attached,
+            [
+                session_meta_line("session-new", "c:/work/asterline"),
+                message_line("user", "windows attach message"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let imported = import_from_rollouts(
+            RolloutSnapshot {
+                session_id: None,
+                cwd: Some(r"C:\Work\Asterline".to_string()),
+                path: None,
+                before: 0,
+                started: SystemTime::UNIX_EPOCH,
+            },
+            vec![attached],
+        );
+
+        assert_eq!(imported[0].text, "windows attach message");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn message_line(role: &str, text: &str) -> String {

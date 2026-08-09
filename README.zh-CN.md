@@ -36,11 +36,9 @@ Asterline 直接运行你电脑上已经安装的官方 CLI。它不是模型网
 ### 环境要求
 
 - 从源码构建时需要 Rust 1.85 或更高版本
-- Linux 或 macOS，以及支持颜色和备用屏幕的终端
+- Linux、macOS 或 Windows 10/11，以及支持颜色和备用屏幕的终端
 - 至少安装并登录一个 CLI：`codex`、`claude`、`grok` 或 `agy`
 - 推荐安装 Git，以便查看差异和运行验证流程
-
-目前尚未发布 Windows 预编译包。
 
 ### 安装并启动
 
@@ -53,8 +51,16 @@ install -m 755 ast ~/.local/bin/ast
 ast --help
 ```
 
-Release 提供 Linux x86-64、Linux ARM64、macOS Intel 和 macOS Apple silicon
-四种构建，并附带 `SHA256SUMS` 与 GitHub 签名的构建来源证明。
+Windows PowerShell 用户可解压 `.zip` 并安装其中任意一个 `.exe`：
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
+Copy-Item .\ast.exe "$HOME\bin\ast.exe"
+& "$HOME\bin\ast.exe" --help
+```
+
+Release 提供 Linux x86-64、Linux ARM64、macOS Intel、macOS Apple silicon 和
+Windows x86-64 构建，并附带 `SHA256SUMS` 与 GitHub 签名的构建来源证明。
 
 如果希望从源码安装，克隆本仓库后执行：
 
@@ -70,6 +76,8 @@ ast
 
 如果安装 Release 后找不到 `ast`，请把 `$HOME/.local/bin` 加入 `PATH` 并重新
 打开 Shell。从源码安装时使用 Cargo 的二进制目录，通常是 `$HOME/.cargo/bin`。
+Windows 用户应把 `$HOME\bin`（或 Cargo 的 `%USERPROFILE%\.cargo\bin`）加入
+`PATH`；Asterline 会按 `PATHEXT` 查找 `.exe`、`.cmd`、`.bat` 等后端启动器。
 
 在 Team 编辑器中：
 
@@ -382,6 +390,7 @@ Normal 模式有意要求第一条消息明确目标。可以使用 `@builder`�
 - [命令与键盘参考](docs/commands.zh-CN.md)
 - [配置、本地数据、权限与故障排查](docs/configuration.md)
 - [审批层与工具级控制](docs/approvals.md)
+- [v0.2.1 发布说明](docs/releases/v0.2.1.md)
 - [v0.2.0 发布说明](docs/releases/v0.2.0.md)
 - 内置命令面板：`/help`
 - 命令行帮助：`asterline --help`
@@ -400,8 +409,8 @@ cargo run -- --fake
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked --no-fail-fast
 ```
 
 如果已安装 `just`，也可以使用 `just run --fake`、`just install` 和 `just check`。
@@ -419,9 +428,9 @@ src/
 
 ## 项目状态
 
-Asterline 当前版本为 `0.2.0`，仍在积极开发。带版本标签的提交会通过 GitHub
-Actions 自动发布 Linux 和 macOS 预编译包。在稳定版之前，配置、持久化数据、
-命令和界面细节都可能不兼容地变化。
+Asterline 当前版本为 `0.2.1`，仍在积极开发。带版本标签的提交会通过 GitHub
+Actions 自动发布 Linux、macOS 和 Windows 预编译包。在稳定版之前，配置、持久化
+数据、命令和界面细节都可能不兼容地变化。
 
 发布维护者请参考[发布指南](docs/releasing.md)。
 

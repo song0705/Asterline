@@ -1,16 +1,20 @@
 //! Backend session-history discovery and selection state for the Team editor.
 
 use std::cmp::Reverse;
+use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::domain::team::BackendKind;
+use crate::domain::{config, team::BackendKind};
+use crate::tui::import_io;
 
 const MAX_METADATA_LINES: usize = 256;
+const MAX_SESSION_SCAN_DEPTH: usize = 8;
+const MAX_SESSION_SCAN_ENTRIES: usize = 50_000;
+const MAX_SESSION_FILES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionEntry {
@@ -183,12 +187,7 @@ impl SessionPicker {
 }
 
 fn retain_current_project(entries: &mut Vec<SessionEntry>, cwd: &Path) {
-    let cwd = project_key(cwd);
-    entries.retain(|entry| project_key(Path::new(&entry.project)) == cwd);
-}
-
-fn project_key(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    entries.retain(|entry| config::paths_equivalent(Path::new(&entry.project), cwd));
 }
 
 fn window_start(len: usize, selected: usize, height: usize) -> usize {
@@ -200,16 +199,20 @@ fn window_start(len: usize, selected: usize, height: usize) -> usize {
 }
 
 fn provider_root(backend: BackendKind) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let user_home = config::user_home_dir();
+    let codex_home = config::codex_home_dir();
+    provider_root_from(backend, user_home.as_deref(), codex_home.as_deref())
+}
+
+fn provider_root_from(
+    backend: BackendKind,
+    user_home: Option<&Path>,
+    codex_home: Option<&Path>,
+) -> Option<PathBuf> {
     match backend {
-        BackendKind::Codex => Some(
-            std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex"))
-                .join("sessions"),
-        ),
-        BackendKind::Claude => Some(home.join(".claude").join("projects")),
-        BackendKind::Grok => Some(home.join(".grok").join("sessions")),
+        BackendKind::Codex => Some(codex_home?.join("sessions")),
+        BackendKind::Claude => Some(user_home?.join(".claude").join("projects")),
+        BackendKind::Grok => Some(user_home?.join(".grok").join("sessions")),
         BackendKind::Agy => None,
     }
 }
@@ -218,27 +221,26 @@ fn discover_in(backend: BackendKind, root: &Path) -> Vec<SessionEntry> {
     match backend {
         BackendKind::Codex => files_below(root, |path| {
             path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                .is_some_and(|name| os_starts_and_ends(name, "rollout-", ".jsonl"))
         })
         .into_iter()
         .filter_map(|path| parse_codex(&path))
         .collect(),
         BackendKind::Claude => files_below(root, |path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            path.extension().is_some_and(|ext| os_eq(ext, "jsonl"))
                 && !path
                     .components()
-                    .any(|part| part.as_os_str() == "subagents")
+                    .any(|part| os_eq(part.as_os_str(), "subagents"))
                 && !path
                     .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| stem.starts_with("agent-"))
+                    .is_some_and(|stem| os_starts_with(stem, "agent-"))
         })
         .into_iter()
         .filter_map(|path| parse_claude(&path))
         .collect(),
         BackendKind::Grok => files_below(root, |path| {
-            path.file_name().and_then(|name| name.to_str()) == Some("summary.json")
+            path.file_name()
+                .is_some_and(|name| os_eq(name, "summary.json"))
         })
         .into_iter()
         .filter_map(|path| parse_grok(&path))
@@ -247,36 +249,79 @@ fn discover_in(backend: BackendKind, root: &Path) -> Vec<SessionEntry> {
     }
 }
 
+fn os_eq(value: &OsStr, expected: &str) -> bool {
+    if cfg!(windows) {
+        value.to_string_lossy().eq_ignore_ascii_case(expected)
+    } else {
+        value == OsStr::new(expected)
+    }
+}
+
+fn os_starts_with(value: &OsStr, prefix: &str) -> bool {
+    let value = value.to_string_lossy();
+    if cfg!(windows) {
+        value
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+    } else {
+        value.starts_with(prefix)
+    }
+}
+
+fn os_starts_and_ends(value: &OsStr, prefix: &str, suffix: &str) -> bool {
+    let value = value.to_string_lossy();
+    if cfg!(windows) {
+        let value = value.to_ascii_lowercase();
+        value.starts_with(&prefix.to_ascii_lowercase())
+            && value.ends_with(&suffix.to_ascii_lowercase())
+    } else {
+        value.starts_with(prefix) && value.ends_with(suffix)
+    }
+}
+
 fn files_below(root: &Path, accept: impl Fn(&Path) -> bool + Copy) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    let mut entries_remaining = MAX_SESSION_SCAN_ENTRIES;
+    files_below_inner(root, 0, &mut entries_remaining, &mut files, accept);
+    files
+}
+
+fn files_below_inner(
+    root: &Path,
+    depth: usize,
+    entries_remaining: &mut usize,
+    files: &mut Vec<PathBuf>,
+    accept: impl Fn(&Path) -> bool + Copy,
+) {
+    if depth > MAX_SESSION_SCAN_DEPTH || *entries_remaining == 0 || files.len() >= MAX_SESSION_FILES
+    {
+        return;
+    }
     let Ok(entries) = fs::read_dir(root) else {
-        return files;
+        return;
     };
     for entry in entries.flatten() {
+        if *entries_remaining == 0 || files.len() >= MAX_SESSION_FILES {
+            break;
+        }
+        *entries_remaining -= 1;
         let path = entry.path();
         let Ok(kind) = entry.file_type() else {
             continue;
         };
         if kind.is_dir() {
-            files.extend(files_below(&path, accept));
+            files_below_inner(&path, depth + 1, entries_remaining, files, accept);
         } else if kind.is_file() && accept(&path) {
             files.push(path);
         }
     }
-    files
 }
 
 fn parse_codex(path: &Path) -> Option<SessionEntry> {
-    let reader = BufReader::new(File::open(path).ok()?);
     let mut id = None;
     let mut project = None;
     let mut title = None;
-    for value in reader
-        .lines()
-        .take(MAX_METADATA_LINES)
-        .filter_map(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-    {
+    import_io::for_each_json_value_limit(path, MAX_METADATA_LINES, |value| {
         if value["type"] == "session_meta" {
             let payload = &value["payload"];
             id = string_at(payload, "id")
@@ -286,10 +331,8 @@ fn parse_codex(path: &Path) -> Option<SessionEntry> {
         } else if title.is_none() && value["type"] == "response_item" {
             title = value.get("payload").and_then(codex_user_text);
         }
-        if id.is_some() && project.is_some() && title.is_some() {
-            break;
-        }
-    }
+        !(id.is_some() && project.is_some() && title.is_some())
+    });
     Some(SessionEntry {
         id: id?,
         title: title.unwrap_or_else(|| "Untitled session".to_string()),
@@ -310,29 +353,28 @@ fn codex_user_text(payload: &Value) -> Option<String> {
 }
 
 fn parse_claude(path: &Path) -> Option<SessionEntry> {
-    let reader = BufReader::new(File::open(path).ok()?);
     let mut id = None;
     let mut project = None;
     let mut title = None;
-    for value in reader
-        .lines()
-        .take(MAX_METADATA_LINES)
-        .filter_map(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-    {
-        id = id.or_else(|| string_at(&value, "sessionId").map(str::to_string));
-        project = project.or_else(|| string_at(&value, "cwd").map(str::to_string));
+    import_io::for_each_json_value_limit(path, MAX_METADATA_LINES, |value| {
+        if id.is_none() {
+            id = string_at(&value, "sessionId").map(str::to_string);
+        }
+        if project.is_none() {
+            project = string_at(&value, "cwd").map(str::to_string);
+        }
         if title.is_none()
             && value["type"] == "user"
             && !value["isSidechain"].as_bool().unwrap_or(false)
         {
             title = claude_message_text(&value["message"]["content"]);
         }
-        if id.is_some() && project.is_some() && title.is_some() {
-            break;
-        }
-    }
-    let id = id.or_else(|| path.file_stem()?.to_str().map(str::to_string))?;
+        !(id.is_some() && project.is_some() && title.is_some())
+    });
+    let id = id.or_else(|| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    })?;
     Some(SessionEntry {
         id,
         title: title.unwrap_or_else(|| "Untitled session".to_string()),
@@ -356,24 +398,27 @@ fn claude_message_text(content: &Value) -> Option<String> {
 fn claude_project_from_path(path: &Path) -> String {
     path.parent()
         .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown")
-        .to_string()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn parse_grok(path: &Path) -> Option<SessionEntry> {
+    if path.metadata().ok()?.len() > import_io::MAX_JSONL_LINE_BYTES as u64 {
+        return None;
+    }
     let value: Value = serde_json::from_reader(File::open(path).ok()?).ok()?;
     let id = string_at(&value["info"], "id")
-        .or_else(|| path.parent()?.file_name()?.to_str())?
-        .to_string();
-    let project = string_at(&value["info"], "cwd")
         .map(str::to_string)
         .or_else(|| {
             path.parent()?
-                .parent()?
-                .file_name()?
-                .to_str()
-                .map(percent_decode)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })?;
+    let project = string_at(&value["info"], "cwd")
+        .map(str::to_string)
+        .or_else(|| {
+            let name = path.parent()?.parent()?.file_name()?.to_string_lossy();
+            Some(percent_decode(&name))
         })
         .unwrap_or_else(|| "unknown".to_string());
     let title = string_at(&value, "session_summary")
@@ -480,6 +525,18 @@ mod tests {
     }
 
     #[test]
+    fn custom_codex_home_does_not_require_a_user_home() {
+        assert_eq!(
+            provider_root_from(BackendKind::Codex, None, Some(Path::new("/custom/codex")),),
+            Some(PathBuf::from("/custom/codex/sessions"))
+        );
+        assert_eq!(
+            provider_root_from(BackendKind::Claude, Some(Path::new("/profiles/ada")), None,),
+            Some(PathBuf::from("/profiles/ada/.claude/projects"))
+        );
+    }
+
+    #[test]
     fn discovers_claude_and_grok_metadata() {
         let claude_root = fixture_root("claude");
         let claude_project = claude_root.join("-tmp-project");
@@ -545,5 +602,19 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "current");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn session_filter_accepts_windows_case_and_separator_variants() {
+        let mut entries = vec![SessionEntry::fixture(
+            "current",
+            "Current",
+            "c:/work/asterline",
+        )];
+
+        retain_current_project(&mut entries, Path::new(r"C:\Work\Asterline"));
+
+        assert_eq!(entries.len(), 1);
     }
 }

@@ -2,6 +2,49 @@
 
 use serde_json::Value;
 
+/// Maximum retained text for one assistant message. Stream transports may
+/// produce arbitrarily many individually-valid chunks, so the per-line limit
+/// alone is not a total-memory bound.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum retained detail for one tool invocation.
+pub const MAX_TOOL_DETAIL_BYTES: usize = 1024 * 1024;
+const OUTPUT_TRUNCATION_MARKER: &str = "\n[asterline: output truncated]\n";
+
+/// Append a UTF-8 chunk without letting the retained string exceed `max`
+/// bytes. The first overflow appends a visible marker; subsequent chunks are
+/// ignored. The returned delta is exactly what was appended.
+pub fn append_bounded_text(target: &mut String, chunk: &str, max: usize) -> Option<String> {
+    let content_limit = max.saturating_sub(OUTPUT_TRUNCATION_MARKER.len());
+    // Under this helper's invariant, only a truncated value can be longer
+    // than content_limit because normal content never crosses that boundary.
+    if target.len() > content_limit || chunk.is_empty() {
+        return None;
+    }
+    let remaining = content_limit.saturating_sub(target.len());
+    if chunk.len() <= remaining {
+        target.push_str(chunk);
+        return Some(chunk.to_string());
+    }
+
+    let mut end = remaining.min(chunk.len());
+    while end > 0 && !chunk.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &chunk[..end];
+    let mut delta = String::with_capacity(prefix.len() + OUTPUT_TRUNCATION_MARKER.len());
+    delta.push_str(prefix);
+    delta.push_str(OUTPUT_TRUNCATION_MARKER);
+    target.push_str(&delta);
+    Some(delta)
+}
+
+/// Return one bounded, visibly-truncated UTF-8 value.
+pub fn bounded_text(text: &str, max: usize) -> String {
+    let mut bounded = String::with_capacity(text.len().min(max));
+    let _ = append_bounded_text(&mut bounded, text, max);
+    bounded
+}
+
 /// Read a string field from a JSON object.
 pub fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
@@ -89,5 +132,21 @@ mod tests {
         assert!(rendered.contains("\n"));
         assert!(rendered.contains("one\\ntwo"));
         assert!(rendered.contains("exit_code"));
+    }
+
+    #[test]
+    fn bounded_text_stops_total_chunk_growth_on_a_utf8_boundary() {
+        let max = OUTPUT_TRUNCATION_MARKER.len() + 5;
+        let mut text = String::new();
+        assert_eq!(
+            append_bounded_text(&mut text, "ab", max).as_deref(),
+            Some("ab")
+        );
+        let overflow = append_bounded_text(&mut text, "你cd", max).unwrap();
+
+        assert!(overflow.starts_with('你'));
+        assert!(text.ends_with(OUTPUT_TRUNCATION_MARKER));
+        assert!(text.len() <= max);
+        assert!(append_bounded_text(&mut text, "ignored", max).is_none());
     }
 }

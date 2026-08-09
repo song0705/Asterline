@@ -19,6 +19,8 @@ pub enum Submission {
     FindInChat(String),
     /// Show help.
     Help,
+    /// Reject invalid command syntax while leaving the draft untouched.
+    Invalid(String),
     /// Non-empty message text without an explicit target prefix.
     NeedsTarget,
     /// Nothing to do (blank input).
@@ -83,18 +85,17 @@ fn parse_slash(rest: &str) -> Submission {
                 })
             }
         }
-        "team" => Submission::Drawer(Drawer::Team),
-        "runs" => Submission::Drawer(Drawer::Runs),
-        "logs" => Submission::Drawer(Drawer::Logs),
-        "diff" => Submission::Drawer(Drawer::Diff),
-        "skills" => Submission::Drawer(Drawer::Skills),
-        "new" => Submission::Runtime(UiCommand::NewSession),
+        "team" if arg.is_empty() => Submission::Drawer(Drawer::Team),
+        "runs" if arg.is_empty() => Submission::Drawer(Drawer::Runs),
+        "logs" if arg.is_empty() => Submission::Drawer(Drawer::Logs),
+        "diff" if arg.is_empty() => Submission::Drawer(Drawer::Diff),
+        "skills" if arg.is_empty() => Submission::Drawer(Drawer::Skills),
+        "new" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
         "resume" if arg.is_empty() => Submission::Runtime(UiCommand::RequestResume),
-        "resume" => Submission::Help,
-        "abort" => Submission::Runtime(UiCommand::Cancel { member: None }),
-        "retry" => Submission::Runtime(UiCommand::Retry),
-        "approve" => Submission::ApproveFirst(ApprovalDecision::Approve),
-        "reject" => Submission::ApproveFirst(ApprovalDecision::Reject),
+        "abort" if arg.is_empty() => Submission::Runtime(UiCommand::Cancel { member: None }),
+        "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
+        "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
+        "reject" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Reject),
         "effort" => {
             let (member, level) = split_first_word(arg);
             match Effort::parse(level) {
@@ -166,7 +167,11 @@ fn parse_slash(rest: &str) -> Submission {
                 Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
             }
         }
-        "help" => Submission::Help,
+        "help" if arg.is_empty() => Submission::Help,
+        "team" | "runs" | "logs" | "diff" | "skills" | "new" | "resume" | "abort" | "retry"
+        | "approve" | "reject" | "help" => {
+            Submission::Invalid(format!("/{cmd} does not accept arguments; draft kept"))
+        }
         _ => Submission::Help,
     }
 }
@@ -432,6 +437,29 @@ mod tests {
     }
 
     #[test]
+    fn no_argument_commands_reject_trailing_text() {
+        for command in [
+            "/team extra",
+            "/runs extra",
+            "/logs extra",
+            "/diff extra",
+            "/skills extra",
+            "/new extra",
+            "/resume extra",
+            "/abort extra",
+            "/retry extra",
+            "/approve extra",
+            "/reject extra",
+            "/help extra",
+        ] {
+            assert!(
+                matches!(parse(command), Submission::Invalid(message) if message.contains("does not accept arguments")),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn blank_is_empty_and_unknown_slash_is_help() {
         assert_eq!(parse("   "), Submission::Empty);
         assert_eq!(parse("/wat"), Submission::Help);
@@ -641,7 +669,7 @@ mod tests {
             parse("/resume"),
             Submission::Runtime(UiCommand::RequestResume)
         );
-        assert_eq!(parse("/resume 3"), Submission::Help);
+        assert!(matches!(parse("/resume 3"), Submission::Invalid(_)));
     }
 
     #[test]

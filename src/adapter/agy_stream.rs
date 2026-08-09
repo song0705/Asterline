@@ -10,7 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::adapter::parser::{str_field, summarize, tool_detail, tool_value};
+use crate::adapter::parser::{
+    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, str_field, summarize, tool_detail,
+    tool_value,
+};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
@@ -55,8 +58,18 @@ impl AgyStreamAdapter {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        self.log_dir
-            .join(format!("{}-{millis}.log", self.member_id))
+        let safe_member = self
+            .member_id
+            .chars()
+            .map(|ch| {
+                if ch.is_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        self.log_dir.join(format!("{safe_member}-{millis}.log"))
     }
 
     fn prompt_with_system(&self, prompt: &str) -> String {
@@ -192,8 +205,11 @@ impl AgyLineParser {
         if str_field(step, "step_type") == Some("agent_response") {
             if let Some(text) = str_field(step, "text_delta").filter(|value| !value.is_empty()) {
                 self.open_message(out);
-                self.text_acc.push_str(text);
-                out.push(AgentEvent::TextDelta(text.to_string()));
+                if let Some(delta) =
+                    append_bounded_text(&mut self.text_acc, text, MAX_MESSAGE_TEXT_BYTES)
+                {
+                    out.push(AgentEvent::TextDelta(delta));
+                }
             }
             return;
         }
@@ -286,14 +302,16 @@ impl LineParser for AgyLineParser {
                 {
                     if !self.message_open {
                         self.open_message(&mut out);
-                        out.push(AgentEvent::TextDelta(response.to_string()));
+                        out.push(AgentEvent::TextDelta(bounded_text(
+                            response,
+                            MAX_MESSAGE_TEXT_BYTES,
+                        )));
                     }
                     // Agy's incremental text_delta may split a multi-byte UTF-8
                     // character and contain U+FFFD. Its final response is the
                     // authoritative, reassembled message, so always use it when
                     // finalizing the cell.
-                    self.text_acc.clear();
-                    self.text_acc.push_str(response);
+                    self.text_acc = bounded_text(response, MAX_MESSAGE_TEXT_BYTES);
                 }
                 self.close_message(&mut out);
                 if str_field(result, "status") != Some("SUCCESS") {
@@ -321,6 +339,16 @@ impl LineParser for AgyLineParser {
             let mut out = Vec::new();
             self.close_message(&mut out);
             out
+        }
+    }
+
+    fn finish_after_exit(&mut self, ok: bool) -> Vec<AgentEvent> {
+        if ok && !self.result_seen {
+            vec![AgentEvent::Fatal(
+                "agy exited without a terminal result event".to_string(),
+            )]
+        } else {
+            Vec::new()
         }
     }
 }
@@ -361,6 +389,16 @@ mod tests {
         assert!(command.args.contains(&"--sandbox".to_string()));
         assert!(command.args[command.args.len() - 1].contains("hi there"));
         assert_eq!(command.stdin, None);
+    }
+
+    #[test]
+    fn member_id_cannot_escape_the_log_directory() {
+        let member = TeamMember::new("../../escape", "Agy", BackendKind::Agy, "research");
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let path = adapter.log_path();
+
+        assert_eq!(path.parent(), Some(adapter.log_dir.as_path()));
+        assert!(!path.file_name().unwrap().to_string_lossy().contains('/'));
     }
 
     #[test]
@@ -423,6 +461,18 @@ mod tests {
             r#"{"event":"result","result":{"conversation_id":"x","status":"ERROR","error":"rate limited"}}"#,
         );
         assert!(events.contains(&AgentEvent::Fatal("rate limited".to_string())));
+    }
+
+    #[test]
+    fn successful_exit_requires_a_terminal_result_event() {
+        let mut parser = AgyLineParser::default();
+        assert!(matches!(
+            parser.finish_after_exit(true).as_slice(),
+            [AgentEvent::Fatal(message)] if message.contains("terminal result")
+        ));
+
+        parser.parse_line(r#"{"event":"result","result":{"status":"SUCCESS"}}"#);
+        assert!(parser.finish_after_exit(true).is_empty());
     }
 
     #[test]

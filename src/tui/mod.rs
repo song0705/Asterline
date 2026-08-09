@@ -12,6 +12,7 @@ pub mod composer;
 pub mod drawer_view;
 pub mod drawers;
 pub mod header;
+mod import_io;
 pub mod keymap;
 pub mod markdown;
 pub mod notify;
@@ -25,10 +26,12 @@ pub mod team_builder;
 pub mod team_editor;
 pub mod theme;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
@@ -56,6 +59,8 @@ use crate::tui::selection::{ChatSelection, MouseSelection};
 use crate::tui::team_editor::TeamEditorOutcome;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_RUNTIME_EVENTS_PER_DRAIN: usize = 1_024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const RESET_KEYBOARD_TO_LEGACY: &[u8] = b"\x1b[=0u";
 
 /// Asterline uses color for backend identity, status, and selection—not only
@@ -253,14 +258,7 @@ fn run_loop(
     let mut chat_layout: Option<ChatLayout> = None;
     loop {
         state.poll_team_editor_catalog();
-        while let Ok(event) = events.try_recv() {
-            if notify_enabled && let Some(title) = notify_title_for(&event) {
-                let mut out = io::stdout();
-                let _ = notify::emit(&mut out, title);
-                let _ = out.flush();
-            }
-            state.apply(event);
-        }
+        drain_runtime_events(state, events, notify_enabled);
 
         let screen = terminal
             .draw(|frame| {
@@ -277,6 +275,12 @@ fn run_loop(
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if !state.runtime_available() {
+                        if keymap::resolve(key) == Some(Action::Interrupt) {
+                            state.quit();
+                        }
+                        continue;
+                    }
                     let any_sel = drawer_selection.is_active() || chat_selection.is_active();
                     if any_sel && key.code == KeyCode::Esc {
                         drawer_selection.clear();
@@ -301,6 +305,9 @@ fn run_loop(
                     &screen,
                 )?,
                 Event::Paste(text) => {
+                    if !state.runtime_available() {
+                        continue;
+                    }
                     drawer_selection.clear();
                     chat_selection.clear();
                     if !state.insert_team_editor_text(&text) {
@@ -332,7 +339,7 @@ fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
         TeamEditorOutcome::Ignored => false,
         TeamEditorOutcome::Consumed(command) => {
             if let Some(command) = command {
-                handle.send(command);
+                send_runtime(state, handle, command);
             }
             true
         }
@@ -509,13 +516,6 @@ fn status_bar_at(
     })
 }
 
-/// Check whether `name` is an executable on the current `PATH`.
-fn binary_on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
-}
-
 /// Hand the whole terminal to the member's real interactive CLI (resuming its
 /// session), then restore Asterline when that CLI exits.
 fn attach_to_member(
@@ -527,21 +527,16 @@ fn attach_to_member(
     legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     let (program, args) = req.command();
-    let exit_hint = match req.backend {
-        BackendKind::Codex => "type /exit or press Ctrl+D",
-        BackendKind::Claude => "type /exit or press Ctrl+D",
-        BackendKind::Grok => "type /exit or press Ctrl+D",
-        BackendKind::Agy => "type /exit or press Ctrl+D",
-    };
+    let exit_hint = attach_exit_hint();
 
     // Bail out before suspending the terminal if the backend CLI is missing,
     // so the user never sees a blank screen + confusing error.
-    if !binary_on_path(&program) {
+    let Some(program_path) = crate::domain::config::resolve_binary_on_path(&program) else {
         state.apply(RuntimeEvent::Notice(format!(
             "could not attach: {program} is not on PATH"
         )));
         return Ok(());
-    }
+    };
 
     // Snapshot the backend transcript so we can import whatever is typed during
     // the attached session once it exits (codex rollouts / claude session jsonl).
@@ -586,7 +581,7 @@ fn attach_to_member(
     )?;
     out.flush()?;
 
-    let result = std::process::Command::new(&program)
+    let result = std::process::Command::new(&program_path)
         .args(&args)
         .current_dir(&req.cwd)
         .status();
@@ -635,13 +630,25 @@ fn attach_to_member(
             AttachSnapshot::Claude(s) => claude_import::imported_since(s),
         };
         if !imported.is_empty() {
-            handle.send(UiCommand::ImportTranscript {
-                member: req.member.clone(),
-                items: imported,
-            });
+            send_runtime(
+                state,
+                handle,
+                UiCommand::ImportTranscript {
+                    member: req.member.clone(),
+                    items: imported,
+                },
+            );
         }
     }
     Ok(())
+}
+
+fn attach_exit_hint() -> &'static str {
+    if cfg!(windows) {
+        "type /exit or press Ctrl+Z then Enter"
+    } else {
+        "type /exit or press Ctrl+D"
+    }
 }
 
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
@@ -779,17 +786,17 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state.clear_header_selection();
             } else if state.drawer().is_some() {
                 state.close_drawer();
-            } else if state.running_count() > 0 {
-                handle.send(UiCommand::Cancel { member: None });
+            } else {
+                abort_active_work(state, handle);
             }
         }
         Action::Interrupt => {
-            if state.running_count() > 0 {
-                state.disarm_quit();
-                handle.send(UiCommand::Cancel { member: None });
-            } else if !state.composer().is_empty() {
+            if !abort_active_work(state, handle) && !state.composer().is_empty() {
                 state.clear_composer();
-            } else {
+            } else if state.running_count() == 0
+                && !state.verification_active()
+                && state.composer().is_empty()
+            {
                 state.request_quit();
             }
         }
@@ -797,7 +804,7 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             if state.drawer() == Some(drawers::Drawer::Resume) {
                 if let Some(command) = state.selected_resume_command() {
                     state.close_drawer();
-                    handle.send(command);
+                    send_runtime(state, handle, command);
                 }
                 return;
             }
@@ -823,6 +830,15 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     }
 }
 
+fn abort_active_work(state: &mut AppState, handle: &RuntimeHandle) -> bool {
+    if state.running_count() == 0 && !state.verification_active() {
+        return false;
+    }
+    state.disarm_quit();
+    send_runtime(state, handle, UiCommand::Cancel { member: None });
+    true
+}
+
 /// Handle keys while a reverse history search (Ctrl+R) is active.
 fn handle_search_action(action: Action, state: &mut AppState) {
     match action {
@@ -841,34 +857,121 @@ fn handle_search_action(action: Action, state: &mut AppState) {
 /// Capture the workspace's working-tree git diff, including untracked files
 /// (mirrors codex's `/diff`). Returns a human-readable message on failure.
 fn compute_git_diff(workspace: &str) -> String {
-    let dir = if workspace.is_empty() { "." } else { workspace };
-    let run = |args: &[&str]| -> Option<String> {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-    };
+    const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_UNTRACKED_BYTES: usize = 256 * 1024;
+    const MAX_UNTRACKED_FILES: usize = 2_000;
 
-    let mut out = match run(&["--no-pager", "diff"]) {
-        Some(diff) => diff,
-        None => return "not a git repository (or git is unavailable)".to_string(),
+    let dir = if workspace.is_empty() { "." } else { workspace };
+    let (mut out, diff_truncated) = match run_git_bounded(
+        dir,
+        &["--no-pager", "diff", "--no-ext-diff", "--no-textconv"],
+        MAX_DIFF_BYTES,
+    ) {
+        Ok(diff) => diff,
+        Err(message) => return message.to_string(),
     };
+    if diff_truncated {
+        out.push_str("\n[diff output truncated at 2 MiB]\n");
+    }
     // Codex's /diff also surfaces untracked files; list them after the diff.
-    if let Some(untracked) = run(&["ls-files", "--others", "--exclude-standard"])
-        && !untracked.trim().is_empty()
+    if let Ok((untracked, byte_truncated)) = run_git_bounded(
+        dir,
+        &["ls-files", "--others", "--exclude-standard"],
+        MAX_UNTRACKED_BYTES,
+    ) && !untracked.trim().is_empty()
     {
         out.push_str("\nUntracked files:\n");
-        for file in untracked.lines() {
+        let mut lines = untracked.lines();
+        for file in lines.by_ref().take(MAX_UNTRACKED_FILES) {
             out.push_str("  ");
             out.push_str(file);
             out.push('\n');
         }
+        if byte_truncated || lines.next().is_some() {
+            out.push_str("  [untracked file list truncated]\n");
+        }
     }
     out
+}
+
+fn run_git_bounded(dir: &str, args: &[&str], limit: usize) -> Result<(String, bool), &'static str> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::adapter::process::configure_process_tree(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "not a git repository (or git is unavailable)")?;
+    let tree = match crate::adapter::process::ChildProcessTree::attach(&mut child) {
+        Ok(tree) => tree,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("could not isolate the git process");
+        }
+    };
+    let stdout = child.stdout.take().ok_or("git stdout was unavailable")?;
+    let (capture_tx, capture_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let _ = capture_tx.send(read_bounded(stdout, limit));
+    });
+    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = tree.terminate_with_fallback(&mut child);
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("git command timed out after 10 seconds");
+            }
+            Err(_) => {
+                let _ = tree.terminate_with_fallback(&mut child);
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("git command failed");
+            }
+        }
+    };
+    let captured = match capture_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        Ok(captured) => captured,
+        Err(_) => {
+            let _ = tree.terminate_with_fallback(&mut child);
+            let _ = reader.join();
+            return Err("git command timed out after 10 seconds");
+        }
+    };
+    let _ = reader.join();
+    let (bytes, truncated) = captured.map_err(|_| "git output reader failed")?;
+    if !status.success() {
+        return Err("not a git repository (or git is unavailable)");
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
+/// Keep at most `limit` bytes while continuing to drain the reader so the
+/// producer cannot block on a full pipe.
+fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::with_capacity(limit.min(64 * 1024));
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(kept.len());
+        let take = read.min(remaining);
+        kept.extend_from_slice(&buffer[..take]);
+        truncated |= take < read;
+    }
+    Ok((kept, truncated))
 }
 
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
@@ -876,25 +979,24 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let mut reset_scroll = true;
     match commands::parse(&text) {
         Submission::Runtime(command) => {
-            state.record_submission(&text);
-            state.take_composer();
-            if let UiCommand::UserMessage { target, body } = &command {
-                // Collaboration/team modes emit their own canonical user
-                // event after resolving participants. Only normal chat can be
-                // rendered optimistically with a known local target.
-                if state.active_mode() == TerminalMode::Normal {
-                    state.handle_user_message_submitted(target, body.clone());
+            // `/mode` and `/new` can be rejected by the runtime (for example,
+            // when persistence fails or work is still active). Apply their UI
+            // state only after the corresponding runtime event arrives.
+            let user_target = match &command {
+                UiCommand::UserMessage { target, .. }
+                    if state.active_mode() == TerminalMode::Normal =>
+                {
+                    Some(target.clone())
                 }
-            } else if let UiCommand::SetMode { mode } = &command {
-                // Mirror Codex's mode picker: update the terminal UI state
-                // immediately, then let the runtime acknowledge the setting.
-                state.apply(RuntimeEvent::ModeChanged { mode: *mode });
-            } else if matches!(command, UiCommand::NewSession) {
-                // Reset the visible chat and stale run footer immediately; the
-                // runtime emits the same idempotent event after persistence.
-                state.apply(RuntimeEvent::SessionReset);
+                _ => None,
+            };
+            if send_runtime(state, handle, command) {
+                state.record_submission(&text);
+                state.take_composer();
+                if let Some(target) = user_target.as_ref() {
+                    state.remember_user_message_target(target);
+                }
             }
-            handle.send(command);
         }
         Submission::Drawer(drawer) => {
             state.record_submission(&text);
@@ -913,9 +1015,10 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
         }
         Submission::ApproveFirst(decision) => match state.first_pending_approval() {
             Some(id) => {
-                state.record_submission(&text);
-                state.take_composer();
-                handle.send(UiCommand::Approve { id, decision });
+                if send_runtime(state, handle, UiCommand::Approve { id, decision }) {
+                    state.record_submission(&text);
+                    state.take_composer();
+                }
             }
             None => state.apply(RuntimeEvent::Notice("no pending approval".to_string())),
         },
@@ -931,20 +1034,34 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.take_composer();
             state.toggle_drawer(drawers::Drawer::Palette);
         }
+        Submission::Invalid(message) => state.apply(RuntimeEvent::Notice(message)),
         Submission::NeedsTarget => {
             if state.active_mode() != TerminalMode::Normal {
                 let body = text.trim().to_string();
-                state.record_submission(&body);
-                state.take_composer();
-                handle.send(UiCommand::UserMessage {
-                    target: crate::domain::event::MessageTarget::Default,
-                    body,
-                });
+                if send_runtime(
+                    state,
+                    handle,
+                    UiCommand::UserMessage {
+                        target: crate::domain::event::MessageTarget::Default,
+                        body: body.clone(),
+                    },
+                ) {
+                    state.record_submission(&body);
+                    state.take_composer();
+                }
             } else if let Some((target, body)) = state.inherited_user_message(&text) {
-                state.record_submission(&body);
-                state.take_composer();
-                state.handle_user_message_submitted(&target, body.clone());
-                handle.send(UiCommand::UserMessage { target, body });
+                if send_runtime(
+                    state,
+                    handle,
+                    UiCommand::UserMessage {
+                        target: target.clone(),
+                        body: body.clone(),
+                    },
+                ) {
+                    state.record_submission(&body);
+                    state.take_composer();
+                    state.remember_user_message_target(&target);
+                }
             } else {
                 state.apply(RuntimeEvent::Notice(
                     "message needs a target prefix: @member, @all, /ask, or /all (draft kept)"
@@ -959,6 +1076,38 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     if reset_scroll {
         state.reset_scroll();
     }
+}
+
+fn drain_runtime_events(
+    state: &mut AppState,
+    events: &Receiver<RuntimeEvent>,
+    notify_enabled: bool,
+) {
+    for _ in 0..MAX_RUNTIME_EVENTS_PER_DRAIN {
+        match events.try_recv() {
+            Ok(event) => {
+                if notify_enabled && let Some(title) = notify_title_for(&event) {
+                    let mut out = io::stdout();
+                    let _ = notify::emit(&mut out, title);
+                    let _ = out.flush();
+                }
+                state.apply(event);
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                state.mark_runtime_unavailable();
+                break;
+            }
+        }
+    }
+}
+
+fn send_runtime(state: &mut AppState, handle: &RuntimeHandle, command: UiCommand) -> bool {
+    let sent = handle.send(command);
+    if !sent {
+        state.mark_runtime_unavailable();
+    }
+    sent
 }
 
 /// Titles for attention-needed runtime events (terminal BEL + OSC 9).
@@ -989,12 +1138,50 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn attach_exit_hint_matches_platform_eof_sequence() {
+        if cfg!(windows) {
+            assert_eq!(attach_exit_hint(), "type /exit or press Ctrl+Z then Enter");
+        } else {
+            assert_eq!(attach_exit_hint(), "type /exit or press Ctrl+D");
+        }
+    }
+
+    #[test]
+    fn bounded_capture_keeps_prefix_and_drains_the_rest() {
+        let input = std::io::Cursor::new(b"0123456789".to_vec());
+
+        let (captured, truncated) = read_bounded(input, 4).unwrap();
+
+        assert_eq!(captured, b"0123");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn runtime_event_drain_yields_after_a_bounded_batch() {
+        let (tx, rx) = mpsc::channel();
+        for index in 0..=MAX_RUNTIME_EVENTS_PER_DRAIN {
+            tx.send(RuntimeEvent::Notice(format!("event {index}")))
+                .unwrap();
+        }
+        let mut state = AppState::new(Vec::new());
+
+        drain_runtime_events(&mut state, &rx, false);
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "one event should remain for next frame"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn keyboard_enhancement_cleanup_emits_protocol_pop() {
         let mut bytes = Vec::new();
         disable_keyboard_enhancement(&mut bytes, true).unwrap();
         assert_eq!(bytes, b"\x1b[<1u");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn keyboard_enhancement_push_uses_only_disambiguation() {
         let mut bytes = Vec::new();
@@ -1015,6 +1202,131 @@ mod tests {
         assert!(terminal_requires_legacy_reset(Some("vscode"), false, false));
         assert!(!terminal_requires_legacy_reset(Some("vscode"), false, true));
         assert!(!terminal_requires_legacy_reset(Some("kitty"), false, false));
+    }
+
+    #[test]
+    fn disconnected_runtime_event_channel_disables_input() {
+        let (event_tx, event_rx) = mpsc::channel::<RuntimeEvent>();
+        drop(event_tx);
+        let mut state = AppState::new(Vec::new());
+
+        drain_runtime_events(&mut state, &event_rx, false);
+
+        assert!(!state.runtime_available());
+        assert!(matches!(
+            state.chat().last(),
+            Some(ChatItem::Error { member: None, message })
+                if message.contains("input is disabled")
+        ));
+    }
+
+    #[test]
+    fn failed_runtime_send_keeps_draft_and_disables_input() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("/retry");
+
+        submit(&mut state, &handle);
+
+        assert!(!state.runtime_available());
+        assert_eq!(state.composer().text(), "/retry");
+    }
+
+    #[test]
+    fn no_argument_command_with_trailing_text_keeps_state_and_draft() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(vec![ChatItem::Notice {
+            text: "existing chat".to_string(),
+        }]);
+        state.apply(RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Plan,
+        });
+        state.insert_text("/new accidental");
+
+        submit(&mut state, &handle);
+
+        assert_eq!(state.active_mode(), TerminalMode::Plan);
+        assert_eq!(state.composer().text(), "/new accidental");
+        assert!(matches!(
+            state.chat().last(),
+            Some(ChatItem::Notice { text }) if text.contains("does not accept arguments")
+        ));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn escape_and_interrupt_abort_verification_only_work() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+
+        let verifying_state = || {
+            let mut state = AppState::new(Vec::new());
+            state.apply(RuntimeEvent::RunUpdated {
+                run: RunSummary {
+                    id: RunId(1),
+                    goal: "ship parser".to_string(),
+                    status: RunStatus::Verifying,
+                    coordinator: None,
+                    verification: None,
+                    created_at: "2026-08-09 10:00:00".to_string(),
+                    updated_at: "2026-08-09 10:00:00".to_string(),
+                    attempt: 1,
+                    events: Vec::new(),
+                    steps: Vec::new(),
+                    mode: None,
+                    legacy_mode: None,
+                },
+            });
+            assert_eq!(state.running_count(), 0);
+            assert!(state.verification_active());
+            state
+        };
+
+        let mut escape = verifying_state();
+        handle_action(Action::CloseOverlay, &mut escape, &handle);
+        assert!(!escape.runtime_available(), "Esc must dispatch /abort");
+
+        let mut interrupt = verifying_state();
+        interrupt.insert_text("keep this draft");
+        handle_action(Action::Interrupt, &mut interrupt, &handle);
+        assert!(
+            !interrupt.runtime_available(),
+            "Ctrl+C must dispatch /abort"
+        );
+        assert!(!interrupt.should_quit());
+        assert_eq!(interrupt.composer().text(), "keep this draft");
     }
 
     #[test]
@@ -1231,6 +1543,46 @@ mod tests {
     }
 
     #[test]
+    fn mode_and_new_session_wait_for_runtime_acknowledgement() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(vec![ChatItem::Notice {
+            text: "existing chat".to_string(),
+        }]);
+
+        for ch in "/mode plan".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+        assert_eq!(state.active_mode(), TerminalMode::Normal);
+
+        state.apply(RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Plan,
+        });
+        for ch in "/new".chars() {
+            state.insert_char(ch);
+        }
+        submit(&mut state, &handle);
+        assert_eq!(state.active_mode(), TerminalMode::Plan);
+        assert!(!state.chat().is_empty());
+
+        state.apply(RuntimeEvent::SessionReset);
+        assert_eq!(state.active_mode(), TerminalMode::Normal);
+        assert!(state.chat().is_empty());
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
     fn untargeted_text_reuses_previous_target() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
@@ -1274,10 +1626,15 @@ mod tests {
         submit(&mut state, &handle);
 
         assert!(state.composer().is_empty());
-        assert!(state.chat().iter().any(|item| matches!(
-            item,
-            ChatItem::User { body } if body == "@builder now add tests"
-        )));
+        assert_eq!(
+            state.inherited_user_message("one more"),
+            Some((
+                crate::domain::event::MessageTarget::Member(crate::domain::team::MemberId::new(
+                    "builder"
+                )),
+                "@builder one more".to_string()
+            ))
+        );
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
@@ -1325,6 +1682,7 @@ mod tests {
             state.insert_char(ch);
         }
         submit(&mut state, &handle);
+        state.apply(RuntimeEvent::SessionReset);
         for ch in "now add tests".chars() {
             state.insert_char(ch);
         }

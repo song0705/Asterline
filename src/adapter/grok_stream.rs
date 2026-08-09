@@ -6,24 +6,33 @@
 //! sessions all come from one structured protocol.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::adapter::parser::{str_field, summarize, tool_detail, tool_value};
+use crate::adapter::parser::{
+    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, str_field, summarize, tool_detail, tool_value,
+};
+use crate::adapter::process::{
+    ChildProcessTree, MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_LINE_BYTES, bounded_lines,
+    configure_process_tree,
+};
 use crate::adapter::{MemberRunner, RunRequest};
+use crate::domain::config::resolve_binary_on_path;
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
 
 const TOOL_SUMMARY_MAX: usize = 160;
 const TOOL_OUTPUT_MAX: usize = 32_000;
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+const ACP_OUTPUT_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct GrokAcpRunner {
@@ -56,7 +65,11 @@ impl GrokAcpRunner {
 
     /// Global Grok flags must precede `agent`; agent flags must precede `stdio`.
     fn command_args(&self, effort: Option<Effort>) -> Vec<String> {
-        let mut args = vec!["--sandbox".to_string(), self.sandbox.grok_arg().to_string()];
+        let mut args = vec![
+            "--no-auto-update".to_string(),
+            "--sandbox".to_string(),
+            self.sandbox.grok_arg().to_string(),
+        ];
         if let Some(mode) = self.permission_mode {
             args.push("--permission-mode".to_string());
             args.push(mode.grok_arg().to_string());
@@ -125,19 +138,22 @@ impl MemberRunner for GrokAcpRunner {
         BackendKind::Grok
     }
 
-    fn run(&self, req: RunRequest, events: Sender<AgentEvent>) {
+    fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
         run_acp(self, req, events);
     }
 }
 
-fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) {
-    let mut builder = Command::new(&runner.binary);
+fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: SyncSender<AgentEvent>) {
+    let resolved_binary =
+        resolve_binary_on_path(&runner.binary).unwrap_or_else(|| PathBuf::from(&runner.binary));
+    let mut builder = Command::new(resolved_binary);
     builder
         .args(runner.command_args(req.effort))
         .current_dir(&runner.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_process_tree(&mut builder);
 
     let mut child = match builder.spawn() {
         Ok(child) => child,
@@ -154,11 +170,28 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
         }
     };
 
+    let process_tree = match ChildProcessTree::attach(&mut child) {
+        Ok(process_tree) => Arc::new(process_tree),
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = events.send(AgentEvent::Fatal(format!(
+                "failed to isolate {} ACP process tree: {err}",
+                runner.binary
+            )));
+            let _ = events.send(AgentEvent::Exited {
+                code: None,
+                ok: false,
+            });
+            return;
+        }
+    };
+
     let Some(stdin) = child.stdin.take() else {
         let _ = events.send(AgentEvent::Fatal(
             "grok ACP server did not expose stdin".to_string(),
         ));
-        let _ = child.kill();
+        let _ = process_tree.terminate_with_fallback(&mut child);
         let _ = child.wait();
         let _ = events.send(AgentEvent::Exited {
             code: None,
@@ -170,7 +203,7 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
         let _ = events.send(AgentEvent::Fatal(
             "grok ACP server did not expose stdout".to_string(),
         ));
-        let _ = child.kill();
+        let _ = process_tree.terminate_with_fallback(&mut child);
         let _ = child.wait();
         let _ = events.send(AgentEvent::Exited {
             code: None,
@@ -181,35 +214,57 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
     let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
     let done = Arc::new(AtomicBool::new(false));
+    let transport_ok = Arc::new(AtomicBool::new(true));
 
     let watcher = {
         let child = Arc::clone(&child);
+        let process_tree = Arc::clone(&process_tree);
         let done = Arc::clone(&done);
         let cancel = Arc::clone(&req.cancel);
         thread::spawn(move || {
+            let mut deadline = None;
             while !done.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {
-                    if let Ok(mut child) = child.lock() {
-                        let _ = child.kill();
+                    let deadline = *deadline.get_or_insert_with(|| Instant::now() + CANCEL_GRACE);
+                    if Instant::now() >= deadline {
+                        if process_tree.terminate().is_err()
+                            && let Ok(mut child) = child.lock()
+                        {
+                            let _ = child.kill();
+                        }
+                        break;
                     }
-                    break;
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(25));
             }
         })
     };
 
     let stderr_thread = stderr.map(|stderr| {
         let events = events.clone();
+        let process_tree = Arc::clone(&process_tree);
+        let transport_ok = Arc::clone(&transport_ok);
         thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = events.send(AgentEvent::Stderr(line));
+            for line in bounded_lines(BufReader::new(stderr), MAX_STDERR_LINE_BYTES) {
+                match line {
+                    Ok(line) => {
+                        let _ = events.send(AgentEvent::Stderr(line));
+                    }
+                    Err(err) => {
+                        transport_ok.store(false, Ordering::Relaxed);
+                        let _ = events.send(AgentEvent::Fatal(format!(
+                            "failed to read grok ACP stderr: {err}"
+                        )));
+                        let _ = process_tree.terminate();
+                        break;
+                    }
+                }
             }
         })
     });
 
     let mut input = BufWriter::new(stdin);
-    let mut output = BufReader::new(stdout).lines();
+    let mut output = bounded_lines(BufReader::new(stdout), MAX_PROTOCOL_LINE_BYTES);
     let mut protocol_ok = true;
 
     protocol_ok &= send_request(
@@ -222,15 +277,77 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false
             },
+            "clientInfo": {
+                "name": "asterline",
+                "version": env!("CARGO_PKG_VERSION")
+            },
             "_meta": {"clientIdentifier": "asterline"}
         }),
         &events,
     );
+    let initialize_response = if protocol_ok {
+        wait_for_response(&mut output, 1, &events)
+    } else {
+        None
+    };
     if protocol_ok {
-        protocol_ok &= wait_for_response(&mut output, 1, &events).is_some();
+        protocol_ok = initialize_response.as_ref().is_some_and(|response| {
+            if response["result"]["protocolVersion"].as_u64() == Some(1) {
+                true
+            } else {
+                let _ = events.send(AgentEvent::Fatal(
+                    "grok ACP server negotiated an unsupported protocol version".to_string(),
+                ));
+                false
+            }
+        });
+    }
+
+    let load_session_supported = initialize_response
+        .as_ref()
+        .is_some_and(supports_load_session);
+    if protocol_ok && req.session.is_some() && !load_session_supported {
+        let _ = events.send(AgentEvent::Fatal(
+            "grok ACP server does not support restoring sessions".to_string(),
+        ));
+        protocol_ok = false;
+    }
+
+    let mut next_request_id = 2;
+    if protocol_ok {
+        match initialize_response.as_ref().and_then(|response| {
+            select_auth_method(response, std::env::var_os("XAI_API_KEY").is_some())
+        }) {
+            Some(method_id) => {
+                protocol_ok &= send_request(
+                    &mut input,
+                    next_request_id,
+                    "authenticate",
+                    json!({
+                        "methodId": method_id,
+                        "_meta": {"headless": true}
+                    }),
+                    &events,
+                );
+                if protocol_ok {
+                    protocol_ok &=
+                        wait_for_response(&mut output, next_request_id, &events).is_some();
+                }
+                next_request_id += 1;
+            }
+            None => {
+                let _ = events.send(AgentEvent::Fatal(
+                    "grok ACP has no usable authentication method; run `grok login` or set XAI_API_KEY"
+                        .to_string(),
+                ));
+                protocol_ok = false;
+            }
+        }
     }
 
     let meta = runner.session_meta();
+    let session_request_id = next_request_id;
+    let prompt_request_id = session_request_id + 1;
     let session_id = if protocol_ok {
         match req.session.as_ref() {
             Some(session) => {
@@ -240,7 +357,7 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
                 }
                 protocol_ok &= send_request(
                     &mut input,
-                    2,
+                    session_request_id,
                     "session/load",
                     json!({
                         "sessionId": session.as_str(),
@@ -251,14 +368,15 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
                     &events,
                 );
                 if protocol_ok {
-                    protocol_ok &= wait_for_response(&mut output, 2, &events).is_some();
+                    protocol_ok &=
+                        wait_for_response(&mut output, session_request_id, &events).is_some();
                 }
                 protocol_ok.then(|| session.as_str().to_string())
             }
             None => {
                 protocol_ok &= send_request(
                     &mut input,
-                    2,
+                    session_request_id,
                     "session/new",
                     json!({
                         "cwd": runner.cwd,
@@ -268,7 +386,7 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
                     &events,
                 );
                 let response = if protocol_ok {
-                    wait_for_response(&mut output, 2, &events)
+                    wait_for_response(&mut output, session_request_id, &events)
                 } else {
                     None
                 };
@@ -289,13 +407,14 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
         protocol_ok = false;
     }
 
+    let mut output_thread = None;
     if let Some(session_id) = session_id {
         let _ = events.send(AgentEvent::SessionDiscovered(AgentSessionId(
             session_id.clone(),
         )));
         protocol_ok &= send_request(
             &mut input,
-            3,
+            prompt_request_id,
             "session/prompt",
             json!({
                 "sessionId": session_id,
@@ -304,24 +423,46 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
             &events,
         );
         if protocol_ok {
+            let (output_tx, output_rx) = mpsc::sync_channel(ACP_OUTPUT_QUEUE_CAPACITY);
+            output_thread = Some(thread::spawn(move || {
+                for line in output {
+                    if output_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }));
             let mut parser = GrokAcpParser::default();
             protocol_ok = process_prompt(
-                &mut output,
+                &output_rx,
                 &mut input,
                 &mut parser,
-                runner.permission_mode,
-                &events,
+                PromptContext {
+                    permission_mode: runner.permission_mode,
+                    cancel: &req.cancel,
+                    session_id: &session_id,
+                    request_id: prompt_request_id,
+                    events: &events,
+                },
             );
-            for event in parser.finish() {
+            for event in parser.finish(req.cancel.load(Ordering::Relaxed)) {
                 let _ = events.send(event);
             }
         }
     }
 
+    if !protocol_ok {
+        let _ = process_tree.terminate();
+    }
     // ACP stdio exits on EOF after the request has completed.
     drop(input);
+    // Poll instead of holding the child mutex across `wait`: a cancelled ACP
+    // server that acknowledges the turn but ignores stdin EOF must remain
+    // killable by the grace-period watcher.
+    let status = wait_for_child(&child);
     done.store(true, Ordering::Relaxed);
-    let status = child.lock().ok().and_then(|mut child| child.wait().ok());
+    if let Some(output_thread) = output_thread {
+        let _ = output_thread.join();
+    }
     if let Some(stderr_thread) = stderr_thread {
         let _ = stderr_thread.join();
     }
@@ -331,7 +472,7 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
         Some(status) => {
             let _ = events.send(AgentEvent::Exited {
                 code: status.code(),
-                ok: protocol_ok && status.success(),
+                ok: protocol_ok && transport_ok.load(Ordering::Relaxed) && status.success(),
             });
         }
         None => {
@@ -346,12 +487,22 @@ fn run_acp(runner: &GrokAcpRunner, req: RunRequest, events: Sender<AgentEvent>) 
     }
 }
 
+fn wait_for_child(child: &Mutex<Child>) -> Option<ExitStatus> {
+    loop {
+        let status = child.lock().ok()?.try_wait().ok()?;
+        if status.is_some() {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn send_request(
     input: &mut BufWriter<impl Write>,
     id: u64,
     method: &str,
     params: Value,
-    events: &Sender<AgentEvent>,
+    events: &SyncSender<AgentEvent>,
 ) -> bool {
     let message = json!({
         "jsonrpc": "2.0",
@@ -369,10 +520,51 @@ fn send_request(
     }
 }
 
+fn send_notification(
+    input: &mut BufWriter<impl Write>,
+    method: &str,
+    params: Value,
+    events: &SyncSender<AgentEvent>,
+) -> bool {
+    let message = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    });
+    if let Err(err) = writeln!(input, "{message}").and_then(|_| input.flush()) {
+        let _ = events.send(AgentEvent::Fatal(format!(
+            "grok ACP {method} notification failed: {err}"
+        )));
+        false
+    } else {
+        true
+    }
+}
+
+fn supports_load_session(response: &Value) -> bool {
+    response["result"]["agentCapabilities"]["loadSession"].as_bool() == Some(true)
+}
+
+fn select_auth_method(response: &Value, api_key_present: bool) -> Option<&'static str> {
+    let methods = response["result"]["authMethods"].as_array()?;
+    let advertises = |wanted: &str| {
+        methods
+            .iter()
+            .any(|method| str_field(method, "id") == Some(wanted))
+    };
+    if api_key_present && advertises("xai.api_key") {
+        Some("xai.api_key")
+    } else if advertises("cached_token") {
+        Some("cached_token")
+    } else {
+        None
+    }
+}
+
 fn wait_for_response(
     output: &mut impl Iterator<Item = std::io::Result<String>>,
     wanted_id: u64,
-    events: &Sender<AgentEvent>,
+    events: &SyncSender<AgentEvent>,
 ) -> Option<Value> {
     for line in output {
         let line = match line {
@@ -412,28 +604,58 @@ fn wait_for_response(
     None
 }
 
+struct PromptContext<'a> {
+    permission_mode: Option<PermissionMode>,
+    cancel: &'a AtomicBool,
+    session_id: &'a str,
+    request_id: u64,
+    events: &'a SyncSender<AgentEvent>,
+}
+
 fn process_prompt(
-    output: &mut impl Iterator<Item = std::io::Result<String>>,
+    output: &Receiver<std::io::Result<String>>,
     input: &mut BufWriter<impl Write>,
     parser: &mut GrokAcpParser,
-    permission_mode: Option<PermissionMode>,
-    events: &Sender<AgentEvent>,
+    context: PromptContext<'_>,
 ) -> bool {
-    for line in output {
+    let mut cancel_sent = false;
+    loop {
+        if context.cancel.load(Ordering::Relaxed) && !cancel_sent {
+            if !send_notification(
+                input,
+                "session/cancel",
+                json!({"sessionId": context.session_id}),
+                context.events,
+            ) {
+                return false;
+            }
+            cancel_sent = true;
+        }
+        let line = match output.recv_timeout(Duration::from_millis(25)) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) if cancel_sent => return false,
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = context.events.send(AgentEvent::Fatal(
+                    "grok ACP closed before the prompt completed".to_string(),
+                ));
+                return false;
+            }
+        };
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                let _ = events.send(AgentEvent::Fatal(format!(
+                let _ = context.events.send(AgentEvent::Fatal(format!(
                     "failed to read grok ACP output: {err}"
                 )));
                 return false;
             }
         };
-        let _ = events.send(AgentEvent::Raw(line.clone()));
+        let _ = context.events.send(AgentEvent::Raw(line.clone()));
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(err) => {
-                let _ = events.send(AgentEvent::ParseWarning(format!(
+                let _ = context.events.send(AgentEvent::ParseWarning(format!(
                     "grok ACP: invalid JSON line: {err}"
                 )));
                 continue;
@@ -443,58 +665,80 @@ fn process_prompt(
         match str_field(&value, "method") {
             Some("session/update") | Some("x.ai/session/update") => {
                 for event in parser.parse_update(&value["params"]["update"]) {
-                    let _ = events.send(event);
+                    let _ = context.events.send(event);
                 }
             }
             Some("session/request_permission") => {
-                respond_to_permission(input, &value, permission_mode, events);
+                respond_to_permission(
+                    input,
+                    &value,
+                    context.permission_mode,
+                    cancel_sent || context.cancel.load(Ordering::Relaxed),
+                    context.events,
+                );
             }
             Some(method) if value.get("id").is_some() => {
-                respond_method_not_found(input, &value, method, events);
+                respond_method_not_found(input, &value, method, context.events);
             }
             _ => {}
         }
 
-        if value.get("id").and_then(Value::as_u64) == Some(3) {
+        if value.get("id").and_then(Value::as_u64) == Some(context.request_id) {
             if let Some(error) = value.get("error") {
-                let _ = events.send(AgentEvent::Fatal(
+                let _ = context.events.send(AgentEvent::Fatal(
                     str_field(error, "message")
                         .unwrap_or("grok prompt failed")
                         .to_string(),
                 ));
                 return false;
             }
-            return true;
+            return match str_field(&value["result"], "stopReason") {
+                Some("end_turn") => true,
+                Some("cancelled") if cancel_sent || context.cancel.load(Ordering::Relaxed) => true,
+                Some(reason) => {
+                    let _ = context.events.send(AgentEvent::Fatal(format!(
+                        "grok ACP prompt stopped before completion: {reason}"
+                    )));
+                    false
+                }
+                None => {
+                    let _ = context.events.send(AgentEvent::Fatal(
+                        "grok ACP prompt response did not include a stopReason".to_string(),
+                    ));
+                    false
+                }
+            };
         }
     }
-    let _ = events.send(AgentEvent::Fatal(
-        "grok ACP closed before the prompt completed".to_string(),
-    ));
-    false
 }
 
 fn respond_to_permission(
     input: &mut BufWriter<impl Write>,
     request: &Value,
     mode: Option<PermissionMode>,
-    events: &Sender<AgentEvent>,
+    cancelled: bool,
+    events: &SyncSender<AgentEvent>,
 ) {
     let Some(id) = request.get("id").cloned() else {
         return;
     };
     let tool_kind = str_field(&request["params"]["toolCall"], "kind").unwrap_or_default();
     let allow = match mode.unwrap_or(PermissionMode::Default) {
-        PermissionMode::BypassPermissions | PermissionMode::Auto => true,
+        PermissionMode::BypassPermissions => true,
         PermissionMode::AcceptEdits => matches!(tool_kind, "edit" | "delete" | "move"),
-        PermissionMode::Default | PermissionMode::DontAsk | PermissionMode::Plan => false,
+        PermissionMode::Default
+        | PermissionMode::DontAsk
+        | PermissionMode::Plan
+        | PermissionMode::Auto => false,
     };
     let preferred = if allow {
         ["allow_once", "allow_always"]
     } else {
         ["reject_once", "reject_always"]
     };
-    let option = request["params"]["options"]
-        .as_array()
+    let option = (!cancelled)
+        .then_some(&request["params"]["options"])
+        .and_then(|options| options.as_array())
         .and_then(|options| {
             preferred.iter().find_map(|kind| {
                 options
@@ -523,7 +767,7 @@ fn respond_method_not_found(
     input: &mut BufWriter<impl Write>,
     request: &Value,
     method: &str,
-    events: &Sender<AgentEvent>,
+    events: &SyncSender<AgentEvent>,
 ) {
     let response = json!({
         "jsonrpc": "2.0",
@@ -571,8 +815,11 @@ impl GrokAcpParser {
                     && !text.is_empty()
                 {
                     self.open_message(&mut out);
-                    self.text_acc.push_str(text);
-                    out.push(AgentEvent::TextDelta(text.to_string()));
+                    if let Some(delta) =
+                        append_bounded_text(&mut self.text_acc, text, MAX_MESSAGE_TEXT_BYTES)
+                    {
+                        out.push(AgentEvent::TextDelta(delta));
+                    }
                 }
             }
             Some("agent_thought_chunk") => {
@@ -633,14 +880,14 @@ impl GrokAcpParser {
     }
 
     fn complete_tool(&mut self, update: &Value, id: String) -> Vec<AgentEvent> {
-        if !self.completed_tools.insert(id.clone()) {
-            return Vec::new();
-        }
-        let status = str_field(update, "status").unwrap_or("completed");
         let fallback = self
             .active_tools
             .remove(&id)
             .unwrap_or_else(|| "tool".to_string());
+        if !self.completed_tools.insert(id.clone()) {
+            return Vec::new();
+        }
+        let status = str_field(update, "status").unwrap_or("completed");
         let summary = tool_update_detail(update)
             .filter(|value| !value.is_empty())
             .unwrap_or(fallback);
@@ -659,9 +906,23 @@ impl GrokAcpParser {
         out
     }
 
-    pub fn finish(&mut self) -> Vec<AgentEvent> {
+    pub fn finish(&mut self, cancelled: bool) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         self.close_message(&mut out);
+        let summary = if cancelled {
+            "cancelled"
+        } else {
+            "grok ACP stream ended before tool completion"
+        };
+        for (id, _) in std::mem::take(&mut self.active_tools) {
+            if self.completed_tools.insert(id.clone()) {
+                out.push(AgentEvent::ToolCompleted {
+                    id,
+                    ok: false,
+                    summary: summary.to_string(),
+                });
+            }
+        }
         out
     }
 }
@@ -706,6 +967,60 @@ fn tool_diff_files(update: &Value) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+
+    #[cfg(unix)]
+    fn fake_acp_server(
+        dir: &Path,
+        graceful: bool,
+        linger_after_response: bool,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let server = dir.join("fake-grok-acp");
+        let cancel_log = dir.join("cancel.json");
+        let permission_log = dir.join("permission.json");
+        let eof_log = dir.join("stdin-closed");
+        let mut lines = vec![
+            "#!/bin/sh".to_string(),
+            "IFS= read -r initialize".to_string(),
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"authMethods\":[{\"id\":\"cached_token\"}]}}'".to_string(),
+            "IFS= read -r authenticate".to_string(),
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}'".to_string(),
+            "IFS= read -r session".to_string(),
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"sessionId\":\"fake-session\"}}'".to_string(),
+            "IFS= read -r prompt".to_string(),
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"fake-session\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"ready\"}}}}'".to_string(),
+            "IFS= read -r cancel".to_string(),
+            format!("printf '%s\\n' \"$cancel\" > '{}'", cancel_log.display()),
+        ];
+        if graceful {
+            lines.extend([
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"session/request_permission\",\"params\":{\"toolCall\":{\"kind\":\"execute\"},\"options\":[{\"optionId\":\"yes\",\"kind\":\"allow_once\"},{\"optionId\":\"no\",\"kind\":\"reject_once\"}]}}'".to_string(),
+                "IFS= read -r permission".to_string(),
+                format!(
+                    "printf '%s\\n' \"$permission\" > '{}'",
+                    permission_log.display()
+                ),
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"cancelled\"}}'".to_string(),
+            ]);
+            if linger_after_response {
+                lines.push("sleep 30".to_string());
+            } else {
+                lines.extend([
+                    "if IFS= read -r trailing; then exit 7; fi".to_string(),
+                    format!("printf closed > '{}'", eof_log.display()),
+                ]);
+            }
+        } else {
+            lines.push("sleep 30".to_string());
+        }
+        std::fs::write(&server, lines.join("\n")).unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+        (server, cancel_log, permission_log, eof_log)
+    }
 
     #[test]
     fn command_uses_agent_stdio_with_flags_in_their_required_positions() {
@@ -718,6 +1033,7 @@ mod tests {
         assert_eq!(
             runner.command_args(Some(Effort::Xhigh)),
             vec![
+                "--no-auto-update",
                 "--sandbox",
                 "workspace",
                 "--permission-mode",
@@ -748,6 +1064,291 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_does_not_bypass_an_acp_permission_request() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {"kind": "execute"},
+                "options": [
+                    {"optionId": "yes", "kind": "allow_once"},
+                    {"optionId": "no", "kind": "reject_once"}
+                ]
+            }
+        });
+        let (events, _received) = mpsc::sync_channel(65_536);
+        let mut output = BufWriter::new(Vec::new());
+
+        respond_to_permission(
+            &mut output,
+            &request,
+            Some(PermissionMode::Auto),
+            false,
+            &events,
+        );
+        let response: Value = serde_json::from_slice(output.get_ref()).unwrap();
+
+        assert_eq!(response["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(response["result"]["outcome"]["optionId"], "no");
+    }
+
+    #[test]
+    fn cancellation_sends_notification_and_cancels_permission() {
+        let (output_tx, output) = mpsc::sync_channel(65_536);
+        output_tx
+            .send(Ok(json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "session/request_permission",
+                "params": {
+                    "toolCall": {"kind": "execute"},
+                    "options": [{"optionId": "yes", "kind": "allow_once"}]
+                }
+            })
+            .to_string()))
+            .unwrap();
+        output_tx
+            .send(Ok(
+                json!({"jsonrpc":"2.0","id":4,"result":{"stopReason":"cancelled"}}).to_string(),
+            ))
+            .unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut input = BufWriter::new(Vec::new());
+        let mut parser = GrokAcpParser::default();
+        let (events, _) = mpsc::sync_channel(65_536);
+
+        assert!(process_prompt(
+            &output,
+            &mut input,
+            &mut parser,
+            PromptContext {
+                permission_mode: Some(PermissionMode::BypassPermissions),
+                cancel: &cancel,
+                session_id: "session-1",
+                request_id: 4,
+                events: &events,
+            },
+        ));
+        let messages = String::from_utf8(input.into_inner().unwrap()).unwrap();
+        let messages = messages
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages[0]["method"], "session/cancel");
+        assert_eq!(messages[0]["params"]["sessionId"], "session-1");
+        assert_eq!(messages[1]["id"], 9);
+        assert_eq!(messages[1]["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_acp_server_completes_graceful_cancellation() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-grok-acp-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (server, cancel_log, permission_log, eof_log) = fake_acp_server(&dir, true, false);
+        let member = TeamMember::new("grok", "Grok", BackendKind::Grok, "test");
+        let runner =
+            GrokAcpRunner::from_member(&member, &dir).with_binary(server.display().to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_run = Arc::clone(&cancel);
+        let (events, received) = mpsc::sync_channel(65_536);
+        let handle = thread::spawn(move || {
+            runner.run(
+                RunRequest {
+                    prompt: "wait".to_string(),
+                    session: None,
+                    cancel: cancel_for_run,
+                    effort: None,
+                },
+                events,
+            );
+        });
+
+        loop {
+            match received.recv_timeout(Duration::from_secs(3)).unwrap() {
+                AgentEvent::Reasoning(text) if text == "ready" => {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                AgentEvent::Fatal(message) => panic!("graceful cancellation failed: {message}"),
+                AgentEvent::Exited { ok, .. } => {
+                    assert!(ok, "graceful cancellation must exit successfully");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+
+        let notification: Value =
+            serde_json::from_str(&std::fs::read_to_string(cancel_log).unwrap()).unwrap();
+        let permission: Value =
+            serde_json::from_str(&std::fs::read_to_string(permission_log).unwrap()).unwrap();
+        assert_eq!(notification["method"], "session/cancel");
+        assert_eq!(notification["params"]["sessionId"], "fake-session");
+        assert_eq!(permission["result"]["outcome"]["outcome"], "cancelled");
+        assert!(
+            eof_log.exists(),
+            "the ACP server did not observe stdin closing before exit"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_acp_server_is_killed_after_cancel_timeout() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-grok-acp-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (server, cancel_log, _, _) = fake_acp_server(&dir, false, false);
+        let member = TeamMember::new("grok", "Grok", BackendKind::Grok, "test");
+        let runner =
+            GrokAcpRunner::from_member(&member, &dir).with_binary(server.display().to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_run = Arc::clone(&cancel);
+        let (events, received) = mpsc::sync_channel(65_536);
+        let started = Instant::now();
+        let handle = thread::spawn(move || {
+            runner.run(
+                RunRequest {
+                    prompt: "wait".to_string(),
+                    session: None,
+                    cancel: cancel_for_run,
+                    effort: None,
+                },
+                events,
+            );
+        });
+
+        loop {
+            match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+                AgentEvent::Reasoning(text) if text == "ready" => {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                AgentEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let notification: Value =
+            serde_json::from_str(&std::fs::read_to_string(cancel_log).unwrap()).unwrap();
+        assert_eq!(notification["method"], "session/cancel");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_timeout_still_kills_after_cancelled_response_if_server_ignores_eof() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-grok-acp-eof-timeout-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (server, _, _, _) = fake_acp_server(&dir, true, true);
+        let member = TeamMember::new("grok", "Grok", BackendKind::Grok, "test");
+        let runner =
+            GrokAcpRunner::from_member(&member, &dir).with_binary(server.display().to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_run = Arc::clone(&cancel);
+        let (events, received) = mpsc::sync_channel(65_536);
+        let started = Instant::now();
+        let handle = thread::spawn(move || {
+            runner.run(
+                RunRequest {
+                    prompt: "wait".to_string(),
+                    session: None,
+                    cancel: cancel_for_run,
+                    effort: None,
+                },
+                events,
+            );
+        });
+
+        loop {
+            match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+                AgentEvent::Reasoning(text) if text == "ready" => {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                AgentEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_acp_frame_is_fatal_and_kills_the_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-grok-acp-oversized-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("fake-grok-acp");
+        std::fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\nhead -c {} /dev/zero | tr '\\000' x\nsleep 30\n",
+                MAX_PROTOCOL_LINE_BYTES + 1
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+        let member = TeamMember::new("grok", "Grok", BackendKind::Grok, "test");
+        let runner =
+            GrokAcpRunner::from_member(&member, &dir).with_binary(server.display().to_string());
+        let (events, received) = mpsc::sync_channel(65_536);
+        let handle = thread::spawn(move || {
+            runner.run(
+                RunRequest {
+                    prompt: "wait".to_string(),
+                    session: None,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    effort: None,
+                },
+                events,
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = Vec::new();
+        loop {
+            let event = received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("oversized ACP server did not terminate");
+            let exited = matches!(event, AgentEvent::Exited { .. });
+            observed.push(event);
+            if exited {
+                break;
+            }
+        }
+        handle.join().unwrap();
+
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            AgentEvent::Fatal(message) if message.contains("line exceeded")
+        )));
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Exited { ok: false, .. }))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn parses_text_reasoning_and_tool_lifecycle() {
         let mut parser = GrokAcpParser::default();
         let mut events = Vec::new();
@@ -773,7 +1374,7 @@ mod tests {
             "status": "completed",
             "rawOutput": {"stdout": "ok"}
         })));
-        events.extend(parser.finish());
+        events.extend(parser.finish(false));
 
         assert!(events.contains(&AgentEvent::Reasoning("checking".to_string())));
         assert!(events.contains(&AgentEvent::TextDelta("Done".to_string())));
@@ -806,6 +1407,36 @@ mod tests {
     }
 
     #[test]
+    fn finish_fails_all_active_tools_for_cancel_and_unexpected_end() {
+        let mut cancelled = GrokAcpParser::default();
+        cancelled.parse_update(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "cancelled-tool",
+            "title": "Long command",
+            "status": "in_progress"
+        }));
+        assert!(cancelled.finish(true).iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCompleted { id, ok: false, summary }
+                if id == "cancelled-tool" && summary == "cancelled"
+        )));
+
+        let mut truncated = GrokAcpParser::default();
+        truncated.parse_update(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "truncated-tool",
+            "title": "Interrupted command",
+            "status": "in_progress"
+        }));
+        assert!(truncated.finish(false).iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCompleted { id, ok: false, summary }
+                if id == "truncated-tool" && summary.contains("ended before tool completion")
+        )));
+        assert!(truncated.finish(false).is_empty());
+    }
+
+    #[test]
     fn tool_title_is_used_when_optional_kind_is_absent() {
         let mut parser = GrokAcpParser::default();
         let events = parser.parse_update(&json!({
@@ -819,5 +1450,90 @@ mod tests {
             event,
             AgentEvent::ToolStarted { name, .. } if name == "read_file"
         )));
+    }
+
+    #[test]
+    fn initialize_capability_controls_session_loading() {
+        assert!(supports_load_session(&json!({
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {"loadSession": true}
+            }
+        })));
+        assert!(!supports_load_session(&json!({
+            "result": {"protocolVersion": 1, "agentCapabilities": {}}
+        })));
+    }
+
+    #[test]
+    fn authentication_prefers_api_key_then_cached_token() {
+        let response = json!({
+            "result": {
+                "authMethods": [
+                    {"id": "cached_token"},
+                    {"id": "xai.api_key"}
+                ]
+            }
+        });
+
+        assert_eq!(select_auth_method(&response, true), Some("xai.api_key"));
+        assert_eq!(select_auth_method(&response, false), Some("cached_token"));
+        assert_eq!(
+            select_auth_method(
+                &json!({"result": {"authMethods": [{"id": "interactive"}]}}),
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_stop_reason_must_represent_completion() {
+        let (successful_tx, successful_output) = mpsc::sync_channel(65_536);
+        successful_tx
+            .send(Ok(
+                json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}).to_string(),
+            ))
+            .unwrap();
+        let mut input = BufWriter::new(Vec::new());
+        let mut parser = GrokAcpParser::default();
+        let (events, _) = mpsc::sync_channel(65_536);
+        assert!(process_prompt(
+            &successful_output,
+            &mut input,
+            &mut parser,
+            PromptContext {
+                permission_mode: None,
+                cancel: &AtomicBool::new(false),
+                session_id: "session-1",
+                request_id: 3,
+                events: &events,
+            },
+        ));
+
+        let (incomplete_tx, incomplete_output) = mpsc::sync_channel(65_536);
+        incomplete_tx
+            .send(Ok(
+                json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"max_tokens"}}).to_string(),
+            ))
+            .unwrap();
+        let (events, received) = mpsc::sync_channel(65_536);
+        assert!(!process_prompt(
+            &incomplete_output,
+            &mut input,
+            &mut parser,
+            PromptContext {
+                permission_mode: None,
+                cancel: &AtomicBool::new(false),
+                session_id: "session-1",
+                request_id: 3,
+                events: &events,
+            },
+        ));
+        assert!(matches!(received.recv().unwrap(), AgentEvent::Raw(_)));
+        assert!(matches!(
+            received.recv().unwrap(),
+            AgentEvent::Fatal(message) if message.contains("max_tokens")
+        ));
     }
 }

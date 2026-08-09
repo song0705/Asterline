@@ -9,7 +9,11 @@ use std::{
 
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
+use crate::adapter::process::ChildProcessTree;
+use crate::domain::config::resolve_binary_on_path;
+
 const DEFAULT_PTY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PTY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CliPtySize {
@@ -87,12 +91,14 @@ impl std::error::Error for CliPtyError {}
 #[derive(Debug, Default)]
 struct SessionOutput {
     bytes: Vec<u8>,
+    dropped_bytes: usize,
     read_error: Option<String>,
 }
 
 pub struct CliPtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+    process_tree: ChildProcessTree,
     writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<SessionOutput>>,
     reader_thread: Option<thread::JoinHandle<()>>,
@@ -200,16 +206,28 @@ impl CliPtyAdapter {
             .openpty(self.size.into())
             .map_err(|err| CliPtyError::OpenPty(err.to_string()))?;
 
-        let mut command = CommandBuilder::new(&self.program);
+        let resolved_program =
+            resolve_binary_on_path(&self.program).unwrap_or_else(|| PathBuf::from(&self.program));
+        let mut command = CommandBuilder::new(resolved_program);
         for arg in &self.args {
             command.arg(arg);
         }
         command.cwd(&self.cwd);
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(command)
             .map_err(|err| CliPtyError::Spawn(err.to_string()))?;
+        let process_tree = match ChildProcessTree::attach_pty(child.as_ref()) {
+            Ok(process_tree) => process_tree,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CliPtyError::Spawn(format!(
+                    "could not isolate PTY process tree: {err}"
+                )));
+            }
+        };
         drop(pair.slave);
 
         let reader = pair
@@ -223,6 +241,7 @@ impl CliPtyAdapter {
         let mut session = CliPtySession {
             master: Some(pair.master),
             child,
+            process_tree,
             writer: None,
             output,
             reader_thread: Some(reader_thread),
@@ -278,9 +297,7 @@ impl CliPtySession {
             return Err(CliPtyError::Read(error.clone()));
         }
 
-        let drained = String::from_utf8_lossy(&output.bytes).to_string();
-        output.bytes.clear();
-        Ok(drained)
+        Ok(take_buffered_output(&mut output))
     }
 
     pub fn try_wait(&mut self) -> Result<Option<CliPtySessionStatus>, CliPtyError> {
@@ -294,7 +311,7 @@ impl CliPtySession {
         let status = match wait_with_timeout(self.child.as_mut(), timeout) {
             Ok(status) => status,
             Err(CliPtyError::TimedOut { after_ms, .. }) => {
-                let _ = self.child.kill();
+                self.terminate_process_tree();
                 let _ = self.child.wait();
                 let raw_output = self.close_and_take_output()?;
 
@@ -316,7 +333,7 @@ impl CliPtySession {
     }
 
     pub fn stop(&mut self) -> Result<CliPtyRun, CliPtyError> {
-        let _ = self.child.kill();
+        self.terminate_process_tree();
         let status = self
             .child
             .wait()
@@ -340,11 +357,17 @@ impl CliPtySession {
         }
         self.drain_output()
     }
+
+    fn terminate_process_tree(&mut self) {
+        if self.process_tree.terminate().is_err() {
+            let _ = self.child.kill();
+        }
+    }
 }
 
 impl Drop for CliPtySession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        self.terminate_process_tree();
         let _ = self.child.wait();
         self.writer.take();
         self.master.take();
@@ -393,12 +416,12 @@ fn read_pty_into_buffer(mut reader: Box<dyn Read + Send>, output: Arc<Mutex<Sess
             Ok(0) => break,
             Ok(n) => {
                 if let Ok(mut output) = output.lock() {
-                    output.bytes.extend_from_slice(&buffer[..n]);
+                    append_pty_output(&mut output, &buffer[..n]);
                 } else {
                     break;
                 }
             }
-            Err(err) if err.raw_os_error() == Some(5) => break,
+            Err(err) if is_pty_eof_error(&err) => break,
             Err(err) => {
                 if let Ok(mut output) = output.lock() {
                     output.read_error = Some(err.to_string());
@@ -407,6 +430,41 @@ fn read_pty_into_buffer(mut reader: Box<dyn Read + Send>, output: Arc<Mutex<Sess
             }
         }
     }
+}
+
+fn append_pty_output(output: &mut SessionOutput, bytes: &[u8]) {
+    let remaining = MAX_PTY_BUFFER_BYTES.saturating_sub(output.bytes.len());
+    let retained = remaining.min(bytes.len());
+    output.bytes.extend_from_slice(&bytes[..retained]);
+    output.dropped_bytes = output
+        .dropped_bytes
+        .saturating_add(bytes.len().saturating_sub(retained));
+}
+
+fn take_buffered_output(output: &mut SessionOutput) -> String {
+    let mut bytes = std::mem::take(&mut output.bytes);
+    let dropped = std::mem::take(&mut output.dropped_bytes);
+    if dropped > 0 {
+        bytes.extend_from_slice(
+            format!("\n[asterline: PTY output truncated; dropped {dropped} bytes]\n").as_bytes(),
+        );
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(unix)]
+fn is_pty_eof_error(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EIO)
+}
+
+#[cfg(windows)]
+fn is_pty_eof_error(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_pty_eof_error(_err: &std::io::Error) -> bool {
+    false
 }
 
 fn session_status(status: ExitStatus) -> CliPtySessionStatus {
@@ -429,6 +487,22 @@ mod tests {
         assert_eq!(codex.args(), Vec::<String>::new());
         assert_eq!(codex.cwd(), Path::new("/tmp/project"));
         assert_eq!(claude.program(), "claude");
+    }
+
+    #[test]
+    fn unread_pty_output_is_bounded_and_reports_dropped_bytes() {
+        let mut output = SessionOutput::default();
+        append_pty_output(&mut output, &vec![b'x'; MAX_PTY_BUFFER_BYTES + 17]);
+
+        assert_eq!(output.bytes.len(), MAX_PTY_BUFFER_BYTES);
+        assert_eq!(output.dropped_bytes, 17);
+        let drained = take_buffered_output(&mut output);
+        assert!(drained.contains("PTY output truncated; dropped 17 bytes"));
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.dropped_bytes, 0);
+
+        append_pty_output(&mut output, b"next");
+        assert_eq!(take_buffered_output(&mut output), "next");
     }
 
     #[cfg(unix)]
@@ -552,6 +626,54 @@ mod tests {
         let run = session.stop().expect("session should stop");
 
         assert!(!run.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_stop_terminates_descendants() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-pty-tree-stop-{}", std::process::id()));
+        let survivor = dir.join("survived");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = CliPtyAdapter::new("/bin/sh", "/tmp")
+            .with_args([
+                "-lc".to_string(),
+                format!(
+                    "(sleep 0.3; printf survived > '{}') & printf 'ready\\n'; wait",
+                    survivor.display()
+                ),
+            ])
+            .spawn_session()
+            .expect("PTY session should start");
+
+        assert!(wait_for_session_output(&session, "ready").contains("ready"));
+        let _ = session.stop().expect("session should stop");
+        thread::sleep(Duration::from_millis(450));
+
+        assert!(!survivor.exists(), "a stopped PTY descendant survived");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_eio_is_treated_as_pty_eof() {
+        assert!(is_pty_eof_error(&std::io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_only_treats_broken_pipe_as_pty_eof() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE};
+
+        assert!(is_pty_eof_error(&std::io::Error::from_raw_os_error(
+            ERROR_BROKEN_PIPE as i32
+        )));
+        assert!(!is_pty_eof_error(&std::io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32
+        )));
     }
 
     #[cfg(unix)]

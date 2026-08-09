@@ -12,15 +12,18 @@ Before a prompt reaches a backend process, Asterline classifies it against the
 the dispatch until you `/approve` or `/reject` it. The gate covers three
 surfaces:
 
-| Surface | What is gated                                                       |
-| ------- | ------------------------------------------------------------------- |
-| `user`  | Messages you type (`@member …`, `/ask …`)                           |
-| `relay` | Automatic agent-to-agent handoffs (`@@team_message` routes)         |
-| `mode`  | Engine dispatches inside selected collaboration-mode runs           |
+| Surface | What is gated                                             |
+| ------- | --------------------------------------------------------- |
+| `user`  | Messages you type (`@member …`, `/ask …`)                 |
+| `relay` | Agent handoffs and agent-requested roster additions       |
+| `mode`  | Engine dispatches inside selected collaboration-mode runs |
 
 Rejecting a gated mode dispatch blocks the run (resume later with `/continue`).
 A route resumed explicitly with `/retry` is not re-gated: the resume itself is
-your decision. `--debug` disables this layer entirely.
+your decision. An `@@team_member` request is always held when the `relay`
+surface is enabled, regardless of prompt keyword categories, because it can
+change backend, model, working-directory, sandbox, and permission settings.
+`--debug` disables this layer entirely.
 
 The gate classifies **prompts**, not tool calls: it decides whether an
 instruction may start, not what a running agent may execute.
@@ -46,13 +49,16 @@ We verified the Claude control protocol on claude 2.1.207 (2026-07): in
 headless `--print --input-format stream-json` mode, a Bash tool call executes
 according to the CLI's own permission configuration and **no
 `control_request` / `can_use_tool` round-trip is offered** — even under
-`--permission-mode manual` — and the former `--permission-prompt-tool` flag no
-longer exists. Codex `exec` is likewise non-interactive by design.
+`--permission-mode manual`. Claude still offers `--permission-prompt-tool` for
+an MCP-based permission callback, but Asterline does not configure that bridge.
+Codex `exec` is likewise non-interactive by design.
 
 Grok is different: Asterline uses its bidirectional ACP server and answers
-`session/request_permission` callbacks. `auto` and `bypassPermissions` allow
-requests, `acceptEdits` allows edit/delete/move requests, and
-`default`/`dontAsk`/`plan` reject requests that reach the client. These are
+`session/request_permission` callbacks. `bypassPermissions` allows requests,
+`acceptEdits` allows edit/delete/move requests, and
+`default`/`dontAsk`/`plan` reject requests that reach the client. In `auto`
+mode Grok handles safe operations itself; a request that still reaches the
+client is rejected instead of being silently elevated. These are
 automatic policy responses, not a modal user prompt. The structured ACP stream
 also carries Grok tool starts, progress, completion, diffs, and thought chunks.
 

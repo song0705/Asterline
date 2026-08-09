@@ -8,6 +8,7 @@
 
 use std::cell::Cell;
 use std::path::Path;
+use std::time::Duration;
 use std::{io, result};
 
 use rusqlite::types::Type;
@@ -19,7 +20,7 @@ use crate::domain::event::{
     LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId, RunStatus, RunStepStatus,
     RunStepSummary, RunSummary, RunVerification, TurnId,
 };
-use crate::domain::mode::{CollabMode, ModeStatusSummary};
+use crate::domain::mode::{CollabMode, ModeStatusSummary, TerminalMode};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
@@ -46,6 +47,7 @@ pub struct StoredConversationSession {
 pub struct ConversationSnapshot {
     pub team: TeamConfig,
     pub sessions: Vec<StoredConversationSession>,
+    pub mode: TerminalMode,
 }
 
 #[derive(Debug)]
@@ -76,8 +78,23 @@ impl SqliteStore {
     }
 
     fn initialize(&self) -> Result<()> {
-        self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        // Another Asterline process (or an external SQLite reader) may hold a
+        // short write lock. Wait for it instead of failing the runtime on the
+        // first SQLITE_BUSY response.
+        self.conn.busy_timeout(Duration::from_secs(5))?;
+        self.conn
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         self.create_schema()
+    }
+
+    /// Run one compound mutation atomically. `unchecked_transaction` accepts
+    /// `&self`; SqliteStore is owned by the single runtime thread, so nested
+    /// transactions cannot occur through the public runtime path.
+    fn transactional<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let value = op()?;
+        transaction.commit()?;
+        Ok(value)
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -125,6 +142,7 @@ impl SqliteStore {
                 conversation_id INTEGER PRIMARY KEY,
                 team_json       TEXT NOT NULL,
                 sessions_json   TEXT NOT NULL,
+                mode            TEXT NOT NULL DEFAULT 'normal',
                 updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id)
             );
@@ -154,6 +172,7 @@ impl SqliteStore {
 
             CREATE TABLE IF NOT EXISTS approvals (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL DEFAULT 0,
                 turn_id    INTEGER,
                 member_id  TEXT,
                 action     TEXT NOT NULL,
@@ -215,15 +234,67 @@ impl SqliteStore {
                 ON run_steps (run_id, position);
             "#,
         )?;
-        let columns = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(runs)")?;
-            stmt.query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>>>()?
-        };
-        if !columns.iter().any(|column| column == "conversation_id") {
+        let migrate_runs = !self.has_column("runs", "conversation_id")?;
+        let migrate_approvals = !self.has_column("approvals", "conversation_id")?;
+        // Repair conversation_id = 0 every time, not only while adding the
+        // column. Older builds could have completed the column migration but
+        // left those legacy rows permanently outside every conversation.
+        self.transactional(|| {
+            if migrate_runs {
+                self.conn.execute(
+                    "ALTER TABLE runs
+                     ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if migrate_approvals {
+                self.conn.execute(
+                    "ALTER TABLE approvals
+                     ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
             self.conn.execute(
-                "ALTER TABLE runs
-                 ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0",
+                "INSERT INTO conversations (created_at)
+                 SELECT CURRENT_TIMESTAMP
+                 WHERE NOT EXISTS (SELECT 1 FROM conversations)
+                   AND (EXISTS (SELECT 1 FROM runs WHERE conversation_id = 0)
+                        OR EXISTS (SELECT 1 FROM approvals WHERE conversation_id = 0))",
+                [],
+            )?;
+            let active_conversation = "COALESCE(
+                    (SELECT c.id
+                       FROM runtime_state s
+                       JOIN conversations c ON c.id = CAST(s.value AS INTEGER)
+                      WHERE s.key = 'active_conversation'),
+                    (SELECT id FROM conversations ORDER BY id DESC LIMIT 1),
+                    0
+                )";
+            self.conn.execute(
+                &format!(
+                    "UPDATE runs SET conversation_id = {active_conversation}
+                     WHERE conversation_id = 0"
+                ),
+                [],
+            )?;
+            self.conn.execute(
+                &format!(
+                    "UPDATE approvals
+                     SET conversation_id = {active_conversation},
+                         decision = CASE
+                             WHEN decision = 'pending' THEN 'rejected'
+                             ELSE decision
+                         END
+                     WHERE conversation_id = 0"
+                ),
+                [],
+            )?;
+            Ok(())
+        })?;
+        if !self.has_column("conversation_snapshots", "mode")? {
+            self.conn.execute(
+                "ALTER TABLE conversation_snapshots
+                 ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'",
                 [],
             )?;
         }
@@ -232,7 +303,20 @@ impl SqliteStore {
              ON runs (conversation_id, id)",
             [],
         )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS approvals_conversation_idx
+             ON approvals (conversation_id, id)",
+            [],
+        )?;
         Ok(())
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(columns.iter().any(|name| name == column))
     }
 
     // --- roster snapshot -------------------------------------------------
@@ -240,6 +324,10 @@ impl SqliteStore {
     /// Persist a snapshot of the team roster (for inspection; the in-memory
     /// config remains the source of truth).
     pub fn upsert_team(&self, config: &TeamConfig) -> Result<()> {
+        self.transactional(|| self.replace_team_rows(config))
+    }
+
+    fn replace_team_rows(&self, config: &TeamConfig) -> Result<()> {
         self.conn.execute("DELETE FROM team_members", [])?;
         self.conn.execute("DELETE FROM teams", [])?;
         self.conn.execute(
@@ -458,6 +546,7 @@ impl SqliteStore {
             )
             .optional()?;
         if let Some(id) = selected {
+            self.conversation.set(id);
             return Ok(id);
         }
         let latest: Option<i64> = self
@@ -469,8 +558,11 @@ impl SqliteStore {
             )
             .optional()?;
         match latest {
-            Some(id) => Ok(id),
-            None => self.create_conversation(),
+            Some(id) => {
+                self.set_conversation(id)?;
+                Ok(id)
+            }
+            None => self.create_and_set_conversation(),
         }
     }
 
@@ -481,15 +573,40 @@ impl SqliteStore {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Set the conversation new rows are written to / replayed from.
-    pub fn set_conversation(&self, id: i64) {
+    /// Create and select a conversation as one durable mutation.
+    pub fn create_and_set_conversation(&self) -> Result<i64> {
+        let id = self.transactional(|| {
+            self.conn
+                .execute("INSERT INTO conversations DEFAULT VALUES", [])?;
+            let id = self.conn.last_insert_rowid();
+            self.write_active_conversation(id)?;
+            Ok(id)
+        })?;
         self.conversation.set(id);
-        let _ = self.conn.execute(
+        Ok(id)
+    }
+
+    /// Set the conversation new rows are written to / replayed from.
+    pub fn set_conversation(&self, id: i64) -> Result<()> {
+        self.write_active_conversation(id)?;
+        self.conversation.set(id);
+        Ok(())
+    }
+
+    fn write_active_conversation(&self, id: i64) -> Result<()> {
+        let updated = self.conn.execute(
             "INSERT INTO runtime_state (key, value)
-             VALUES ('active_conversation', ?1)
+             SELECT 'active_conversation', CAST(id AS TEXT)
+             FROM conversations
+             WHERE id = ?1
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![id.to_string()],
-        );
+            params![id],
+        )?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
     }
 
     pub fn active_conversation(&self) -> i64 {
@@ -501,43 +618,112 @@ impl SqliteStore {
         &self,
         team: &TeamConfig,
         sessions: &[StoredConversationSession],
+        mode: TerminalMode,
     ) -> Result<()> {
-        let team_json = serde_json::to_string(team)
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-        let sessions_json = serde_json::to_string(sessions)
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let (team_json, sessions_json) = serialize_conversation_snapshot(team, sessions)?;
+        self.write_conversation_snapshot(
+            self.active_conversation(),
+            &team_json,
+            &sessions_json,
+            mode,
+        )
+    }
+
+    fn write_conversation_snapshot(
+        &self,
+        conversation: i64,
+        team_json: &str,
+        sessions_json: &str,
+        mode: TerminalMode,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO conversation_snapshots
-                (conversation_id, team_json, sessions_json, updated_at)
-             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+                (conversation_id, team_json, sessions_json, mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
              ON CONFLICT(conversation_id) DO UPDATE SET
                 team_json = excluded.team_json,
                 sessions_json = excluded.sessions_json,
+                mode = excluded.mode,
                 updated_at = CURRENT_TIMESTAMP",
-            params![self.conversation.get(), team_json, sessions_json],
+            params![conversation, team_json, sessions_json, mode.as_str()],
         )?;
         Ok(())
     }
 
+    /// Atomically persist the SQLite side of a live roster replacement.
+    pub fn replace_runtime_team_state(
+        &self,
+        roster: &TeamConfig,
+        snapshot_team: &TeamConfig,
+        sessions: &[StoredConversationSession],
+        mode: TerminalMode,
+        approvals_to_reject: &[ApprovalId],
+    ) -> Result<()> {
+        let (team_json, sessions_json) = serialize_conversation_snapshot(snapshot_team, sessions)?;
+        self.transactional(|| {
+            self.reject_pending_approval_rows(approvals_to_reject)?;
+            self.replace_team_rows(roster)?;
+            self.replace_session_rows(sessions)?;
+            self.write_conversation_snapshot(
+                self.active_conversation(),
+                &team_json,
+                &sessions_json,
+                mode,
+            )
+        })
+    }
+
+    /// Atomically activate a restored conversation and all of its live state.
+    pub fn activate_runtime_team_state(
+        &self,
+        conversation: i64,
+        roster: &TeamConfig,
+        snapshot_team: &TeamConfig,
+        sessions: &[StoredConversationSession],
+        mode: TerminalMode,
+    ) -> Result<usize> {
+        let (team_json, sessions_json) = serialize_conversation_snapshot(snapshot_team, sessions)?;
+        let rejected = self.transactional(|| {
+            self.write_active_conversation(conversation)?;
+            let rejected = self.conn.execute(
+                "UPDATE approvals
+                 SET decision = 'rejected'
+                 WHERE conversation_id = ?1 AND decision = 'pending'",
+                params![conversation],
+            )?;
+            self.replace_team_rows(roster)?;
+            self.replace_session_rows(sessions)?;
+            self.write_conversation_snapshot(conversation, &team_json, &sessions_json, mode)?;
+            Ok(rejected)
+        })?;
+        self.conversation.set(conversation);
+        Ok(rejected)
+    }
+
     /// Load the roster and native backend sessions saved with one chat.
     pub fn conversation_snapshot(&self, conversation: i64) -> Result<Option<ConversationSnapshot>> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, String)> = self
             .conn
             .query_row(
-                "SELECT team_json, sessions_json
+                "SELECT team_json, sessions_json, mode
                  FROM conversation_snapshots WHERE conversation_id = ?1",
                 params![conversation],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        row.map(|(team_json, sessions_json)| {
+        row.map(|(team_json, sessions_json, mode)| {
             let team = serde_json::from_str(&team_json).map_err(|err| {
                 rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(err))
             })?;
             let sessions = serde_json::from_str(&sessions_json).map_err(|err| {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(err))
             })?;
-            Ok(ConversationSnapshot { team, sessions })
+            let mode = TerminalMode::parse(&mode).unwrap_or_default();
+            Ok(ConversationSnapshot {
+                team,
+                sessions,
+                mode,
+            })
         })
         .transpose()
     }
@@ -663,6 +849,25 @@ impl SqliteStore {
             .map(|opt| opt.map(AgentSessionId))
     }
 
+    /// Load a resumable session only when it belongs to the member's current
+    /// backend. Native session ids are backend-scoped and must not cross an
+    /// adapter change that reused the same member id.
+    pub fn session_for_backend(
+        &self,
+        member: &MemberId,
+        backend: BackendKind,
+    ) -> Result<Option<AgentSessionId>> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM agent_sessions
+                 WHERE member_id = ?1 AND backend = ?2",
+                params![member.as_str(), backend.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|opt| opt.map(AgentSessionId))
+    }
+
     /// Forget a member's resumable session so the next run starts fresh.
     pub fn delete_session(&self, member: &MemberId) -> Result<()> {
         self.conn.execute(
@@ -677,6 +882,22 @@ impl SqliteStore {
         Ok(())
     }
 
+    fn replace_session_rows(&self, sessions: &[StoredConversationSession]) -> Result<()> {
+        self.conn.execute("DELETE FROM agent_sessions", [])?;
+        for session in sessions {
+            self.conn.execute(
+                "INSERT INTO agent_sessions (member_id, backend, session_id, updated_at)
+                 VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+                params![
+                    session.member.as_str(),
+                    session.backend.as_str(),
+                    session.session_id
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     // --- approvals -------------------------------------------------------
 
     pub fn insert_approval(
@@ -687,9 +908,11 @@ impl SqliteStore {
         body: &str,
     ) -> Result<ApprovalId> {
         self.conn.execute(
-            "INSERT INTO approvals (turn_id, member_id, action, body, decision)
-             VALUES (?1, ?2, ?3, ?4, 'pending')",
+            "INSERT INTO approvals (
+                 conversation_id, turn_id, member_id, action, body, decision
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
             params![
+                self.active_conversation(),
                 turn.map(|t| t.0 as i64),
                 member.map(MemberId::as_str),
                 action,
@@ -702,16 +925,53 @@ impl SqliteStore {
     pub fn pending_approvals(&self) -> Result<Vec<StoredApproval>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, turn_id, member_id, action, body, decision
-             FROM approvals WHERE decision = 'pending' ORDER BY id ASC",
+             FROM approvals
+             WHERE conversation_id = ?1 AND decision = 'pending'
+             ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map([], map_approval)?;
+        let rows = stmt.query_map(params![self.active_conversation()], map_approval)?;
         rows.collect()
+    }
+
+    /// Pending approvals cannot be resumed after a process restart because the
+    /// in-memory dispatch context (targets and wrapped prompts) is gone. Reject
+    /// them explicitly so they do not remain actionable-looking orphan rows.
+    pub fn reject_pending_approvals_for_active_conversation(&self) -> Result<usize> {
+        self.conn.execute(
+            "UPDATE approvals
+             SET decision = 'rejected'
+             WHERE conversation_id = ?1 AND decision = 'pending'",
+            params![self.active_conversation()],
+        )
+    }
+
+    /// Atomically reject a known set of pending approvals in the active chat.
+    pub fn reject_pending_approvals(&self, ids: &[ApprovalId]) -> Result<usize> {
+        self.transactional(|| self.reject_pending_approval_rows(ids))
+    }
+
+    fn reject_pending_approval_rows(&self, ids: &[ApprovalId]) -> Result<usize> {
+        let mut updated = 0;
+        for id in ids {
+            updated += self.conn.execute(
+                "UPDATE approvals
+                 SET decision = 'rejected'
+                 WHERE id = ?1 AND conversation_id = ?2 AND decision = 'pending'",
+                params![id.0 as i64, self.active_conversation()],
+            )?;
+        }
+        if updated != ids.len() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(updated)
     }
 
     pub fn resolve_approval(&self, id: ApprovalId, decision: ApprovalDecision) -> Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE approvals SET decision = ?1 WHERE id = ?2 AND decision = 'pending'",
-            params![decision.as_str(), id.0 as i64],
+            "UPDATE approvals
+             SET decision = ?1
+             WHERE id = ?2 AND conversation_id = ?3 AND decision = 'pending'",
+            params![decision.as_str(), id.0 as i64, self.active_conversation()],
         )?;
         Ok(updated == 1)
     }
@@ -719,18 +979,21 @@ impl SqliteStore {
     // --- runs ---------------------------------------------------
 
     pub fn create_run(&self, goal: &str, coordinator: Option<&MemberId>) -> Result<RunSummary> {
-        self.conn.execute(
-            "INSERT INTO runs (conversation_id, goal, status, coordinator)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                self.active_conversation(),
-                goal,
-                RunStatus::Running.as_str(),
-                coordinator.map(MemberId::as_str)
-            ],
-        )?;
-        let id = RunId(self.conn.last_insert_rowid() as u64);
-        self.record_run_event(id, "started", "Started run", Some(goal))?;
+        let id = self.transactional(|| {
+            self.conn.execute(
+                "INSERT INTO runs (conversation_id, goal, status, coordinator)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    self.active_conversation(),
+                    goal,
+                    RunStatus::Running.as_str(),
+                    coordinator.map(MemberId::as_str)
+                ],
+            )?;
+            let id = RunId(self.conn.last_insert_rowid() as u64);
+            self.record_run_event(id, "started", "Started run", Some(goal))?;
+            Ok(id)
+        })?;
         self.run(id)
     }
 
@@ -742,21 +1005,24 @@ impl SqliteStore {
         mode: CollabMode,
         mode_state: &str,
     ) -> Result<RunSummary> {
-        self.conn.execute(
-            "INSERT INTO runs
-                (conversation_id, goal, status, coordinator, mode, mode_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                self.active_conversation(),
-                goal,
-                RunStatus::Running.as_str(),
-                coordinator.map(MemberId::as_str),
-                mode.as_str(),
-                mode_state
-            ],
-        )?;
-        let id = RunId(self.conn.last_insert_rowid() as u64);
-        self.record_run_event(id, "started", "Started run", Some(goal))?;
+        let id = self.transactional(|| {
+            self.conn.execute(
+                "INSERT INTO runs
+                    (conversation_id, goal, status, coordinator, mode, mode_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    self.active_conversation(),
+                    goal,
+                    RunStatus::Running.as_str(),
+                    coordinator.map(MemberId::as_str),
+                    mode.as_str(),
+                    mode_state
+                ],
+            )?;
+            let id = RunId(self.conn.last_insert_rowid() as u64);
+            self.record_run_event(id, "started", "Started run", Some(goal))?;
+            Ok(id)
+        })?;
         self.run(id)
     }
 
@@ -789,6 +1055,7 @@ impl SqliteStore {
 
     /// Persist an updated `mode_state` blob without recording a timeline event.
     pub fn update_run_mode_state(&self, id: RunId, mode_state: &str) -> Result<RunSummary> {
+        self.ensure_active_run(id)?;
         self.conn.execute(
             "UPDATE runs SET mode_state = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![mode_state, id.0 as i64],
@@ -800,8 +1067,8 @@ impl SqliteStore {
     pub fn run_mode_state(&self, id: RunId) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT mode_state FROM runs WHERE id = ?1",
-                params![id.0 as i64],
+                "SELECT mode_state FROM runs WHERE id = ?1 AND conversation_id = ?2",
+                params![id.0 as i64, self.active_conversation()],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()
@@ -810,6 +1077,7 @@ impl SqliteStore {
 
     /// Record a verdict on a mode run's event timeline.
     pub fn record_run_verdict_event(&self, id: RunId, approve: bool, summary: &str) -> Result<()> {
+        self.ensure_active_run(id)?;
         let title = if approve {
             "Review approved"
         } else {
@@ -830,6 +1098,7 @@ impl SqliteStore {
         voter: &MemberId,
         ranked: &[String],
     ) -> Result<()> {
+        self.ensure_active_run(id)?;
         self.record_run_event(
             id,
             "vote",
@@ -854,12 +1123,15 @@ impl SqliteStore {
     }
 
     pub fn update_run_status(&self, id: RunId, status: RunStatus) -> Result<RunSummary> {
-        self.conn.execute(
-            "UPDATE runs SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-            params![status.as_str(), id.0 as i64],
-        )?;
-        let (kind, title) = run_status_event(status);
-        self.record_run_event(id, kind, title, None)?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.conn.execute(
+                "UPDATE runs SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                params![status.as_str(), id.0 as i64],
+            )?;
+            let (kind, title) = run_status_event(status);
+            self.record_run_event(id, kind, title, None)
+        })?;
         self.run(id)
     }
 
@@ -870,77 +1142,117 @@ impl SqliteStore {
         ok: bool,
         summary: &str,
     ) -> Result<RunSummary> {
-        self.conn.execute(
-            "UPDATE runs
-             SET status = ?1,
-                 verification_command = ?2,
-                 verification_ok = ?3,
-                 verification_summary = ?4,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?5",
-            params![
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.conn.execute(
+                "UPDATE runs
+                 SET status = ?1,
+                     verification_command = ?2,
+                     verification_ok = ?3,
+                     verification_summary = ?4,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?5",
+                params![
+                    if ok {
+                        RunStatus::Done.as_str()
+                    } else {
+                        RunStatus::Failed.as_str()
+                    },
+                    command,
+                    ok as i64,
+                    summary,
+                    id.0 as i64
+                ],
+            )?;
+            self.record_run_event(
+                id,
                 if ok {
-                    RunStatus::Done.as_str()
+                    "verification_passed"
                 } else {
-                    RunStatus::Failed.as_str()
+                    "verification_failed"
                 },
-                command,
-                ok as i64,
-                summary,
-                id.0 as i64
-            ],
-        )?;
-        self.record_run_event(
-            id,
-            if ok {
-                "verification_passed"
-            } else {
-                "verification_failed"
-            },
-            if ok {
-                "Verification passed"
-            } else {
-                "Verification failed"
-            },
-            Some(&format!("{command}\n{summary}")),
-        )?;
+                if ok {
+                    "Verification passed"
+                } else {
+                    "Verification failed"
+                },
+                Some(&format!("{command}\n{summary}")),
+            )
+        })?;
+        self.run(id)
+    }
+
+    pub fn cancel_run_verification(
+        &self,
+        id: RunId,
+        command: &str,
+        summary: &str,
+    ) -> Result<RunSummary> {
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.conn.execute(
+                "UPDATE runs
+                 SET status = ?1,
+                     verification_command = ?2,
+                     verification_ok = 0,
+                     verification_summary = ?3,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?4",
+                params![RunStatus::Blocked.as_str(), command, summary, id.0 as i64],
+            )?;
+            self.record_run_event(
+                id,
+                "verification_cancelled",
+                "Verification cancelled",
+                Some(&format!("{command}\n{summary}")),
+            )
+        })?;
         self.run(id)
     }
 
     pub fn continue_run(&self, id: RunId, note: Option<&str>) -> Result<RunSummary> {
-        self.conn.execute(
-            "UPDATE runs
-             SET status = ?1,
-                 attempt = attempt + 1,
-                 verification_command = NULL,
-                 verification_ok = NULL,
-                 verification_summary = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?2",
-            params![RunStatus::Running.as_str(), id.0 as i64],
-        )?;
-        self.record_run_event(id, "continued", "Continued run", note)?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.conn.execute(
+                "UPDATE runs
+                 SET status = ?1,
+                     attempt = attempt + 1,
+                     verification_command = NULL,
+                     verification_ok = NULL,
+                     verification_summary = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2",
+                params![RunStatus::Running.as_str(), id.0 as i64],
+            )?;
+            self.record_run_event(id, "continued", "Continued run", note)
+        })?;
         self.run(id)
     }
 
     pub fn add_run_note(&self, id: RunId, note: &str) -> Result<RunSummary> {
-        self.conn.execute(
-            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id.0 as i64],
-        )?;
-        self.record_run_event(id, "note", "User note", Some(note))?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.conn.execute(
+                "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id.0 as i64],
+            )?;
+            self.record_run_event(id, "note", "User note", Some(note))
+        })?;
         self.run(id)
     }
 
     pub fn block_run(&self, id: RunId, reason: &str) -> Result<RunSummary> {
-        self.conn.execute(
-            "UPDATE runs
-             SET status = ?1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?2",
-            params![RunStatus::Blocked.as_str(), id.0 as i64],
-        )?;
-        self.record_run_event(id, "blocked", "Run blocked", Some(reason))?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.conn.execute(
+                "UPDATE runs
+                 SET status = ?1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2",
+                params![RunStatus::Blocked.as_str(), id.0 as i64],
+            )?;
+            self.record_run_event(id, "blocked", "Run blocked", Some(reason))
+        })?;
         self.run(id)
     }
 
@@ -950,38 +1262,41 @@ impl SqliteStore {
         owner: Option<&MemberId>,
         title: &str,
     ) -> Result<RunSummary> {
-        let inserted = self.conn.execute(
-            "INSERT INTO run_steps (run_id, position, status, owner, title)
-             SELECT id,
-                    (
-                        SELECT COALESCE(MAX(position), 0) + 1
-                          FROM run_steps
-                         WHERE run_id = ?1
-                    ),
-                    ?2,
-                    ?3,
-                    ?4
-              FROM runs
-             WHERE id = ?1",
-            params![
-                id.0 as i64,
-                RunStepStatus::Todo.as_str(),
-                owner.map(MemberId::as_str),
-                title
-            ],
-        )?;
-        if inserted == 0 {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
-        }
-        self.conn.execute(
-            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id.0 as i64],
-        )?;
         let detail = match owner {
             Some(owner) => format!("@{owner}: {title}"),
             None => title.to_string(),
         };
-        self.record_run_event(id, "step_added", "Step added", Some(&detail))?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            let inserted = self.conn.execute(
+                "INSERT INTO run_steps (run_id, position, status, owner, title)
+                 SELECT id,
+                        (
+                            SELECT COALESCE(MAX(position), 0) + 1
+                              FROM run_steps
+                             WHERE run_id = ?1
+                        ),
+                        ?2,
+                        ?3,
+                        ?4
+                  FROM runs
+                 WHERE id = ?1",
+                params![
+                    id.0 as i64,
+                    RunStepStatus::Todo.as_str(),
+                    owner.map(MemberId::as_str),
+                    title
+                ],
+            )?;
+            if inserted == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            self.conn.execute(
+                "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id.0 as i64],
+            )?;
+            self.record_run_event(id, "step_added", "Step added", Some(&detail))
+        })?;
         self.run(id)
     }
 
@@ -992,85 +1307,94 @@ impl SqliteStore {
         status: RunStepStatus,
         note: Option<&str>,
     ) -> Result<RunSummary> {
-        let title: String = self.conn.query_row(
-            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
-            params![id.0 as i64, number as i64],
-            |row| row.get(0),
-        )?;
         let note_value = note.filter(|note| !note.trim().is_empty());
-        self.conn.execute(
-            "UPDATE run_steps
-             SET status = ?1,
-                 note = ?2,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE run_id = ?3 AND position = ?4",
-            params![status.as_str(), note_value, id.0 as i64, number as i64],
-        )?;
-        self.conn.execute(
-            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id.0 as i64],
-        )?;
-        let detail = match note_value {
-            Some(note) => format!("#{number} {}: {title}\n{note}", status.as_str()),
-            None => format!("#{number} {}: {title}", status.as_str()),
-        };
-        self.record_run_event(id, "step_updated", "Step updated", Some(&detail))?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            let title: String = self.conn.query_row(
+                "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
+                params![id.0 as i64, number as i64],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "UPDATE run_steps
+                 SET status = ?1,
+                     note = ?2,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE run_id = ?3 AND position = ?4",
+                params![status.as_str(), note_value, id.0 as i64, number as i64],
+            )?;
+            self.conn.execute(
+                "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id.0 as i64],
+            )?;
+            let detail = match note_value {
+                Some(note) => format!("#{number} {}: {title}\n{note}", status.as_str()),
+                None => format!("#{number} {}: {title}", status.as_str()),
+            };
+            self.record_run_event(id, "step_updated", "Step updated", Some(&detail))
+        })?;
         self.run(id)
     }
 
     pub fn rename_run_step(&self, id: RunId, number: u32, title: &str) -> Result<RunSummary> {
-        let old_title: String = self.conn.query_row(
-            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
-            params![id.0 as i64, number as i64],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "UPDATE run_steps
-             SET title = ?1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE run_id = ?2 AND position = ?3",
-            params![title, id.0 as i64, number as i64],
-        )?;
-        self.conn.execute(
-            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id.0 as i64],
-        )?;
-        self.record_run_event(
-            id,
-            "step_renamed",
-            "Step renamed",
-            Some(&format!("#{number}: {old_title}\n{title}")),
-        )?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            let old_title: String = self.conn.query_row(
+                "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
+                params![id.0 as i64, number as i64],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "UPDATE run_steps
+                 SET title = ?1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE run_id = ?2 AND position = ?3",
+                params![title, id.0 as i64, number as i64],
+            )?;
+            self.conn.execute(
+                "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id.0 as i64],
+            )?;
+            self.record_run_event(
+                id,
+                "step_renamed",
+                "Step renamed",
+                Some(&format!("#{number}: {old_title}\n{title}")),
+            )
+        })?;
         self.run(id)
     }
 
     pub fn remove_run_step(&self, id: RunId, number: u32) -> Result<RunSummary> {
-        let title: String = self.conn.query_row(
-            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
-            params![id.0 as i64, number as i64],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "DELETE FROM run_steps WHERE run_id = ?1 AND position = ?2",
-            params![id.0 as i64, number as i64],
-        )?;
-        self.conn.execute(
-            "UPDATE run_steps
-             SET position = position - 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE run_id = ?1 AND position > ?2",
-            params![id.0 as i64, number as i64],
-        )?;
-        self.conn.execute(
-            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id.0 as i64],
-        )?;
-        self.record_run_event(
-            id,
-            "step_removed",
-            "Step removed",
-            Some(&format!("#{number}: {title}")),
-        )?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            let title: String = self.conn.query_row(
+                "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
+                params![id.0 as i64, number as i64],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "DELETE FROM run_steps WHERE run_id = ?1 AND position = ?2",
+                params![id.0 as i64, number as i64],
+            )?;
+            self.conn.execute(
+                "UPDATE run_steps
+                 SET position = position - 1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE run_id = ?1 AND position > ?2",
+                params![id.0 as i64, number as i64],
+            )?;
+            self.conn.execute(
+                "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id.0 as i64],
+            )?;
+            self.record_run_event(
+                id,
+                "step_removed",
+                "Step removed",
+                Some(&format!("#{number}: {title}")),
+            )
+        })?;
         self.run(id)
     }
 
@@ -1080,27 +1404,30 @@ impl SqliteStore {
         number: u32,
         owner: Option<&MemberId>,
     ) -> Result<RunSummary> {
-        let title: String = self.conn.query_row(
-            "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
-            params![id.0 as i64, number as i64],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "UPDATE run_steps
-             SET owner = ?1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE run_id = ?2 AND position = ?3",
-            params![owner.map(MemberId::as_str), id.0 as i64, number as i64],
-        )?;
-        self.conn.execute(
-            "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id.0 as i64],
-        )?;
-        let detail = match owner {
-            Some(owner) => format!("#{number} @{owner}: {title}"),
-            None => format!("#{number} unassigned: {title}"),
-        };
-        self.record_run_event(id, "step_assigned", "Step assigned", Some(&detail))?;
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            let title: String = self.conn.query_row(
+                "SELECT title FROM run_steps WHERE run_id = ?1 AND position = ?2",
+                params![id.0 as i64, number as i64],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "UPDATE run_steps
+                 SET owner = ?1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE run_id = ?2 AND position = ?3",
+                params![owner.map(MemberId::as_str), id.0 as i64, number as i64],
+            )?;
+            self.conn.execute(
+                "UPDATE runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id.0 as i64],
+            )?;
+            let detail = match owner {
+                Some(owner) => format!("#{number} @{owner}: {title}"),
+                None => format!("#{number} unassigned: {title}"),
+            };
+            self.record_run_event(id, "step_assigned", "Step assigned", Some(&detail))
+        })?;
         self.run(id)
     }
 
@@ -1142,6 +1469,25 @@ impl SqliteStore {
             map_run,
         )?;
         self.with_run_events(run)
+    }
+
+    /// Load a run only when it belongs to the currently selected chat.
+    pub fn active_run(&self, id: RunId) -> Result<RunSummary> {
+        let run = self.conn.query_row(
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
+             FROM runs WHERE id = ?1 AND conversation_id = ?2",
+            params![id.0 as i64, self.active_conversation()],
+            map_run,
+        )?;
+        self.with_run_events(run)
+    }
+
+    fn ensure_active_run(&self, id: RunId) -> Result<()> {
+        self.conn.query_row(
+            "SELECT 1 FROM runs WHERE id = ?1 AND conversation_id = ?2",
+            params![id.0 as i64, self.active_conversation()],
+            |_| Ok(()),
+        )
     }
 
     fn record_run_event(
@@ -1252,6 +1598,17 @@ fn member_csv(ids: &[MemberId]) -> String {
         .map(MemberId::as_str)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn serialize_conversation_snapshot(
+    team: &TeamConfig,
+    sessions: &[StoredConversationSession],
+) -> Result<(String, String)> {
+    let team_json = serde_json::to_string(team)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    let sessions_json = serde_json::to_string(sessions)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    Ok((team_json, sessions_json))
 }
 
 fn split_targets(value: Option<String>) -> Vec<String> {

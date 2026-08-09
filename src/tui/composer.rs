@@ -1,7 +1,8 @@
 //! The bottom composer: a single logical input line with a movable cursor and
-//! word/line editing. Stores characters so cursor math is Unicode-safe.
+//! word/line editing. Cursor movement and deletion follow user-visible graphemes.
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default)]
 pub struct Composer {
@@ -22,7 +23,7 @@ impl Composer {
         self.chars.is_empty()
     }
 
-    /// Cursor position as a character index.
+    /// Cursor position as a Unicode scalar index kept on a grapheme boundary.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -30,6 +31,7 @@ impl Composer {
     pub fn insert(&mut self, ch: char) {
         self.chars.insert(self.cursor, ch);
         self.cursor += 1;
+        self.cursor = self.grapheme_boundary_at_or_after(self.cursor);
     }
 
     /// Insert a complete paste in one operation, leaving the cursor after it.
@@ -38,6 +40,7 @@ impl Composer {
         let count = inserted.len();
         self.chars.splice(self.cursor..self.cursor, inserted);
         self.cursor += count;
+        self.cursor = self.grapheme_boundary_at_or_after(self.cursor);
     }
 
     /// Insert a hard line break at the cursor (multi-line composer).
@@ -47,8 +50,9 @@ impl Composer {
 
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
-            self.cursor -= 1;
-            self.chars.remove(self.cursor);
+            let start = self.previous_grapheme_boundary(self.cursor);
+            self.chars.drain(start..self.cursor);
+            self.cursor = start;
         }
     }
 
@@ -72,13 +76,11 @@ impl Composer {
     }
 
     pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = self.previous_grapheme_boundary(self.cursor);
     }
 
     pub fn right(&mut self) {
-        if self.cursor < self.chars.len() {
-            self.cursor += 1;
-        }
+        self.cursor = self.next_grapheme_boundary(self.cursor);
     }
 
     pub fn home(&mut self) {
@@ -120,18 +122,18 @@ impl Composer {
         self.chars.iter().filter(|&&c| c == '\n').count() + 1
     }
 
-    /// Cursor position as a (row, column) pair in characters.
+    /// Cursor position as a (row, column) pair in grapheme clusters.
     pub fn cursor_row_col(&self) -> (usize, usize) {
         let mut row = 0;
-        let mut col = 0;
-        for &c in &self.chars[..self.cursor] {
-            if c == '\n' {
+        let mut line_start = 0;
+        for (index, &ch) in self.chars[..self.cursor].iter().enumerate() {
+            if ch == '\n' {
                 row += 1;
-                col = 0;
-            } else {
-                col += 1;
+                line_start = index + 1;
             }
         }
+        let line: String = self.chars[line_start..self.cursor].iter().collect();
+        let col = line.graphemes(true).count();
         (row, col)
     }
 
@@ -144,8 +146,8 @@ impl Composer {
         }
         let starts = self.line_starts();
         let prev_start = starts[row - 1];
-        let prev_len = (starts[row] - 1).saturating_sub(prev_start);
-        self.cursor = prev_start + col.min(prev_len);
+        let prev_end = (starts[row] - 1).max(prev_start);
+        self.cursor = self.grapheme_column_index(prev_start, prev_end, col);
         true
     }
 
@@ -163,7 +165,7 @@ impl Composer {
         } else {
             self.chars.len()
         };
-        self.cursor = next_start + col.min(next_end - next_start);
+        self.cursor = self.grapheme_column_index(next_start, next_end, col);
         true
     }
 
@@ -183,7 +185,7 @@ impl Composer {
         for (offset, ch) in inserted.into_iter().enumerate() {
             self.chars.insert(start + offset, ch);
         }
-        self.cursor = start + count;
+        self.cursor = self.grapheme_boundary_at_or_after(start + count);
     }
 
     /// Take the current text and clear the composer.
@@ -200,6 +202,49 @@ impl Composer {
         self.cursor = self.chars.len();
     }
 
+    fn grapheme_boundaries(&self) -> Vec<usize> {
+        let text = self.text();
+        let mut scalar = 0;
+        let mut boundaries = vec![0];
+        for grapheme in text.graphemes(true) {
+            scalar += grapheme.chars().count();
+            boundaries.push(scalar);
+        }
+        boundaries
+    }
+
+    fn previous_grapheme_boundary(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .take_while(|boundary| *boundary < cursor)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn next_grapheme_boundary(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .find(|boundary| *boundary > cursor)
+            .unwrap_or(self.chars.len())
+    }
+
+    fn grapheme_boundary_at_or_after(&self, cursor: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .find(|boundary| *boundary >= cursor)
+            .unwrap_or(self.chars.len())
+    }
+
+    fn grapheme_column_index(&self, start: usize, end: usize, column: usize) -> usize {
+        let line: String = self.chars[start..end].iter().collect();
+        start
+            + line
+                .graphemes(true)
+                .take(column)
+                .map(|grapheme| grapheme.chars().count())
+                .sum::<usize>()
+    }
+
     /// Wrap the composer text to `width` display columns and return every
     /// visual line plus the cursor's visual (row, column) position. Each
     /// logical line (`\n`) starts a new visual line; long lines wrap at the
@@ -212,28 +257,46 @@ impl Composer {
         let mut cursor_row = 0usize;
         let mut cursor_col = 0usize;
 
-        for (i, &ch) in self.chars.iter().enumerate() {
-            if i == self.cursor {
-                cursor_row = lines.len() - 1;
-                cursor_col = cur_col;
+        let text = self.text();
+        let mut scalar_index = 0;
+        for grapheme in text.graphemes(true) {
+            if scalar_index == self.cursor {
+                if cur_col >= width {
+                    cursor_row = lines.len();
+                    cursor_col = 0;
+                } else {
+                    cursor_row = lines.len() - 1;
+                    cursor_col = cur_col;
+                }
             }
-            if ch == '\n' {
+            if grapheme == "\n" {
                 lines.push(String::new());
                 cur_col = 0;
             } else {
-                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let w = UnicodeWidthStr::width(grapheme);
                 if cur_col > 0 && cur_col + w > width {
                     lines.push(String::new());
                     cur_col = 0;
+                    if scalar_index == self.cursor {
+                        cursor_row = lines.len() - 1;
+                        cursor_col = 0;
+                    }
                 }
-                lines.last_mut().unwrap().push(ch);
+                lines.last_mut().unwrap().push_str(grapheme);
                 cur_col += w;
             }
+            scalar_index += grapheme.chars().count();
         }
         // Cursor at the very end of the text.
         if self.cursor == self.chars.len() {
-            cursor_row = lines.len() - 1;
-            cursor_col = cur_col;
+            if cur_col >= width {
+                lines.push(String::new());
+                cursor_row = lines.len() - 1;
+                cursor_col = 0;
+            } else {
+                cursor_row = lines.len() - 1;
+                cursor_col = cur_col;
+            }
         }
         (lines, cursor_row, cursor_col)
     }
@@ -383,5 +446,33 @@ mod tests {
     fn visual_line_count_empty_is_one() {
         let c = Composer::new();
         assert_eq!(c.visual_line_count(10), 1);
+    }
+
+    #[test]
+    fn movement_and_backspace_keep_graphemes_intact() {
+        let mut combining = typed("e\u{301}");
+        assert_eq!(combining.cursor(), 2);
+        combining.left();
+        assert_eq!(combining.cursor(), 0);
+        combining.right();
+        assert_eq!(combining.cursor(), 2);
+        combining.backspace();
+        assert!(combining.is_empty());
+
+        let mut family = typed("👨‍👩‍👧‍👦");
+        family.left();
+        assert_eq!(family.cursor(), 0);
+        family.right();
+        family.backspace();
+        assert!(family.is_empty());
+    }
+
+    #[test]
+    fn cursor_wraps_to_a_new_visual_line_at_exact_width() {
+        let c = typed("abcd");
+        let (lines, row, col) = c.visual_lines_with_cursor(4);
+
+        assert_eq!(lines, vec!["abcd", ""]);
+        assert_eq!((row, col), (1, 0));
     }
 }

@@ -9,7 +9,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::adapter::parser::{str_field, summarize, tool_value};
+use crate::adapter::parser::{
+    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, str_field, summarize, tool_value,
+};
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, TeamMember};
@@ -91,14 +93,14 @@ impl StreamAdapter for ClaudeStreamAdapter {
             args.push("--effort".to_string());
             args.push(effort.claude_arg().to_string());
         }
-        // Prompt is the trailing positional argument.
-        args.push(prompt.to_string());
-
         AdapterCommand {
             program: self.binary.clone(),
             args,
             cwd: self.cwd.clone(),
-            stdin: None,
+            // Claude officially accepts print-mode prompts on stdin. Keeping
+            // user text out of argv prevents prompts such as `--version` from
+            // being reinterpreted as CLI options.
+            stdin: Some(prompt.to_string()),
         }
     }
 
@@ -114,6 +116,7 @@ pub struct ClaudeLineParser {
     text_acc: String,
     tool_blocks: HashMap<u64, String>,
     tool_input_started: HashSet<u64>,
+    result_seen: bool,
 }
 
 impl ClaudeLineParser {
@@ -170,8 +173,11 @@ impl ClaudeLineParser {
                     && let Some(text) = str_field(delta, "text")
                 {
                     self.open_message(out);
-                    self.text_acc.push_str(text);
-                    out.push(AgentEvent::TextDelta(text.to_string()));
+                    if let Some(delta) =
+                        append_bounded_text(&mut self.text_acc, text, MAX_MESSAGE_TEXT_BYTES)
+                    {
+                        out.push(AgentEvent::TextDelta(delta));
+                    }
                 } else if str_field(delta, "type") == Some("input_json_delta")
                     && let Some(partial) = str_field(delta, "partial_json")
                     && let Some(index) = event.get("index").and_then(Value::as_u64)
@@ -300,6 +306,7 @@ impl LineParser for ClaudeLineParser {
                 }
             }
             Some("result") => {
+                self.result_seen = true;
                 if let Some(session) = str_field(&value, "session_id") {
                     out.push(AgentEvent::SessionDiscovered(AgentSessionId(
                         session.to_string(),
@@ -324,6 +331,16 @@ impl LineParser for ClaudeLineParser {
         let mut out = Vec::new();
         self.close_message(&mut out);
         out
+    }
+
+    fn finish_after_exit(&mut self, ok: bool) -> Vec<AgentEvent> {
+        if ok && !self.result_seen {
+            vec![AgentEvent::Fatal(
+                "claude exited without a terminal result event".to_string(),
+            )]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -381,7 +398,8 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--allowed-tools", "Read,Bash"])
         );
-        assert_eq!(command.args.last().unwrap(), "hello");
+        assert_eq!(command.stdin.as_deref(), Some("hello"));
+        assert!(!command.args.iter().any(|arg| arg == "hello"));
         // The product path never disables session persistence.
         assert!(!command.args.iter().any(|a| a == "--no-session-persistence"));
     }
@@ -394,6 +412,16 @@ mod tests {
         let command = adapter.build_command("hello", None, None);
         assert!(!command.args.iter().any(|a| a == "--permission-mode"));
         assert!(!command.args.iter().any(|a| a == "default"));
+    }
+
+    #[test]
+    fn option_shaped_prompt_is_sent_on_stdin() {
+        let member = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+        let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let command = adapter.build_command("--version", None, None);
+
+        assert_eq!(command.stdin.as_deref(), Some("--version"));
+        assert!(!command.args.iter().any(|arg| arg == "--version"));
     }
 
     #[test]
@@ -537,5 +565,17 @@ mod tests {
             r#"{"type":"result","is_error":true,"result":"rate limited","session_id":"s"}"#,
         ]);
         assert!(events.contains(&AgentEvent::Fatal("rate limited".to_string())));
+    }
+
+    #[test]
+    fn successful_exit_requires_a_terminal_result_event() {
+        let mut parser = ClaudeLineParser::default();
+        assert!(matches!(
+            parser.finish_after_exit(true).as_slice(),
+            [AgentEvent::Fatal(message)] if message.contains("terminal result")
+        ));
+
+        parser.parse_line(r#"{"type":"result","is_error":false}"#);
+        assert!(parser.finish_after_exit(true).is_empty());
     }
 }

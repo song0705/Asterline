@@ -3,7 +3,7 @@
 //! Emits a scripted sequence of [`AgentEvent`]s without spawning a process, so
 //! the runtime and TUI can be exercised without real backends or usage.
 
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::event::{AgentEvent, AgentSessionId};
@@ -166,7 +166,7 @@ impl MemberRunner for FakeRunner {
         self.backend
     }
 
-    fn run(&self, req: RunRequest, events: Sender<AgentEvent>) {
+    fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
         for event in (self.responder)(&req) {
             let _ = events.send(event);
         }
@@ -185,7 +185,7 @@ mod tests {
     use std::sync::mpsc;
 
     fn run(runner: &FakeRunner, prompt: &str) -> Vec<AgentEvent> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
                 prompt: prompt.to_string(),

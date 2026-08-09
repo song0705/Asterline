@@ -15,11 +15,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::domain::event::ImportedMessage;
+use crate::domain::{config, event::ImportedMessage};
+use crate::tui::import_io;
 
 /// Clock-skew grace: import rows whose timestamp is up to this much earlier
 /// than the attach start.
 const CLOCK_SKEW: Duration = Duration::from_secs(2);
+const MAX_CANDIDATE_FILES: usize = 10_000;
+const MAX_CANDIDATE_SCAN_ENTRIES: usize = 50_000;
 
 /// A snapshot taken before launching the interactive session, used to import
 /// only the messages added while attached.
@@ -40,18 +43,29 @@ pub struct ClaudeSnapshot {
 
 /// Snapshot the Claude session for `session_id` (if any) before attaching.
 pub fn snapshot(session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
-    snapshot_with_root(&default_projects_root(), session_id, cwd)
+    match default_projects_root() {
+        Some(root) => snapshot_with_root(&root, session_id, cwd),
+        None => ClaudeSnapshot {
+            session_id: session_id.map(str::to_string),
+            cwd: cwd.to_string(),
+            path: None,
+            before: 0,
+            started: SystemTime::now(),
+        },
+    }
 }
 
 /// After the attach exits, return the messages added during it.
 pub fn imported_since(snapshot: ClaudeSnapshot) -> Vec<ImportedMessage> {
-    imported_since_with_root(snapshot, &default_projects_root())
+    let Some(root) = default_projects_root() else {
+        return Vec::new();
+    };
+    imported_since_with_root(snapshot, &root)
 }
 
-/// `~/.claude/projects` (may not exist).
-fn default_projects_root() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    Path::new(&home).join(".claude").join("projects")
+/// The platform user profile's `.claude/projects` directory (may not exist).
+fn default_projects_root() -> Option<PathBuf> {
+    config::user_home_dir().map(|home| home.join(".claude").join("projects"))
 }
 
 /// Project directory for `cwd` under a Claude projects root.
@@ -129,9 +143,16 @@ fn candidate_files(snapshot: &ClaudeSnapshot, project_dir: &Path) -> Vec<PathBuf
 
     let mut others: Vec<(SystemTime, PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(project_dir) {
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(MAX_CANDIDATE_SCAN_ENTRIES) {
+            if seen.len() >= MAX_CANDIDATE_FILES {
+                break;
+            }
             let path = entry.path();
-            if path.extension().is_none_or(|e| e != "jsonl") {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file())
+                || path
+                    .extension()
+                    .is_none_or(|e| !e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
+            {
                 continue;
             }
             let Some(mtime) = modified(&path) else {
@@ -165,23 +186,18 @@ fn count_messages(path: &Path) -> usize {
 }
 
 fn parse_classified(path: &Path) -> Vec<ClassifiedRow> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    import_io::for_each_json_value(path, |value| {
         let Some(msg) = classify_row(&value) else {
-            continue;
+            return true;
         };
         let timestamp = value
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(rfc3339_to_system_time);
         out.push(ClassifiedRow { msg, timestamp });
-    }
+        true
+    });
     out
 }
 
@@ -194,7 +210,7 @@ fn classify_row(value: &Value) -> Option<ImportedMessage> {
     let row_type = value.get("type").and_then(Value::as_str)?;
     match row_type {
         "user" => {
-            let text = user_text(value.get("message")?.get("content")?)?;
+            let text = import_io::imported_text(user_text(value.get("message")?.get("content")?)?)?;
             if text.is_empty() || is_injected_user_meta(&text) {
                 return None;
             }
@@ -204,7 +220,8 @@ fn classify_row(value: &Value) -> Option<ImportedMessage> {
             })
         }
         "assistant" => {
-            let text = assistant_text(value.get("message")?.get("content")?)?;
+            let text =
+                import_io::imported_text(assistant_text(value.get("message")?.get("content")?)?)?;
             if text.is_empty() {
                 return None;
             }
@@ -395,6 +412,7 @@ mod tests {
     #[test]
     fn munge_cwd_replaces_non_alnum() {
         assert_eq!(munge_cwd("/Users/x/proj.name"), "-Users-x-proj-name");
+        assert_eq!(munge_cwd(r"C:\Users\Ada\repo"), "C--Users-Ada-repo");
         assert_eq!(munge_cwd("/tmp/你好"), "-tmp---");
         assert_eq!(
             munge_cwd("/Users/pys/project/git/engine/Asterline"),
@@ -491,6 +509,27 @@ mod tests {
             let v = serde_json::json!({ "type": t, "message": { "content": "x" } });
             assert!(classify_row(&v).is_none(), "expected skip for type {t}");
         }
+    }
+
+    #[test]
+    fn parser_drains_oversized_rows_and_skips_oversized_messages() {
+        let root = fixture_root("large-row");
+        let path = root.join("large.jsonl");
+        let mut fixture = "x".repeat(import_io::MAX_JSONL_LINE_BYTES + 1);
+        fixture.push('\n');
+        fixture.push_str(&user_line(
+            &"y".repeat(import_io::MAX_IMPORTED_MESSAGE_BYTES + 1),
+            "2099-01-01T00:00:00Z",
+        ));
+        fixture.push('\n');
+        fixture.push_str(&user_line("still parsed", "2099-01-01T00:00:00Z"));
+        std::fs::write(&path, fixture).unwrap();
+
+        let parsed = parse_classified(&path);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].msg.text, "still parsed");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

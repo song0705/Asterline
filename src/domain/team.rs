@@ -374,15 +374,15 @@ impl<'de> Deserialize<'de> for TeamMember {
         }
 
         let input = TeamMemberInput::deserialize(deserializer)?;
+        let explicit_id = input.id.map(|id| MemberId::new(id.as_str().trim()));
         let display_name = input
             .display_name
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
-            .or_else(|| input.id.as_ref().map(|id| id.as_str().to_string()))
+            .or_else(|| explicit_id.as_ref().map(|id| id.as_str().to_string()))
             .ok_or_else(|| de::Error::custom("team member needs id or display_name"))?;
-        let id = input
-            .id
-            .unwrap_or_else(|| derived_member_id(&display_name, input.backend.as_str()));
+        let id =
+            explicit_id.unwrap_or_else(|| derived_member_id(&display_name, input.backend.as_str()));
 
         Ok(Self {
             id,
@@ -500,7 +500,12 @@ fn default_max_auto_relays() -> u32 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TeamConfigError {
     Empty,
+    InvalidMemberId(String),
+    InvalidDisplayName(String),
+    ReservedMemberName(String),
     DuplicateMember(String),
+    DuplicateDisplayName(String),
+    AmbiguousDisplayName(String),
     UnknownDefaultTarget(String),
     UnsupportedEffort {
         member: String,
@@ -513,7 +518,27 @@ impl fmt::Display for TeamConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("team has no members"),
+            Self::InvalidMemberId(id) => write!(
+                f,
+                "invalid member id {id:?}: use only ASCII letters, digits, '-' or '_'"
+            ),
+            Self::InvalidDisplayName(name) => {
+                write!(
+                    f,
+                    "invalid member display name {name:?}: control characters are not allowed"
+                )
+            }
+            Self::ReservedMemberName(name) => {
+                write!(f, "member name {name:?} is reserved for broadcast routing")
+            }
             Self::DuplicateMember(id) => write!(f, "duplicate member id: {id}"),
+            Self::DuplicateDisplayName(name) => {
+                write!(f, "duplicate member display name: {name}")
+            }
+            Self::AmbiguousDisplayName(name) => write!(
+                f,
+                "member display name {name:?} conflicts with another member id"
+            ),
             Self::UnknownDefaultTarget(id) => {
                 write!(f, "default target refers to unknown member: {id}")
             }
@@ -551,17 +576,47 @@ impl TeamConfig {
     }
 
     /// Validate roster invariants. All-codex, all-claude, and mixed rosters are
-    /// all accepted; the only rules are non-empty, unique ids, and a resolvable
-    /// default target.
+    /// all accepted. Member names must remain unambiguous to both user and
+    /// agent routing, ids must be safe tokens, and the default target must
+    /// resolve to a roster member.
     pub fn validate(&self) -> Result<(), TeamConfigError> {
         if self.members.is_empty() {
             return Err(TeamConfigError::Empty);
         }
 
         let mut seen = std::collections::HashSet::new();
+        let mut seen_names = std::collections::HashSet::new();
         for member in &self.members {
-            if !seen.insert(member.id.as_str()) {
+            let id = member.id.as_str();
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            {
+                return Err(TeamConfigError::InvalidMemberId(id.to_string()));
+            }
+            if id.eq_ignore_ascii_case("all") {
+                return Err(TeamConfigError::ReservedMemberName(id.to_string()));
+            }
+            let folded_id = id.to_ascii_lowercase();
+            if !seen.insert(folded_id) {
                 return Err(TeamConfigError::DuplicateMember(member.id.to_string()));
+            }
+            let display_name = member.display_name.trim();
+            if display_name.is_empty() || display_name.chars().any(char::is_control) {
+                return Err(TeamConfigError::InvalidDisplayName(
+                    member.display_name.clone(),
+                ));
+            }
+            if display_name.eq_ignore_ascii_case("all") {
+                return Err(TeamConfigError::ReservedMemberName(
+                    member.display_name.clone(),
+                ));
+            }
+            if !seen_names.insert(display_name.to_ascii_lowercase()) {
+                return Err(TeamConfigError::DuplicateDisplayName(
+                    member.display_name.clone(),
+                ));
             }
             if let Some(effort) = member.effort
                 && ((member.backend == BackendKind::Agy
@@ -573,6 +628,20 @@ impl TeamConfig {
                     backend: member.backend,
                     effort,
                 });
+            }
+        }
+
+        for member in &self.members {
+            if self.members.iter().any(|other| {
+                other.id != member.id
+                    && other
+                        .id
+                        .as_str()
+                        .eq_ignore_ascii_case(member.display_name.trim())
+            }) {
+                return Err(TeamConfigError::AmbiguousDisplayName(
+                    member.display_name.clone(),
+                ));
             }
         }
 
@@ -594,7 +663,7 @@ impl TeamConfig {
     pub fn find(&self, id_or_name: &str) -> Option<&TeamMember> {
         self.members
             .iter()
-            .find(|member| member.id.as_str() == id_or_name)
+            .find(|member| member.id.as_str().eq_ignore_ascii_case(id_or_name))
             .or_else(|| {
                 self.members
                     .iter()
@@ -669,6 +738,21 @@ mod tests {
 
         assert_eq!(member.id, MemberId::new("lead-engineer"));
         assert_eq!(member.display_name, "Lead Engineer");
+    }
+
+    #[test]
+    fn explicit_member_id_is_trimmed() {
+        let member: TeamMember = serde_json::from_str(
+            r#"{
+                "id": "  builder  ",
+                "backend": "codex",
+                "role": "implementation"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(member.id, MemberId::new("builder"));
+        assert_eq!(member.display_name, "builder");
     }
 
     #[test]
@@ -757,6 +841,69 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_and_reserved_member_names_are_rejected() {
+        let unsafe_id =
+            TeamConfig::new("bad", "/tmp/ws").with_member(codex("../builder", "implementation"));
+        assert_eq!(
+            unsafe_id.validate(),
+            Err(TeamConfigError::InvalidMemberId("../builder".to_string()))
+        );
+
+        let reserved_id =
+            TeamConfig::new("bad", "/tmp/ws").with_member(codex("ALL", "implementation"));
+        assert_eq!(
+            reserved_id.validate(),
+            Err(TeamConfigError::ReservedMemberName("ALL".to_string()))
+        );
+
+        let mut reserved_display = codex("builder", "implementation");
+        reserved_display.display_name = "All".to_string();
+        assert_eq!(
+            TeamConfig::new("bad", "/tmp/ws")
+                .with_member(reserved_display)
+                .validate(),
+            Err(TeamConfigError::ReservedMemberName("All".to_string()))
+        );
+    }
+
+    #[test]
+    fn routing_names_are_case_insensitively_unambiguous() {
+        let duplicate_ids = TeamConfig::new("bad", "/tmp/ws")
+            .with_member(codex("Builder", "implementation"))
+            .with_member(claude("builder", "review"));
+        assert!(matches!(
+            duplicate_ids.validate(),
+            Err(TeamConfigError::DuplicateMember(_))
+        ));
+
+        let mut first = codex("builder", "implementation");
+        first.display_name = "Agent".to_string();
+        let mut second = claude("reviewer", "review");
+        second.display_name = "agent".to_string();
+        assert!(matches!(
+            TeamConfig::new("bad", "/tmp/ws")
+                .with_member(first)
+                .with_member(second)
+                .validate(),
+            Err(TeamConfigError::DuplicateDisplayName(_))
+        ));
+
+        let mut builder = codex("builder", "implementation");
+        builder.display_name = "Reviewer".to_string();
+        let mut reviewer = claude("reviewer", "review");
+        reviewer.display_name = "Review Bot".to_string();
+        assert_eq!(
+            TeamConfig::new("bad", "/tmp/ws")
+                .with_member(builder)
+                .with_member(reviewer)
+                .validate(),
+            Err(TeamConfigError::AmbiguousDisplayName(
+                "Reviewer".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn unknown_default_target_is_rejected() {
         let mut config =
             TeamConfig::new("t", "/tmp/ws").with_member(codex("builder", "implementation"));
@@ -825,6 +972,7 @@ mod tests {
         let config = TeamConfig::new("t", "/tmp/ws").with_member(builder);
 
         assert_eq!(config.find("builder").unwrap().id, MemberId::new("builder"));
+        assert_eq!(config.find("BUILDER").unwrap().id, MemberId::new("builder"));
         assert_eq!(
             config.find("Builder Bot").unwrap().id,
             MemberId::new("builder")

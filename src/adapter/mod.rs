@@ -19,7 +19,7 @@ pub mod process;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, TeamMember};
@@ -44,10 +44,12 @@ pub struct RunRequest {
 }
 
 /// Runs one member turn, streaming [`AgentEvent`]s to `events` until the run
-/// finishes. Implementations block; the runtime calls `run` on a worker thread.
+/// finishes. Implementations block and should end with [`AgentEvent::Exited`];
+/// the transport synthesizes a failed exit if an implementation returns
+/// without one.
 pub trait MemberRunner: Send + Sync {
     fn backend(&self) -> BackendKind;
-    fn run(&self, req: RunRequest, events: Sender<AgentEvent>);
+    fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>);
 }
 
 /// Build a real CLI runner for a member, based on its backend.
