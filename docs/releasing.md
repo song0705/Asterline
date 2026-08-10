@@ -26,8 +26,20 @@ must exactly match the package version in `Cargo.toml`.
    test -z "$(git tag --list "v${version}")"
    ```
 
-6. Commit and push the version change and release notes.
-7. Create and push an annotated tag from that release commit:
+6. Commit and push the version change and release notes without a tag.
+7. Wait for the regular CI workflow on that exact commit to pass on Linux,
+   macOS, and Windows. Do not create a release tag while any required job is
+   pending or failing:
+
+   ```bash
+   commit="$(git rev-parse HEAD)"
+   run_id="$(gh run list --workflow CI --commit "$commit" --limit 1 \
+     --json databaseId --jq '.[0].databaseId')"
+   test -n "$run_id"
+   gh run watch "$run_id" --exit-status
+   ```
+
+8. Only after that commit is green, create and push an annotated tag from it:
 
    ```bash
    version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"

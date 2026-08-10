@@ -74,7 +74,9 @@ fn documented_team_json_is_valid_and_loadable() {
 
 #[test]
 fn documented_team_json_accepts_crlf_checkout() {
-    let crlf = CONFIGURATION_DOC.replace('\n', "\r\n");
+    let crlf = CONFIGURATION_DOC
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
     assert!(first_json_fence(&crlf).is_some());
 }
 
