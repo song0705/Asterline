@@ -166,7 +166,7 @@ attach, navigation, Run steps, Skills, logs, search, and diffs.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration and local data](docs/configuration.md)
 - [Approvals and tool control](docs/approvals.md)
-- [Release notes](docs/releases/v0.2.2.md)
+- [Release notes](docs/releases/v0.2.3.md)
 - [Maintainer release process](docs/releasing.md)
 
 Built-in help is available through `/help` and `asterline --help`.

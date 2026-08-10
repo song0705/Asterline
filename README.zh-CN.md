@@ -137,7 +137,7 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 - [命令与键盘参考](docs/commands.zh-CN.md)
 - [配置与本地数据](docs/configuration.md)
 - [审批与工具控制](docs/approvals.md)
-- [版本发布说明](docs/releases/v0.2.2.md)
+- [版本发布说明](docs/releases/v0.2.3.md)
 - [维护者发布流程](docs/releasing.md)
 
 程序内可通过 `/help` 和 `asterline --help` 查看帮助。
