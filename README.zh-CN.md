@@ -8,187 +8,87 @@
 
 **在一个终端里，运行一支看得见、能恢复的编程 Agent 团队。**
 
-Asterline 是一个本地优先的终端协作工作台，统一调度电脑上已经安装的 Codex、
-Claude、Grok 和 Agy 官方 CLI。它把各后端的原生事件整理成一段可审计对话，在成员
-之间路由任务，并用结构化 Runs 持久保存协作过程。
+Asterline 统一调度电脑上已经安装的 Codex、Claude、Grok 和 Agy 官方 CLI。它将各后端的原生事件汇入同一工作台，在成员之间路由任务，并把多步骤协作记录为结构化 Runs。
 
-[下载](https://github.com/song0705/Asterline/releases/latest) ·
-[快速开始](#快速开始) ·
-[命令参考](docs/commands.zh-CN.md) ·
-[配置参考](docs/configuration.md)
+[安装](#安装) · [开始使用](#开始使用) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline/releases/latest)
 
 ![Codex 将前端设计方案发送给 Agy](docs/assets/asterline-codex-to-agy.webp)
 
-## 快速开始
+## 为什么选择 Asterline
 
-### 环境要求
+- **统一工作台。** 消息、思考、工具、diff、错误、审批和交接都归属于实际产生它的成员。
+- **结构化协作。** Review、Plan、Brainstorm 和 Team 工作流为 Agent 任务增加负责人、有限重试、审阅结论和验证结果。
+- **沿用原生 CLI。** Asterline 直接启动各厂商 CLI，保留原有认证、模型、权限设置与可恢复会话。
+- **本地掌控。** 团队配置和运行记录保存在项目工作区，并提供明确的审批与取消入口。
 
-- Linux、macOS 或 Windows 10/11，以及支持颜色的终端
-- 至少安装并登录一个 CLI：`codex`、`claude`、`grok` 或 `agy`
-- 仅从源码构建时需要 Rust 1.85 或更高版本
+## 安装
 
-### 安装发布版本
+Asterline 支持 macOS、Linux 和 Windows 10/11。使用前，至少需要安装并登录一个受支持的 CLI。
 
-打开 [GitHub Releases](https://github.com/song0705/Asterline/releases/latest)，
-然后按照自己的操作系统选择步骤。发布包同时包含完整命令 `asterline` 和短命令
-`ast`；以下步骤安装 `ast`。
+| 平台    | 推荐安装方式                                                                         |
+| ------- | ------------------------------------------------------------------------------------ |
+| macOS   | 下载 `asterline-<version>-macos-universal.dmg`，打开后运行 `Install Asterline.pkg`。 |
+| Windows | 下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。                          |
+| Linux   | 下载 `x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu` 对应的压缩包。        |
 
-#### macOS
+安装器会同时提供完整命令 `asterline` 和短命令 `ast`。便携安装、源码构建、版本校验、自动更新、卸载与故障排查请参阅[安装指南](docs/installation.zh-CN.md)。
 
-根据 Mac 处理器下载对应的 `.tar.gz`：
+## 开始使用
 
-- Apple silicon：`aarch64-apple-darwin`
-- Intel：`x86_64-apple-darwin`
-
-解压后，在解压目录中打开终端并运行：
-
-```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 ast "$HOME/.local/bin/ast"
-"$HOME/.local/bin/ast" --help
-```
-
-如果新终端找不到 `ast`，请在 `~/.zprofile` 中把 `$HOME/.local/bin` 加入 `PATH`。
-
-#### Linux
-
-根据机器架构下载对应的 `.tar.gz`：
-
-- Intel/AMD 64 位：`x86_64-unknown-linux-gnu`
-- ARM64：`aarch64-unknown-linux-gnu`
-
-解压后，在解压目录中打开 shell 并运行：
-
-```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 ast "$HOME/.local/bin/ast"
-"$HOME/.local/bin/ast" --help
-```
-
-如果新 shell 找不到 `ast`，请在 shell 的 `PATH` 配置（通常为 `~/.profile`）中加入
-`$HOME/.local/bin`。
-
-#### Windows
-
-从最新 Release 下载 `asterline-<version>-x86_64-windows-setup.exe`，双击完成安装。
-安装器会把 Asterline 安装到当前用户目录、自动把 `ast` 加入用户 `Path`，并注册标准
-卸载入口。安装完成后打开新的 PowerShell：
-
-```powershell
-ast --help
-```
-
-安装版每天最多检查一次最新稳定 Release。只有新安装器与同一 Release 中的
-`SHA256SUMS` 匹配时才会下载，并在 Asterline 退出后静默安装。使用 `ast --update`
-可以立即检查；单次启动使用 `ast --no-auto-update` 可跳过检查。
-
-安装器目前还没有 Authenticode 签名，因此第一次手动安装时 Windows 可能显示“未知
-发布者”。Release 仍提供校验和与 GitHub 构建来源证明供核验。
-
-已经发布的 `v0.2.2` 早于安装器功能。在下一个带标签版本发布前，请使用便携 ZIP：
-
-<details>
-<summary>Windows 便携 ZIP</summary>
-
-解压 `x86_64-pc-windows-msvc.zip`，在解压目录中打开 PowerShell，然后运行
-`./ast.exe`。便携版不会修改 `Path`，也不会自动更新。
-
-</details>
-
-每个 Release 还附带 `SHA256SUMS` 与 GitHub 构建来源证明。
-
-### 从源码构建
-
-在任一受支持的操作系统中安装 Rust 1.85 或更高版本，然后在 Asterline 源码目录运行：
-
-```bash
-cargo install --path . --force
-```
-
-Cargo 会把两个命令安装到 macOS/Linux 的 `$HOME/.cargo/bin` 或 Windows 的
-`%USERPROFILE%\.cargo\bin`。请确认对应目录已经加入 `PATH`。
-
-### 启动团队
-
-进入希望 Agent 工作的项目，然后启动 Asterline。
-
-macOS 或 Linux：
+进入希望 Agent 工作的项目，然后启动 Asterline：
 
 ```bash
 cd /path/to/your/project
 ast
 ```
 
-Windows PowerShell：
+首次启动时，Team 编辑器会发现 `PATH` 中受支持的 CLI。使用 `↑`/`↓` 选择成员，按 `Enter` 编辑，再按 `s` 保存团队。Asterline 不会代为安装厂商 CLI，也不会代替用户登录账号。
 
-```powershell
-Set-Location C:\path\to\your-project
-ast.exe
-```
-
-首次启动时，Asterline 会发现 `PATH` 中受支持的 CLI，并打开 Team 编辑器。使用
-`↑`/`↓` 选择成员，按 `Enter` 编辑字段，再按 `s` 保存并启动。编辑器会发现每个已
-安装后端可用的模型与 reasoning effort；Asterline 不会代为安装 CLI 或登录账号。
-
-把第一项任务发给界面中显示的成员 handle：
+把第一项任务发给团队中显示的成员：
 
 ```text
-@builder 审计这个仓库，并找出风险最高的代码路径
+@builder 审计这个仓库，并修复风险最高的缺陷
 ```
 
-也可以先选择一个可追踪工作流，再把下一条消息作为任务：
+也可以先选择一个可追踪工作流，再输入任务：
 
 ```text
 /mode review
 修复支付回调的竞态问题，并补充回归测试
 ```
 
-新的 normal 对话要求第一条消息明确目标；之后的普通文本会继续发给上一次目标，
-`@all` 会广播给整个团队。在 Asterline 中输入 `/help` 可打开命令面板。
+输入 `/help` 打开命令面板；输入 `/runs` 查看正在运行和已经保存的工作。
 
-## Asterline 带来了什么
+## 为可追踪的 Agent 协作而设计
 
-### 一份记录，而不是一墙终端
+### 基于原生 CLI 的实时团队
 
-成员消息、思考、工具调用、diff、错误和交接始终归属于实际产生它的成员。Markdown、
-代码块、表格和工作区差异会直接在 TUI 中渲染；`/logs` 保留原始诊断信息但不淹没
-主对话，`/focus <member>` 可以只查看一个成员。
-
-### 沿用原生 CLI，组成实时团队
-
-同一团队可以混用不同后端，也可以多次使用同一后端。成员可配置职责、模型、推理
-强度、工作目录、系统提示、沙箱、权限模式、工具白名单和会话策略。运行中输入
-`/team` 即可更新成员列表。
+同一团队可以混用多个提供商，也可以多次使用同一后端。每个成员都可以独立设置职责、模型、推理强度、工作目录、系统提示、沙箱、权限模式、工具白名单与会话策略。
 
 ![Asterline Team 编辑器](docs/assets/asterline-team.webp)
 
-| 后端   | 可执行文件 | 流式接口                 | 会话恢复 | 模型来源                       |
-| ------ | ---------- | ------------------------ | -------- | ------------------------------ |
-| Codex  | `codex`    | `codex exec --json`      | 支持     | `codex debug models`           |
-| Claude | `claude`   | 带增量消息的流式 JSON    | 支持     | 别名与 `availableModels`       |
-| Grok   | `grok`     | `grok agent stdio` ACP   | 支持     | `grok --no-auto-update models` |
-| Agy    | `agy`      | print `stream-json` 事件 | 支持     | `agy models`                   |
+| 后端   | 接入方式               | 会话恢复 | 模型发现                       |
+| ------ | ---------------------- | -------- | ------------------------------ |
+| Codex  | `codex exec --json`    | 支持     | `codex debug models`           |
+| Claude | 流式 JSON              | 支持     | CLI 设置与模型别名             |
+| Grok   | `grok agent stdio` ACP | 支持     | `grok --no-auto-update models` |
+| Agy    | `stream-json` 事件     | 支持     | `agy models`                   |
 
-Asterline 不代替各厂商的认证、计费、模型授权或用量限制；这些仍由对应 CLI 账号决定。
+Asterline 不代替各提供商的认证、计费、模型授权或用量限制。
 
-### 用 Runs 管理工作，而不是堆叠回合
+### 用 Runs 管理工作，而不是堆叠对话回合
 
-Runs 会保存阶段、清单负责人、尝试次数、阻塞、备注、验证、审阅结论和下一步。先选择
-模式，下一条消息就会成为该模式的任务。
+Runs 会保存当前阶段、清单负责人、尝试次数、阻塞原因、备注、验证结果、审阅结论和下一步操作。
 
-| 模式         | 适合场景                     | Asterline 的运行方式                              |
-| ------------ | ---------------------------- | ------------------------------------------------- |
-| `normal`     | 直接与一个/全部成员工作      | 路由普通消息，并记住上一次目标                    |
-| `review`     | 带质量门的实现               | builder → 结构化 reviewer verdict → 修改循环      |
-| `plan`       | 多步骤、带负责人的工作       | 规划清单、派发负责人，最后进入审阅                |
-| `brainstorm` | 先广泛探索，再进行判断       | seed/build/stretch、私密投票、排名、综合          |
-| `team`       | 端到端协调交付               | Coordinator 负责步骤、整合和验证                  |
+| 模式         | 适合场景               | 执行方式                             |
+| ------------ | ---------------------- | ------------------------------------ |
+| `normal`     | 直接对话与任务转交     | 路由给一个成员或整个团队             |
+| `review`     | 带质量门的实现任务     | Builder、Reviewer 结论、有限修改循环 |
+| `plan`       | 多步骤且有负责人的工作 | 规划、分配、执行、审阅、验证         |
+| `brainstorm` | 先探索、后判断         | 生成、私密投票、排名、综合           |
+| `team`       | 端到端协调交付         | Coordinator 负责执行与整合           |
 
-Review 和 Plan 模式使用有次数上限的审阅循环；Brainstorm 将想法生成与私密投票、确定性
-排名分开；Team 模式由 Coordinator 负责清单、整合与验证。`/runs` 只展示当前对话的
-Runs。
-
-工作需要等待或显式检查时，可以直接记录状态：
+工作暂停后，Run 仍然可以继续推进：
 
 ```text
 /block 等待 staging client secret
@@ -197,16 +97,9 @@ Runs。
 /verify cargo test
 ```
 
-没有指定验证命令时，Asterline 可以识别 `cargo test`、`npm test`、`pytest` 等常见
-检查。
+### 保存在本地、可以恢复的历史记录
 
-### 本地保存，可以恢复，也可以检查
-
-`/new` 会保存当前对话并启动全新的后端会话；`/resume` 会恢复选中的聊天、Roster、
-原生 session ID、模式和 Runs。使用 `Ctrl+N` 或 `Ctrl+B` 聚焦成员后按 `Enter`，
-还可以打开该成员的原生交互式 CLI，并在支持时恢复其会话。
-
-默认情况下，运行状态保存在项目内：
+`/new` 创建干净的新对话；`/resume` 恢复已保存的聊天、团队、后端会话、模式与 Runs。项目状态默认保存在：
 
 ```text
 <workspace>/.asterline/
@@ -214,74 +107,44 @@ Runs。
 └── asterline.sqlite3
 ```
 
-数据库包含提示、回复、工具事件、路由、原始后端事件、日志、审批、会话和 Run 历史。
-这些都是敏感开发数据，通常应把 `.asterline/` 加入 `.gitignore`。
+数据库可能包含提示、回复、工具输出、路由、审批、日志与会话标识。请将它视为敏感开发数据；除非项目明确需要版本管理，否则应把 `.asterline/` 加入 `.gitignore`。
 
-Asterline 还可能在 `.agents/skills/` 下安装工作区级 Team 和 Brainstorm Skills。这些是
-集成文件而不是运行历史；请审查内容并自行决定是否纳入版本控制。
+## 安全边界
 
-## 工作方式
+Asterline 在本机启动后端进程，并继承其凭据、环境变量、文件系统权限与网络权限。每个后端仍然受对应提供商的数据政策和权限模型约束。
 
-```text
-你
- └─ 指定一个成员、整个团队或一个可追踪工作流
-     ├─ Asterline 启动或恢复对应的后端 CLI
-     ├─ 原生事件变成对话、工具、差异、日志和会话状态
-     ├─ 合法的队友消息被路由给其他成员
-     └─ 消息、路由、Runs、审批和验证结果持久化到 SQLite
-```
-
-自动转交有明确上限。一次任务达到配置的转交次数后，Asterline 会暂停路由并显示
-当前状态，而不是允许 Agent 之间形成失控循环。
-
-## 信任模型与边界
-
-Asterline 在本机启动后端进程，并继承其凭据、环境变量、文件系统访问和网络访问。
-Asterline 没有接收工作区的云服务，但每个后端仍遵循其厂商自己的网络行为与数据
-政策。
-
-成员可以使用后端原生的沙箱和权限设置。Asterline 另外提供可配置审批门，覆盖高风险
-用户请求、Agent 间转发、工作流派发和 Agent 发起的成员变更；它不会在后端之外再
-提供一层进程级沙箱。`--debug` 会关闭 Asterline 审批门，只适合受控开发环境。
-
-放宽权限前请阅读[审批与工具级控制](docs/approvals.md)（英文）。如果每个 Agent 都
-必须自动拥有隔离 worktree、需要托管式控制台或远程队列、必须直接调用厂商 API，
-或者目标是无人值守自动合并，应选择其他方案。
+Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起的成员变更增加审批门，但不会在所选后端之外再提供一层进程沙箱。放宽权限前，请阅读[审批与工具控制](docs/approvals.md)。
 
 ## 常用命令
 
-| 命令                   | 用途                              |
-| ---------------------- | --------------------------------- |
-| `@<member> <message>`  | 向一个成员发送消息                |
-| `@all <message>`       | 向全队广播                        |
-| `/mode`                | 选择 normal 或协作模式            |
-| `/runs`                | 查看 Run 状态、阶段和下一步       |
-| `/team`                | 编辑当前团队                      |
-| `/skills`              | 为下一条提示选择 Skill            |
-| `/find <text>`         | 搜索当前对话记录                  |
-| `/diff`                | 查看未暂存修改和未跟踪文件        |
-| `/logs`                | 打开持久化诊断日志                |
-| `/new`                 | 创建新对话和新的后端会话          |
-| `/resume`              | 选择并恢复之前的团队对话          |
-| `/approve` / `/reject` | 处理待审批请求                    |
-| `/abort`               | 取消运行中的任务、模式和验证      |
-| `/help`                | 打开命令面板                      |
+| 命令                   | 用途                     |
+| ---------------------- | ------------------------ |
+| `@<member> <message>`  | 向一个成员发送任务       |
+| `@all <message>`       | 向整个团队广播           |
+| `/mode`                | 选择普通对话或协作模式   |
+| `/runs`                | 查看工作状态和下一步     |
+| `/team`                | 编辑当前团队             |
+| `/resume`              | 恢复已保存的对话         |
+| `/approve` / `/reject` | 处理待审批请求           |
+| `/abort`               | 取消正在运行的工作与验证 |
+| `/help`                | 打开命令面板             |
 
-[完整命令与键盘参考](docs/commands.zh-CN.md)包含 Run 步骤、Team 操作、历史记录、
-原生会话接入和导航方式。
+[完整命令与键盘参考](docs/commands.zh-CN.md)还包含原生会话接入、导航、Run 步骤、Skills、日志、搜索和 diff。
 
 ## 文档
 
+- [安装与更新](docs/installation.zh-CN.md)
 - [命令与键盘参考](docs/commands.zh-CN.md)
-- [配置、本地数据、权限与故障排查](docs/configuration.md)
-- [审批层与工具级控制](docs/approvals.md)
-- [最新版本发布说明](docs/releases/v0.2.2.md)
+- [配置与本地数据](docs/configuration.md)
+- [审批与工具控制](docs/approvals.md)
+- [版本发布说明](docs/releases/v0.2.2.md)
 - [维护者发布流程](docs/releasing.md)
-- 内置帮助：`/help` 与 `asterline --help`
 
-## 开发与贡献
+程序内可通过 `/help` 和 `asterline --help` 查看帮助。
 
-不调用真实后端即可运行产品：
+## 开发
+
+无需调用真实后端即可运行 Asterline：
 
 ```bash
 cargo run -- --fake
@@ -295,18 +158,11 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked --no-fail-fast
 ```
 
-如果已经安装 `just`，可以使用 `just run --fake`、`just install` 或 `just check`。
-真实后端 smoke 测试需要显式启用，默认不会运行。
-
-请通过 [GitHub Issues](https://github.com/song0705/Asterline/issues) 提交可复现的 Bug
-和范围明确的功能建议，并附上操作系统、终端、Asterline 版本、后端 CLI/版本、经过
-脱敏的 `/logs` 和最短复现步骤。
+源码构建需要 Rust 1.85 或更高版本。真实后端 smoke 测试需要显式启用。可复现的问题和范围明确的建议请提交到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
 
 ## 项目状态
 
-Asterline 当前版本为 `0.2.2`，仍在积极开发。带版本标签的提交会发布 Linux、macOS
-预编译包，以及 Windows 便携包和用户级安装器。在稳定版之前，配置、持久化数据、
-命令和界面细节都可能发生不兼容变化。
+Asterline 仍处于 1.0 之前的积极开发阶段。配置、持久化数据、命令和界面细节可能在版本之间发生变化。
 
 ## 许可证
 

@@ -5,6 +5,16 @@ use unicode_width::UnicodeWidthStr;
 const CONFIGURATION_DOC: &str = include_str!("../docs/configuration.md");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
+const INSTALLATION_DOCS: &[(&str, &str)] = &[
+    (
+        "docs/installation.md",
+        include_str!("../docs/installation.md"),
+    ),
+    (
+        "docs/installation.zh-CN.md",
+        include_str!("../docs/installation.zh-CN.md"),
+    ),
+];
 const DOCUMENTS: &[(&str, &str)] = &[
     ("README.md", include_str!("../README.md")),
     ("README.zh-CN.md", include_str!("../README.zh-CN.md")),
@@ -18,6 +28,8 @@ const DOCUMENTS: &[(&str, &str)] = &[
         include_str!("../docs/configuration.md"),
     ),
     ("docs/approvals.md", include_str!("../docs/approvals.md")),
+    INSTALLATION_DOCS[0],
+    INSTALLATION_DOCS[1],
 ];
 
 #[test]
@@ -156,13 +168,16 @@ fn markdown_strong_markers_are_not_rendered_literally() {
 }
 
 #[test]
-fn windows_installer_is_tested_checksums_and_attested() {
+fn installers_are_tested_checksummed_and_attested() {
     assert!(CI_WORKFLOW.contains("Smoke test Windows installer"));
     assert!(RELEASE_WORKFLOW.contains("./scripts/build-windows-installer.ps1 -Version $version"));
-    assert!(RELEASE_WORKFLOW.contains("sha256sum *.tar.gz *.zip *.exe"));
+    assert!(RELEASE_WORKFLOW.contains("sha256sum *.tar.gz *.zip *.exe *.dmg"));
     assert!(RELEASE_WORKFLOW.contains("dist/*.exe"));
+    assert!(RELEASE_WORKFLOW.contains("./scripts/build-macos-dmg.sh"));
+    assert!(RELEASE_WORKFLOW.contains("Smoke test DMG and package payload"));
+    assert!(RELEASE_WORKFLOW.contains("dist/*.dmg"));
 
-    for (path, document) in &DOCUMENTS[..2] {
+    for (path, document) in INSTALLATION_DOCS {
         assert!(
             document.contains("x86_64-windows-setup.exe"),
             "{path} must link the Windows Setup asset"
@@ -170,6 +185,21 @@ fn windows_installer_is_tested_checksums_and_attested() {
         assert!(
             document.contains("--no-auto-update"),
             "{path} must document the update opt-out"
+        );
+        assert!(
+            document.contains("macos-universal.dmg"),
+            "{path} must link the universal macOS DMG"
+        );
+        assert!(
+            document.contains("Install Asterline.pkg"),
+            "{path} must explain the native macOS installer"
+        );
+    }
+
+    for (path, document) in &DOCUMENTS[..2] {
+        assert!(
+            document.contains("docs/installation"),
+            "{path} must link to a dedicated installation guide"
         );
     }
 }

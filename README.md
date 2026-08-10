@@ -6,206 +6,108 @@
 [![Latest release](https://img.shields.io/github/v/release/song0705/Asterline)](https://github.com/song0705/Asterline/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**One terminal for a visible, persistent team of coding agents.**
+**Run a visible, persistent team of coding agents in one terminal.**
 
-Asterline is a local-first terminal workspace that coordinates the official
-Codex, Claude, Grok, and Agy CLIs already installed on your machine. It turns
-their native event streams into one auditable conversation, routes work between
-members, and persists collaboration as structured Runs.
+Asterline coordinates the official Codex, Claude, Grok, and Agy CLIs already
+installed on your machine. It combines their native event streams into one
+auditable workspace, routes work between team members, and records multi-step
+work as structured Runs.
 
-[Download](https://github.com/song0705/Asterline/releases/latest) ·
-[Quick start](#quick-start) ·
-[Commands](docs/commands.md) ·
-[Configuration](docs/configuration.md)
+[Install](#installation) · [Get started](#get-started) ·
+[Documentation](#documentation) ·
+[Releases](https://github.com/song0705/Asterline/releases/latest)
 
 ![Codex handing a frontend design proposal to Agy](docs/assets/asterline-codex-to-agy.webp)
 
-## Quick start
+## Why Asterline
 
-### Requirements
+- **One workspace.** Messages, reasoning, tools, diffs, errors, approvals, and
+  handoffs stay attached to the member that produced them.
+- **Structured collaboration.** Review, plan, brainstorm, and team workflows add
+  ownership, bounded retries, verdicts, and verification to agent work.
+- **Native integrations.** Asterline launches the provider CLIs directly and
+  preserves their authentication, models, permissions, and resumable sessions.
+- **Local control.** Team configuration and operational history remain in the
+  project workspace, with explicit approval and cancellation controls.
 
-- Linux, macOS, or Windows 10/11 with a color-capable terminal
-- At least one installed and authenticated CLI: `codex`, `claude`, `grok`, or
-  `agy`
-- Rust 1.85 or newer only when building from source
+## Installation
 
-### Install a release build
+Asterline supports macOS, Linux, and Windows 10/11. At least one supported CLI
+must already be installed and authenticated.
 
-Open [GitHub Releases](https://github.com/song0705/Asterline/releases/latest),
-then follow the section for your operating system. Asterline ships both the
-`asterline` command and its shorter alias, `ast`; the steps below install `ast`.
+| Platform | Recommended installation                                                                      |
+| -------- | --------------------------------------------------------------------------------------------- |
+| macOS    | Download `asterline-<version>-macos-universal.dmg`, open it, and run `Install Asterline.pkg`. |
+| Windows  | Download and run `asterline-<version>-x86_64-windows-setup.exe`.                              |
+| Linux    | Download the archive for `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`.           |
 
-#### macOS
+The installers provide both `asterline` and the shorter `ast` command. See the
+[installation guide](docs/installation.md) for portable packages, source builds,
+release verification, updates, uninstallation, and troubleshooting.
 
-Download the `.tar.gz` archive that matches the Mac:
+## Get started
 
-- Apple silicon: `aarch64-apple-darwin`
-- Intel: `x86_64-apple-darwin`
-
-Extract it, open Terminal in the extracted directory, and run:
-
-```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 ast "$HOME/.local/bin/ast"
-"$HOME/.local/bin/ast" --help
-```
-
-Add `$HOME/.local/bin` to `PATH` in `~/.zprofile` if `ast` is not found in a
-new terminal.
-
-#### Linux
-
-Download the `.tar.gz` archive for the machine architecture:
-
-- Intel/AMD 64-bit: `x86_64-unknown-linux-gnu`
-- ARM64: `aarch64-unknown-linux-gnu`
-
-Extract it, open a shell in the extracted directory, and run:
-
-```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 ast "$HOME/.local/bin/ast"
-"$HOME/.local/bin/ast" --help
-```
-
-Add `$HOME/.local/bin` to the shell's `PATH` configuration, commonly
-`~/.profile`, if `ast` is not found in a new shell.
-
-#### Windows
-
-Download `asterline-<version>-x86_64-windows-setup.exe` from the latest Release
-and double-click it. Setup installs Asterline for the current user, adds `ast`
-to the user `Path`, and registers an uninstaller. Open a new PowerShell window
-after Setup finishes:
-
-```powershell
-ast --help
-```
-
-Installer-managed copies check the latest stable Release once per day. A newer
-installer is downloaded only after its entry in `SHA256SUMS` matches, then runs
-silently after Asterline exits. Use `ast --update` to check immediately or
-`ast --no-auto-update` to skip the check for one launch.
-
-The installer is not yet Authenticode-signed, so Windows may show an unknown
-publisher warning on the first manual install. Release checksums and GitHub
-provenance attestations remain available for verification.
-
-The published `v0.2.2` Release predates the Setup executable. Until the next
-tagged Release, use its portable ZIP:
-
-<details>
-<summary>Portable Windows ZIP</summary>
-
-Extract `x86_64-pc-windows-msvc.zip`, open PowerShell in the extracted
-directory, and run `./ast.exe`. The portable build does not modify `Path` and
-does not update itself.
-
-</details>
-
-Each release also includes `SHA256SUMS` and GitHub build provenance
-attestations.
-
-### Build from source
-
-On any supported operating system with Rust 1.85 or newer, run this from an
-Asterline source checkout:
-
-```bash
-cargo install --path . --force
-```
-
-Cargo installs both commands into `$HOME/.cargo/bin` on macOS/Linux and
-`%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on `PATH`.
-
-### Start a team
-
-Run Asterline from the project the agents should work on.
-
-On macOS or Linux:
+Open the project that the agents should work on, then start Asterline:
 
 ```bash
 cd /path/to/your/project
 ast
 ```
 
-On Windows PowerShell:
+On first launch, the Team editor discovers supported CLIs on `PATH`. Select a
+member with `↑`/`↓`, press `Enter` to edit, and press `s` to save the roster.
+Asterline never installs a provider CLI or signs in on your behalf.
 
-```powershell
-Set-Location C:\path\to\your-project
-ast.exe
-```
-
-On first launch, Asterline discovers the supported CLIs on `PATH` and opens the
-Team editor. Select a member with `↑`/`↓`, press `Enter` to edit its fields, and
-press `s` to save and start. The editor discovers available models and reasoning
-effort for each installed backend; it never installs a CLI or signs in for you.
-
-Send the first task to a displayed member handle:
+Send the first task to a member shown in the roster:
 
 ```text
-@builder audit this repository and identify the highest-risk code path
+@builder audit this repository and fix the highest-risk defect
 ```
 
-Or select a tracked workflow, then send the task as the next message:
+Or select a tracked workflow before entering the task:
 
 ```text
 /mode review
 fix the payment callback race and add a regression test
 ```
 
-A new normal conversation requires an explicit first target. Later plain text
-continues to the previous target; `@all` broadcasts to the roster. Open `/help`
-inside Asterline for the command palette.
+Use `/help` for the command palette and `/runs` to inspect active and saved
+work.
 
-## What Asterline adds
+## Built for traceable agent work
 
-### One transcript, not a wall of terminals
+### Live teams over native CLIs
 
-Every message, reasoning update, tool call, diff, error, and handoff stays on the
-member that produced it. Markdown, code blocks, tables, and working-tree diffs
-render directly in the TUI. `/logs` keeps raw diagnostics available without
-flooding the main conversation, while `/focus <member>` isolates one member.
-
-### Native CLIs, one live roster
-
-A team may mix providers or use the same backend more than once. Members can
-carry a role, model, reasoning effort, working directory, system prompt,
-sandbox, permission mode, tool allowlist, and session policy. `/team` updates
-the roster while Asterline is running.
+A team can mix providers or use the same backend more than once. Each member can
+have its own role, model, reasoning effort, working directory, system prompt,
+sandbox, permission mode, tool allowlist, and session policy.
 
 ![Asterline Team editor](docs/assets/asterline-team.webp)
 
-| Backend | Executable | Streaming                         | Resume | Model choices                  |
-| ------- | ---------- | --------------------------------- | ------ | ------------------------------ |
-| Codex   | `codex`    | `codex exec --json`               | Yes    | `codex debug models`           |
-| Claude  | `claude`   | stream JSON with partial messages | Yes    | aliases and `availableModels`  |
-| Grok    | `grok`     | ACP over `grok agent stdio`       | Yes    | `grok --no-auto-update models` |
-| Agy     | `agy`      | `stream-json` print events        | Yes    | `agy models`                   |
+| Backend | Integration                 | Session resume | Model discovery                |
+| ------- | --------------------------- | -------------- | ------------------------------ |
+| Codex   | `codex exec --json`         | Yes            | `codex debug models`           |
+| Claude  | Streaming JSON              | Yes            | CLI settings and aliases       |
+| Grok    | ACP over `grok agent stdio` | Yes            | `grok --no-auto-update models` |
+| Agy     | `stream-json` events        | Yes            | `agy models`                   |
 
 Asterline does not replace provider authentication, billing, model access, or
-usage limits. Those remain properties of each CLI account.
+usage limits.
 
-### Runs instead of loose agent turns
+### Runs instead of loose turns
 
-Runs preserve phase, checklist ownership, attempts, blockers, notes,
-verification, verdicts, and the next action. Select a mode first; the following
-message becomes its task.
+Runs preserve the current phase, checklist owners, attempts, blockers, notes,
+verification results, verdicts, and next action.
 
-| Mode         | Use it for                         | What Asterline does                                    |
-| ------------ | ---------------------------------- | ------------------------------------------------------ |
-| `normal`     | Direct work with one/all members   | Routes ordinary messages and remembers the last target |
-| `review`     | Implementation with a quality gate | Loops builder → structured reviewer verdict → revision |
-| `plan`       | Multi-step owned work              | Plans a checklist, dispatches owners, then reviews     |
-| `brainstorm` | Broad exploration before judgment  | Runs seed/build/stretch, private vote, rank, synthesis |
-| `team`       | End-to-end coordinated delivery    | Lets a coordinator own steps, integrate, and verify    |
+| Mode         | Best for                           | Execution model                                  |
+| ------------ | ---------------------------------- | ------------------------------------------------ |
+| `normal`     | Direct chat and delegation         | Route to one member or the full roster           |
+| `review`     | Implementation with a quality gate | Builder, reviewer verdict, bounded revision loop |
+| `plan`       | Multi-step owned work              | Plan, assign, execute, review, verify            |
+| `brainstorm` | Exploration before judgment        | Generate, vote privately, rank, synthesize       |
+| `team`       | End-to-end coordinated delivery    | Coordinator-owned execution and integration      |
 
-Review and plan runs enforce bounded iteration. Brainstorm separates generation
-from private voting and deterministic ranking. Team mode gives a coordinator
-ownership of the checklist, integration, and verification. `/runs` shows only
-the Runs attached to the current conversation.
-
-When work must wait or needs an explicit check:
+Runs remain actionable when work pauses:
 
 ```text
 /block waiting for the staging client secret
@@ -214,18 +116,10 @@ When work must wait or needs an explicit check:
 /verify cargo test
 ```
 
-Without an explicit command, Asterline can detect common checks such as
-`cargo test`, `npm test`, and `pytest`.
+### Local, resumable history
 
-### Local state that can be resumed and inspected
-
-`/new` saves the current conversation and starts clean backend sessions.
-`/resume` restores a selected transcript together with its roster, native
-session IDs, mode, and Runs. `Ctrl+N` or `Ctrl+B` focuses a member; pressing
-`Enter` opens that member's native interactive CLI and resumes its session when
-supported.
-
-By default, operational state stays inside the project:
+`/new` starts a clean conversation. `/resume` restores a saved transcript,
+roster, backend sessions, mode, and Runs. Project state is stored by default in:
 
 ```text
 <workspace>/.asterline/
@@ -233,81 +127,53 @@ By default, operational state stays inside the project:
 └── asterline.sqlite3
 ```
 
-The database contains prompts, responses, tool events, routes, raw backend
-events, logs, approvals, sessions, and Run history. Treat it as sensitive
-development data and normally add `.asterline/` to `.gitignore`.
+The database may contain prompts, responses, tool output, routes, approvals,
+logs, and session identifiers. Treat it as sensitive development data and add
+`.asterline/` to `.gitignore` unless the project has a deliberate reason to
+version it.
 
-Asterline may also install workspace-local team and brainstorm Skills under
-`.agents/skills/`. These are integration files rather than runtime history;
-review them and decide whether the project should version them.
+## Safety model
 
-## How it works
+Asterline runs backend processes locally and inherits their credentials,
+environment, filesystem access, and network access. Each backend remains subject
+to its provider's data policy and permission model.
 
-```text
-You
- └─ target a member, the whole team, or a tracked workflow
-     ├─ Asterline launches or resumes the selected backend CLI
-     ├─ native events become chat, tools, diffs, logs, and session state
-     ├─ valid teammate envelopes are routed to other members
-     └─ messages, routes, Runs, approvals, and verification persist to SQLite
-```
-
-Automatic teammate relays are bounded. When a turn reaches its configured
-limit, Asterline pauses the route and makes that state visible instead of
-allowing an uncontrolled agent loop.
-
-## Trust model and boundaries
-
-Asterline starts backend processes locally and inherits their credentials,
-environment variables, filesystem access, and network access. No Asterline
-cloud service receives the workspace, but each backend still follows its own
-vendor data policy and network behavior.
-
-Members may use backend-native sandbox and permission settings. Asterline adds
-a configurable approval gate for risky user requests, agent-to-agent relays,
-workflow dispatches, and agent-originated roster changes. It does not provide a
-second process-level sandbox beyond the selected backend. `--debug` disables
-the Asterline gate and is intended only for controlled development.
-
-Read [approvals and tool-level control](docs/approvals.md) before relaxing
-permissions. Choose a different setup if every agent must receive an isolated
-worktree, if you need a hosted dashboard or remote queue, if you require direct
-provider APIs, or if unattended merge automation is the goal.
+Asterline adds approval gates for risky requests, agent-to-agent relays,
+workflow dispatches, and agent-originated roster changes. It does not add a
+second process sandbox beyond the selected backend. Read
+[Approvals and tool control](docs/approvals.md) before relaxing permissions.
 
 ## Essential commands
 
-| Command                | Purpose                                       |
-| ---------------------- | --------------------------------------------- |
-| `@<member> <message>`  | Send to one member                            |
-| `@all <message>`       | Broadcast to the team                         |
-| `/mode`                | Choose normal or a collaboration mode         |
-| `/runs`                | Inspect Run state, phase, and next actions    |
-| `/team`                | Edit the live roster                          |
-| `/skills`              | Select a Skill for the next prompt            |
-| `/find <text>`         | Search the transcript                         |
-| `/diff`                | Inspect unstaged changes and untracked files  |
-| `/logs`                | Open persisted diagnostics                    |
-| `/new`                 | Start a new conversation and backend sessions |
-| `/resume`              | Choose and restore a saved team conversation  |
-| `/approve` / `/reject` | Resolve a pending approval                    |
-| `/abort`               | Cancel running work, modes, and verification  |
-| `/help`                | Open the command palette                      |
+| Command                | Purpose                                     |
+| ---------------------- | ------------------------------------------- |
+| `@<member> <message>`  | Send a task to one member                   |
+| `@all <message>`       | Broadcast to the roster                     |
+| `/mode`                | Select a conversation or collaboration mode |
+| `/runs`                | Inspect work state and next actions         |
+| `/team`                | Edit the live roster                        |
+| `/resume`              | Restore a saved conversation                |
+| `/approve` / `/reject` | Resolve a pending approval                  |
+| `/abort`               | Cancel active work and verification         |
+| `/help`                | Open the command palette                    |
 
-The [complete command and keyboard reference](docs/commands.md) covers Run
-steps, Team controls, history, session attach, and navigation.
+See the [complete command and keyboard reference](docs/commands.md) for session
+attach, navigation, Run steps, Skills, logs, search, and diffs.
 
 ## Documentation
 
+- [Installation and updates](docs/installation.md)
 - [Commands and keyboard](docs/commands.md)
-- [Configuration, local data, permissions, and troubleshooting](docs/configuration.md)
-- [Approval layers and tool-level control](docs/approvals.md)
-- [Latest release notes](docs/releases/v0.2.2.md)
-- [Release process for maintainers](docs/releasing.md)
-- Built-in help: `/help` and `asterline --help`
+- [Configuration and local data](docs/configuration.md)
+- [Approvals and tool control](docs/approvals.md)
+- [Release notes](docs/releases/v0.2.2.md)
+- [Maintainer release process](docs/releasing.md)
 
-## Development and contributing
+Built-in help is available through `/help` and `asterline --help`.
 
-Run the product without calling real backends:
+## Development
+
+Run Asterline without invoking real backends:
 
 ```bash
 cargo run -- --fake
@@ -321,20 +187,14 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked --no-fail-fast
 ```
 
-If `just` is installed, use `just run --fake`, `just install`, or `just check`.
-Real-backend smoke tests are opt-in and are not run by default.
-
-Use [GitHub Issues](https://github.com/song0705/Asterline/issues) for
-reproducible bugs and focused feature proposals. Include the operating system,
-terminal, Asterline version, backend CLI/version, relevant sanitized `/logs`,
-and the smallest reproduction.
+Rust 1.85 or newer is required. Real-backend smoke tests are opt-in. Please use
+[GitHub Issues](https://github.com/song0705/Asterline/issues) for reproducible
+bugs and focused proposals.
 
 ## Project status
 
-Asterline is currently version `0.2.2` and under active development. Tagged
-versions publish prebuilt Linux and macOS archives plus a Windows archive and
-user-level Setup executable. Before a stable release, configuration, persisted
-data, commands, and UI details may change without backward compatibility.
+Asterline is pre-1.0 and under active development. Configuration, persisted
+data, commands, and interface details may change between releases.
 
 ## License
 
