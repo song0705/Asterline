@@ -1,7 +1,7 @@
 use super::*;
 use crate::domain::event::ChatItem;
 use crate::domain::mode::{
-    BrainstormModeConfig, PlanModeConfig, ReviewModeConfig, resolve_mode_roles,
+    BrainstormModeConfig, PlanModeConfig, ReviewModeConfig, TeamModeConfig, resolve_mode_roles,
 };
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, SessionPolicy, TeamMember,
@@ -129,6 +129,114 @@ fn user_message_is_not_dispatched_when_persistence_fails() {
         event,
         RuntimeEvent::Notice(text) if text.contains("could not save the user message")
     )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn agent_message_controls_are_not_executed_when_message_persistence_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-agent-message-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    rt.on_ui_command(user("must remain auditable"));
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_agent_message
+             BEFORE INSERT ON messages
+             WHEN NEW.kind = 'agent'
+             BEGIN SELECT RAISE(ABORT, 'agent message unavailable'); END;",
+        )
+        .unwrap();
+
+    let step = rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::MessageCompleted(
+            "visible answer\n@@team_message {\"to\":\"reviewer\",\"body\":\"act on this\"}"
+                .to_string(),
+        ),
+    );
+
+    assert!(step.actions.is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Route { .. }))
+    );
+    assert!(!step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MessageCompleted { text, .. } if !text.is_empty()
+    )));
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save an agent message")
+    )));
+    let (agents, routes): (i64, i64) = external
+        .query_row(
+            "SELECT
+                 SUM(CASE WHEN kind = 'agent' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN kind = 'route' THEN 1 ELSE 0 END)
+             FROM messages",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((agents, routes), (0, 0));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn route_is_not_emitted_or_dispatched_when_route_persistence_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-route-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    rt.on_ui_command(user("route durably"));
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_route
+             BEFORE INSERT ON messages
+             WHEN NEW.kind = 'route'
+             BEGIN SELECT RAISE(ABORT, 'route unavailable'); END;",
+        )
+        .unwrap();
+
+    let step = rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::MessageCompleted(
+            "done\n@@team_message {\"to\":\"reviewer\",\"body\":\"review this\"}".to_string(),
+        ),
+    );
+
+    assert!(step.actions.is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Route { .. }))
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save an agent route")
+    )));
+    let route_count: i64 = external
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE kind = 'route'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(route_count, 0);
     drop(external);
     drop(rt);
     remove_sqlite_test_files(&path);
@@ -2712,6 +2820,232 @@ fn review_auto_verify_runs_on_approve() {
     assert!(step.actions.iter().any(|a| a.member == builder));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verification_result_failure_keeps_the_mode_session_owned() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-review-verify-store-failure-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let path = dir.join("state.sqlite3");
+    let mut config = team();
+    config.workspace = dir.clone();
+    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    rt.on_ui_command(run_mode("finish durably"));
+    complete_ok(&mut rt, &builder, "done");
+    let approve = complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
+    );
+    let verify = &approve.verify_actions[0];
+    let run_id = verify.run_id;
+    let command = verify.command.clone();
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_verification_done
+             BEFORE UPDATE OF status ON runs
+             WHEN NEW.status = 'done'
+             BEGIN SELECT RAISE(ABORT, 'done unavailable'); END;",
+        )
+        .unwrap();
+
+    let step = rt.on_verify_output(VerifyOutput {
+        run_id,
+        command,
+        ok: true,
+        stdout: b"ok".to_vec(),
+        stderr: Vec::new(),
+        start_error: None,
+        cancelled: false,
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save verification result")
+    )));
+    assert!(rt.mode_sessions.contains_key(&run_id));
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Verifying);
+    let second = rt.on_ui_command(run_mode("must wait"));
+    assert!(second.actions.is_empty());
+    assert!(second.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("already active")
+    )));
+
+    drop(external);
+    drop(rt);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn block_failure_keeps_the_mode_session_owned() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-mode-block-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    let started = rt.on_ui_command(run_mode("do not lose ownership"));
+    let run_id = find_run_id(&started);
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_run_block
+             BEFORE UPDATE OF status ON runs
+             WHEN NEW.status = 'blocked'
+             BEGIN SELECT RAISE(ABORT, 'block unavailable'); END;",
+        )
+        .unwrap();
+
+    let step = rt.on_ui_command(UiCommand::Cancel { member: None });
+
+    assert!(rt.mode_sessions.contains_key(&run_id));
+    assert!(!rt.failed_runs.contains(&run_id));
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Running);
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not block mode run")
+    )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn plain_run_finish_failure_retains_turn_ownership() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-run-finish-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut config = team();
+    config.modes.team = Some(TeamModeConfig {
+        auto_verify: Some(false),
+        ..TeamModeConfig::default()
+    });
+    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    let started = start_team(&mut rt, "finish atomically");
+    let run_id = find_run_id(&started);
+    let builder = MemberId::new("builder");
+    rt.on_agent_event(&builder, AgentEvent::MessageCompleted("done".to_string()));
+    let queued_turn = rt.store.create_turn().unwrap();
+    rt.enqueue_prompt(
+        &builder,
+        queued_turn,
+        "queued after completion".to_string(),
+        &mut RuntimeStep::default(),
+    );
+    assert_eq!(rt.members[&builder].queue.len(), 1);
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_run_done
+             BEFORE UPDATE OF status ON runs
+             WHEN NEW.status = 'done'
+             BEGIN SELECT RAISE(ABORT, 'done unavailable'); END;",
+        )
+        .unwrap();
+
+    let step = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    assert!(step.actions.is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
+    );
+    assert!(rt.run_turns.values().any(|id| *id == run_id));
+    assert_eq!(rt.members[&builder].queue.len(), 1);
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Running);
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not finish the run")
+    )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn failed_run_status_failure_does_not_finish_or_start_queued_work() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-run-failed-status-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut config = team();
+    config.modes.team = Some(TeamModeConfig {
+        auto_verify: Some(false),
+        ..TeamModeConfig::default()
+    });
+    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    let started = start_team(&mut rt, "persist failure status");
+    let run_id = find_run_id(&started);
+    let builder = MemberId::new("builder");
+    let queued_turn = rt.store.create_turn().unwrap();
+    rt.enqueue_prompt(
+        &builder,
+        queued_turn,
+        "queued work".to_string(),
+        &mut RuntimeStep::default(),
+    );
+    assert_eq!(rt.members[&builder].queue.len(), 1);
+    rt.on_agent_event(&builder, AgentEvent::Fatal("backend failed".to_string()));
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_run_failed
+             BEFORE UPDATE OF status ON runs
+             WHEN NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'failed unavailable'); END;",
+        )
+        .unwrap();
+
+    let step = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+
+    assert!(step.actions.is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
+    );
+    assert!(rt.run_turns.values().any(|id| *id == run_id));
+    assert_eq!(rt.members[&builder].queue.len(), 1);
+    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Running);
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save a run status")
+    )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
 }
 
 #[test]

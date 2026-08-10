@@ -125,27 +125,36 @@ impl StreamAdapter for AgyStreamAdapter {
         if self.sandbox != SandboxPolicy::DangerFullAccess {
             args.push("--sandbox".to_string());
         }
-        match self.permission_mode {
-            Some(PermissionMode::BypassPermissions) => {
-                args.push("--dangerously-skip-permissions".to_string());
+        // Agy's --sandbox only restricts terminal execution. Its per-run plan
+        // mode is the strongest CLI-level guard available for a ReadOnly
+        // member, so ReadOnly must win over permissive permission settings.
+        let mode = if self.sandbox == SandboxPolicy::ReadOnly {
+            Some("plan")
+        } else {
+            match self.permission_mode {
+                Some(PermissionMode::AcceptEdits) => Some("accept-edits"),
+                Some(PermissionMode::Plan) => Some("plan"),
+                _ => None,
             }
-            Some(PermissionMode::AcceptEdits) => {
-                args.push("--mode".to_string());
-                args.push("accept-edits".to_string());
-            }
-            Some(PermissionMode::Plan) => {
-                args.push("--mode".to_string());
-                args.push("plan".to_string());
-            }
-            _ => {}
+        };
+        if let Some(mode) = mode {
+            args.push("--mode".to_string());
+            args.push(mode.to_string());
+        }
+        if self.permission_mode == Some(PermissionMode::BypassPermissions)
+            && self.sandbox == SandboxPolicy::DangerFullAccess
+        {
+            args.push("--dangerously-skip-permissions".to_string());
         }
         args.push("--print".to_string());
-        args.push(self.prompt_with_system(prompt));
         AdapterCommand {
             program: self.binary.clone(),
             args,
             cwd: self.cwd.clone(),
-            stdin: None,
+            // Agy print mode reads a missing positional prompt from stdin.
+            // This avoids exposing prompts in process listings and Windows'
+            // command-line length limit.
+            stdin: Some(self.prompt_with_system(prompt)),
         }
     }
 
@@ -387,8 +396,9 @@ mod tests {
                 .any(|w| { w == ["--conversation", "1ddde77f-dcaf-47cf-97e8-b3e6a3f4e43d",] })
         );
         assert!(command.args.contains(&"--sandbox".to_string()));
-        assert!(command.args[command.args.len() - 1].contains("hi there"));
-        assert_eq!(command.stdin, None);
+        assert!(command.args.windows(2).any(|w| w == ["--mode", "plan"]));
+        assert_eq!(command.args.last().map(String::as_str), Some("--print"));
+        assert!(command.stdin.as_deref().unwrap().contains("hi there"));
     }
 
     #[test]
@@ -404,6 +414,7 @@ mod tests {
     #[test]
     fn exact_agy_modes_map_to_cli_flags() {
         let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        member.sandbox = SandboxPolicy::WorkspaceWrite;
         member.permission_mode = Some(PermissionMode::AcceptEdits);
         let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
         let command = adapter.build_command("hi", None, None);
@@ -412,6 +423,45 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|w| w == ["--mode", "accept-edits"])
+        );
+    }
+
+    #[test]
+    fn sandboxed_agy_cannot_bypass_permissions() {
+        for sandbox in [SandboxPolicy::ReadOnly, SandboxPolicy::WorkspaceWrite] {
+            let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+            member.sandbox = sandbox;
+            member.permission_mode = Some(PermissionMode::BypassPermissions);
+            let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+
+            let command = adapter.build_command("inspect", None, None);
+
+            assert!(command.args.contains(&"--sandbox".to_string()));
+            if sandbox == SandboxPolicy::ReadOnly {
+                assert!(command.args.windows(2).any(|w| w == ["--mode", "plan"]));
+            }
+            assert!(
+                !command
+                    .args
+                    .contains(&"--dangerously-skip-permissions".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn agy_bypass_requires_explicit_full_access() {
+        let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        member.sandbox = SandboxPolicy::DangerFullAccess;
+        member.permission_mode = Some(PermissionMode::BypassPermissions);
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+
+        let command = adapter.build_command("inspect", None, None);
+
+        assert!(!command.args.contains(&"--sandbox".to_string()));
+        assert!(
+            command
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string())
         );
     }
 

@@ -1577,6 +1577,21 @@ impl TeamRuntime {
                     .record_agent(turn, member, &display, backend, &visible_text)
             {
                 self.report_store_error("save an agent message", err, step);
+                if let Some(state) = self.members.get_mut(member)
+                    && let Some(running) = &mut state.running
+                {
+                    running.failed = true;
+                    running.message = None;
+                    running.text.clear();
+                }
+                // Streaming deltas are provisional until the canonical message
+                // is durable. Clear them and do not execute controls from an
+                // output that is absent from the audit trail.
+                step.events.push(RuntimeEvent::MessageCompleted {
+                    msg,
+                    text: String::new(),
+                });
+                return;
             }
         }
         step.events.push(RuntimeEvent::MessageCompleted {
@@ -1717,6 +1732,7 @@ impl TeamRuntime {
         if !to_labels.is_empty() {
             if let Err(err) = self.store.record_route(turn, from, &to_labels, &tmsg.body) {
                 self.report_store_error("save an agent route", err, step);
+                return;
             }
             step.events.push(RuntimeEvent::Route {
                 turn,
@@ -1959,16 +1975,17 @@ impl TeamRuntime {
                 None => return,
             };
 
-        if cancelled {
+        let terminal_state_saved = if cancelled {
             // A user-requested cancel kills the process (no exit code); that is
             // expected, not an error.
             self.mode_mark_turn_cancelled(turn);
             step.events
                 .push(RuntimeEvent::Notice(format!("{member} cancelled")));
+            true
         } else if failed {
             // A structured backend failure remains authoritative even when the
             // child process subsequently exits with status 0.
-            self.mark_run_turn(turn, RunStatus::Failed, step);
+            self.mark_run_turn(turn, RunStatus::Failed, step)
         } else if !ok {
             let message = format!(
                 "{} exited without success (code {})",
@@ -1983,8 +2000,10 @@ impl TeamRuntime {
                 member: member.clone(),
                 message,
             });
-            self.mark_run_turn(turn, RunStatus::Failed, step);
-        }
+            self.mark_run_turn(turn, RunStatus::Failed, step)
+        } else {
+            true
+        };
 
         if let Some(state) = self.members.get_mut(member) {
             state.tools.clear();
@@ -1995,6 +2014,19 @@ impl TeamRuntime {
             status: MemberStatus::Idle,
         });
 
+        if !terminal_state_saved {
+            return;
+        }
+
+        // Finalize the completed turn before starting unrelated queued work.
+        // If the terminal transition could not be persisted, run_turns keeps
+        // ownership and the queue remains stopped for an explicit recovery.
+        let finishing_turn = !self.turn_active(turn);
+        self.check_turn_complete(turn, step);
+        if finishing_turn && self.run_turns.contains_key(&turn) {
+            return;
+        }
+
         // Start the next queued prompt for this member, if any.
         let next = self
             .members
@@ -2003,8 +2035,6 @@ impl TeamRuntime {
         if let Some(queued) = next {
             self.start_run(member, queued.turn, queued.prompt, step);
         }
-
-        self.check_turn_complete(turn, step);
     }
 
     // === queueing / dispatch ============================================
@@ -2176,33 +2206,43 @@ impl TeamRuntime {
     fn check_turn_complete(&mut self, turn: TurnId, step: &mut RuntimeStep) {
         if !self.turn_active(turn) {
             self.relay.reset_turn(turn);
-            let run_id = self.run_turns.remove(&turn);
+            let run_id = self.run_turns.get(&turn).copied();
             match run_id {
                 Some(run_id) if self.mode_sessions.contains_key(&run_id) => {
+                    self.run_turns.remove(&turn);
                     step.events.push(RuntimeEvent::TurnFinished { turn });
                     self.mode_on_turn_complete(run_id, step);
                     return;
                 }
                 Some(run_id) if !self.failed_runs.contains(&run_id) => {
                     // Team runs may auto-verify; plain/team Done otherwise.
-                    self.finish_plain_or_team_run(run_id, step);
+                    if !self.finish_plain_or_team_run(run_id, step) {
+                        return;
+                    }
                 }
                 _ => {}
             }
+            self.run_turns.remove(&turn);
             step.events.push(RuntimeEvent::TurnFinished { turn });
         }
     }
 
-    fn mark_run_turn(&mut self, turn: TurnId, status: RunStatus, step: &mut RuntimeStep) {
+    fn mark_run_turn(&mut self, turn: TurnId, status: RunStatus, step: &mut RuntimeStep) -> bool {
         let Some(run_id) = self.run_turns.get(&turn).copied() else {
-            return;
+            return true;
         };
-        if status == RunStatus::Failed {
-            self.failed_runs.insert(run_id);
-        }
         match self.store.update_run_status(run_id, status) {
-            Ok(run) => step.events.push(RuntimeEvent::RunUpdated { run }),
-            Err(err) => self.report_store_error("save a run status", err, step),
+            Ok(run) => {
+                if status == RunStatus::Failed {
+                    self.failed_runs.insert(run_id);
+                }
+                step.events.push(RuntimeEvent::RunUpdated { run });
+                true
+            }
+            Err(err) => {
+                self.report_store_error("save a run status", err, step);
+                false
+            }
         }
     }
 

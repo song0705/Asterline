@@ -249,12 +249,12 @@ impl TeamRuntime {
     }
 
     /// Finish a non-mode-session run turn: team runs may auto-verify; others Done.
-    fn finish_plain_or_team_run(&mut self, run_id: RunId, step: &mut RuntimeStep) {
+    fn finish_plain_or_team_run(&mut self, run_id: RunId, step: &mut RuntimeStep) -> bool {
         let run = match self.store.run(run_id) {
             Ok(run) => run,
             Err(err) => {
                 self.report_store_error("load the finishing run", err, step);
-                return;
+                return false;
             }
         };
         let is_team = run
@@ -288,7 +288,7 @@ impl TeamRuntime {
                         step.events.push(RuntimeEvent::Notice(format!(
                             "could not encode team verification state: {err}"
                         )));
-                        return;
+                        return false;
                     }
                 };
                 match self.store.update_run_mode_state(run_id, &json) {
@@ -297,7 +297,7 @@ impl TeamRuntime {
                         .push(RuntimeEvent::RunUpdated { run: updated }),
                     Err(err) => {
                         self.report_store_error("save team verification state", err, step);
-                        return;
+                        return false;
                     }
                 }
                 match self
@@ -309,7 +309,7 @@ impl TeamRuntime {
                         .push(RuntimeEvent::RunUpdated { run: updated }),
                     Err(err) => {
                         self.report_store_error("save team verification status", err, step);
-                        return;
+                        return false;
                     }
                 }
                 step.events
@@ -320,14 +320,18 @@ impl TeamRuntime {
                     workspace: self.config.workspace.clone(),
                     cancel: Arc::new(AtomicBool::new(false)),
                 });
-                return;
+                return true;
             }
         }
         match self.store.update_run_status(run_id, RunStatus::Done) {
-            Ok(updated) => step
-                .events
-                .push(RuntimeEvent::RunUpdated { run: updated }),
-            Err(err) => self.report_store_error("finish the run", err, step),
+            Ok(updated) => {
+                step.events.push(RuntimeEvent::RunUpdated { run: updated });
+                true
+            }
+            Err(err) => {
+                self.report_store_error("finish the run", err, step);
+                false
+            }
         }
     }
 
@@ -396,11 +400,11 @@ impl TeamRuntime {
         };
 
         // continue_run clears verification columns and bumps attempt; store first.
-        self.failed_runs.remove(&run.id);
         match self.store.continue_run(run.id, None) {
-            Ok(updated) => step
-                .events
-                .push(RuntimeEvent::RunUpdated { run: updated }),
+            Ok(updated) => {
+                self.failed_runs.remove(&run.id);
+                step.events.push(RuntimeEvent::RunUpdated { run: updated });
+            }
             Err(err) => {
                 self.report_store_error("continue the failed team run", err, step);
                 return;
@@ -477,10 +481,10 @@ impl TeamRuntime {
             )));
             return;
         }
-        self.failed_runs.insert(run.id);
         match self.store.block_run(run.id, &reason) {
             Ok(run) => {
                 let id = run.id;
+                self.failed_runs.insert(id);
                 step.events.push(RuntimeEvent::RunUpdated { run });
                 step.events
                     .push(RuntimeEvent::Notice(format!("run {id} blocked")));
@@ -769,11 +773,6 @@ impl TeamRuntime {
         } else {
             summarize_verify_output(&output.stdout, &output.stderr)
         };
-        if ok || cancelled {
-            self.failed_runs.remove(&output.run_id);
-        } else {
-            self.failed_runs.insert(output.run_id);
-        }
         let saved = if cancelled {
             self.store
                 .cancel_run_verification(output.run_id, &output.command, &summary)
@@ -783,6 +782,11 @@ impl TeamRuntime {
         };
         match saved {
             Ok(run) => {
+                if ok || cancelled {
+                    self.failed_runs.remove(&output.run_id);
+                } else {
+                    self.failed_runs.insert(output.run_id);
+                }
                 step.events.push(RuntimeEvent::RunUpdated { run });
                 step.events.push(RuntimeEvent::Notice(format!(
                     "verification {}: {}",
@@ -796,9 +800,12 @@ impl TeamRuntime {
                     summary
                 )));
             }
-            Err(err) => step.events.push(RuntimeEvent::Notice(format!(
-                "could not save verification result: {err}"
-            ))),
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "could not save verification result: {err}"
+                )));
+                return step;
+            }
         }
 
         // Review/plan ModeSession path (Verifying phase).

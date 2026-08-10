@@ -542,8 +542,6 @@ impl TeamRuntime {
             return;
         }
 
-        self.failed_runs.remove(&run_id);
-
         let steps = match self.store.run_steps_all(run_id) {
             Ok(steps) => steps,
             Err(err) => {
@@ -567,7 +565,10 @@ impl TeamRuntime {
         }
         // mark_run_turn already wrote Failed; restore Running before UI events.
         match self.store.update_run_status(run_id, RunStatus::Running) {
-            Ok(run) => step.events.push(RuntimeEvent::RunUpdated { run }),
+            Ok(run) => {
+                self.failed_runs.remove(&run_id);
+                step.events.push(RuntimeEvent::RunUpdated { run });
+            }
             Err(err) => {
                 self.report_store_error("restore the plan run status", err, step);
                 self.block_mode_run(run_id, "could not persist plan recovery", step);
@@ -1147,15 +1148,12 @@ impl TeamRuntime {
         step.events.push(RuntimeEvent::Notice(notice));
     }
 
-    /// Block a mode run, record the reason, and free the live session.
-    ///
-    /// Inserts into `failed_runs` **before** any further turn completion
-    /// can mark the run Done.
+    /// Block a mode run, then free its live session only after persistence.
     fn block_mode_run(&mut self, run_id: RunId, reason: &str, step: &mut RuntimeStep) {
-        self.failed_runs.insert(run_id);
-        self.mode_sessions.remove(&run_id);
         match self.store.block_run(run_id, reason) {
             Ok(run) => {
+                self.failed_runs.insert(run_id);
+                self.mode_sessions.remove(&run_id);
                 step.events.push(RuntimeEvent::RunUpdated { run });
                 step.events
                     .push(RuntimeEvent::Notice(format!("{run_id} blocked: {reason}")));

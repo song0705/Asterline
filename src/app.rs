@@ -3,7 +3,7 @@
 //! and run the chat-first TUI. Exiting shuts the runtime down gracefully.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -60,6 +60,7 @@ where
         join,
         events,
         state,
+        instance_lock: _instance_lock,
     } = prepared;
 
     if config.banner {
@@ -91,6 +92,55 @@ struct Prepared {
     join: JoinHandle<()>,
     events: mpsc::Receiver<RuntimeEvent>,
     state: AppState,
+    instance_lock: InstanceLock,
+}
+
+/// An OS-backed exclusive lock for one SQLite store. The marker file remains
+/// after exit, but the lock itself is released automatically with the handle.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    fn acquire(db_path: &Path) -> io::Result<Self> {
+        let mut lock_name = db_path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let mut file = options.open(&lock_path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "could not lock {} (another Asterline instance may be using this store): \
+                     {err}",
+                    db_path.display()
+                ),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let err = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!(
+                        "another Asterline instance is already using {}: {err}",
+                        db_path.display()
+                    ),
+                ));
+            }
+        }
+        file.set_len(0)?;
+        writeln!(file, "pid={}", std::process::id())?;
+        Ok(Self { _file: file })
+    }
 }
 
 /// Build the team, store, runners, and runtime. Returns `None` if no team can
@@ -146,6 +196,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let instance_lock = InstanceLock::acquire(&db_path)?;
     let store = SqliteStore::open(&db_path).map_err(|err| io::Error::other(err.to_string()))?;
 
     let runners = build_runners(&team, config.fake);
@@ -198,6 +249,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         join,
         events: events_rx,
         state,
+        instance_lock,
     }))
 }
 
@@ -378,6 +430,25 @@ mod tests {
             result.expect_err("panic must be visible").to_string(),
             "Asterline runtime thread panicked"
         );
+    }
+
+    #[test]
+    fn store_instance_lock_is_exclusive_and_released_on_drop() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-instance-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.sqlite3");
+
+        let first = InstanceLock::acquire(&db).unwrap();
+        let error = InstanceLock::acquire(&db)
+            .err()
+            .expect("a second instance must be rejected");
+        assert!(error.to_string().contains("another Asterline instance"));
+
+        drop(first);
+        InstanceLock::acquire(&db).expect("lock must be released when the owner exits");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

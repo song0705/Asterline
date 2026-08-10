@@ -33,6 +33,9 @@ const RUN_STEP_PREFIX: &str = "@@run_step";
 const REVIEW_PREFIX: &str = "@@review";
 const BRAINSTORM_CARD_PREFIX: &str = "@@brainstorm_card";
 const BRAINSTORM_VOTE_PREFIX: &str = "@@brainstorm_vote";
+/// A single model response must not expand into an unbounded number of
+/// persistent routes, approvals, or run mutations.
+pub const MAX_CONTROL_ENVELOPES: usize = 64;
 
 /// The result of scanning one agent message for envelopes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -217,6 +220,8 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut brainstorm_votes = Vec::new();
     let mut warnings = Vec::new();
     let mut fence: Option<(char, usize)> = None;
+    let mut envelope_lines = 0usize;
+    let mut limit_reported = false;
 
     for line in text.lines() {
         if let Some((marker, minimum)) = fence {
@@ -242,6 +247,18 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         for &(prefix, parse_fn) in ENVELOPE_PARSERS {
             if let Some(payload) = envelope_payload(line, prefix) {
                 matched = true;
+                if envelope_lines >= MAX_CONTROL_ENVELOPES {
+                    kept_lines.push(line);
+                    if !limit_reported {
+                        warnings.push(format!(
+                            "control envelope limit exceeded; only the first \
+                             {MAX_CONTROL_ENVELOPES} envelope lines were processed"
+                        ));
+                        limit_reported = true;
+                    }
+                    break;
+                }
+                envelope_lines += 1;
                 match parse_fn(payload) {
                     Ok(EnvelopeValue::Message(message)) => messages.push(message),
                     Ok(EnvelopeValue::Member(member)) => members.push(member),
@@ -656,6 +673,22 @@ mod tests {
         );
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(parsed.messages[1].body, "two");
+    }
+
+    #[test]
+    fn caps_control_envelopes_and_keeps_excess_lines_visible() {
+        let text = (0..MAX_CONTROL_ENVELOPES + 10)
+            .map(|index| format!(r#"@@team_message {{"to":"builder","body":"message {index}"}}"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed = parse_agent_output(&text);
+
+        assert_eq!(parsed.messages.len(), MAX_CONTROL_ENVELOPES);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.warnings[0].contains("control envelope limit exceeded"));
+        assert!(parsed.visible_text.contains("message 64"));
+        assert!(parsed.visible_text.contains("message 73"));
     }
 
     #[test]

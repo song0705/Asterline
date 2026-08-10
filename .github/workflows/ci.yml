@@ -10,7 +10,7 @@ env:
 
 jobs:
   check:
-    name: fmt · clippy · test
+    name: fmt · clippy · test · audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,6 +26,10 @@ jobs:
       - name: Test
         run: cargo test
         # Real-CLI smoke tests are #[ignore]d and never run in CI.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependencies
+        run: cargo audit
 
   test-macos:
     name: test · macOS

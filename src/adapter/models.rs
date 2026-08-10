@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::adapter::process::{
     ChildProcessTree, MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_LINE_BYTES, configure_process_tree,
 };
-use crate::domain::config::resolve_binary_on_path;
+use crate::domain::config::{resolve_binary_on_path, user_home_dir};
 use crate::domain::team::{BackendKind, Effort};
 
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -172,8 +172,8 @@ fn claude_models_from_settings(paths: &[PathBuf], custom: Option<&str>) -> Vec<D
 
 fn claude_settings_paths(cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".claude/settings.json"));
+    if let Some(home) = user_home_dir() {
+        paths.push(home.join(".claude/settings.json"));
     }
     let project_root = git_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     paths.push(project_root.join(".claude/settings.json"));
