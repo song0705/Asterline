@@ -2207,7 +2207,7 @@ impl TeamRuntime {
         if !self.turn_active(turn) {
             self.relay.reset_turn(turn);
             let run_id = self.run_turns.get(&turn).copied();
-            match run_id {
+            let completion_saved = match run_id {
                 Some(run_id) if self.mode_sessions.contains_key(&run_id) => {
                     self.run_turns.remove(&turn);
                     step.events.push(RuntimeEvent::TurnFinished { turn });
@@ -2216,11 +2216,12 @@ impl TeamRuntime {
                 }
                 Some(run_id) if !self.failed_runs.contains(&run_id) => {
                     // Team runs may auto-verify; plain/team Done otherwise.
-                    if !self.finish_plain_or_team_run(run_id, step) {
-                        return;
-                    }
+                    self.finish_plain_or_team_run(run_id, step)
                 }
-                _ => {}
+                _ => true,
+            };
+            if !completion_saved {
+                return;
             }
             self.run_turns.remove(&turn);
             step.events.push(RuntimeEvent::TurnFinished { turn });
