@@ -1,4 +1,5 @@
 use asterline::domain::team::{ApprovalSurface, BackendKind, DefaultTarget, MemberId, TeamConfig};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthStr;
 
 const CONFIGURATION_DOC: &str = include_str!("../docs/configuration.md");
@@ -129,6 +130,26 @@ fn readmes_use_real_product_images_without_a_handwritten_ui_mockup() {
             !document.contains("┌ Asterline") && !document.contains("Illustrative transcript"),
             "{path} must not embed a handwritten TUI mockup"
         );
+    }
+}
+
+#[test]
+fn markdown_strong_markers_are_not_rendered_literally() {
+    for (path, document) in DOCUMENTS {
+        let mut in_code_block = false;
+        for event in Parser::new(document) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+                Event::End(TagEnd::CodeBlock) => in_code_block = false,
+                Event::Text(text) if !in_code_block => {
+                    assert!(
+                        !text.contains("**"),
+                        "literal strong delimiter in rendered text from {path}: {text}"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }
 
