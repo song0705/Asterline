@@ -128,8 +128,9 @@ fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<Import
 }
 
 /// Candidate session files: the snapshot path (if present) plus every `.jsonl`
-/// in the project dir whose mtime is at least `started`. Original path first,
-/// then others sorted by mtime ascending. Deduplicated.
+/// in the project dir whose mtime is within the clock-skew grace before
+/// `started`. Original path first, then others sorted by mtime ascending.
+/// Deduplicated.
 fn candidate_files(snapshot: &ClaudeSnapshot, project_dir: &Path) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
@@ -141,6 +142,10 @@ fn candidate_files(snapshot: &ClaudeSnapshot, project_dir: &Path) -> Vec<PathBuf
         candidates.push(path.clone());
     }
 
+    let candidate_threshold = snapshot
+        .started
+        .checked_sub(CLOCK_SKEW)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut others: Vec<(SystemTime, PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(project_dir) {
         for entry in entries.flatten().take(MAX_CANDIDATE_SCAN_ENTRIES) {
@@ -158,7 +163,7 @@ fn candidate_files(snapshot: &ClaudeSnapshot, project_dir: &Path) -> Vec<PathBuf
             let Some(mtime) = modified(&path) else {
                 continue;
             };
-            if mtime < snapshot.started {
+            if mtime < candidate_threshold {
                 continue;
             }
             if seen.insert(path.clone()) {

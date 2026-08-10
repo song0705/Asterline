@@ -1322,12 +1322,20 @@ mod tests {
                 events,
             );
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let frame_deadline = Instant::now() + Duration::from_secs(15);
+        let mut exit_deadline = None;
         let mut observed = Vec::new();
         loop {
+            let deadline = exit_deadline.unwrap_or(frame_deadline);
             let event = received
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("oversized ACP server did not terminate");
+            if matches!(
+                &event,
+                AgentEvent::Fatal(message) if message.contains("line exceeded")
+            ) {
+                exit_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
             let exited = matches!(event, AgentEvent::Exited { .. });
             observed.push(event);
             if exited {

@@ -390,6 +390,7 @@ Normal 模式有意要求第一条消息明确目标。可以使用 `@builder`�
 - [命令与键盘参考](docs/commands.zh-CN.md)
 - [配置、本地数据、权限与故障排查](docs/configuration.md)
 - [审批层与工具级控制](docs/approvals.md)
+- [v0.2.2 发布说明](docs/releases/v0.2.2.md)
 - [v0.2.1 发布说明](docs/releases/v0.2.1.md)
 - [v0.2.0 发布说明](docs/releases/v0.2.0.md)
 - 内置命令面板：`/help`
@@ -428,7 +429,7 @@ src/
 
 ## 项目状态
 
-Asterline 当前版本为 `0.2.1`，仍在积极开发。带版本标签的提交会通过 GitHub
+Asterline 当前版本为 `0.2.2`，仍在积极开发。带版本标签的提交会通过 GitHub
 Actions 自动发布 Linux、macOS 和 Windows 预编译包。在稳定版之前，配置、持久化
 数据、命令和界面细节都可能不兼容地变化。
 

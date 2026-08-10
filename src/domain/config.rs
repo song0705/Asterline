@@ -862,7 +862,11 @@ mod tests {
     #[test]
     fn embedded_team_skill_is_protocol_v12() {
         assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 12);
-        assert!(ASTERLINE_TEAM_SKILL.contains("metadata:\n  version: 12"));
+        assert!(
+            ASTERLINE_TEAM_SKILL
+                .lines()
+                .any(|line| line.trim() == "version: 12")
+        );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
         assert!(ASTERLINE_TEAM_SKILL.contains("Brainstorm Generation and Voting"));

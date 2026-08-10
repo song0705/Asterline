@@ -40,7 +40,8 @@ must exactly match the package version in `Cargo.toml`.
 Pushing the tag starts `.github/workflows/release.yml`. The workflow:
 
 1. verifies that the tag and Cargo package version match;
-2. runs formatting, Clippy, and the test suite;
+2. runs formatting and warning-free Clippy on Linux, then runs the test suite
+   on Linux, macOS, and Windows;
 3. builds `asterline` and `ast` for Linux x86-64, Linux ARM64, macOS Intel,
    macOS Apple silicon, and Windows x86-64 MSVC;
 4. packages Unix targets as `.tar.gz` and Windows as `.zip`, including the
@@ -50,9 +51,9 @@ Pushing the tag starts `.github/workflows/release.yml`. The workflow:
    release notes when no matching file exists.
 
 The Windows build runs on `windows-latest` and links the bundled SQLite source,
-so it does not rely on a runner- or user-installed `sqlite3.lib`. The regular CI
-workflow also runs `cargo test --all-targets --locked` on Windows; keep this as
-a real link-and-execute job rather than replacing it with `cargo check`.
+so it does not rely on a runner- or user-installed `sqlite3.lib`. Both release
+gating and regular CI run `cargo test --all-targets --locked` on Windows; keep
+this as a real link-and-execute job rather than replacing it with `cargo check`.
 
 Monitor a release from the command line:
 
