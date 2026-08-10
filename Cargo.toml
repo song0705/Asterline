@@ -28,6 +28,9 @@ unicode-width = "0.2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+semver = "1.0"
+sha2 = "0.10"
+ureq = { version = "=3.3.0", default-features = false, features = ["native-tls"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

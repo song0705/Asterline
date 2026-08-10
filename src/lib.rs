@@ -6,3 +6,6 @@ pub mod run_support;
 pub mod runtime;
 pub mod store;
 pub mod tui;
+
+#[cfg(windows)]
+mod update;

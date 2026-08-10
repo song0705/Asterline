@@ -70,16 +70,30 @@ install -m 755 ast "$HOME/.local/bin/ast"
 
 #### Windows
 
-下载 `x86_64-pc-windows-msvc.zip`，解压后在解压目录中打开 PowerShell 并运行：
+从最新 Release 下载 `asterline-<version>-x86_64-windows-setup.exe`，双击完成安装。
+安装器会把 Asterline 安装到当前用户目录、自动把 `ast` 加入用户 `Path`，并注册标准
+卸载入口。安装完成后打开新的 PowerShell：
 
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
-Copy-Item .\ast.exe "$HOME\bin\ast.exe"
-& "$HOME\bin\ast.exe" --help
+ast --help
 ```
 
-随后在 Windows“环境变量”中把 `%USERPROFILE%\bin` 加入用户 `Path`，再打开新的
-PowerShell 窗口，即可在其他目录运行 `ast`。
+安装版每天最多检查一次最新稳定 Release。只有新安装器与同一 Release 中的
+`SHA256SUMS` 匹配时才会下载，并在 Asterline 退出后静默安装。使用 `ast --update`
+可以立即检查；单次启动使用 `ast --no-auto-update` 可跳过检查。
+
+安装器目前还没有 Authenticode 签名，因此第一次手动安装时 Windows 可能显示“未知
+发布者”。Release 仍提供校验和与 GitHub 构建来源证明供核验。
+
+已经发布的 `v0.2.2` 早于安装器功能。在下一个带标签版本发布前，请使用便携 ZIP：
+
+<details>
+<summary>Windows 便携 ZIP</summary>
+
+解压 `x86_64-pc-windows-msvc.zip`，在解压目录中打开 PowerShell，然后运行
+`./ast.exe`。便携版不会修改 `Path`，也不会自动更新。
+
+</details>
 
 每个 Release 还附带 `SHA256SUMS` 与 GitHub 构建来源证明。
 
@@ -291,8 +305,8 @@ cargo test --all-targets --locked --no-fail-fast
 ## 项目状态
 
 Asterline 当前版本为 `0.2.2`，仍在积极开发。带版本标签的提交会发布 Linux、macOS
-和 Windows 预编译包。在稳定版之前，配置、持久化数据、命令和界面细节都可能发生
-不兼容变化。
+预编译包，以及 Windows 便携包和用户级安装器。在稳定版之前，配置、持久化数据、
+命令和界面细节都可能发生不兼容变化。
 
 ## 许可证
 

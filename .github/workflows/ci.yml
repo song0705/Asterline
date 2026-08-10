@@ -52,3 +52,75 @@ jobs:
         run: cargo test --all-targets --locked
         # This intentionally links and executes tests; `cargo check` would not
         # catch missing native libraries or Windows-only linker failures.
+      - name: Build release binaries for installer smoke test
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Build Windows installer
+        shell: pwsh
+        run: ./scripts/build-windows-installer.ps1
+      - name: Smoke test Windows installer
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $installer = (Resolve-Path "dist/asterline-$version-x86_64-windows-setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "AsterlineInstallerSmoke"
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Installer exited with $($install.ExitCode)."
+          }
+          foreach ($file in @("asterline.exe", "ast.exe", ".asterline-installer-managed", "unins000.exe")) {
+            if (-not (Test-Path (Join-Path $installDir $file))) {
+              throw "Installer did not create $file."
+            }
+          }
+          & (Join-Path $installDir "ast.exe") --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed ast.exe --help failed."
+          }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if (-not (($userPath -split ";") -contains $installDir)) {
+            throw "Installer did not add its directory to the user Path."
+          }
+          $blocker = Start-Process -FilePath "pwsh" -ArgumentList @(
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Seconds 2"
+          ) -PassThru
+          $update = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$installDir",
+            "/WAITPID=$($blocker.Id)"
+          ) -PassThru
+          Start-Sleep -Milliseconds 500
+          if ($update.HasExited) {
+            throw "Update installer did not wait for the running Asterline process."
+          }
+          $blocker.WaitForExit()
+          if (-not $update.WaitForExit(15000)) {
+            $update.Kill()
+            throw "Update installer did not finish after the process exited."
+          }
+          if ($update.ExitCode -ne 0) {
+            throw "Update installer exited with $($update.ExitCode)."
+          }
+          $uninstall = Start-Process -FilePath (Join-Path $installDir "unins000.exe") -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Uninstaller exited with $($uninstall.ExitCode)."
+          }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if (($userPath -split ";") -contains $installDir) {
+            throw "Uninstaller left its directory on the user Path."
+          }
+          if (Test-Path (Join-Path $installDir "ast.exe")) {
+            throw "Uninstaller left ast.exe behind."
+          }

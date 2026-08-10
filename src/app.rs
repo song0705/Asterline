@@ -36,6 +36,13 @@ where
         println!("{}", AppConfig::help());
         return Ok(());
     }
+    if config.update {
+        #[cfg(windows)]
+        println!("{}", crate::update::update_now().map_err(io::Error::other)?);
+        #[cfg(not(windows))]
+        println!("automatic updates are currently available for the Windows Setup installation");
+        return Ok(());
+    }
 
     let prepared = match prepare(&config, cwd.as_ref())? {
         Some(prepared) => prepared,
@@ -171,6 +178,10 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     // Bound the runtime-to-TUI stream so a fast or malformed backend cannot
     // turn a slow terminal renderer into an unbounded in-memory queue.
     let (events_tx, events_rx) = mpsc::sync_channel(2_048);
+    #[cfg(windows)]
+    if !config.no_auto_update {
+        crate::update::spawn_auto_update(events_tx.clone());
+    }
     let team_save_path = config.team_path.clone().unwrap_or(saved_team);
     let (handle, join) = runtime::spawn_bounded(
         team,
@@ -213,6 +224,8 @@ pub struct AppConfig {
     fake: bool,
     pick_team: bool,
     banner: bool,
+    no_auto_update: bool,
+    update: bool,
     show_help: bool,
 }
 
@@ -240,6 +253,8 @@ impl AppConfig {
                 "--fake" => config.fake = true,
                 "--pick-team" => config.pick_team = true,
                 "--banner" => config.banner = true,
+                "--no-auto-update" => config.no_auto_update = true,
+                "--update" => config.update = true,
                 "-h" | "--help" => config.show_help = true,
                 _ if arg.starts_with("--team=") => {
                     config.team_path = Some(arg["--team=".len()..].into())
@@ -284,6 +299,8 @@ impl AppConfig {
          \x20 --debug             Disable the approval gate (developer mode).\n\
          \x20 --fake              Use offline fake agents instead of real CLIs.\n\
          \x20 --banner            Print a compact startup banner before the TUI.\n\
+         \x20 --update            Check now and schedule a Windows installer update.\n\
+         \x20 --no-auto-update    Skip the Windows installer update check.\n\
          \x20 -h, --help          Show this help.\n\
          \n\
          With no --team, Asterline opens a team builder from the detected backends\n\
@@ -307,6 +324,7 @@ mod tests {
             "--no-restore",
             "--fake",
             "--banner",
+            "--no-auto-update",
         ])
         .unwrap();
         assert_eq!(config.team_path, Some(PathBuf::from("/tmp/t.json")));
@@ -314,6 +332,7 @@ mod tests {
         assert!(config.no_restore);
         assert!(config.fake);
         assert!(config.banner);
+        assert!(config.no_auto_update);
     }
 
     #[test]
@@ -322,12 +341,22 @@ mod tests {
         assert_eq!(config.db_path, Some(PathBuf::from("/tmp/x.sqlite3")));
         assert!(config.show_help);
         assert!(!config.banner);
+        assert!(!config.update);
     }
 
     #[test]
     fn help_mentions_compact_banner_flag() {
         assert!(AppConfig::help().contains("--banner"));
         assert!(AppConfig::help().contains("compact startup banner"));
+        assert!(AppConfig::help().contains("--update"));
+        assert!(AppConfig::help().contains("--no-auto-update"));
+    }
+
+    #[test]
+    fn parses_manual_update_flag() {
+        let config = AppConfig::parse(["--update"]).unwrap();
+        assert!(config.update);
+        assert!(!config.no_auto_update);
     }
 
     #[test]

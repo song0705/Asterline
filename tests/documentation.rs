@@ -3,6 +3,8 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthStr;
 
 const CONFIGURATION_DOC: &str = include_str!("../docs/configuration.md");
+const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const DOCUMENTS: &[(&str, &str)] = &[
     ("README.md", include_str!("../README.md")),
     ("README.zh-CN.md", include_str!("../README.zh-CN.md")),
@@ -150,6 +152,25 @@ fn markdown_strong_markers_are_not_rendered_literally() {
                 _ => {}
             }
         }
+    }
+}
+
+#[test]
+fn windows_installer_is_tested_checksums_and_attested() {
+    assert!(CI_WORKFLOW.contains("Smoke test Windows installer"));
+    assert!(RELEASE_WORKFLOW.contains("./scripts/build-windows-installer.ps1 -Version $version"));
+    assert!(RELEASE_WORKFLOW.contains("sha256sum *.tar.gz *.zip *.exe"));
+    assert!(RELEASE_WORKFLOW.contains("dist/*.exe"));
+
+    for (path, document) in &DOCUMENTS[..2] {
+        assert!(
+            document.contains("x86_64-windows-setup.exe"),
+            "{path} must link the Windows Setup asset"
+        );
+        assert!(
+            document.contains("--no-auto-update"),
+            "{path} must document the update opt-out"
+        );
     }
 }
 

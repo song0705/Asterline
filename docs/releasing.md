@@ -56,16 +56,21 @@ Pushing the tag starts `.github/workflows/release.yml`. The workflow:
    on Linux, macOS, and Windows;
 3. builds `asterline` and `ast` for Linux x86-64, Linux ARM64, macOS Intel,
    macOS Apple silicon, and Windows x86-64 MSVC;
-4. packages Unix targets as `.tar.gz` and Windows as `.zip`, including the
-   license and readmes;
-5. creates `SHA256SUMS` and signed GitHub artifact attestations;
+4. packages Unix targets as `.tar.gz`, Windows as a portable `.zip`, and the
+   Windows binaries as a per-user Setup `.exe` that adds/removes the install
+   directory from the user `Path`;
+5. creates `SHA256SUMS` and signed GitHub artifact attestations for every
+   archive and the Windows installer;
 6. publishes a GitHub Release using `docs/releases/<tag>.md`, or generated
    release notes when no matching file exists.
 
 The Windows build runs on `windows-latest` and links the bundled SQLite source,
-so it does not rely on a runner- or user-installed `sqlite3.lib`. Both release
-gating and regular CI run `cargo test --all-targets --locked` on Windows; keep
-this as a real link-and-execute job rather than replacing it with `cargo check`.
+so it does not rely on a runner- or user-installed `sqlite3.lib`. Inno Setup
+builds the installer from `packaging/windows/asterline.iss`. Regular Windows CI
+installs it into a temporary directory, runs `ast --help`, verifies the user
+`Path`, uninstalls it, and confirms cleanup. Both release gating and regular CI
+also run `cargo test --all-targets --locked` on Windows; keep this as a real
+link-and-execute job rather than replacing it with `cargo check`.
 
 Monitor a release from the command line:
 

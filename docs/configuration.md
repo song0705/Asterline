@@ -34,6 +34,20 @@ platform `PATH`; on Windows it also honors `PATHEXT` and launches the resolved
 `.exe`, `.cmd`, or `.bat` path. When leaving an attached CLI, use `Ctrl+D` on
 Unix or `Ctrl+Z` followed by `Enter` on Windows (or type `/exit`).
 
+### Windows installer updates
+
+Only copies installed by the Windows Setup executable update automatically.
+Portable ZIP copies and source builds never rewrite themselves. An installed
+copy checks GitHub's latest stable Release at most once every 24 hours. When a
+new version exists, Asterline downloads its Setup executable, verifies it
+against the same Release's `SHA256SUMS`, and starts Setup in silent mode after
+the current Asterline process exits.
+
+Run `ast --update` to force a check now. Use `ast --no-auto-update` to skip the
+automatic check for one launch. Network failures are ignored during background
+checks and never prevent Asterline from starting; a forced check reports the
+error to the terminal.
+
 ## Team file
 
 ```json

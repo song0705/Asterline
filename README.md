@@ -73,17 +73,35 @@ Add `$HOME/.local/bin` to the shell's `PATH` configuration, commonly
 
 #### Windows
 
-Download `x86_64-pc-windows-msvc.zip`, extract it, open PowerShell in the
-extracted directory, and run:
+Download `asterline-<version>-x86_64-windows-setup.exe` from the latest Release
+and double-click it. Setup installs Asterline for the current user, adds `ast`
+to the user `Path`, and registers an uninstaller. Open a new PowerShell window
+after Setup finishes:
 
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
-Copy-Item .\ast.exe "$HOME\bin\ast.exe"
-& "$HOME\bin\ast.exe" --help
+ast --help
 ```
 
-Add `%USERPROFILE%\bin` to the user `Path` in Windows Environment Variables,
-then open a new PowerShell window before running `ast` elsewhere.
+Installer-managed copies check the latest stable Release once per day. A newer
+installer is downloaded only after its entry in `SHA256SUMS` matches, then runs
+silently after Asterline exits. Use `ast --update` to check immediately or
+`ast --no-auto-update` to skip the check for one launch.
+
+The installer is not yet Authenticode-signed, so Windows may show an unknown
+publisher warning on the first manual install. Release checksums and GitHub
+provenance attestations remain available for verification.
+
+The published `v0.2.2` Release predates the Setup executable. Until the next
+tagged Release, use its portable ZIP:
+
+<details>
+<summary>Portable Windows ZIP</summary>
+
+Extract `x86_64-pc-windows-msvc.zip`, open PowerShell in the extracted
+directory, and run `./ast.exe`. The portable build does not modify `Path` and
+does not update itself.
+
+</details>
 
 Each release also includes `SHA256SUMS` and GitHub build provenance
 attestations.
@@ -314,9 +332,9 @@ and the smallest reproduction.
 ## Project status
 
 Asterline is currently version `0.2.2` and under active development. Tagged
-versions publish prebuilt Linux, macOS, and Windows archives. Before a stable
-release, configuration, persisted data, commands, and UI details may change
-without backward compatibility.
+versions publish prebuilt Linux and macOS archives plus a Windows archive and
+user-level Setup executable. Before a stable release, configuration, persisted
+data, commands, and UI details may change without backward compatibility.
 
 ## License
 

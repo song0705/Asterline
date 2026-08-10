@@ -113,12 +113,19 @@ jobs:
           Copy-Item LICENSE, README.md, README.zh-CN.md "dist/$package/"
           Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
           Remove-Item -Recurse -Force "dist/$package"
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          ./scripts/build-windows-installer.ps1 -Version $version
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -141,13 +148,14 @@ jobs:
       - name: Create checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip *.exe > SHA256SUMS
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.exe
             dist/SHA256SUMS
       - name: Create GitHub Release
         env:
