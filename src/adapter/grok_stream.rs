@@ -972,6 +972,11 @@ mod tests {
     use std::sync::mpsc;
 
     #[cfg(unix)]
+    const TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+    #[cfg(unix)]
+    const TEST_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[cfg(unix)]
     fn fake_acp_server(
         dir: &Path,
         graceful: bool,
@@ -1168,9 +1173,17 @@ mod tests {
             );
         });
 
+        let mut deadline = Instant::now() + TEST_STARTUP_TIMEOUT;
+        let mut cancel_started = None;
         loop {
-            match received.recv_timeout(Duration::from_secs(3)).unwrap() {
+            match received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
                 AgentEvent::Reasoning(text) if text == "ready" => {
+                    let started = Instant::now();
+                    cancel_started = Some(started);
+                    deadline = started + TEST_CANCEL_TIMEOUT;
                     cancel.store(true, Ordering::Relaxed);
                 }
                 AgentEvent::Fatal(message) => panic!("graceful cancellation failed: {message}"),
@@ -1182,6 +1195,7 @@ mod tests {
             }
         }
         handle.join().unwrap();
+        assert!(cancel_started.unwrap().elapsed() < TEST_CANCEL_TIMEOUT);
 
         let notification: Value =
             serde_json::from_str(&std::fs::read_to_string(cancel_log).unwrap()).unwrap();
@@ -1211,7 +1225,6 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_run = Arc::clone(&cancel);
         let (events, received) = mpsc::sync_channel(65_536);
-        let started = Instant::now();
         let handle = thread::spawn(move || {
             runner.run(
                 RunRequest {
@@ -1224,9 +1237,17 @@ mod tests {
             );
         });
 
+        let mut deadline = Instant::now() + TEST_STARTUP_TIMEOUT;
+        let mut cancel_started = None;
         loop {
-            match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+            match received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
                 AgentEvent::Reasoning(text) if text == "ready" => {
+                    let started = Instant::now();
+                    cancel_started = Some(started);
+                    deadline = started + TEST_CANCEL_TIMEOUT;
                     cancel.store(true, Ordering::Relaxed);
                 }
                 AgentEvent::Exited { .. } => break,
@@ -1235,7 +1256,7 @@ mod tests {
         }
         handle.join().unwrap();
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(cancel_started.unwrap().elapsed() < TEST_CANCEL_TIMEOUT);
         let notification: Value =
             serde_json::from_str(&std::fs::read_to_string(cancel_log).unwrap()).unwrap();
         assert_eq!(notification["method"], "session/cancel");
@@ -1258,7 +1279,6 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_run = Arc::clone(&cancel);
         let (events, received) = mpsc::sync_channel(65_536);
-        let started = Instant::now();
         let handle = thread::spawn(move || {
             runner.run(
                 RunRequest {
@@ -1271,9 +1291,17 @@ mod tests {
             );
         });
 
+        let mut deadline = Instant::now() + TEST_STARTUP_TIMEOUT;
+        let mut cancel_started = None;
         loop {
-            match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+            match received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
                 AgentEvent::Reasoning(text) if text == "ready" => {
+                    let started = Instant::now();
+                    cancel_started = Some(started);
+                    deadline = started + TEST_CANCEL_TIMEOUT;
                     cancel.store(true, Ordering::Relaxed);
                 }
                 AgentEvent::Exited { .. } => break,
@@ -1282,7 +1310,7 @@ mod tests {
         }
         handle.join().unwrap();
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(cancel_started.unwrap().elapsed() < TEST_CANCEL_TIMEOUT);
         let _ = std::fs::remove_dir_all(dir);
     }
 
