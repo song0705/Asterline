@@ -1324,14 +1324,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let server = dir.join("fake-grok-acp");
-        std::fs::write(
-            &server,
-            format!(
-                "#!/bin/sh\nhead -c {} /dev/zero | tr '\\000' x\nsleep 30\n",
-                MAX_PROTOCOL_LINE_BYTES + 1
-            ),
-        )
-        .unwrap();
+        std::fs::write(&server, "#!/bin/sh\nyes x | tr -d '\\n'\n").unwrap();
         let mut permissions = std::fs::metadata(&server).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&server, permissions).unwrap();
