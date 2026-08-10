@@ -19,13 +19,11 @@ const DOCUMENTS: &[(&str, &str)] = &[
 
 #[test]
 fn documented_team_json_is_valid_and_loadable() {
-    let json = CONFIGURATION_DOC
-        .split_once("```json\n")
-        .and_then(|(_, rest)| rest.split_once("\n```").map(|(json, _)| json))
+    let json = first_json_fence(CONFIGURATION_DOC)
         .expect("configuration documentation must contain a fenced JSON example");
 
     let config: TeamConfig =
-        serde_json::from_str(json).expect("documented team JSON must deserialize");
+        serde_json::from_str(&json).expect("documented team JSON must deserialize");
     config
         .validate()
         .expect("documented team JSON must satisfy roster invariants");
@@ -72,6 +70,12 @@ fn documented_team_json_is_valid_and_loadable() {
             "file".to_string()
         ])
     );
+}
+
+#[test]
+fn documented_team_json_accepts_crlf_checkout() {
+    let crlf = CONFIGURATION_DOC.replace('\n', "\r\n");
+    assert!(first_json_fence(&crlf).is_some());
 }
 
 #[test]
@@ -124,6 +128,13 @@ fn readmes_use_real_product_images_without_a_handwritten_ui_mockup() {
             "{path} must not embed a handwritten TUI mockup"
         );
     }
+}
+
+fn first_json_fence(document: &str) -> Option<String> {
+    let normalized = document.replace("\r\n", "\n");
+    normalized
+        .split_once("```json\n")
+        .and_then(|(_, rest)| rest.split_once("\n```").map(|(json, _)| json.to_string()))
 }
 
 fn is_table_row(line: &str) -> bool {

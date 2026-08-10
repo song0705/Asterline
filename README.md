@@ -434,6 +434,7 @@ working-tree result independently of the chat presentation.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration, local data, permissions, and troubleshooting](docs/configuration.md)
 - [Approval layers and tool-level control](docs/approvals.md)
+- [v0.2.3 release notes](docs/releases/v0.2.3.md)
 - [v0.2.2 release notes](docs/releases/v0.2.2.md)
 - [v0.2.1 release notes](docs/releases/v0.2.1.md)
 - [v0.2.0 release notes](docs/releases/v0.2.0.md)
@@ -472,7 +473,7 @@ src/
 
 ## Project status
 
-Asterline is currently version `0.2.2` and under active development. Tagged
+Asterline is currently version `0.2.3` and under active development. Tagged
 versions are published as prebuilt Linux, macOS, and Windows archives through
 GitHub Actions. Before a stable release, configuration, persisted data,
 commands, and UI details may change without backward compatibility.
