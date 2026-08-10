@@ -29,19 +29,52 @@ members, and persists collaboration as structured Runs.
   `agy`
 - Rust 1.85 or newer only when building from source
 
-### Install
+### Install a release build
 
-Download the archive for your platform from
-[GitHub Releases](https://github.com/song0705/Asterline/releases/latest), extract
-it, and place either binary on your `PATH`:
+Open [GitHub Releases](https://github.com/song0705/Asterline/releases/latest),
+then follow the section for your operating system. Asterline ships both the
+`asterline` command and its shorter alias, `ast`; the steps below install `ast`.
+
+#### macOS
+
+Download the `.tar.gz` archive that matches the Mac:
+
+- Apple silicon: `aarch64-apple-darwin`
+- Intel: `x86_64-apple-darwin`
+
+Extract it, open Terminal in the extracted directory, and run:
 
 ```bash
-mkdir -p ~/.local/bin
-install -m 755 ast ~/.local/bin/ast
-ast --help
+mkdir -p "$HOME/.local/bin"
+install -m 755 ast "$HOME/.local/bin/ast"
+"$HOME/.local/bin/ast" --help
 ```
 
-On Windows, extract the `.zip` and use PowerShell:
+Add `$HOME/.local/bin` to `PATH` in `~/.zprofile` if `ast` is not found in a
+new terminal.
+
+#### Linux
+
+Download the `.tar.gz` archive for the machine architecture:
+
+- Intel/AMD 64-bit: `x86_64-unknown-linux-gnu`
+- ARM64: `aarch64-unknown-linux-gnu`
+
+Extract it, open a shell in the extracted directory, and run:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+install -m 755 ast "$HOME/.local/bin/ast"
+"$HOME/.local/bin/ast" --help
+```
+
+Add `$HOME/.local/bin` to the shell's `PATH` configuration, commonly
+`~/.profile`, if `ast` is not found in a new shell.
+
+#### Windows
+
+Download `x86_64-pc-windows-msvc.zip`, extract it, open PowerShell in the
+extracted directory, and run:
 
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
@@ -49,23 +82,40 @@ Copy-Item .\ast.exe "$HOME\bin\ast.exe"
 & "$HOME\bin\ast.exe" --help
 ```
 
-To install from a source checkout instead:
+Add `%USERPROFILE%\bin` to the user `Path` in Windows Environment Variables,
+then open a new PowerShell window before running `ast` elsewhere.
+
+Each release also includes `SHA256SUMS` and GitHub build provenance
+attestations.
+
+### Build from source
+
+On any supported operating system with Rust 1.85 or newer, run this from an
+Asterline source checkout:
 
 ```bash
 cargo install --path . --force
 ```
 
-Release archives are available for Linux x86-64/ARM64, macOS Intel/Apple
-silicon, and Windows x86-64. Each release includes `SHA256SUMS` and GitHub build
-provenance attestations.
+Cargo installs both commands into `$HOME/.cargo/bin` on macOS/Linux and
+`%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on `PATH`.
 
 ### Start a team
 
-Run Asterline from the project the agents should work on:
+Run Asterline from the project the agents should work on.
+
+On macOS or Linux:
 
 ```bash
 cd /path/to/your/project
 ast
+```
+
+On Windows PowerShell:
+
+```powershell
+Set-Location C:\path\to\your-project
+ast.exe
 ```
 
 On first launch, Asterline discovers the supported CLIs on `PATH` and opens the

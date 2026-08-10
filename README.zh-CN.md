@@ -27,18 +27,50 @@ Claude、Grok 和 Agy 官方 CLI。它把各后端的原生事件整理成一段
 - 至少安装并登录一个 CLI：`codex`、`claude`、`grok` 或 `agy`
 - 仅从源码构建时需要 Rust 1.85 或更高版本
 
-### 安装
+### 安装发布版本
 
-从 [GitHub Releases](https://github.com/song0705/Asterline/releases/latest)
-下载对应平台的压缩包，解压后将任意一个命令放入 `PATH`：
+打开 [GitHub Releases](https://github.com/song0705/Asterline/releases/latest)，
+然后按照自己的操作系统选择步骤。发布包同时包含完整命令 `asterline` 和短命令
+`ast`；以下步骤安装 `ast`。
+
+#### macOS
+
+根据 Mac 处理器下载对应的 `.tar.gz`：
+
+- Apple silicon：`aarch64-apple-darwin`
+- Intel：`x86_64-apple-darwin`
+
+解压后，在解压目录中打开终端并运行：
 
 ```bash
-mkdir -p ~/.local/bin
-install -m 755 ast ~/.local/bin/ast
-ast --help
+mkdir -p "$HOME/.local/bin"
+install -m 755 ast "$HOME/.local/bin/ast"
+"$HOME/.local/bin/ast" --help
 ```
 
-Windows 用户可解压 `.zip` 并使用 PowerShell：
+如果新终端找不到 `ast`，请在 `~/.zprofile` 中把 `$HOME/.local/bin` 加入 `PATH`。
+
+#### Linux
+
+根据机器架构下载对应的 `.tar.gz`：
+
+- Intel/AMD 64 位：`x86_64-unknown-linux-gnu`
+- ARM64：`aarch64-unknown-linux-gnu`
+
+解压后，在解压目录中打开 shell 并运行：
+
+```bash
+mkdir -p "$HOME/.local/bin"
+install -m 755 ast "$HOME/.local/bin/ast"
+"$HOME/.local/bin/ast" --help
+```
+
+如果新 shell 找不到 `ast`，请在 shell 的 `PATH` 配置（通常为 `~/.profile`）中加入
+`$HOME/.local/bin`。
+
+#### Windows
+
+下载 `x86_64-pc-windows-msvc.zip`，解压后在解压目录中打开 PowerShell 并运行：
 
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
@@ -46,22 +78,38 @@ Copy-Item .\ast.exe "$HOME\bin\ast.exe"
 & "$HOME\bin\ast.exe" --help
 ```
 
-也可以在源码仓库中安装：
+随后在 Windows“环境变量”中把 `%USERPROFILE%\bin` 加入用户 `Path`，再打开新的
+PowerShell 窗口，即可在其他目录运行 `ast`。
+
+每个 Release 还附带 `SHA256SUMS` 与 GitHub 构建来源证明。
+
+### 从源码构建
+
+在任一受支持的操作系统中安装 Rust 1.85 或更高版本，然后在 Asterline 源码目录运行：
 
 ```bash
 cargo install --path . --force
 ```
 
-Release 提供 Linux x86-64/ARM64、macOS Intel/Apple silicon 和 Windows x86-64
-构建，并附带 `SHA256SUMS` 与 GitHub 构建来源证明。
+Cargo 会把两个命令安装到 macOS/Linux 的 `$HOME/.cargo/bin` 或 Windows 的
+`%USERPROFILE%\.cargo\bin`。请确认对应目录已经加入 `PATH`。
 
 ### 启动团队
 
-进入希望 Agent 工作的项目，然后启动 Asterline：
+进入希望 Agent 工作的项目，然后启动 Asterline。
+
+macOS 或 Linux：
 
 ```bash
 cd /path/to/your/project
 ast
+```
+
+Windows PowerShell：
+
+```powershell
+Set-Location C:\path\to\your-project
+ast.exe
 ```
 
 首次启动时，Asterline 会发现 `PATH` 中受支持的 CLI，并打开 Team 编辑器。使用
