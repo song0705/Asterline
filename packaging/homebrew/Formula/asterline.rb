@@ -7,13 +7,13 @@ class Asterline < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/song0705/Asterline/releases/download/v0.2.5/asterline-0.2.5-aarch64-apple-darwin.tar.gz"
-      sha256 "9fe038680d0e3a380b4bbb190865c46b5b6dc4348314f067f8c0fdd732d957a6"
+      url "https://github.com/song0705/Asterline/releases/download/v0.2.7/asterline-0.2.7-aarch64-apple-darwin.tar.gz"
+      sha256 "d187fe949a93169eb68605d0000326f1046db4de97ad600c9c8729a282167605"
     end
 
     on_intel do
-      url "https://github.com/song0705/Asterline/releases/download/v0.2.5/asterline-0.2.5-x86_64-apple-darwin.tar.gz"
-      sha256 "1970b9ea724481ee54b49ea306aabb3cf7e81bcb09d6e5a6aee1cd80516d412f"
+      url "https://github.com/song0705/Asterline/releases/download/v0.2.7/asterline-0.2.7-x86_64-apple-darwin.tar.gz"
+      sha256 "8880b6beef6515399b0bf11b64804e3ed6e10a14dfc783f97fde3598e81ec6d0"
     end
   end
 

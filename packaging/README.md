@@ -11,7 +11,7 @@ different versions.
 
 ## Homebrew (macOS)
 
-`homebrew/Formula/asterline.rb` mirrors the published v0.2.5 macOS-only
+`homebrew/Formula/asterline.rb` mirrors the published v0.2.7 macOS-only
 Formula in the public `song0705/homebrew-asterline` tap. It pins the Apple
 silicon and Intel portable archives by SHA-256. It deliberately does not support
 Linuxbrew until the Linux release ABI is independently verified.

@@ -23,7 +23,7 @@ const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
 const RPM_SPEC: &str = include_str!("../packaging/rpm/asterline.spec.in");
 const PACKAGE_RPM: &str = include_str!("../scripts/package-rpm.sh");
 const SMOKE_RPM_PACKAGE: &str = include_str!("../scripts/smoke-rpm-package.sh");
-const HOMEBREW_RELEASE_VERSION: &str = "0.2.5";
+const HOMEBREW_RELEASE_VERSION: &str = "0.2.7";
 const AUR_RELEASE_VERSION: &str = "0.2.3";
 const INSTALLATION_DOCS: &[(&str, &str)] = &[
     (
@@ -359,11 +359,11 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     for (target, checksum) in [
         (
             "aarch64-apple-darwin.tar.gz",
-            "9fe038680d0e3a380b4bbb190865c46b5b6dc4348314f067f8c0fdd732d957a6",
+            "d187fe949a93169eb68605d0000326f1046db4de97ad600c9c8729a282167605",
         ),
         (
             "x86_64-apple-darwin.tar.gz",
-            "1970b9ea724481ee54b49ea306aabb3cf7e81bcb09d6e5a6aee1cd80516d412f",
+            "8880b6beef6515399b0bf11b64804e3ed6e10a14dfc783f97fde3598e81ec6d0",
         ),
     ] {
         assert!(
