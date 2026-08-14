@@ -297,6 +297,8 @@ fn debian_packages_are_pinned_and_release_gated() {
         assert!(DEB_CONTROL.contains(placeholder));
     }
     assert!(PACKAGE_DEB.contains("dpkg-shlibdeps -O"));
+    assert!(PACKAGE_DEB.contains("Source: asterline"));
+    assert!(PACKAGE_DEB.contains("debian_dir=\"$work_dir/debian\""));
     assert!(PACKAGE_DEB.contains("--root-owner-group --build"));
     assert!(PACKAGE_DEB.contains("x86_64-unknown-linux-gnu:amd64"));
     assert!(PACKAGE_DEB.contains("aarch64-unknown-linux-gnu:arm64"));

@@ -41,9 +41,11 @@ done < <(tar -tzf "$archive")
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 source_dir="$work_dir/source"
-staging_dir="$work_dir/staging"
+debian_dir="$work_dir/debian"
+staging_dir="$debian_dir/asterline"
 mkdir -p \
   "$source_dir" \
+  "$debian_dir" \
   "$staging_dir/DEBIAN" \
   "$staging_dir/usr/bin" \
   "$staging_dir/usr/share/doc/asterline"
@@ -57,7 +59,23 @@ test -f "$source_dir/LICENSE"
 install -m 644 "$source_dir/LICENSE" "$staging_dir/usr/share/doc/asterline/LICENSE"
 install -m 644 packaging/deb/copyright "$staging_dir/usr/share/doc/asterline/copyright"
 
-dependencies=$(dpkg-shlibdeps -O \
+{
+  cat <<'EOF'
+Source: asterline
+Section: devel
+Priority: optional
+Maintainer: Asterline contributors <asterline@users.noreply.github.com>
+Standards-Version: 4.6.2
+
+EOF
+  sed \
+    -e "s/@VERSION@/$version/g" \
+    -e "s/@ARCH@/$deb_arch/g" \
+    -e 's/@DEPENDS@/${shlibs:Depends}/' \
+    packaging/deb/control.in
+} > "$debian_dir/control"
+
+dependencies=$(cd "$work_dir" && dpkg-shlibdeps -O \
   -e "$staging_dir/usr/bin/asterline" \
   -e "$staging_dir/usr/bin/ast" \
   | sed -n 's/^shlibs:Depends=//p')
