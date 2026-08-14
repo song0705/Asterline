@@ -2,6 +2,7 @@
 name = "asterline"
 version = "0.2.3"
 edition = "2024"
+rust-version = "1.88"
 default-run = "asterline"
 description = "Local-first terminal workspace for coordinating coding agents"
 license = "MIT"
@@ -16,9 +17,10 @@ crossterm = { version = "0.29", features = ["osc52"] }
 portable-pty = "0.9"
 pulldown-cmark = { version = "0.12", default-features = false }
 ratatui = "0.30.2"
-rusqlite = { version = "0.37", features = ["bundled-windows"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 textwrap = { version = "0.16", default-features = false, features = ["unicode-width"] }
 unicode-segmentation = "1.13"
@@ -29,7 +31,6 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 semver = "1.0"
-sha2 = "0.10"
 ureq = { version = "=3.3.0", default-features = false, features = ["native-tls"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

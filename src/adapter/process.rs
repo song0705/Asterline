@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::config::resolve_binary_on_path;
@@ -22,6 +22,7 @@ use crate::domain::team::{BackendKind, Effort};
 
 pub(crate) const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_STDERR_LINE_BYTES: usize = 1024 * 1024;
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 pub(crate) struct BoundedLines<R> {
     reader: R,
@@ -319,6 +320,10 @@ pub struct AdapterCommand {
 /// Builds backend commands and stateful per-run line parsers.
 pub trait StreamAdapter: Send + Sync {
     fn backend(&self) -> BackendKind;
+    /// Validate backend capabilities before starting a member turn.
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn build_command(
         &self,
         prompt: &str,
@@ -359,6 +364,14 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
     }
 
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
+        if let Err(message) = self.adapter.preflight() {
+            let _ = events.send(AgentEvent::Fatal(message));
+            let _ = events.send(AgentEvent::Exited {
+                code: None,
+                ok: false,
+            });
+            return;
+        }
         let command = self
             .adapter
             .build_command(&req.prompt, req.session.as_ref(), req.effort);
@@ -461,7 +474,9 @@ pub fn run_streaming(
     let child = Arc::new(Mutex::new(child));
     let done = Arc::new(AtomicBool::new(false));
 
-    // Watcher: kill the child if cancellation is requested.
+    // Watcher: kill the tree on cancellation. If the direct child has exited
+    // but a descendant still owns an output/input pipe, allow a short drain
+    // window and then reap the owned tree so the adapter cannot hang forever.
     let watcher = {
         let child = Arc::clone(&child);
         let process_tree = Arc::clone(&process_tree);
@@ -477,6 +492,25 @@ pub fn run_streaming(
                         && let Ok(mut child) = child.lock()
                     {
                         let _ = child.kill();
+                    }
+                    break;
+                }
+                let parent_exited = child
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| child.try_wait().ok())
+                    .flatten()
+                    .is_some();
+                if parent_exited {
+                    let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+                    while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    if !done.load(Ordering::Relaxed) {
+                        let _ = process_tree.terminate();
                     }
                     break;
                 }
@@ -539,13 +573,13 @@ pub fn run_streaming(
     }
 
     let status = child.lock().ok().and_then(|mut child| child.wait().ok());
-    done.store(true, Ordering::Relaxed);
     if let Some(stdin_thread) = stdin_thread {
         let _ = stdin_thread.join();
     }
     if let Some(stderr_thread) = stderr_thread {
         let _ = stderr_thread.join();
     }
+    done.store(true, Ordering::Relaxed);
     let _ = watcher.join();
 
     let ok = transport_ok.load(Ordering::Relaxed)
@@ -585,9 +619,34 @@ mod tests {
 
     struct LineToDelta;
 
+    struct FailingPreflightAdapter;
+
     impl LineParser for LineToDelta {
         fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
             vec![AgentEvent::TextDelta(line.to_string())]
+        }
+    }
+
+    impl StreamAdapter for FailingPreflightAdapter {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Agy
+        }
+
+        fn preflight(&self) -> Result<(), String> {
+            Err("Agy 1.1.12 or newer is required".to_string())
+        }
+
+        fn build_command(
+            &self,
+            _prompt: &str,
+            _session: Option<&AgentSessionId>,
+            _effort: Option<Effort>,
+        ) -> AdapterCommand {
+            panic!("preflight failure must prevent command construction")
+        }
+
+        fn parser(&self) -> Box<dyn LineParser> {
+            panic!("preflight failure must prevent parser construction")
         }
     }
 
@@ -619,6 +678,32 @@ mod tests {
             out.push(event);
         }
         out
+    }
+
+    #[test]
+    fn preflight_failure_is_fatal_without_starting_the_backend() {
+        let runner = ProcessRunner::new(FailingPreflightAdapter);
+        let (tx, rx) = mpsc::sync_channel(8);
+
+        runner.run(
+            RunRequest {
+                prompt: "x".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            tx,
+        );
+        let events = collect(rx);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Fatal(message) if message.contains("Agy 1.1.12")
+        )));
+        assert!(events.contains(&AgentEvent::Exited {
+            code: None,
+            ok: false,
+        }));
     }
 
     #[test]
@@ -969,6 +1054,65 @@ mod tests {
         thread::sleep(Duration::from_millis(350));
 
         assert!(survivor.exists(), "normal exit killed a background child");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parent_exit_reaps_descendants_that_keep_output_pipes_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-process-tree-held-pipe-{}",
+            std::process::id()
+        ));
+        let process_group_file = dir.join("process-group");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = ProcessRunner::new(ShAdapter {
+            script: format!(
+                "printf '%s' \"$$\" > '{}'; sleep 30 & exit 0",
+                process_group_file.display()
+            ),
+        });
+        let (tx, rx) = mpsc::sync_channel(65_536);
+        let started = Instant::now();
+
+        runner.run(
+            RunRequest {
+                prompt: "x".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            tx,
+        );
+        let events = recv_until_exit(&rx, Duration::from_secs(2));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(events.contains(&AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        }));
+        let process_group: i32 = std::fs::read_to_string(&process_group_file)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let process_group_gone = loop {
+            // SAFETY: signal 0 only checks whether any process remains in the
+            // isolated group; it does not alter the process.
+            if unsafe { libc::killpg(process_group, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            process_group_gone,
+            "the pipe-holding adapter process group survived parent cleanup"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

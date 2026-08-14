@@ -50,12 +50,19 @@ pub(crate) enum ModelChoices {
 }
 
 impl ModelCatalog {
-    pub(crate) fn preload(&mut self, backends: &[BackendKind], cwds: &[PathBuf]) {
-        for &backend in backends {
-            for cwd in cwds {
-                let _ = self.models(backend, cwd);
-            }
+    /// Start discovery without cloning a ready model list. This is used by
+    /// background warm-up paths that can be called on every TUI frame.
+    fn request(&mut self, backend: BackendKind, cwd: &Path) {
+        let key = (backend, cwd.to_path_buf());
+        if self.loads.contains_key(&key) {
+            return;
         }
+        let worker_cwd = cwd.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(crate::adapter::discover_models(backend, &worker_cwd));
+        });
+        self.loads.insert(key, ModelLoad::Loading(rx));
     }
 
     pub(crate) fn poll(&mut self) {
@@ -77,40 +84,36 @@ impl ModelCatalog {
         }
     }
 
-    pub(crate) fn is_loading(&self) -> bool {
-        self.loads
-            .values()
-            .any(|load| matches!(load, ModelLoad::Loading(_)))
+    /// Forget a completed failed lookup so the next explicit request starts a
+    /// fresh discovery.  Failures can be transient (for example, a CLI that
+    /// is still signing in), whereas an in-flight lookup must never be
+    /// duplicated.
+    pub(crate) fn retry(&mut self, backend: BackendKind, cwd: &Path) {
+        let key = (backend, cwd.to_path_buf());
+        if matches!(self.loads.get(&key), Some(ModelLoad::Ready(Err(_)))) {
+            self.loads.remove(&key);
+        }
     }
 
     pub(crate) fn models(&mut self, backend: BackendKind, cwd: &Path) -> ModelChoices {
         let key = (backend, cwd.to_path_buf());
-        match self.loads.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let worker_cwd = cwd.to_path_buf();
-                let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let _ = tx.send(crate::adapter::discover_models(backend, &worker_cwd));
-                });
-                entry.insert(ModelLoad::Loading(rx));
-                ModelChoices::Loading
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let result = match entry.get_mut() {
-                    ModelLoad::Loading(rx) => match rx.try_recv() {
-                        Ok(result) => result,
-                        Err(TryRecvError::Empty) => return ModelChoices::Loading,
-                        Err(TryRecvError::Disconnected) => {
-                            Err("model discovery worker stopped unexpectedly".to_string())
-                        }
-                    },
-                    ModelLoad::Ready(result) => return model_choices(result),
-                };
-                let choices = model_choices(&result);
-                entry.insert(ModelLoad::Ready(result));
-                choices
-            }
-        }
+        self.request(backend, cwd);
+        let Some(load) = self.loads.get_mut(&key) else {
+            return ModelChoices::Loading;
+        };
+        let result = match load {
+            ModelLoad::Loading(rx) => match rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return ModelChoices::Loading,
+                Err(TryRecvError::Disconnected) => {
+                    Err("model discovery worker stopped unexpectedly".to_string())
+                }
+            },
+            ModelLoad::Ready(result) => return model_choices(result),
+        };
+        let choices = model_choices(&result);
+        *load = ModelLoad::Ready(result);
+        choices
     }
 
     #[cfg(test)]
@@ -125,6 +128,14 @@ impl ModelCatalog {
     }
 
     #[cfg(test)]
+    pub(crate) fn seed_error(&mut self, backend: BackendKind, cwd: &Path, error: &str) {
+        self.loads.insert(
+            (backend, cwd.to_path_buf()),
+            ModelLoad::Ready(Err(error.to_string())),
+        );
+    }
+
+    #[cfg(test)]
     pub(crate) fn contains(&self, backend: BackendKind, cwd: &Path) -> bool {
         self.loads.contains_key(&(backend, cwd.to_path_buf()))
     }
@@ -133,6 +144,13 @@ impl ModelCatalog {
         matches!(
             self.loads.get(&(backend, cwd.to_path_buf())),
             Some(ModelLoad::Loading(_))
+        )
+    }
+
+    fn is_failed_for(&self, backend: BackendKind, cwd: &Path) -> bool {
+        matches!(
+            self.loads.get(&(backend, cwd.to_path_buf())),
+            Some(ModelLoad::Ready(Err(_)))
         )
     }
 
@@ -160,7 +178,8 @@ impl ModelCatalog {
         match (&member.model, discovered) {
             (None, Some(model)) => model.name.clone(),
             (None, None) if self.is_loading_for(member.backend, &cwd) => "loading…".to_string(),
-            (None, None) => "default".to_string(),
+            (None, None) if self.is_failed_for(member.backend, &cwd) => "unavailable".to_string(),
+            (None, None) => "CLI default".to_string(),
             (Some(id), Some(model)) if model.name != *id => format!("{} · {id}", model.name),
             (Some(id), _) => id.clone(),
         }
@@ -195,7 +214,8 @@ impl ModelCatalog {
 
     pub(crate) fn backend_summary(&self, backend: BackendKind, cwd: &Path) -> String {
         match self.loads.get(&(backend, cwd.to_path_buf())) {
-            None | Some(ModelLoad::Loading(_)) => "installed · loading models…".to_string(),
+            None => "installed · models load when selected".to_string(),
+            Some(ModelLoad::Loading(_)) => "installed · loading models…".to_string(),
             Some(ModelLoad::Ready(Err(err))) => {
                 format!("installed · model discovery failed: {}", one_line(err, 42))
             }
@@ -639,7 +659,7 @@ pub(crate) fn backend_picker_lines(
     let mut lines = vec![
         Line::styled(" Agent CLI catalog", theme::accent_bold()),
         Line::styled(
-            " Availability, models, and reasoning effort were loaded when Team opened.",
+            " Availability is checked first; model catalogs load when selected.",
             theme::muted(),
         ),
     ];
@@ -1163,6 +1183,7 @@ struct BuilderState {
     model_catalog: ModelCatalog,
     backend_picker: Option<BackendPicker>,
     model_picker: Option<ModelPicker>,
+    model_picker_pending: bool,
     notice: Option<String>,
     cancelled: bool,
 }
@@ -1193,26 +1214,25 @@ impl BuilderState {
             model_catalog: ModelCatalog::default(),
             backend_picker: None,
             model_picker: None,
+            model_picker_pending: false,
             notice: None,
             cancelled: false,
         }
     }
 
     fn preload_agent_catalog(&mut self) {
-        self.model_catalog
-            .preload(&self.available, std::slice::from_ref(&self.workspace));
-        self.notice = Some("loading installed Agent model and effort catalogs…".to_string());
+        self.notice = Some("Agent CLIs ready · open a Model field to load its catalog".to_string());
     }
 
     fn poll_agent_catalog(&mut self) {
         self.model_catalog.poll();
-        if !self.model_catalog.is_loading()
-            && self
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.starts_with("loading installed Agent"))
+        if self.model_picker_pending
+            && self.field_mode
+            && self.selected_field() == Field::Model
+            && self.model_picker.is_none()
+            && self.editing.is_none()
         {
-            self.notice = Some("Agent model and effort catalogs loaded".to_string());
+            self.cycle_model(false);
         }
     }
 
@@ -1241,11 +1261,15 @@ impl BuilderState {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Char('c') if ctrl => self.cancelled = true,
-            KeyCode::Esc if self.field_mode => self.field_mode = false,
+            KeyCode::Esc if self.field_mode => {
+                self.field_mode = false;
+                self.model_picker_pending = false;
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.cancelled = true,
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.field_mode {
                     self.prev_field();
+                    self.model_picker_pending = false;
                 } else {
                     self.selected = self.selected.saturating_sub(1);
                 }
@@ -1253,6 +1277,7 @@ impl BuilderState {
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.field_mode {
                     self.next_field();
+                    self.model_picker_pending = false;
                 } else if self.selected + 1 < self.members.len() {
                     self.selected += 1;
                 }
@@ -1418,7 +1443,7 @@ impl BuilderState {
             ));
             self.notice = Some("↑/↓ choose an installed Agent CLI · Enter select".to_string());
         } else if field == Field::Model {
-            self.cycle_model();
+            self.cycle_model(true);
         } else if field.is_text() {
             self.edit_selected_field();
         } else {
@@ -1428,6 +1453,9 @@ impl BuilderState {
 
     fn edit_selected_field(&mut self) {
         let field = self.selected_field();
+        if field == Field::Model {
+            self.model_picker_pending = false;
+        }
         if field.is_text() {
             let value = if field == Field::Model {
                 self.selected_member().model.clone().unwrap_or_default()
@@ -1438,17 +1466,22 @@ impl BuilderState {
         }
     }
 
-    fn cycle_model(&mut self) {
+    fn cycle_model(&mut self, retry_failed: bool) {
         let backend = self.selected_member().backend;
         let cwd = self.selected_member().resolved_cwd(&self.workspace);
+        if retry_failed {
+            self.model_catalog.retry(backend, &cwd);
+        }
         match self.model_catalog.models(backend, &cwd) {
             ModelChoices::Loading => {
+                self.model_picker_pending = true;
                 self.notice = Some(format!(
-                    "{} model catalog is already loading automatically",
+                    "loading {} model catalog… keep editing while it loads",
                     backend.as_str()
                 ));
             }
             ModelChoices::Ready(models) => {
+                self.model_picker_pending = false;
                 self.model_picker = Some(ModelPicker::new(
                     backend,
                     self.selected_member().model.as_deref(),
@@ -1458,7 +1491,10 @@ impl BuilderState {
                 self.notice =
                     Some("↑/↓ choose model · ←/→ choose effort · Enter select".to_string());
             }
-            ModelChoices::Failed(err) => self.notice = Some(err),
+            ModelChoices::Failed(err) => {
+                self.model_picker_pending = false;
+                self.notice = Some(format!("{err} · press Enter to retry"));
+            }
         }
     }
 
@@ -2068,6 +2104,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_model_catalog_can_be_retried() {
+        let mut catalog = ModelCatalog::default();
+        let cwd = Path::new("/tmp/ws");
+        catalog.seed_error(BackendKind::Grok, cwd, "temporary authentication failure");
+
+        catalog.retry(BackendKind::Grok, cwd);
+
+        assert!(!catalog.contains(BackendKind::Grok, cwd));
+    }
+
+    #[test]
+    fn completed_model_load_opens_requested_picker() {
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &[BackendKind::Codex]);
+        state.field_mode = true;
+        state.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .unwrap();
+        state.model_picker_pending = true;
+        state.model_catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-test".to_string()],
+        );
+
+        state.poll_agent_catalog();
+
+        assert!(state.model_picker.is_some());
+        assert!(!state.model_picker_pending);
+    }
+
+    #[test]
     fn model_picker_preserves_a_current_custom_model() {
         let picker = ModelPicker::new(
             BackendKind::Claude,
@@ -2250,6 +2318,26 @@ mod tests {
         assert_eq!(
             catalog.effort_label(&member, Path::new("/tmp/ws")),
             "loading…"
+        );
+    }
+
+    #[test]
+    fn catalog_marks_failed_default_model_as_unavailable() {
+        let mut catalog = ModelCatalog::default();
+        catalog.loads.insert(
+            (BackendKind::Grok, PathBuf::from("/tmp/ws")),
+            ModelLoad::Ready(Err("network unavailable".to_string())),
+        );
+        let member = TeamMember::new("builder", "Builder", BackendKind::Grok, "impl");
+
+        assert_eq!(
+            catalog.model_label(&member, Path::new("/tmp/ws")),
+            "unavailable"
+        );
+        assert!(
+            catalog
+                .backend_summary(BackendKind::Grok, Path::new("/tmp/ws"))
+                .contains("model discovery failed")
         );
     }
 

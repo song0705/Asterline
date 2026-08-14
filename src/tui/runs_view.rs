@@ -17,6 +17,9 @@ use crate::tui::theme::{pad_width, run_status_color, truncate_width};
 
 /// One-line hint about the latest run, shown in the footer when idle.
 pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
+    if !state.runtime_available() {
+        return None;
+    }
     let run = state.latest_run()?;
     if let Some(mode) = &run.mode
         && state.active_mode() != terminal_mode(mode.mode)

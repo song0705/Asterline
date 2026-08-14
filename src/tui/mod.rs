@@ -50,7 +50,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::domain::event::{RuntimeEvent, UiCommand};
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::BackendKind;
-use crate::runtime::RuntimeHandle;
+use crate::runtime::{RuntimeCommandSend, RuntimeHandle};
 use crate::tui::app_state::AppState;
 use crate::tui::chat_view::ChatLayout;
 use crate::tui::commands::Submission;
@@ -189,7 +189,7 @@ pub fn run(
     // leave the keyboard protocol or raw mode enabled in the user's shell.
     let cleanup = restore.restore();
 
-    handle.send(UiCommand::Shutdown);
+    handle.shutdown();
     result.and(cleanup)
 }
 
@@ -259,6 +259,11 @@ fn run_loop(
     loop {
         state.poll_team_editor_catalog();
         drain_runtime_events(state, events, notify_enabled);
+        if let Some(member) = state.take_attach_release_pending()
+            && !handle.finish_attach(member, Vec::new())
+        {
+            state.mark_runtime_unavailable();
+        }
 
         let screen = terminal
             .draw(|frame| {
@@ -319,14 +324,27 @@ fn run_loop(
         }
 
         if let Some(req) = state.take_attach_request() {
-            attach_to_member(
+            let member = req.member.clone();
+            let result = attach_to_member(
                 terminal,
                 state,
-                handle,
                 &req,
                 keyboard_enhancement,
                 legacy_keyboard_reset,
-            )?;
+            );
+            match result {
+                Ok(items) => {
+                    if !handle.finish_attach(member, items) {
+                        state.mark_runtime_unavailable();
+                    }
+                }
+                Err(err) => {
+                    if !handle.finish_attach(member, Vec::new()) {
+                        state.mark_runtime_unavailable();
+                    }
+                    return Err(err);
+                }
+            }
         }
         if state.should_quit() {
             return Ok(());
@@ -521,11 +539,10 @@ fn status_bar_at(
 fn attach_to_member(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
-    handle: &RuntimeHandle,
     req: &attach::AttachRequest,
     keyboard_enhancement: bool,
     legacy_keyboard_reset: bool,
-) -> io::Result<()> {
+) -> io::Result<Vec<crate::domain::event::ImportedMessage>> {
     let (program, args) = req.command();
     let exit_hint = attach_exit_hint();
 
@@ -535,7 +552,7 @@ fn attach_to_member(
         state.apply(RuntimeEvent::Notice(format!(
             "could not attach: {program} is not on PATH"
         )));
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     // Snapshot the backend transcript so we can import whatever is typed during
@@ -624,23 +641,15 @@ fn attach_to_member(
     // Import any messages exchanged in the attached session so they appear in
     // (and persist to) the Asterline transcript. The runtime records them and
     // emits the events the main loop renders.
-    if let Some(snapshot) = snapshot {
-        let imported = match snapshot {
+    let imported = if let Some(snapshot) = snapshot {
+        match snapshot {
             AttachSnapshot::Codex(s) => rollout_import::imported_since(s),
             AttachSnapshot::Claude(s) => claude_import::imported_since(s),
-        };
-        if !imported.is_empty() {
-            send_runtime(
-                state,
-                handle,
-                UiCommand::ImportTranscript {
-                    member: req.member.clone(),
-                    items: imported,
-                },
-            );
         }
-    }
-    Ok(())
+    } else {
+        Vec::new()
+    };
+    Ok(imported)
 }
 
 fn attach_exit_hint() -> &'static str {
@@ -793,10 +802,7 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::Interrupt => {
             if !abort_active_work(state, handle) && !state.composer().is_empty() {
                 state.clear_composer();
-            } else if state.running_count() == 0
-                && !state.verification_active()
-                && state.composer().is_empty()
-            {
+            } else if !state.has_cancelable_work() && state.composer().is_empty() {
                 state.request_quit();
             }
         }
@@ -821,8 +827,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
             if let Some(idx) = state.header_selected() {
                 // Selecting a member and pressing Enter attaches to its live
-                // backend session (hands the terminal to the real codex/claude).
-                state.request_attach(idx);
+                // backend session after the runtime grants an ordered,
+                // globally-quiescent reservation.
+                if let Some(member) = state.request_attach(idx)
+                    && !send_runtime(state, handle, UiCommand::RequestAttach { member })
+                {
+                    state.attach_request_send_failed();
+                }
                 return;
             }
             submit(state, handle);
@@ -831,7 +842,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
 }
 
 fn abort_active_work(state: &mut AppState, handle: &RuntimeHandle) -> bool {
-    if state.running_count() == 0 && !state.verification_active() {
+    if let Some(member) = state.cancel_pending_attach() {
+        if !handle.finish_attach(member, Vec::new()) {
+            state.mark_runtime_unavailable();
+        }
+        return true;
+    }
+    if !state.has_cancelable_work() {
         return false;
     }
     state.disarm_quit();
@@ -854,7 +871,7 @@ fn handle_search_action(action: Action, state: &mut AppState) {
     }
 }
 
-/// Capture the workspace's working-tree git diff, including untracked files
+/// Capture staged and unstaged working-tree changes, including untracked files
 /// (mirrors codex's `/diff`). Returns a human-readable message on failure.
 fn compute_git_diff(workspace: &str) -> String {
     const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
@@ -862,11 +879,7 @@ fn compute_git_diff(workspace: &str) -> String {
     const MAX_UNTRACKED_FILES: usize = 2_000;
 
     let dir = if workspace.is_empty() { "." } else { workspace };
-    let (mut out, diff_truncated) = match run_git_bounded(
-        dir,
-        &["--no-pager", "diff", "--no-ext-diff", "--no-textconv"],
-        MAX_DIFF_BYTES,
-    ) {
+    let (mut out, diff_truncated) = match tracked_git_diff(dir, MAX_DIFF_BYTES) {
         Ok(diff) => diff,
         Err(message) => return message.to_string(),
     };
@@ -892,6 +905,53 @@ fn compute_git_diff(workspace: &str) -> String {
         }
     }
     out
+}
+
+fn tracked_git_diff(dir: &str, limit: usize) -> Result<(String, bool), &'static str> {
+    // Against an existing HEAD this is one coherent patch containing index and
+    // worktree changes. An unborn repository has no HEAD, so fall back to the
+    // two comparisons Git supports there: empty-tree→index and index→worktree.
+    if let Ok(diff) = run_git_bounded(
+        dir,
+        &[
+            "--no-pager",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+        limit,
+    ) {
+        return Ok(diff);
+    }
+
+    let (staged, staged_truncated) = run_git_bounded(
+        dir,
+        &[
+            "--no-pager",
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ],
+        limit,
+    )?;
+    let remaining = limit
+        .saturating_sub(staged.len())
+        .saturating_sub(usize::from(!staged.is_empty()));
+    let (unstaged, unstaged_truncated) = run_git_bounded(
+        dir,
+        &["--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--"],
+        remaining,
+    )?;
+    let mut combined = staged;
+    if !combined.is_empty() && !unstaged.is_empty() {
+        combined.push('\n');
+    }
+    combined.push_str(&unstaged);
+    Ok((combined, staged_truncated || unstaged_truncated))
 }
 
 fn run_git_bounded(dir: &str, args: &[&str], limit: usize) -> Result<(String, bool), &'static str> {
@@ -1103,11 +1163,19 @@ fn drain_runtime_events(
 }
 
 fn send_runtime(state: &mut AppState, handle: &RuntimeHandle, command: UiCommand) -> bool {
-    let sent = handle.send(command);
-    if !sent {
-        state.mark_runtime_unavailable();
+    match handle.try_send(command) {
+        RuntimeCommandSend::Sent => true,
+        RuntimeCommandSend::Full => {
+            state.apply(RuntimeEvent::Notice(
+                "runtime input queue is busy; command was not sent — try again".to_string(),
+            ));
+            false
+        }
+        RuntimeCommandSend::Disconnected => {
+            state.mark_runtime_unavailable();
+            false
+        }
     }
-    sent
 }
 
 /// Titles for attention-needed runtime events (terminal BEL + OSC 9).
@@ -1135,7 +1203,33 @@ mod tests {
     use crate::runtime::{self, Runners};
     use crate::store::sqlite::SqliteStore;
     use crate::tui::drawers::Drawer;
+    use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::SystemTime;
+
+    fn git_test_repo(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-diff-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_test(&dir, &["init", "--quiet"]);
+        dir
+    }
+
+    fn git_test(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
 
     #[test]
     fn attach_exit_hint_matches_platform_eof_sequence() {
@@ -1154,6 +1248,45 @@ mod tests {
 
         assert_eq!(captured, b"0123");
         assert!(truncated);
+    }
+
+    #[test]
+    fn diff_includes_staged_and_unstaged_changes() {
+        let dir = git_test_repo("head");
+        git_test(&dir, &["config", "user.email", "tests@example.invalid"]);
+        git_test(&dir, &["config", "user.name", "Asterline Tests"]);
+        std::fs::write(dir.join("tracked.txt"), "base\n").unwrap();
+        git_test(&dir, &["add", "tracked.txt"]);
+        git_test(&dir, &["commit", "--quiet", "-m", "base"]);
+
+        std::fs::write(dir.join("tracked.txt"), "unstaged\n").unwrap();
+        std::fs::write(dir.join("staged.txt"), "staged\n").unwrap();
+        git_test(&dir, &["add", "staged.txt"]);
+
+        let diff = compute_git_diff(dir.to_str().unwrap());
+
+        assert!(diff.contains("tracked.txt"));
+        assert!(diff.contains("+unstaged"));
+        assert!(diff.contains("staged.txt"));
+        assert!(diff.contains("+staged"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn diff_handles_unborn_head_and_lists_untracked_files() {
+        let dir = git_test_repo("unborn");
+        std::fs::write(dir.join("new.txt"), "from index\n").unwrap();
+        git_test(&dir, &["add", "new.txt"]);
+        std::fs::write(dir.join("new.txt"), "from index\nfrom worktree\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "not added\n").unwrap();
+
+        let diff = compute_git_diff(dir.to_str().unwrap());
+
+        assert!(diff.contains("+from index"));
+        assert!(diff.contains("+from worktree"));
+        assert!(diff.contains("Untracked files:"));
+        assert!(diff.contains("untracked.txt"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1244,6 +1377,41 @@ mod tests {
     }
 
     #[test]
+    fn busy_runtime_queue_keeps_draft_without_disabling_input() {
+        let (evt_tx, _evt_rx) = mpsc::sync_channel(0);
+        let (handle, join) = runtime::spawn_bounded(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        // Ready cannot enter the zero-capacity event sink, so the runtime
+        // deliberately stops consuming ordinary UI work. Fill that bounded
+        // queue and exercise the product submit path at its Full boundary.
+        while handle.try_send(UiCommand::Retry) == RuntimeCommandSend::Sent {}
+
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("/retry");
+        submit(&mut state, &handle);
+
+        assert!(state.runtime_available());
+        assert_eq!(state.composer().text(), "/retry");
+        assert!(matches!(
+            state.chat().last(),
+            Some(ChatItem::Notice { text }) if text.contains("queue is busy")
+        ));
+
+        assert_eq!(
+            handle.try_send(UiCommand::Shutdown),
+            RuntimeCommandSend::Sent
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
     fn no_argument_command_with_trailing_text_keeps_state_and_draft() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
@@ -1327,6 +1495,35 @@ mod tests {
         );
         assert!(!interrupt.should_quit());
         assert_eq!(interrupt.composer().text(), "keep this draft");
+    }
+
+    #[test]
+    fn escape_aborts_paused_route_even_without_running_member() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::RoutePaused {
+            turn: crate::domain::event::TurnId(1),
+            from: MemberId::new("builder"),
+            to: vec!["reviewer".to_string()],
+            reason: "relay paused".to_string(),
+            queued: 1,
+        });
+
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+
+        assert!(!state.runtime_available(), "Esc must dispatch /abort");
+        assert_eq!(state.paused_routes(), 0);
     }
 
     #[test]

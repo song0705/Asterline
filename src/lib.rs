@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod app;
 pub mod domain;
+mod fs_safety;
 pub mod router;
 pub mod run_support;
 pub mod runtime;

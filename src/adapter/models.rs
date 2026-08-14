@@ -209,7 +209,7 @@ fn run(program: &str, args: &[&str], cwd: &Path) -> Result<Output, String> {
     run_with_timeout(program, args, cwd, MODEL_DISCOVERY_TIMEOUT)
 }
 
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     program: &str,
     args: &[&str],
     cwd: &Path,

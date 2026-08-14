@@ -25,6 +25,13 @@ use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
 
+const REPLAY_MAX_ITEMS: usize = 10_000;
+const REPLAY_MAX_BYTES: usize = 16 * 1024 * 1024;
+const REPLAY_ITEM_OVERHEAD: usize = 64;
+const REPLAY_TRUNCATION_NOTICE: &str =
+    "Earlier history was omitted to keep chat replay within memory limits.";
+const MAX_PERSISTED_LOGS: usize = 4_000;
+
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredApproval {
@@ -387,6 +394,24 @@ impl SqliteStore {
         })
     }
 
+    /// Persist the exact source text for structured agent controls. These rows
+    /// are intentionally omitted from chat replay; the visible agent message
+    /// and the resulting route/run/verdict rows remain the rendered history.
+    pub fn record_agent_control_source(
+        &self,
+        turn: TurnId,
+        member: &MemberId,
+        text: &str,
+    ) -> Result<MessageId> {
+        self.insert_message(MessageRow {
+            turn: Some(turn),
+            kind: "agent_control",
+            member: Some(member),
+            text: Some(text),
+            ..MessageRow::default()
+        })
+    }
+
     pub fn record_tool(
         &self,
         turn: TurnId,
@@ -430,6 +455,7 @@ impl SqliteStore {
         turn: TurnId,
         member: &MemberId,
         files: &[(String, String)],
+        ok: bool,
     ) -> Result<MessageId> {
         let encoded = files
             .iter()
@@ -441,6 +467,7 @@ impl SqliteStore {
             kind: "diff",
             member: Some(member),
             text: Some(&encoded),
+            ok: Some(ok),
             ..MessageRow::default()
         })
     }
@@ -518,14 +545,52 @@ impl SqliteStore {
     pub fn replay_chat_for(&self, conversation: i64) -> Result<Vec<ChatItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
-             FROM messages WHERE conversation_id = ?1 ORDER BY id ASC",
+             FROM messages
+             WHERE conversation_id = ?1
+               AND kind IN ('user', 'agent', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')
+             ORDER BY id DESC
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![conversation], map_chat_item)?;
-        let mut items = Vec::new();
+        let rows = stmt.query_map(
+            params![conversation, (REPLAY_MAX_ITEMS + 1) as i64],
+            map_chat_item,
+        )?;
+        let mut items = Vec::with_capacity(REPLAY_MAX_ITEMS);
+        let mut retained_bytes = 0_usize;
+        let mut truncated = false;
         for item in rows {
             if let Some(item) = item? {
+                if items.len() == REPLAY_MAX_ITEMS {
+                    truncated = true;
+                    break;
+                }
+                let item_bytes = chat_item_replay_bytes(&item);
+                if retained_bytes.saturating_add(item_bytes) > REPLAY_MAX_BYTES {
+                    truncated = true;
+                    break;
+                }
+                retained_bytes = retained_bytes.saturating_add(item_bytes);
                 items.push(item);
             }
+        }
+        if truncated {
+            let notice = ChatItem::Notice {
+                text: REPLAY_TRUNCATION_NOTICE.to_string(),
+            };
+            let notice_bytes = chat_item_replay_bytes(&notice);
+            while !items.is_empty()
+                && (items.len() == REPLAY_MAX_ITEMS
+                    || retained_bytes.saturating_add(notice_bytes) > REPLAY_MAX_BYTES)
+            {
+                if let Some(removed) = items.pop() {
+                    retained_bytes =
+                        retained_bytes.saturating_sub(chat_item_replay_bytes(&removed));
+                }
+            }
+            items.reverse();
+            items.insert(0, notice);
+        } else {
+            items.reverse();
         }
         Ok(items)
     }
@@ -586,6 +651,24 @@ impl SqliteStore {
         Ok(id)
     }
 
+    /// Start a new chat and clear all resumable backend sessions as one durable
+    /// mutation. The in-memory selection changes only after the transaction
+    /// commits, so callers can keep their current chat on any failure.
+    pub fn create_fresh_conversation(&self, team: &TeamConfig, mode: TerminalMode) -> Result<i64> {
+        let (team_json, sessions_json) = serialize_conversation_snapshot(team, &[])?;
+        let id = self.transactional(|| {
+            self.conn
+                .execute("INSERT INTO conversations DEFAULT VALUES", [])?;
+            let id = self.conn.last_insert_rowid();
+            self.write_active_conversation(id)?;
+            self.replace_session_rows(&[])?;
+            self.write_conversation_snapshot(id, &team_json, &sessions_json, mode)?;
+            Ok(id)
+        })?;
+        self.conversation.set(id);
+        Ok(id)
+    }
+
     /// Set the conversation new rows are written to / replayed from.
     pub fn set_conversation(&self, id: i64) -> Result<()> {
         self.write_active_conversation(id)?;
@@ -611,6 +694,25 @@ impl SqliteStore {
 
     pub fn active_conversation(&self) -> i64 {
         self.conversation.get()
+    }
+
+    /// Restore the active conversation's roster-scoped configuration while
+    /// retaining the already-resolved launch workspace (including a CLI
+    /// override). Call this before constructing runners and TeamRuntime.
+    pub fn restore_active_team_config(&self, launch: &TeamConfig) -> Result<TeamConfig> {
+        let conversation = self.current_conversation()?;
+        let Some(snapshot) = self.conversation_snapshot(conversation)? else {
+            return Ok(launch.clone());
+        };
+        let mut restored = snapshot.team;
+        restored.workspace = launch.workspace.clone();
+        restored.validate().map_err(|err| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid active conversation team: {err}"),
+            )))
+        })?;
+        Ok(restored)
     }
 
     /// Save the roster and native backend sessions belonging to the active chat.
@@ -742,7 +844,8 @@ impl SqliteStore {
                          ORDER BY id ASC LIMIT 1),
                         ''
                     ),
-                    (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id),
+                    (SELECT COUNT(*) FROM messages
+                     WHERE conversation_id = c.id AND kind != 'agent_control'),
                     s.team_json
              FROM conversations c
              JOIN conversation_snapshots s ON s.conversation_id = c.id
@@ -794,24 +897,32 @@ impl SqliteStore {
     }
 
     pub fn record_log(&self, entry: &LogEntry) -> Result<i64> {
+        let entry = entry.clone().bounded();
         self.conn.execute(
             "INSERT INTO logs (level, source, message) VALUES (?1, ?2, ?3)",
             params![entry.level.as_str(), entry.source, entry.message],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?1)",
+            params![MAX_PERSISTED_LOGS as i64],
+        )?;
+        Ok(id)
     }
 
     /// Most recent `limit` log entries, oldest-first.
     pub fn recent_logs(&self, limit: usize) -> Result<Vec<LogEntry>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT level, source, message FROM logs ORDER BY id DESC LIMIT ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT level, substr(source, 1, 256), substr(message, 1, 4096) \
+                 FROM logs ORDER BY id DESC LIMIT ?1",
+        )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(LogEntry {
                 level: parse_log_level(&row.get::<_, String>(0)?),
                 source: row.get(1)?,
                 message: row.get(2)?,
-            })
+            }
+            .bounded())
         })?;
         let mut entries = rows.collect::<Result<Vec<_>>>()?;
         entries.reverse();
@@ -1055,12 +1166,17 @@ impl SqliteStore {
 
     /// Persist an updated `mode_state` blob without recording a timeline event.
     pub fn update_run_mode_state(&self, id: RunId, mode_state: &str) -> Result<RunSummary> {
+        self.write_run_mode_state(id, mode_state)?;
+        self.run(id)
+    }
+
+    fn write_run_mode_state(&self, id: RunId, mode_state: &str) -> Result<()> {
         self.ensure_active_run(id)?;
         self.conn.execute(
             "UPDATE runs SET mode_state = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![mode_state, id.0 as i64],
         )?;
-        self.run(id)
+        Ok(())
     }
 
     /// Raw `mode_state` JSON for a run, if any.
@@ -1091,6 +1207,27 @@ impl SqliteStore {
         self.record_run_event(id, "verdict", title, detail)
     }
 
+    /// Atomically commit every durable representation of an accepted mode
+    /// verdict. The runtime must not expose or act on the verdict before this
+    /// transaction succeeds.
+    pub fn commit_mode_verdict(
+        &self,
+        turn: TurnId,
+        member: &MemberId,
+        id: RunId,
+        approve: bool,
+        summary: &str,
+        mode_state: &str,
+    ) -> Result<MessageId> {
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            let message = self.record_verdict(turn, member, approve, summary)?;
+            self.record_run_verdict_event(id, approve, summary)?;
+            self.write_run_mode_state(id, mode_state)?;
+            Ok(message)
+        })
+    }
+
     /// Record one accepted private brainstorm ballot in the run timeline.
     pub fn record_brainstorm_vote_event(
         &self,
@@ -1105,6 +1242,23 @@ impl SqliteStore {
             "Brainstorm ballot",
             Some(&format!("@{voter}: {}", ranked.join(" > "))),
         )
+    }
+
+    /// Atomically record an accepted private ballot and the mode state that
+    /// contains it. This prevents a timeline-only ballot or an untracked state
+    /// mutation when either write fails.
+    pub fn commit_brainstorm_vote(
+        &self,
+        id: RunId,
+        voter: &MemberId,
+        ranked: &[String],
+        mode_state: &str,
+    ) -> Result<()> {
+        self.transactional(|| {
+            self.ensure_active_run(id)?;
+            self.record_brainstorm_vote_event(id, voter, ranked)?;
+            self.write_run_mode_state(id, mode_state)
+        })
     }
 
     /// Ids of in-flight mode runs (`running`/`verifying` with a non-null mode).
@@ -1618,6 +1772,43 @@ fn split_targets(value: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn chat_item_replay_bytes(item: &ChatItem) -> usize {
+    let payload = match item {
+        ChatItem::User { body } => body.len(),
+        ChatItem::Agent {
+            member,
+            display_name,
+            text,
+            ..
+        } => member.as_str().len() + display_name.len() + text.len(),
+        ChatItem::Tool {
+            member,
+            name,
+            summary,
+            detail,
+            ..
+        } => member.as_str().len() + name.len() + summary.len() + detail.len(),
+        ChatItem::Diff { member, files, .. } => {
+            member.as_str().len()
+                + files
+                    .iter()
+                    .map(|(path, kind)| path.len() + kind.len())
+                    .sum::<usize>()
+        }
+        ChatItem::Route { from, to, body } => {
+            from.as_str().len() + to.iter().map(String::len).sum::<usize>() + body.len()
+        }
+        ChatItem::Notice { text } => text.len(),
+        ChatItem::Error { member, message } => {
+            member.as_ref().map_or(0, |member| member.as_str().len()) + message.len()
+        }
+        ChatItem::Verdict {
+            member, summary, ..
+        } => member.as_str().len() + summary.len(),
+    };
+    REPLAY_ITEM_OVERHEAD.saturating_add(payload)
+}
+
 fn parse_log_level(value: &str) -> LogLevel {
     match value {
         "debug" => LogLevel::Debug,
@@ -1672,6 +1863,7 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
                     Some((path, kind))
                 })
                 .collect(),
+            ok: ok.map(|value| value != 0).unwrap_or(true),
         },
         "notice" => ChatItem::Notice {
             text: text.unwrap_or_default(),

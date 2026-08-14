@@ -160,9 +160,14 @@ fn parse_slash(rest: &str) -> Submission {
         }
         "step" => parse_step_command(arg),
         "focus" => {
-            let (member, _) = split_first_word(arg);
+            let (member, extra) = split_first_word(arg);
             if member.is_empty() {
                 Submission::Help
+            } else if !extra.is_empty() {
+                Submission::Invalid(
+                    "/focus accepts exactly one member; trailing arguments were not used; draft kept"
+                        .to_string(),
+                )
             } else {
                 Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
             }
@@ -255,18 +260,23 @@ fn parse_step_command(arg: &str) -> Submission {
         }
         "remove" | "delete" | "drop" => {
             let (first, rest_after_first) = split_first_word(rest);
-            let (run_id, number_text) = if let Some(run_id) = parse_run_id(first) {
-                let (number, _) = split_first_word(rest_after_first);
-                (Some(run_id), number)
+            let (run_id, number_text, extra) = if let Some(run_id) = parse_run_id(first) {
+                let (number, extra) = split_first_word(rest_after_first);
+                (Some(run_id), number, extra)
             } else {
-                let (number, _) = split_first_word(rest);
-                (None, number)
+                let (number, extra) = split_first_word(rest);
+                (None, number, extra)
             };
             let Ok(step) = number_text.parse::<u32>() else {
                 return Submission::Help;
             };
             if step == 0 {
                 return Submission::Help;
+            }
+            if !extra.is_empty() {
+                return Submission::Invalid(format!(
+                    "/step {action} does not accept trailing arguments; draft kept"
+                ));
             }
             Submission::Runtime(UiCommand::RemoveRunStep { run_id, step })
         }
@@ -296,18 +306,23 @@ fn parse_step_command(arg: &str) -> Submission {
         }
         "unassign" | "clear-owner" | "clear_owner" => {
             let (first, rest_after_first) = split_first_word(rest);
-            let (run_id, number_text) = if let Some(run_id) = parse_run_id(first) {
-                let (number, _) = split_first_word(rest_after_first);
-                (Some(run_id), number)
+            let (run_id, number_text, extra) = if let Some(run_id) = parse_run_id(first) {
+                let (number, extra) = split_first_word(rest_after_first);
+                (Some(run_id), number, extra)
             } else {
-                let (number, _) = split_first_word(rest);
-                (None, number)
+                let (number, extra) = split_first_word(rest);
+                (None, number, extra)
             };
             let Ok(step) = number_text.parse::<u32>() else {
                 return Submission::Help;
             };
             if step == 0 {
                 return Submission::Help;
+            }
+            if !extra.is_empty() {
+                return Submission::Invalid(format!(
+                    "/step {action} does not accept trailing arguments; draft kept"
+                ));
             }
             Submission::Runtime(UiCommand::AssignRunStep {
                 run_id,
@@ -455,6 +470,23 @@ mod tests {
             assert!(
                 matches!(parse(command), Submission::Invalid(message) if message.contains("does not accept arguments")),
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_arity_commands_reject_unused_trailing_text() {
+        for command in [
+            "/focus reviewer accidental",
+            "/step remove 2 accidental",
+            "/step remove run-12 2 accidental",
+            "/step delete 2 accidental",
+            "/step unassign 3 accidental",
+            "/step clear-owner run-12 3 accidental",
+        ] {
+            assert!(
+                matches!(parse(command), Submission::Invalid(message) if message.contains("trailing")),
+                "{command} must not silently discard input"
             );
         }
     }

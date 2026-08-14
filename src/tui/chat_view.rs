@@ -9,9 +9,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
-use crate::domain::event::{ChatItem, MemberStatus};
+use crate::domain::event::ChatItem;
 use crate::domain::team::{DefaultTarget, MemberId};
-use crate::tui::app_state::AppState;
+use crate::tui::app_state::{AppState, member_status_is_active};
 use crate::tui::completion::Completion;
 use crate::tui::drawer_view::render_drawer;
 use crate::tui::header::{render_footer, render_header};
@@ -246,11 +246,22 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
 
     render_chat_history(state, width, &mut lines);
 
+    let omitted_active = state.omitted_active_output_count();
+    if omitted_active > 0 {
+        let text = format!(
+            "… {omitted_active} active output cell(s) omitted by the TUI memory limit; final results will appear on completion"
+        );
+        for wrapped in markdown::wrap(&text, width.max(1)) {
+            lines.push(Line::from(Span::styled(wrapped, theme::warning_bold())));
+        }
+        lines.push(Line::raw(""));
+    }
+
     // Append live activity lines for members that are currently busy.
     let active_members: Vec<_> = state
         .members()
         .iter()
-        .filter(|m| m.status != MemberStatus::Idle)
+        .filter(|m| member_status_is_active(m.status))
         .collect();
 
     let spin_char = status_indicator::spinner();
@@ -288,24 +299,25 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
         }
     }
 
-    // Plain-text snapshot for content-anchored selection (O of existing work).
-    let plain: Vec<String> = lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect();
-
     let height = inner.height as usize;
     let total = lines.len();
     let max_start = total.saturating_sub(height);
     let start = max_start.saturating_sub(state.scroll());
-    let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
-
+    // Clone only the viewport for the widget. The remaining styled lines are
+    // consumed into the selection snapshot below instead of first duplicating
+    // the entire flattened transcript.
+    let visible: Vec<Line> = lines.iter().skip(start).take(height).cloned().collect();
     frame.render_widget(Paragraph::new(visible), inner);
+
+    let plain: Vec<String> = lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect();
 
     ChatLayout {
         area: inner,
@@ -605,11 +617,16 @@ fn render_item(
                 }
             }
         }
-        ChatItem::Diff { member, files } => {
+        ChatItem::Diff { member, files, ok } => {
             let rail_color = member_rail_color(state, member);
+            let (marker, title_style) = if *ok {
+                ("✎", theme::accent_bold())
+            } else {
+                ("✕", theme::error_bold())
+            };
             out.push(Line::from(vec![
                 chat_rail(rail_color),
-                Span::styled("   ✎ file changes", theme::accent_bold()),
+                Span::styled(format!("   {marker} file changes"), title_style),
             ]));
             for (path, kind) in files {
                 let (sign, color) = match kind.as_str() {
@@ -1050,6 +1067,55 @@ mod tests {
     }
 
     #[test]
+    fn queued_waiting_and_approval_are_active_in_header_and_footer() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "impl",
+                    MemberStatus::Queued,
+                ),
+                member_summary(
+                    "reviewer",
+                    "Reviewer",
+                    BackendKind::Claude,
+                    "review",
+                    MemberStatus::Waiting,
+                ),
+                member_summary(
+                    "qa",
+                    "QA",
+                    BackendKind::Codex,
+                    "verify",
+                    MemberStatus::NeedsApproval,
+                ),
+            ],
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(150, 18)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state);
+            })
+            .unwrap();
+        let view = format!("{}", terminal.backend());
+
+        assert!(view.contains("Active 3 members"));
+        assert!(view.contains("Builder queued"));
+        assert!(view.contains("Reviewer waiting"));
+        assert!(view.contains("QA approval"));
+        assert!(!view.contains("○ Reviewer"));
+        assert!(!view.contains("@member first"));
+    }
+
+    #[test]
     fn pure_conversation_does_not_show_work_separator() {
         let state = AppState::new(vec![
             ChatItem::User {
@@ -1141,6 +1207,7 @@ mod tests {
             ChatItem::Diff {
                 member: member.clone(),
                 files: vec![("src/lib.rs".to_string(), "modify".to_string())],
+                ok: true,
             },
             ChatItem::Error {
                 member: Some(member),
@@ -1184,6 +1251,24 @@ mod tests {
                 "rail cell at row {y} must have a full-cell background"
             );
         }
+    }
+
+    #[test]
+    fn failed_file_change_has_a_failure_marker() {
+        let state = AppState::new(vec![ChatItem::Diff {
+            member: MemberId::new("builder"),
+            files: vec![("src/lib.rs".to_string(), "update".to_string())],
+            ok: false,
+        }]);
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 70, &mut lines);
+
+        assert!(
+            plain_text(&lines)
+                .iter()
+                .any(|line| line.contains("✕ file changes"))
+        );
     }
 
     #[test]
@@ -1883,6 +1968,30 @@ mod tests {
         assert_eq!(
             layout.screen_to_content(layout.area.x + 50, layout.area.y),
             Some((1, theme::display_width("second line") - 1))
+        );
+    }
+
+    #[test]
+    fn large_chat_is_trimmed_before_frame_flattening() {
+        let chat = (0..5_000)
+            .map(|index| ChatItem::Notice {
+                text: format!("notice {index}"),
+            })
+            .collect();
+        let state = AppState::new(chat);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut flattened = 0;
+
+        terminal
+            .draw(|frame| {
+                flattened = render(frame, &state).unwrap().lines.len();
+            })
+            .unwrap();
+
+        assert!(state.chat().len() <= super::super::app_state::MAX_CHAT_ITEMS);
+        assert!(
+            flattened < 10_000,
+            "frame work must be bounded: {flattened}"
         );
     }
 }

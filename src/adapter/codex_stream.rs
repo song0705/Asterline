@@ -1,6 +1,6 @@
 //! Codex streaming adapter.
 //!
-//! Drives `codex exec --json` (and `codex exec resume <id> --json`) and
+//! Drives `codex exec --json` (and `codex exec --json resume <id>`) and
 //! translates the JSONL thread events into [`AgentEvent`]s. Sessions are
 //! resumable via the thread id; `--ephemeral` is never used.
 
@@ -44,7 +44,7 @@ impl CodexStreamAdapter {
         self
     }
 
-    /// Flags accepted by both `exec` and `exec resume`.
+    /// Exec-level flags that must precede the optional `resume` subcommand.
     fn common_flags(&self) -> Vec<String> {
         let mut flags = vec!["--json".to_string(), "--skip-git-repo-check".to_string()];
         if let Some(model) = &self.model {
@@ -79,27 +79,22 @@ impl StreamAdapter for CodexStreamAdapter {
         session: Option<&AgentSessionId>,
         effort: Option<Effort>,
     ) -> AdapterCommand {
-        // `codex exec resume` accepts only a subset of `exec`'s flags — notably
-        // NOT --color, -C, or -s. The cwd is set on the spawned process and the
-        // sandbox is restored from the resumed session.
         let mut args = vec!["exec".to_string()];
-        match session {
-            Some(session) => {
-                args.push("resume".to_string());
-                args.extend(self.common_flags());
-                args.push(session.as_str().to_string());
-            }
-            None => {
-                args.extend(self.common_flags());
-                args.push("-C".to_string());
-                args.push(self.cwd.display().to_string());
-                args.push("-s".to_string());
-                args.push(self.sandbox.codex_arg().to_string());
-            }
-        }
+        args.extend(self.common_flags());
+        // `-C` and `-s` are exec-level options. Current Codex accepts them for
+        // resumed runs only before the `resume` subcommand; placing them here
+        // also makes member confinement changes override persisted session state.
+        args.push("-C".to_string());
+        args.push(self.cwd.display().to_string());
+        args.push("-s".to_string());
+        args.push(self.sandbox.codex_arg().to_string());
         if let Some(effort) = effort {
             args.push("-c".to_string());
             args.push(format!("model_reasoning_effort={}", effort.codex_value()));
+        }
+        if let Some(session) = session {
+            args.push("resume".to_string());
+            args.push(session.as_str().to_string());
         }
         // Codex documents `-` as the prompt sentinel for both fresh and
         // resumed exec runs. Keeping user text on stdin also avoids exposing it
@@ -129,6 +124,7 @@ enum Phase {
 #[derive(Default)]
 pub struct CodexLineParser {
     command_output: HashMap<String, String>,
+    pending_message: Option<String>,
     turn_completed: bool,
 }
 
@@ -138,10 +134,14 @@ impl CodexLineParser {
         let status = str_field(item, "status").unwrap_or_default();
         match str_field(item, "type") {
             Some("agent_message") if phase == Phase::Completed => {
-                vec![AgentEvent::MessageCompleted(bounded_text(
+                // `codex exec --json` currently omits the message phase, so an
+                // item may be commentary rather than the final answer. Keep the
+                // latest candidate and commit it only at `turn.completed`.
+                self.pending_message = Some(bounded_text(
                     str_field(item, "text").unwrap_or_default(),
                     MAX_MESSAGE_TEXT_BYTES,
-                ))]
+                ));
+                Vec::new()
             }
             Some("reasoning") if phase == Phase::Completed => {
                 vec![AgentEvent::Reasoning(
@@ -185,7 +185,7 @@ impl CodexLineParser {
                     }
                 }
             }
-            Some("file_change") => {
+            Some("file_change") if phase == Phase::Completed => {
                 let ok = status == "completed";
                 vec![AgentEvent::FileChange {
                     files: file_change_files(item),
@@ -277,10 +277,27 @@ impl CodexLineParser {
                     TOOL_SUMMARY_MAX
                 )
             ))],
-            Some("error") => vec![AgentEvent::Log(format!(
-                "codex item error: {}",
-                str_field(item, "message").unwrap_or_default()
-            ))],
+            Some("error") => {
+                let message = str_field(item, "message").unwrap_or("codex item failed");
+                let id = if id.is_empty() {
+                    "codex-item-error".to_string()
+                } else {
+                    id
+                };
+                let summary = format!("codex item error: {message}");
+                vec![
+                    AgentEvent::ToolStarted {
+                        id: id.clone(),
+                        name: "codex error".to_string(),
+                        summary: "backend reported a failed item".to_string(),
+                    },
+                    AgentEvent::ToolCompleted {
+                        id,
+                        ok: false,
+                        summary,
+                    },
+                ]
+            }
             _ => Vec::new(),
         }
     }
@@ -308,21 +325,40 @@ impl LineParser for CodexLineParser {
                 ))],
                 None => Vec::new(),
             },
-            Some("turn.started") => Vec::new(),
-            Some("turn.completed") => {
-                self.turn_completed = true;
+            Some("turn.started") => {
+                self.pending_message = None;
+                self.turn_completed = false;
                 Vec::new()
             }
-            Some("turn.failed") => vec![AgentEvent::Fatal(
-                str_field(&value["error"], "message")
-                    .unwrap_or("codex turn failed")
-                    .to_string(),
-            )],
-            Some("error") => vec![AgentEvent::Fatal(
-                str_field(&value, "message")
+            Some("turn.completed") => {
+                self.turn_completed = true;
+                self.pending_message
+                    .take()
+                    .map(AgentEvent::MessageCompleted)
+                    .into_iter()
+                    .collect()
+            }
+            Some("turn.failed") => {
+                self.pending_message = None;
+                vec![AgentEvent::Fatal(
+                    str_field(&value["error"], "message")
+                        .unwrap_or("codex turn failed")
+                        .to_string(),
+                )]
+            }
+            Some("error") => {
+                let message = str_field(&value, "message")
                     .unwrap_or("codex stream error")
-                    .to_string(),
-            )],
+                    .to_string();
+                if is_recoverable_stream_error(&message) {
+                    vec![AgentEvent::ParseWarning(format!(
+                        "codex transient stream error: {message}"
+                    ))]
+                } else {
+                    self.pending_message = None;
+                    vec![AgentEvent::Fatal(message)]
+                }
+            }
             Some("item.started") => self.handle_item(&value["item"], Phase::Started),
             Some("item.completed") => self.handle_item(&value["item"], Phase::Completed),
             Some("item.updated") => {
@@ -364,6 +400,13 @@ impl LineParser for CodexLineParser {
             Vec::new()
         }
     }
+}
+
+fn is_recoverable_stream_error(message: &str) -> bool {
+    message
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("reconnecting")
 }
 
 fn file_change_files(item: &Value) -> Vec<(String, String)> {
@@ -433,18 +476,22 @@ mod tests {
         let command =
             adapter.build_command("again", Some(&AgentSessionId("thread-9".to_string())), None);
 
+        assert_eq!(command.args.first().map(String::as_str), Some("exec"));
+        let resume = command.args.iter().position(|arg| arg == "resume").unwrap();
+        let cwd = command.args.iter().position(|arg| arg == "-C").unwrap();
+        let sandbox = command.args.iter().position(|arg| arg == "-s").unwrap();
+        assert!(cwd < resume, "-C must be an exec option before resume");
+        assert!(sandbox < resume, "-s must be an exec option before resume");
         assert_eq!(
-            &command.args[0..2],
-            &["exec".to_string(), "resume".to_string()]
+            command.args.get(resume + 1).map(String::as_str),
+            Some("thread-9")
         );
-        assert!(command.args.contains(&"thread-9".to_string()));
+        assert!(command.args.windows(2).any(|w| w == ["-C", "/tmp/ws"]));
+        assert!(command.args.windows(2).any(|w| w == ["-s", "read-only"]));
         assert_eq!(command.args.last().unwrap(), "-");
         assert_eq!(command.stdin.as_deref(), Some("again"));
-        // `codex exec resume` rejects these exec-only flags — never send them.
         assert!(command.args.contains(&"--json".to_string()));
         assert!(!command.args.iter().any(|a| a == "--color"));
-        assert!(!command.args.iter().any(|a| a == "-C"));
-        assert!(!command.args.iter().any(|a| a == "-s"));
     }
 
     #[test]
@@ -474,15 +521,25 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_completes_only_on_item_completed() {
-        let started = parse_all(&[
-            r#"{"type":"item.started","item":{"id":"i1","type":"agent_message","text":"partial"}}"#,
-        ]);
-        assert!(started.is_empty());
+    fn only_the_last_agent_message_is_committed_at_turn_completed() {
+        let mut parser = CodexLineParser::default();
+        assert!(parser
+            .parse_line(
+                r#"{"type":"item.started","item":{"id":"i1","type":"agent_message","text":"partial"}}"#,
+            )
+            .is_empty());
+        assert!(parser
+            .parse_line(
+                r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"@@team_message {\"to\":\"reviewer\",\"body\":\"premature\"}"}}"#,
+            )
+            .is_empty());
+        assert!(parser
+            .parse_line(
+                r#"{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Done."}}"#,
+            )
+            .is_empty());
 
-        let completed = parse_all(&[
-            r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Done."}}"#,
-        ]);
+        let completed = parser.parse_line(r#"{"type":"turn.completed"}"#);
         assert_eq!(
             completed,
             vec![AgentEvent::MessageCompleted("Done.".to_string())]
@@ -584,6 +641,29 @@ mod tests {
     }
 
     #[test]
+    fn item_error_is_visible_as_a_failed_operation() {
+        let events = parse_all(&[
+            r#"{"type":"item.completed","item":{"id":"e1","type":"error","message":"permission denied"}}"#,
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ToolStarted {
+                    id: "e1".to_string(),
+                    name: "codex error".to_string(),
+                    summary: "backend reported a failed item".to_string(),
+                },
+                AgentEvent::ToolCompleted {
+                    id: "e1".to_string(),
+                    ok: false,
+                    summary: "codex item error: permission denied".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn successful_exit_requires_turn_completed() {
         let mut parser = CodexLineParser::default();
         assert!(matches!(
@@ -635,6 +715,43 @@ mod tests {
                 ],
                 ok: true,
             }]
+        );
+    }
+
+    #[test]
+    fn file_change_waits_for_item_completion() {
+        let events = parse_all(&[
+            r#"{"type":"item.started","item":{"id":"f1","type":"file_change","status":"in_progress","changes":[{"path":"src/a.rs","kind":"update"}]}}"#,
+            r#"{"type":"item.completed","item":{"id":"f1","type":"file_change","status":"completed","changes":[{"path":"src/a.rs","kind":"update"}]}}"#,
+        ]);
+
+        assert_eq!(
+            events,
+            vec![AgentEvent::FileChange {
+                files: vec![("src/a.rs".to_string(), "update".to_string())],
+                ok: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn reconnecting_stream_error_warns_without_failing_a_completed_turn() {
+        let events = parse_all(&[
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"error","message":"Reconnecting to Codex…"}"#,
+            r#"{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"Done."}}"#,
+            r#"{"type":"turn.completed"}"#,
+        ]);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ParseWarning(message) if message.contains("Reconnecting")
+        )));
+        assert!(events.contains(&AgentEvent::MessageCompleted("Done.".to_string())));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_)))
         );
     }
 }

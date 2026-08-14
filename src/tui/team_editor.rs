@@ -1,6 +1,8 @@
 //! Live team roster editor used by the `/team` drawer.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -36,7 +38,9 @@ pub(crate) struct TeamEditor {
     model_catalog: ModelCatalog,
     backend_picker: Option<BackendPicker>,
     model_picker: Option<ModelPicker>,
+    model_picker_pending: bool,
     session_picker: Option<SessionPicker>,
+    backend_detection: Option<Receiver<DetectedBackends>>,
     dirty: bool,
     notice: Option<String>,
 }
@@ -67,7 +71,9 @@ impl TeamEditor {
             model_catalog: ModelCatalog::default(),
             backend_picker: None,
             model_picker: None,
+            model_picker_pending: false,
             session_picker: None,
+            backend_detection: None,
             dirty: false,
             notice: None,
         }
@@ -128,6 +134,9 @@ impl TeamEditor {
     }
 
     pub(crate) fn agent_availability_label(&self) -> String {
+        if self.backend_detection.is_some() {
+            return "checking installed Agent CLIs…".to_string();
+        }
         [
             BackendKind::Codex,
             BackendKind::Claude,
@@ -151,54 +160,55 @@ impl TeamEditor {
     }
 
     pub(crate) fn load_agent_catalog(&mut self) {
-        self.detected = detect_backends();
-        self.available = [
-            BackendKind::Codex,
-            BackendKind::Claude,
-            BackendKind::Grok,
-            BackendKind::Agy,
-        ]
-        .into_iter()
-        .filter(|backend| self.detected.contains(*backend))
-        .collect();
-        let mut cwds = self
-            .members
-            .iter()
-            .map(|member| member.resolved_cwd(&self.workspace))
-            .collect::<Vec<_>>();
-        cwds.push(self.workspace.clone());
-        cwds.sort();
-        cwds.dedup();
-        self.model_catalog.preload(&self.available, &cwds);
-        self.preload_member_catalogs();
-        self.notice = Some("loading installed Agent model and effort catalogs…".to_string());
+        if self.backend_detection.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(detect_backends());
+        });
+        self.backend_detection = Some(rx);
+        self.notice = Some("checking installed Agent CLIs…".to_string());
     }
 
     pub(crate) fn poll_agent_catalog(&mut self) {
-        self.preload_member_catalogs();
-        self.model_catalog.poll();
-        if !self.model_catalog.is_loading()
-            && self
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.starts_with("loading installed Agent"))
-        {
-            self.notice = Some(if self.available.is_empty() {
-                "no supported Agent CLI found on PATH".to_string()
-            } else {
-                "Agent model and effort catalogs loaded".to_string()
-            });
+        let result = self
+            .backend_detection
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match result {
+            Some(Ok(detected)) => {
+                self.backend_detection = None;
+                self.detected = detected;
+                self.available = [
+                    BackendKind::Codex,
+                    BackendKind::Claude,
+                    BackendKind::Grok,
+                    BackendKind::Agy,
+                ]
+                .into_iter()
+                .filter(|backend| self.detected.contains(*backend))
+                .collect();
+                self.notice = Some(if self.available.is_empty() {
+                    "no supported Agent CLI found on PATH".to_string()
+                } else {
+                    "Agent CLIs ready · open a Model field to load its catalog".to_string()
+                });
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.backend_detection = None;
+                self.notice = Some("Agent CLI check stopped unexpectedly".to_string());
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
         }
-    }
-
-    fn preload_member_catalogs(&mut self) {
-        let targets = self
-            .members
-            .iter()
-            .map(|member| (member.backend, member.resolved_cwd(&self.workspace)))
-            .collect::<Vec<_>>();
-        for (backend, cwd) in targets {
-            let _ = self.model_catalog.models(backend, &cwd);
+        self.model_catalog.poll();
+        if self.model_picker_pending
+            && self.field_mode
+            && self.selected_field() == Field::Model
+            && self.model_picker.is_none()
+            && self.editing.is_none()
+        {
+            self.cycle_model(false);
         }
     }
 
@@ -265,12 +275,14 @@ impl TeamEditor {
             KeyCode::Char('c') if ctrl => TeamEditorOutcome::Close,
             KeyCode::Esc if self.field_mode => {
                 self.field_mode = false;
+                self.model_picker_pending = false;
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Esc | KeyCode::Char('q') => TeamEditorOutcome::Close,
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.field_mode {
                     self.prev_field();
+                    self.model_picker_pending = false;
                 } else {
                     self.selected = self.selected.saturating_sub(1);
                 }
@@ -279,6 +291,7 @@ impl TeamEditor {
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.field_mode {
                     self.next_field();
+                    self.model_picker_pending = false;
                 } else if self.selected + 1 < self.members.len() {
                     self.selected += 1;
                 }
@@ -521,13 +534,17 @@ impl TeamEditor {
     fn activate_field(&mut self) {
         let field = self.selected_field();
         if field == Field::Backend {
+            if self.backend_detection.is_some() {
+                self.notice = Some("still checking installed Agent CLIs…".to_string());
+                return;
+            }
             let Some(member) = self.selected_member() else {
                 return;
             };
             self.backend_picker = Some(BackendPicker::new(member.backend, self.detected));
             self.notice = Some("↑/↓ choose an installed Agent CLI · Enter select".to_string());
         } else if field == Field::Model {
-            self.cycle_model();
+            self.cycle_model(true);
         } else if field == Field::SessionId {
             let Some(member) = self.selected_member() else {
                 return;
@@ -566,6 +583,9 @@ impl TeamEditor {
 
     fn edit_selected_field(&mut self) {
         let field = self.selected_field();
+        if field == Field::Model {
+            self.model_picker_pending = false;
+        }
         let Some(member) = self.selected_member() else {
             return;
         };
@@ -577,22 +597,36 @@ impl TeamEditor {
         self.editing = Some(EditState::new(field, value));
     }
 
-    fn cycle_model(&mut self) {
+    fn cycle_model(&mut self, retry_failed: bool) {
+        if self.backend_detection.is_some() {
+            self.model_picker_pending = true;
+            self.notice = Some("still checking installed Agent CLIs…".to_string());
+            return;
+        }
         let Some(member) = self.selected_member() else {
             return;
         };
         let backend = member.backend;
+        if !self.detected.contains(backend) {
+            self.notice = Some(format!("{} is not installed on PATH", backend.as_str()));
+            return;
+        }
         let current = member.model.clone();
         let current_effort = member.effort;
         let cwd = member.resolved_cwd(&self.workspace);
+        if retry_failed {
+            self.model_catalog.retry(backend, &cwd);
+        }
         match self.model_catalog.models(backend, &cwd) {
             ModelChoices::Loading => {
+                self.model_picker_pending = true;
                 self.notice = Some(format!(
-                    "{} model catalog is already loading automatically",
+                    "loading {} model catalog… keep editing while it loads",
                     backend.as_str()
                 ));
             }
             ModelChoices::Ready(models) => {
+                self.model_picker_pending = false;
                 self.model_picker = Some(ModelPicker::new(
                     backend,
                     current.as_deref(),
@@ -602,7 +636,10 @@ impl TeamEditor {
                 self.notice =
                     Some("↑/↓ choose model · ←/→ choose effort · Enter select".to_string());
             }
-            ModelChoices::Failed(err) => self.notice = Some(err),
+            ModelChoices::Failed(err) => {
+                self.model_picker_pending = false;
+                self.notice = Some(format!("{err} · press Enter to retry"));
+            }
         }
     }
 
@@ -832,8 +869,8 @@ mod tests {
     }
 
     #[test]
-    fn member_model_catalog_is_preloaded_without_opening_model_field() {
-        let mut editor = TeamEditor::new(
+    fn member_model_catalog_stays_idle_until_model_field_is_opened() {
+        let editor = TeamEditor::new(
             "t",
             "/tmp/ws",
             None,
@@ -845,17 +882,105 @@ mod tests {
             )],
         );
 
-        editor.preload_member_catalogs();
-
         assert!(
-            editor
+            !editor
                 .model_catalog
                 .contains(BackendKind::Claude, Path::new("/tmp/ws"))
         );
         assert_eq!(
             editor.field_value(&editor.members[0], Field::Model),
-            "loading…"
+            "CLI default"
         );
+    }
+
+    #[test]
+    fn agent_detection_is_polled_without_blocking_the_editor() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut editor = editor();
+        editor.backend_detection = Some(rx);
+
+        assert_eq!(
+            editor.agent_availability_label(),
+            "checking installed Agent CLIs…"
+        );
+        tx.send(DetectedBackends {
+            codex: true,
+            claude: false,
+            grok: true,
+            agy: false,
+        })
+        .unwrap();
+
+        editor.poll_agent_catalog();
+
+        assert_eq!(
+            editor.agent_availability_label(),
+            "codex ✓ · claude ✕ · grok ✓ · agy ✕"
+        );
+        assert_eq!(
+            editor.available,
+            vec![BackendKind::Codex, BackendKind::Grok]
+        );
+        assert!(
+            editor
+                .notice()
+                .is_some_and(|notice| notice.contains("ready"))
+        );
+    }
+
+    #[test]
+    fn completed_model_load_opens_the_requested_picker() {
+        let mut editor = editor();
+        editor.detected.codex = true;
+        editor.field_mode = true;
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .unwrap();
+        editor.model_picker_pending = true;
+        editor.model_catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-test".to_string()],
+        );
+
+        editor.poll_agent_catalog();
+
+        assert!(editor.model_picker().is_some());
+        assert!(!editor.model_picker_pending);
+    }
+
+    #[test]
+    fn requested_model_picker_waits_for_backend_detection() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut editor = editor();
+        editor.field_mode = true;
+        editor.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .unwrap();
+        editor.backend_detection = Some(rx);
+        editor.model_catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-test".to_string()],
+        );
+
+        editor.activate_field();
+        assert!(editor.model_picker_pending);
+        assert!(editor.model_picker().is_none());
+
+        tx.send(DetectedBackends {
+            codex: true,
+            claude: false,
+            grok: false,
+            agy: false,
+        })
+        .unwrap();
+        editor.poll_agent_catalog();
+
+        assert!(editor.model_picker().is_some());
+        assert!(!editor.model_picker_pending);
     }
 
     #[test]
@@ -1055,6 +1180,7 @@ mod tests {
                 "implementation",
             )],
         );
+        editor.detected.grok = true;
         editor.field = Field::ALL
             .iter()
             .position(|field| *field == Field::Model)
@@ -1077,6 +1203,7 @@ mod tests {
     #[test]
     fn codex_model_field_uses_discovered_catalog() {
         let mut editor = editor();
+        editor.detected.codex = true;
         editor.field = Field::ALL
             .iter()
             .position(|field| *field == Field::Model)

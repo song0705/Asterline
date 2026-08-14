@@ -70,12 +70,24 @@ fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> Ve
     let Some(path) = target else {
         return Vec::new();
     };
-    let messages = parse_messages(&path);
-    messages
-        .into_iter()
-        .skip(snapshot.before)
-        .filter_map(to_imported)
-        .collect()
+    let mut imported = Vec::new();
+    let mut retained_bytes = 0_usize;
+    let mut message_index = 0_usize;
+    import_io::for_each_json_value(&path, |value| {
+        let Some(message) = parse_rollout_message(&value) else {
+            return true;
+        };
+        let index = message_index;
+        message_index = message_index.saturating_add(1);
+        if index < snapshot.before {
+            return true;
+        }
+        let Some(message) = to_imported(message) else {
+            return true;
+        };
+        import_io::push_imported_bounded(&mut imported, &mut retained_bytes, message)
+    });
+    imported
 }
 
 /// `$CODEX_HOME/sessions`, or the platform user profile's `.codex/sessions`.
@@ -115,11 +127,15 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, entries_remaining: &mut usi
         }
         *entries_remaining -= 1;
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_jsonl(&path, out, entries_remaining, depth + 1);
-        } else if path
-            .extension()
-            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
             && path
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
@@ -161,8 +177,12 @@ fn newest_rollout_for_session_since(
 }
 
 fn rollout_matches_session(path: &Path, session_id: &str) -> bool {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) {
+        return false;
+    }
+    let suffix = format!("-{session_id}.jsonl");
     path.file_name()
-        .is_some_and(|n| n.to_string_lossy().contains(session_id))
+        .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
 }
 
 fn newest_rollout_for_cwd_since(
@@ -209,36 +229,47 @@ struct RolloutMessage {
 }
 
 fn count_messages(path: &Path) -> usize {
-    parse_messages(path).len()
+    let mut count = 0_usize;
+    import_io::for_each_json_value(path, |value| {
+        if parse_rollout_message(&value).is_some() {
+            count = count.saturating_add(1);
+        }
+        true
+    });
+    count
 }
 
+#[cfg(test)]
 fn parse_messages(path: &Path) -> Vec<RolloutMessage> {
     let mut out = Vec::new();
     import_io::for_each_json_value(path, |value| {
-        if value.get("type").and_then(Value::as_str) != Some("response_item") {
-            return true;
+        if let Some(message) = parse_rollout_message(&value) {
+            out.push(message);
         }
-        let payload = match value.get("payload") {
-            Some(p) => p,
-            None => return true,
-        };
-        if payload.get("type").and_then(Value::as_str) != Some("message") {
-            return true;
-        }
-        let role = payload
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let text = payload
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|items| join_text(items))
-            .unwrap_or_default();
-        out.push(RolloutMessage { role, text });
         true
     });
     out
+}
+
+fn parse_rollout_message(value: &Value) -> Option<RolloutMessage> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let text = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| join_text(items))
+        .unwrap_or_default();
+    Some(RolloutMessage { role, text })
 }
 
 /// Join the text of a message's content parts, dropping codex's injected
@@ -408,6 +439,15 @@ mod tests {
     }
 
     #[test]
+    fn rollout_session_matching_is_exact_and_rejects_empty_ids() {
+        let path = Path::new("rollout-2026-session-abc.jsonl");
+        assert!(rollout_matches_session(path, "session-abc"));
+        assert!(!rollout_matches_session(path, "session"));
+        assert!(!rollout_matches_session(path, ""));
+        assert!(!rollout_matches_session(path, "../session-abc"));
+    }
+
+    #[test]
     fn fresh_attach_imports_only_rollout_from_matching_cwd() {
         let dir = std::env::temp_dir().join(format!("ast-rollout-cwd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -453,6 +493,34 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attached_codex_import_stops_at_aggregate_item_budget() {
+        let dir =
+            std::env::temp_dir().join(format!("ast-rollout-import-budget-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-session-budget.jsonl");
+        let lines = (0..import_io::MAX_IMPORTED_ITEMS + 25)
+            .map(|index| message_line("user", &format!("message-{index}")))
+            .collect::<Vec<_>>();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let imported = import_from_rollouts(
+            RolloutSnapshot {
+                session_id: Some("session-budget".to_string()),
+                cwd: Some("/tmp/attached".to_string()),
+                path: Some(path.clone()),
+                before: 0,
+                started: SystemTime::UNIX_EPOCH,
+            },
+            vec![path],
+        );
+
+        assert_eq!(imported.len(), import_io::MAX_IMPORTED_ITEMS);
+        assert_eq!(imported.last().unwrap().text, "message-999");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(windows)]

@@ -397,8 +397,8 @@ impl TeamRuntime {
             .get_mut(&run_id)
             .and_then(|s| s.pending_verdict.take());
         match pending {
-            Some(ReviewVerdict {
-                verdict: ReviewVerdictKind::Approve,
+            Some(PersistedReviewVerdict {
+                verdict: PersistedReviewVerdictKind::Approve,
                 summary: _,
             }) => {
                 if !self.persist_mode_state(run_id, step) {
@@ -444,8 +444,8 @@ impl TeamRuntime {
                 }
                 self.finish_mode_run_approved(run_id, step);
             }
-            Some(ReviewVerdict {
-                verdict: ReviewVerdictKind::RequestChanges,
+            Some(PersistedReviewVerdict {
+                verdict: PersistedReviewVerdictKind::RequestChanges,
                 summary,
             }) => {
                 let feedback = summary
@@ -1256,24 +1256,51 @@ impl TeamRuntime {
 
             if accept {
                 let run_id = session_meta.as_ref().map(|(id, ..)| *id).expect("accept");
-                if let Some(session) = self.mode_sessions.get_mut(&run_id) {
-                    session.pending_verdict = Some(last);
-                }
-                if let Err(err) = self.store.record_verdict(turn, member, approve, &summary) {
-                    self.report_store_error("save a review verdict", err, step);
-                }
-                if let Err(err) =
-                    self.store
-                        .record_run_verdict_event(run_id, approve, &summary)
-                {
-                    self.report_store_error("save a run verdict event", err, step);
-                }
-                step.events.push(RuntimeEvent::Verdict {
-                    run: run_id,
-                    member: member.clone(),
-                    approve,
-                    summary,
+                let candidate = self.mode_sessions.get(&run_id).cloned().map(|mut session| {
+                    session.pending_verdict = Some(PersistedReviewVerdict::from(&last));
+                    session
                 });
+                let committed = match candidate
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                {
+                    Ok(Some(mode_state)) => match self.store.commit_mode_verdict(
+                        turn, member, run_id, approve, &summary, &mode_state,
+                    ) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            self.report_store_error("save a review verdict", err, step);
+                            false
+                        }
+                    },
+                    Ok(None) => false,
+                    Err(err) => {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "could not serialize mode state for {run_id}: {err}"
+                        )));
+                        false
+                    }
+                };
+                if committed {
+                    if let Some(candidate) = candidate {
+                        self.mode_sessions.insert(run_id, candidate);
+                    }
+                    step.events.push(RuntimeEvent::Verdict {
+                        run: run_id,
+                        member: member.clone(),
+                        approve,
+                        summary,
+                    });
+                } else if let Some(running) = self
+                    .members
+                    .get_mut(member)
+                    .and_then(|state| state.running.as_mut())
+                {
+                    // Fail closed: Exited will block the mode run instead of
+                    // interpreting an unaudited verdict as free-text feedback.
+                    running.failed = true;
+                }
             } else {
                 step.events.push(RuntimeEvent::Notice(format!(
                     "{member} sent a review verdict outside an active review — ignored"
@@ -1314,36 +1341,87 @@ impl TeamRuntime {
                 }
                 self.persist_mode_state_quiet(run_id, step);
             } else if phase == ModePhase::Voting && participants.iter().any(|p| p == member) {
-                let accepted = parsed.brainstorm_votes.last().is_some_and(|vote| {
-                    let Some(session) = self.mode_sessions.get_mut(&run_id) else {
-                        return false;
+                if let Some(vote) = parsed.brainstorm_votes.last() {
+                    let Some(current) = self.mode_sessions.get(&run_id).cloned() else {
+                        return;
                     };
-                    let unchanged = session.votes.iter().any(|record| {
-                        &record.voter == member
-                            && record.ranked == vote.ranked
-                            && record.summary == vote.summary
-                    });
-                    if unchanged {
-                        return false;
+                    let candidates = brainstorm_candidate_ids(&current);
+                    let unknown = vote
+                        .ranked
+                        .iter()
+                        .filter(|candidate| !candidates.contains(candidate.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !unknown.is_empty() {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{member} submitted unknown brainstorm candidate(s): {} — ballot ignored",
+                            unknown.join(", ")
+                        )));
+                        if let Some(running) = self
+                            .members
+                            .get_mut(member)
+                            .and_then(|state| state.running.as_mut())
+                        {
+                            // An invalid structured ballot must not let the
+                            // voting turn advance into synthesis.
+                            running.failed = true;
+                        }
+                    } else {
+                        let unchanged = current.votes.iter().any(|record| {
+                            &record.voter == member
+                                && record.ranked == vote.ranked
+                                && record.summary == vote.summary
+                        });
+                        if !unchanged {
+                            let mut candidate = current;
+                            candidate.votes.retain(|record| &record.voter != member);
+                            candidate.votes.push(BrainstormVoteRecord {
+                                voter: member.clone(),
+                                ranked: vote.ranked.clone(),
+                                summary: vote.summary.clone(),
+                            });
+                            candidate.vote_count = candidate.votes.len() as u32;
+                            match serde_json::to_string(&candidate) {
+                                Ok(mode_state) => match self.store.commit_brainstorm_vote(
+                                    run_id,
+                                    member,
+                                    &vote.ranked,
+                                    &mode_state,
+                                ) {
+                                    Ok(()) => {
+                                        self.mode_sessions.insert(run_id, candidate);
+                                    }
+                                    Err(err) => {
+                                        self.report_store_error(
+                                            "save a brainstorm vote",
+                                            err,
+                                            step,
+                                        );
+                                        if let Some(running) = self
+                                            .members
+                                            .get_mut(member)
+                                            .and_then(|state| state.running.as_mut())
+                                        {
+                                            running.failed = true;
+                                        }
+                                    }
+                                },
+                                Err(err) => {
+                                    step.events.push(RuntimeEvent::Notice(format!(
+                                        "could not serialize mode state for {run_id}: {err}"
+                                    )));
+                                    if let Some(running) = self
+                                        .members
+                                        .get_mut(member)
+                                        .and_then(|state| state.running.as_mut())
+                                    {
+                                        running.failed = true;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    session.votes.retain(|record| &record.voter != member);
-                    session.votes.push(BrainstormVoteRecord {
-                        voter: member.clone(),
-                        ranked: vote.ranked.clone(),
-                        summary: vote.summary.clone(),
-                    });
-                    session.vote_count = session.votes.len() as u32;
-                    true
-                });
-                if accepted
-                    && let Some(vote) = parsed.brainstorm_votes.last()
-                    && let Err(err) =
-                        self.store
-                            .record_brainstorm_vote_event(run_id, member, &vote.ranked)
-                {
-                    self.report_store_error("save a brainstorm vote", err, step);
                 }
-                self.persist_mode_state_quiet(run_id, step);
             } else if phase == ModePhase::Synthesizing {
                 if let Some(session) = self.mode_sessions.get_mut(&run_id) {
                     session.brainstorm_summary = truncate_mode_text(visible_text);
@@ -1417,7 +1495,6 @@ impl TeamRuntime {
         }
         self.failed_runs.remove(&run.id);
         session.cancelled = false;
-        session.pending_verdict = None;
         session.idea_count = session.idea_batches.len() as u32;
 
         let phase = session.phase;
@@ -1563,6 +1640,15 @@ impl TeamRuntime {
                 self.brainstorm_enter_synthesis(run.id, step);
             }
             ModePhase::Reviewing | ModePhase::AwaitingVerdict => {
+                if self
+                    .mode_sessions
+                    .get(&run.id)
+                    .is_some_and(|session| session.pending_verdict.is_some())
+                {
+                    let session = self.mode_sessions[&run.id].clone();
+                    self.mode_handle_verdict_phase(run.id, &session, step);
+                    return;
+                }
                 if let Some(s) = self.mode_sessions.get_mut(&run.id) {
                     s.phase = ModePhase::Reviewing;
                     s.reviewer_nudged = false;
@@ -1765,6 +1851,34 @@ struct BrainstormVoteRecord {
     summary: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedReviewVerdictKind {
+    Approve,
+    RequestChanges,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PersistedReviewVerdict {
+    verdict: PersistedReviewVerdictKind,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+impl From<&ReviewVerdict> for PersistedReviewVerdict {
+    fn from(value: &ReviewVerdict) -> Self {
+        Self {
+            verdict: match value.verdict {
+                ReviewVerdictKind::Approve => PersistedReviewVerdictKind::Approve,
+                ReviewVerdictKind::RequestChanges => {
+                    PersistedReviewVerdictKind::RequestChanges
+                }
+            },
+            summary: value.summary.clone(),
+        }
+    }
+}
+
 /// One live collaboration-mode session. Persisted as the run's `mode_state` JSON;
 /// field names line up with ModeStatusSummary (phase/iteration/max_iterations/round/rounds)
 /// and unknown fields are tolerated by older readers.
@@ -1797,8 +1911,8 @@ struct ModeSession {
     reviewer_nudged: bool,
     #[serde(default)]
     last_feedback: Option<String>,
-    #[serde(skip)]
-    pending_verdict: Option<ReviewVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_verdict: Option<PersistedReviewVerdict>,
     #[serde(skip)]
     reviewer_last_text: String,
     #[serde(skip)]
@@ -1889,25 +2003,44 @@ fn format_brainstorm_generation_context(
     }
 }
 
-fn format_brainstorm_idea_set(session: &ModeSession) -> String {
+fn brainstorm_labeled_batches(session: &ModeSession) -> Vec<(&BrainstormIdeaBatch, String)> {
     let mut occurrences: HashMap<(u32, MemberId), usize> = HashMap::new();
+    session
+        .idea_batches
+        .iter()
+        .filter_map(|batch| {
+            let index = participant_index(session, &batch.author)?;
+            let occurrence = occurrences
+                .entry((batch.round, batch.author.clone()))
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            let base = format!("R{}-{}", batch.round, proposal_label(index));
+            let label = if *occurrence == 1 {
+                base
+            } else {
+                format!("{base}-V{occurrence}")
+            };
+            Some((batch, label))
+        })
+        .collect()
+}
+
+fn brainstorm_candidate_ids(session: &ModeSession) -> HashSet<String> {
+    brainstorm_labeled_batches(session)
+        .into_iter()
+        .flat_map(|(batch, label)| {
+            (1..=batch.cards.len().max(1)).map(move |item| format!("{label}#{item}"))
+        })
+        .collect()
+}
+
+fn format_brainstorm_idea_set(session: &ModeSession) -> String {
     let mut sections = Vec::new();
-    for batch in &session.idea_batches {
-        let Some(index) = participant_index(session, &batch.author) else {
-            continue;
-        };
-        let occurrence = occurrences
-            .entry((batch.round, batch.author.clone()))
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-        let base = format!("R{}-{}", batch.round, proposal_label(index));
-        let label = if *occurrence == 1 {
-            base
-        } else {
-            format!("{base}-V{occurrence}")
-        };
+    for (batch, label) in brainstorm_labeled_batches(session) {
         if batch.cards.is_empty() {
-            sections.push(format!("[{label}]\n{}", batch.text));
+            // A free-text batch still represents one real, votable fallback
+            // candidate, matching brainstorm_card_count's max(1) semantics.
+            sections.push(format!("[{label}#1]\n{}", batch.text));
             continue;
         }
         let cards = batch

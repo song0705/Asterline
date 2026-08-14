@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -15,6 +16,7 @@ use crate::adapter::parser::{
     tool_value,
 };
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
+use crate::domain::config::check_agy_version;
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
 
@@ -31,6 +33,7 @@ pub struct AgyStreamAdapter {
     system_prompt: Option<String>,
     sandbox: SandboxPolicy,
     permission_mode: Option<PermissionMode>,
+    version_check: Arc<OnceLock<Result<(), String>>>,
 }
 
 impl AgyStreamAdapter {
@@ -45,12 +48,20 @@ impl AgyStreamAdapter {
             system_prompt: member.system_prompt.clone(),
             sandbox: member.sandbox,
             permission_mode: member.permission_mode,
+            version_check: Arc::new(OnceLock::new()),
         }
     }
 
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
         self.binary = binary.into();
+        self.version_check = Arc::new(OnceLock::new());
         self
+    }
+
+    fn ensure_supported_version(&self) -> Result<(), String> {
+        self.version_check
+            .get_or_init(|| check_agy_version(&self.binary))
+            .clone()
     }
 
     fn log_path(&self) -> PathBuf {
@@ -91,6 +102,10 @@ impl AgyStreamAdapter {
 impl StreamAdapter for AgyStreamAdapter {
     fn backend(&self) -> BackendKind {
         BackendKind::Agy
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        self.ensure_supported_version()
     }
 
     fn build_command(
@@ -365,6 +380,50 @@ impl LineParser for AgyLineParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::config::validate_agy_version;
+
+    #[test]
+    fn version_gate_requires_agy_1_1_12() {
+        for old in ["1.1.7", "1.1.8", "agy 1.1.11", "v1.1.12-rc.1"] {
+            let error = validate_agy_version(old).unwrap_err();
+            assert!(error.contains("1.1.12"), "{error}");
+        }
+        for supported in [
+            "1.1.12",
+            "agy version 1.1.12\r\n",
+            "build 2026-08-12; agy version v1.1.12\r\n",
+            "agy 1.2.0",
+            "v2.0.0",
+            "1.1.12+build.4",
+        ] {
+            assert!(validate_agy_version(supported).is_ok(), "{supported}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_agy_binary_produces_an_actionable_preflight_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("asterline-old-agy-version-{}", std::process::id()));
+        let binary = dir.join("agy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&binary, "#!/bin/sh\nprintf '1.1.11\\n'\n").unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"))
+            .with_binary(binary.display().to_string());
+        let error = adapter.preflight().unwrap_err();
+
+        assert!(error.contains("found 1.1.11"), "{error}");
+        assert!(error.contains("--mode"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn command_uses_stream_json_effort_workspace_and_resume() {

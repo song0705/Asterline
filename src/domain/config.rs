@@ -3,11 +3,14 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use std::{env, fs, io};
 
+use crate::adapter::models::run_with_timeout;
 use crate::domain::team::{
     BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, TeamConfig, TeamMember,
 };
+use crate::fs_safety;
 
 const TEAM_PROTOCOL_BEGIN: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_BEGIN -->";
 const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
@@ -22,42 +25,61 @@ const ASTERLINE_BRAINSTORM_SKILL: &str =
     include_str!("../../.agents/skills/asterline-brainstorm/SKILL.md");
 const MANAGED_SKILL_MARKER: &str =
     "<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->";
+const MIN_AGY_VERSION: (u64, u64, u64) = (1, 1, 12);
+// Backend discovery runs alongside other startup and test subprocesses. Keep
+// the probe bounded, but leave enough headroom that a loaded machine does not
+// incorrectly hide an installed Agy binary.
+const BACKEND_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ensure the workspace skill file is present and, when Asterline manages it,
 /// upgraded to the embedded protocol version. User-rewritten copies are left alone.
 pub fn ensure_team_skill(workspace: &Path) -> io::Result<()> {
-    let path = workspace.join(ASTERLINE_TEAM_SKILL_PATH);
-    if path.is_file() {
-        let existing = fs::read_to_string(&path)?;
-        if is_managed_skill(&existing) && skill_version(&existing) < ASTERLINE_TEAM_SKILL_VERSION {
-            fs::write(&path, ASTERLINE_TEAM_SKILL)?;
+    let path = managed_skill_path(workspace, ASTERLINE_TEAM_SKILL_NAME)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let existing = fs_safety::read_regular_to_string(&path, "team skill")?;
+            if is_managed_skill(&existing)
+                && skill_version(&existing) < ASTERLINE_TEAM_SKILL_VERSION
+            {
+                fs_safety::write_regular_file(&path, "team skill", ASTERLINE_TEAM_SKILL)?;
+            }
+            Ok(())
         }
-        return Ok(());
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs_safety::write_regular_file(&path, "team skill", ASTERLINE_TEAM_SKILL)
+        }
+        Err(error) => Err(error),
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, ASTERLINE_TEAM_SKILL)
 }
 
 /// Install the default brainstorm protocol once. Existing deployment-local
 /// copies are always preserved so teams can customize the method and card text.
 pub fn ensure_brainstorm_skill(workspace: &Path) -> io::Result<()> {
-    let path = workspace.join(ASTERLINE_BRAINSTORM_SKILL_PATH);
-    if path.is_file() {
-        return Ok(());
+    let path = managed_skill_path(workspace, ASTERLINE_BRAINSTORM_SKILL_NAME)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => fs_safety::read_regular_to_string(&path, "brainstorm skill").map(|_| ()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs_safety::write_regular_file(&path, "brainstorm skill", ASTERLINE_BRAINSTORM_SKILL)
+        }
+        Err(error) => Err(error),
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, ASTERLINE_BRAINSTORM_SKILL)
 }
 
 /// Load the deployment-local brainstorm protocol, falling back to the embedded
 /// default for tests and workspaces that have not been initialized yet.
 pub fn brainstorm_skill_text(workspace: &Path) -> String {
-    fs::read_to_string(workspace.join(ASTERLINE_BRAINSTORM_SKILL_PATH))
+    managed_skill_path(workspace, ASTERLINE_BRAINSTORM_SKILL_NAME)
+        .and_then(|path| fs_safety::read_regular_to_string(&path, "brainstorm skill"))
         .unwrap_or_else(|_| ASTERLINE_BRAINSTORM_SKILL.to_string())
+}
+
+fn managed_skill_path(workspace: &Path, skill_name: &str) -> io::Result<PathBuf> {
+    let directory = fs_safety::ensure_workspace_directory(
+        workspace,
+        &[".agents", "skills", skill_name],
+        false,
+    )?;
+    Ok(directory.join("SKILL.md"))
 }
 
 /// Frontmatter `version:` value; missing or invalid values are treated as v1.
@@ -92,7 +114,7 @@ pub fn team_skill_hint() -> String {
 
 /// Read and validate a team config from a JSON file.
 pub fn load_team_config(path: &Path) -> io::Result<TeamConfig> {
-    let text = fs::read_to_string(path)?;
+    let text = fs_safety::read_regular_to_string(path, "team config")?;
     let config: TeamConfig =
         serde_json::from_str(&text).map_err(|err| invalid_config(path, err.to_string()))?;
     config
@@ -143,12 +165,95 @@ pub fn detect_backends() -> DetectedBackends {
         codex: binary_in_dirs(&dirs, "codex"),
         claude: binary_in_dirs(&dirs, "claude"),
         grok: binary_in_dirs(&dirs, "grok"),
-        agy: binary_in_dirs(&dirs, "agy"),
+        agy: supported_agy_in_dirs(&dirs, env::var_os("PATHEXT").as_deref(), cfg!(windows)),
     }
 }
 
 fn binary_in_dirs(dirs: &[PathBuf], name: &str) -> bool {
     resolve_binary_in_dirs(dirs, name, env::var_os("PATHEXT").as_deref(), cfg!(windows)).is_some()
+}
+
+fn supported_agy_in_dirs(dirs: &[PathBuf], path_ext: Option<&OsStr>, windows: bool) -> bool {
+    resolve_binary_in_dirs(dirs, "agy", path_ext, windows)
+        .is_some_and(|binary| check_agy_version_path(&binary).is_ok())
+}
+
+pub(crate) fn check_agy_version(binary: &str) -> Result<(), String> {
+    let resolved = resolve_binary_on_path(binary).unwrap_or_else(|| PathBuf::from(binary));
+    check_agy_version_path(&resolved)
+}
+
+fn check_agy_version_path(binary: &Path) -> Result<(), String> {
+    let program = binary.to_string_lossy();
+    let output = run_with_timeout(
+        &program,
+        &["--version"],
+        Path::new("."),
+        BACKEND_CAPABILITY_TIMEOUT,
+    )
+    .map_err(|error| format!("Agy 1.1.12 or newer is required; {error}"))?;
+    validate_agy_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub(crate) fn validate_agy_version(raw: &str) -> Result<(), String> {
+    let version = parse_agy_version(raw).ok_or_else(|| {
+        format!(
+            "Agy 1.1.12 or newer is required; could not parse version from `{}`",
+            compact_version_output(raw, 80)
+        )
+    })?;
+    let numeric = (version.major, version.minor, version.patch);
+    if numeric < MIN_AGY_VERSION || (numeric == MIN_AGY_VERSION && version.prerelease) {
+        return Err(format!(
+            "Agy 1.1.12 or newer is required for structured streaming and reliable headless --mode enforcement; found {}",
+            version.display
+        ));
+    }
+    Ok(())
+}
+
+struct AgyVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: bool,
+    display: String,
+}
+
+fn parse_agy_version(raw: &str) -> Option<AgyVersion> {
+    raw.split_whitespace().find_map(parse_agy_version_token)
+}
+
+fn parse_agy_version_token(token: &str) -> Option<AgyVersion> {
+    let display = token.to_string();
+    let token = token.trim_start_matches('v');
+    let token = token.split_once('+').map_or(token, |(version, _)| version);
+    let (core, prerelease) = token
+        .split_once('-')
+        .map_or((token, false), |(version, _)| (version, true));
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(AgyVersion {
+        major,
+        minor,
+        patch,
+        prerelease,
+        display,
+    })
+}
+
+fn compact_version_output(raw: &str, max_chars: usize) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 /// Resolve a runnable program exactly as Asterline will launch it. On Windows,
@@ -608,6 +713,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agy_capability_detection_rejects_versions_before_1_1_12() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "asterline-cfg-agy-capability-{}",
+            std::process::id()
+        ));
+        let old_dir = root.join("old");
+        let supported_dir = root.join("supported");
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, version) in [(&old_dir, "1.1.11"), (&supported_dir, "1.1.12")] {
+            std::fs::create_dir_all(dir).unwrap();
+            let binary = dir.join("agy");
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '{version}\\r\\n'\n")).unwrap();
+            let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&binary, permissions).unwrap();
+        }
+
+        assert!(!supported_agy_in_dirs(&[old_dir], None, false));
+        assert!(supported_agy_in_dirs(&[supported_dir], None, false));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn windows_pathext_resolves_script_shims_without_global_env_mutation() {
         let dir =
@@ -857,6 +988,35 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_skills_reject_symlinks_and_never_read_their_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir =
+            std::env::temp_dir().join(format!("asterline-skill-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let victim = dir.join("outside.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let managed_old = format!("---\nversion: 1\n---\n{MANAGED_SKILL_MARKER}\n");
+        std::fs::write(&victim, &managed_old).unwrap();
+
+        let team_path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
+        symlink(&victim, &team_path).unwrap();
+        assert!(ensure_team_skill(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), managed_old);
+
+        let brainstorm_path = dir.join(ASTERLINE_BRAINSTORM_SKILL_PATH);
+        std::fs::create_dir_all(brainstorm_path.parent().unwrap()).unwrap();
+        std::fs::write(&victim, "PRIVATE_LOCAL_CONTENT").unwrap();
+        symlink(&victim, &brainstorm_path).unwrap();
+        assert!(ensure_brainstorm_skill(&dir).is_err());
+        assert!(!brainstorm_skill_text(&dir).contains("PRIVATE_LOCAL_CONTENT"));
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

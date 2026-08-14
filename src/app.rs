@@ -16,6 +16,7 @@ use crate::domain::config::{
 };
 use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
+use crate::fs_safety;
 use crate::runtime::{self, Runners, RuntimeHandle};
 use crate::store::sqlite::SqliteStore;
 use crate::tui;
@@ -72,7 +73,7 @@ where
     // sends Shutdown on its normal cleanup path; a duplicate send is harmless.
     let shutdown_handle = handle.clone();
     let tui_result = tui::run(handle, events, state);
-    shutdown_handle.send(crate::domain::event::UiCommand::Shutdown);
+    shutdown_handle.shutdown();
     let runtime_result = join_runtime(join);
     tui_result.and(runtime_result)
 }
@@ -106,8 +107,14 @@ impl InstanceLock {
         let mut lock_name = db_path.as_os_str().to_os_string();
         lock_name.push(".lock");
         let lock_path = PathBuf::from(lock_name);
+        fs_safety::ensure_private_regular_file(&lock_path, "instance lock")?;
         let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true);
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -151,12 +158,20 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         .clone()
         .unwrap_or_else(|| cwd.to_path_buf());
 
-    let saved_team = requested_workspace.join(".asterline").join("team.json");
+    let requested_state_dir =
+        fs_safety::ensure_workspace_directory(&requested_workspace, &[".asterline"], true)?;
+    let saved_team = requested_state_dir.join("team.json");
+    // Only an implicitly reused saved roster participates in conversation
+    // snapshot restoration. An explicit --team file or a freshly picked team
+    // is a launch-time choice and must not be overwritten by an older DB.
+    let restore_saved_roster = config.team_path.is_none()
+        && !config.pick_team
+        && fs_safety::regular_file_exists(&saved_team, "saved team config")?;
     let mut team = match &config.team_path {
         Some(path) => load_team_config(path)?,
         // Reuse a previously-built roster so the builder doesn't nag every
         // launch; `--pick-team` forces re-selection.
-        None if !config.pick_team && saved_team.is_file() => load_team_config(&saved_team)?,
+        None if restore_saved_roster => load_team_config(&saved_team)?,
         None => {
             let detected = detect_backends();
             if !detected.any() {
@@ -168,9 +183,6 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             match crate::tui::team_builder::run(detected, &requested_workspace)? {
                 Some(team) => {
                     // Persist the choice for next time (before protocol injection).
-                    if let Some(parent) = saved_team.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
                     runtime::save_team_config(&saved_team, &team)?;
                     team
                 }
@@ -187,17 +199,27 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     let workspace = team.workspace.clone();
     ensure_team_skill(&team.workspace)?;
     ensure_brainstorm_skill(&team.workspace)?;
-    inject_team_protocol(&mut team);
 
-    let db_path = config
-        .db_path
-        .clone()
-        .unwrap_or_else(|| workspace.join(".asterline").join("asterline.sqlite3"));
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let db_path = match &config.db_path {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            path.clone()
+        }
+        None => fs_safety::ensure_workspace_directory(&workspace, &[".asterline"], true)?
+            .join("asterline.sqlite3"),
+    };
+    fs_safety::ensure_private_regular_file(&db_path, "SQLite database")?;
     let instance_lock = InstanceLock::acquire(&db_path)?;
     let store = SqliteStore::open(&db_path).map_err(|err| io::Error::other(err.to_string()))?;
+
+    if !config.no_restore && restore_saved_roster {
+        team = store
+            .restore_active_team_config(&team)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+    }
+    inject_team_protocol(&mut team);
 
     let runners = build_runners(&team, config.fake);
     let (chat, logs) = if config.no_restore {
@@ -212,7 +234,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         // A replay failure must be visible, not a silently-blank transcript:
         // surface it as the first chat item so a schema/store problem is
         // obvious in-app instead of looking like "history was lost".
-        let chat = match store.replay_chat() {
+        let mut chat = match store.replay_chat() {
             Ok(chat) => chat,
             Err(err) => vec![ChatItem::Notice {
                 text: format!("could not replay history: {err}"),
@@ -220,7 +242,15 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         };
         // Logs are persisted too; replay the recent tail so the logs drawer
         // isn't empty after a restart.
-        let logs = store.recent_logs(4000).unwrap_or_default();
+        let logs = match store.recent_logs(4000) {
+            Ok(logs) => logs,
+            Err(err) => {
+                chat.push(ChatItem::Notice {
+                    text: format!("could not replay logs: {err}"),
+                });
+                Vec::new()
+            }
+        };
         (chat, logs)
     };
     let mut state = AppState::new(chat);
@@ -451,6 +481,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_rejects_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-instance-lock-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.sqlite3");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "do not truncate").unwrap();
+        symlink(&victim, format!("{}.lock", db.display())).unwrap();
+
+        assert!(InstanceLock::acquire(&db).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not truncate");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn inject_protocol_lists_teammates() {
         let mut team = crate::domain::config::default_team(
@@ -536,6 +588,123 @@ mod tests {
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prepare_restores_conversation_effort_before_building_runners() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-app-restore-effort-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut launch = crate::domain::config::default_team(
+            &dir,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+        launch.members[0].effort = Some(crate::domain::team::Effort::Low);
+        let team_path = dir.join(".asterline").join("team.json");
+        std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
+        runtime::save_team_config(&team_path, &launch).unwrap();
+
+        let db_path = dir.join("db.sqlite3");
+        let store = SqliteStore::open(&db_path).unwrap();
+        store.current_conversation().unwrap();
+        let mut saved = launch.clone();
+        saved.members[0].effort = Some(crate::domain::team::Effort::High);
+        store
+            .save_conversation_snapshot(&saved, &[], crate::domain::TerminalMode::Normal)
+            .unwrap();
+        drop(store);
+
+        let config = AppConfig::parse([
+            "--workspace",
+            dir.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+            "--fake",
+        ])
+        .unwrap();
+        let prepared = prepare(&config, &dir).unwrap().expect("prepared");
+        let ready = prepared
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        assert!(matches!(
+            ready,
+            RuntimeEvent::Ready { members, .. }
+                if members.first().and_then(|member| member.effort)
+                    == Some(crate::domain::team::Effort::High)
+        ));
+
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_team_is_not_overwritten_by_active_conversation_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-app-explicit-team-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut explicit = crate::domain::config::default_team(
+            &dir,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+        explicit.members[0].effort = Some(crate::domain::team::Effort::Low);
+        let team_path = dir.join("explicit-team.json");
+        runtime::save_team_config(&team_path, &explicit).unwrap();
+
+        let db_path = dir.join("db.sqlite3");
+        let store = SqliteStore::open(&db_path).unwrap();
+        store.current_conversation().unwrap();
+        let mut stale = explicit.clone();
+        stale.members[0].effort = Some(crate::domain::team::Effort::High);
+        stale.members[0].display_name = "Stale snapshot member".to_string();
+        store
+            .save_conversation_snapshot(&stale, &[], crate::domain::TerminalMode::Normal)
+            .unwrap();
+        drop(store);
+
+        let config = AppConfig::parse([
+            "--team",
+            team_path.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+            "--fake",
+        ])
+        .unwrap();
+        let prepared = prepare(&config, &dir).unwrap().expect("prepared");
+        let ready = prepared
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        assert!(matches!(
+            ready,
+            RuntimeEvent::Ready { members, .. }
+                if members.first().is_some_and(|member|
+                    member.effort == Some(crate::domain::team::Effort::Low)
+                        && member.display_name != "Stale snapshot member")
+        ));
+
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

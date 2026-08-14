@@ -290,6 +290,162 @@ fn create_and_select_conversation_rolls_back_together() {
 }
 
 #[test]
+fn fresh_conversation_atomically_clears_sessions_and_writes_snapshot() {
+    let store = store();
+    let original = store.current_conversation().unwrap();
+    let builder = MemberId::new("builder");
+    store
+        .upsert_session(
+            &builder,
+            BackendKind::Codex,
+            &AgentSessionId("old-session".to_string()),
+        )
+        .unwrap();
+    let team = TeamConfig::new("fresh", "/tmp/ws").with_member(TeamMember::new(
+        builder.clone(),
+        "Builder",
+        BackendKind::Codex,
+        "build",
+    ));
+
+    let fresh = store
+        .create_fresh_conversation(&team, TerminalMode::Normal)
+        .unwrap();
+
+    assert_ne!(fresh, original);
+    assert_eq!(store.active_conversation(), fresh);
+    assert_eq!(store.session_for(&builder).unwrap(), None);
+    let snapshot = store.conversation_snapshot(fresh).unwrap().unwrap();
+    assert_eq!(snapshot.team, team);
+    assert!(snapshot.sessions.is_empty());
+    assert_eq!(snapshot.mode, TerminalMode::Normal);
+}
+
+#[test]
+fn fresh_conversation_rolls_back_when_session_clear_fails() {
+    let store = store();
+    let original = store.current_conversation().unwrap();
+    let builder = MemberId::new("builder");
+    store
+        .upsert_session(
+            &builder,
+            BackendKind::Codex,
+            &AgentSessionId("old-session".to_string()),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_session_clear
+             BEFORE DELETE ON agent_sessions
+             BEGIN SELECT RAISE(ABORT, 'session clear unavailable'); END;",
+        )
+        .unwrap();
+    let team = TeamConfig::new("fresh", "/tmp/ws").with_member(TeamMember::new(
+        builder.clone(),
+        "Builder",
+        BackendKind::Codex,
+        "build",
+    ));
+
+    assert!(
+        store
+            .create_fresh_conversation(&team, TerminalMode::Normal)
+            .is_err()
+    );
+
+    assert_eq!(store.active_conversation(), original);
+    assert_eq!(store.current_conversation().unwrap(), original);
+    assert_eq!(
+        store.session_for(&builder).unwrap(),
+        Some(AgentSessionId("old-session".to_string()))
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn fresh_conversation_rolls_back_when_snapshot_write_fails() {
+    let store = store();
+    let original = store.current_conversation().unwrap();
+    let builder = MemberId::new("builder");
+    store
+        .upsert_session(
+            &builder,
+            BackendKind::Codex,
+            &AgentSessionId("old-session".to_string()),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_fresh_snapshot
+             BEFORE INSERT ON conversation_snapshots
+             BEGIN SELECT RAISE(ABORT, 'snapshot unavailable'); END;",
+        )
+        .unwrap();
+    let team = TeamConfig::new("fresh", "/tmp/ws").with_member(TeamMember::new(
+        builder.clone(),
+        "Builder",
+        BackendKind::Codex,
+        "build",
+    ));
+
+    assert!(
+        store
+            .create_fresh_conversation(&team, TerminalMode::Normal)
+            .is_err()
+    );
+
+    assert_eq!(store.active_conversation(), original);
+    assert_eq!(store.current_conversation().unwrap(), original);
+    assert_eq!(
+        store.session_for(&builder).unwrap(),
+        Some(AgentSessionId("old-session".to_string()))
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn active_team_restore_keeps_launch_workspace_and_snapshot_effort() {
+    use crate::domain::team::Effort;
+
+    let store = store();
+    store.current_conversation().unwrap();
+    let mut saved = TeamConfig::new("saved", "/saved/workspace").with_member(TeamMember::new(
+        "builder",
+        "Builder",
+        BackendKind::Codex,
+        "build",
+    ));
+    saved.members[0].effort = Some(Effort::High);
+    store
+        .save_conversation_snapshot(&saved, &[], TerminalMode::Normal)
+        .unwrap();
+    let mut launch = saved.clone();
+    launch.workspace = "/launch/workspace".into();
+    launch.members[0].effort = Some(Effort::Low);
+
+    let restored = store.restore_active_team_config(&launch).unwrap();
+
+    assert_eq!(restored.workspace, launch.workspace);
+    assert_eq!(restored.members[0].effort, Some(Effort::High));
+}
+
+#[test]
 fn replays_chat_in_insertion_order() {
     let store = store();
     let turn = store.create_turn().unwrap();
@@ -345,6 +501,66 @@ fn replays_chat_in_insertion_order() {
             backend: BackendKind::Claude,
             ..
         }
+    ));
+}
+
+#[test]
+fn replay_loads_only_the_deterministic_tail_of_a_hundred_thousand_rows() {
+    let store = store();
+    let conversation = store.current_conversation().unwrap();
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE sequence(value) AS (
+                 VALUES(1)
+                 UNION ALL
+                 SELECT value + 1 FROM sequence WHERE value < 100000
+             )
+             INSERT INTO messages (conversation_id, kind, text)
+             SELECT ?1, 'notice', printf('item-%06d', value) FROM sequence",
+            params![conversation],
+        )
+        .unwrap();
+
+    let items = store.replay_chat().unwrap();
+
+    assert_eq!(items.len(), REPLAY_MAX_ITEMS);
+    assert!(matches!(
+        &items[0],
+        ChatItem::Notice { text } if text == REPLAY_TRUNCATION_NOTICE
+    ));
+    assert!(matches!(
+        &items[1],
+        ChatItem::Notice { text } if text == "item-090002"
+    ));
+    assert!(matches!(
+        items.last().unwrap(),
+        ChatItem::Notice { text } if text == "item-100000"
+    ));
+}
+
+#[test]
+fn replay_tail_respects_the_cumulative_byte_budget() {
+    let store = store();
+    store.current_conversation().unwrap();
+    let payload = "x".repeat(2 * 1024 * 1024);
+    for index in 0..12 {
+        store
+            .record_notice(None, &format!("{payload}#{index}"))
+            .unwrap();
+    }
+
+    let items = store.replay_chat().unwrap();
+    let retained_bytes = items.iter().map(chat_item_replay_bytes).sum::<usize>();
+
+    assert!(retained_bytes <= REPLAY_MAX_BYTES);
+    assert!(matches!(
+        &items[0],
+        ChatItem::Notice { text } if text == REPLAY_TRUNCATION_NOTICE
+    ));
+    assert!(matches!(
+        items.last().unwrap(),
+        ChatItem::Notice { text } if text.ends_with("#11")
     ));
 }
 
@@ -423,6 +639,118 @@ fn verdict_message_and_run_event_round_trip() {
 
     let state = store.run_mode_state(run.id).unwrap();
     assert!(state.is_some_and(|s| s.contains("reviewing")));
+}
+
+#[test]
+fn mode_verdict_commit_rolls_back_message_timeline_and_state_together() {
+    use crate::domain::mode::CollabMode;
+
+    let store = store();
+    store.current_conversation().unwrap();
+    let turn = store.create_turn().unwrap();
+    let reviewer = MemberId::new("reviewer");
+    let original = r#"{"phase":"reviewing"}"#;
+    let run = store
+        .create_mode_run(
+            "atomic verdict",
+            Some(&reviewer),
+            CollabMode::Review,
+            original,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_verdict_mode_state
+             BEFORE UPDATE OF mode_state ON runs
+             BEGIN SELECT RAISE(ABORT, 'mode state unavailable'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .commit_mode_verdict(
+                turn,
+                &reviewer,
+                run.id,
+                true,
+                "approved",
+                r#"{"phase":"reviewing","pending_verdict":{"verdict":"approve"}}"#,
+            )
+            .is_err()
+    );
+
+    let verdict_messages: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE kind = 'verdict'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(verdict_messages, 0);
+    assert!(
+        store
+            .run(run.id)
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event.kind != "verdict")
+    );
+    assert_eq!(
+        store.run_mode_state(run.id).unwrap().as_deref(),
+        Some(original)
+    );
+}
+
+#[test]
+fn brainstorm_vote_commit_rolls_back_timeline_and_state_together() {
+    use crate::domain::mode::CollabMode;
+
+    let store = store();
+    store.current_conversation().unwrap();
+    let voter = MemberId::new("builder");
+    let original = r#"{"phase":"voting","votes":[],"vote_count":0}"#;
+    let run = store
+        .create_mode_run(
+            "atomic vote",
+            Some(&voter),
+            CollabMode::Brainstorm,
+            original,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_vote_mode_state
+             BEFORE UPDATE OF mode_state ON runs
+             BEGIN SELECT RAISE(ABORT, 'mode state unavailable'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .commit_brainstorm_vote(
+                run.id,
+                &voter,
+                &["R1-A#1".to_string()],
+                r#"{"phase":"voting","votes":[{"voter":"builder","ranked":["R1-A#1"]}],"vote_count":1}"#,
+            )
+            .is_err()
+    );
+
+    assert!(
+        store
+            .run(run.id)
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event.kind != "vote")
+    );
+    assert_eq!(
+        store.run_mode_state(run.id).unwrap().as_deref(),
+        Some(original)
+    );
 }
 
 #[test]
@@ -880,6 +1208,43 @@ fn stream_events_and_logs_are_recorded() {
 }
 
 #[test]
+fn logs_are_bounded_and_old_rows_are_pruned() {
+    let store = store();
+    store
+        .record_log(&LogEntry::warn(
+            "source".repeat(100),
+            "message".repeat(crate::domain::event::MAX_LOG_MESSAGE_BYTES),
+        ))
+        .unwrap();
+    let first = store.recent_logs(1).unwrap().pop().unwrap();
+    assert!(first.source.len() <= crate::domain::event::MAX_LOG_SOURCE_BYTES);
+    assert!(first.message.len() <= crate::domain::event::MAX_LOG_MESSAGE_BYTES);
+
+    // Simulate an old database created before entry bounds existed. Reading it
+    // must not allocate an unbounded string in the TUI startup path.
+    store
+        .conn
+        .execute(
+            "INSERT INTO logs (level, source, message) VALUES ('warn', 'old', ?1)",
+            params!["x".repeat(crate::domain::event::MAX_LOG_MESSAGE_BYTES * 2)],
+        )
+        .unwrap();
+    let old = store.recent_logs(1).unwrap().pop().unwrap();
+    assert!(old.message.len() <= crate::domain::event::MAX_LOG_MESSAGE_BYTES);
+
+    for index in 0..MAX_PERSISTED_LOGS + 5 {
+        store
+            .record_log(&LogEntry::info("builder", format!("entry-{index}")))
+            .unwrap();
+    }
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, MAX_PERSISTED_LOGS as i64);
+}
+
+#[test]
 fn upsert_team_snapshots_roster() {
     let store = store();
     let config = TeamConfig::new("mixed", "/tmp/ws")
@@ -915,13 +1280,13 @@ fn diff_round_trips_through_replay() {
         ("src/b.rs".to_string(), "add".to_string()),
     ];
     store
-        .record_diff(turn, &MemberId::new("builder"), &files)
+        .record_diff(turn, &MemberId::new("builder"), &files, false)
         .unwrap();
 
     let items = store.replay_chat().unwrap();
     assert!(matches!(
         &items[0],
-        ChatItem::Diff { files: f, .. } if *f == files
+        ChatItem::Diff { files: f, ok: false, .. } if *f == files
     ));
 }
 

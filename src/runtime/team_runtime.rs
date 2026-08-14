@@ -46,6 +46,11 @@ use crate::runtime::mode_prompts::{
 use crate::runtime::session_registry::SessionRegistry;
 use crate::store::sqlite::{SqliteStore, StoredConversationSession};
 
+pub(super) const MAX_IMPORTED_ITEMS: usize = 1_000;
+pub(super) const MAX_IMPORTED_ITEM_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_IMPORTED_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTIVE_REASONING_BYTES: usize = 8 * 1024;
+
 /// What the core wants the transport layer to do after handling an input.
 #[derive(Default)]
 pub struct RuntimeStep {
@@ -98,7 +103,9 @@ struct RunningState {
     turn: TurnId,
     message: Option<MessageId>,
     text: String,
+    reasoning: String,
     failed: bool,
+    raw_persistence_failed: bool,
 }
 
 struct QueuedPrompt {
@@ -171,6 +178,7 @@ pub struct TeamRuntime {
     approvals_enabled: bool,
     matcher: ApprovalMatcher,
     startup_notices: Vec<String>,
+    startup_reconciled: bool,
 }
 
 impl TeamRuntime {
@@ -208,16 +216,19 @@ impl TeamRuntime {
             }
         };
         // In-flight mode runs cannot be resumed losslessly across process restarts.
+        let mut startup_reconciled = true;
         match store.running_mode_runs() {
             Ok(ids) => {
                 for id in ids {
                     if let Err(err) = store.block_run(id, "interrupted by restart") {
+                        startup_reconciled = false;
                         startup_notices
                             .push(format!("could not block interrupted run {id}: {err}"));
                     }
                 }
             }
             Err(err) => {
+                startup_reconciled = false;
                 startup_notices.push(format!("could not inspect interrupted runs: {err}"));
             }
         }
@@ -259,6 +270,7 @@ impl TeamRuntime {
             approvals_enabled: true,
             matcher,
             startup_notices,
+            startup_reconciled,
         };
         let mut runtime = runtime;
         if let Err(err) = runtime.persist_conversation_snapshot() {
@@ -324,6 +336,36 @@ impl TeamRuntime {
 
     pub fn on_ui_command(&mut self, cmd: UiCommand) -> RuntimeStep {
         let mut step = RuntimeStep::default();
+        let requires_reconciled_startup = matches!(
+            &cmd,
+            UiCommand::UserMessage { .. }
+                | UiCommand::Retry
+                | UiCommand::NewSession
+                | UiCommand::ResumeConversation { .. }
+                | UiCommand::RequestAttach { .. }
+                | UiCommand::Approve {
+                    decision: ApprovalDecision::Approve,
+                    ..
+                }
+                | UiCommand::ResolvePausedRoute { resume: true }
+                | UiCommand::ContinueRun { .. }
+                | UiCommand::VerifyRun { .. }
+                | UiCommand::RunMode { .. }
+        );
+        if requires_reconciled_startup && !self.startup_reconciled {
+            let reason = "cannot change chats or dispatch work because interrupted runs were not reconciled; restart after fixing SQLite persistence"
+                .to_string();
+            match &cmd {
+                UiCommand::RequestAttach { member } => {
+                    step.events.push(RuntimeEvent::AttachDenied {
+                        member: member.clone(),
+                        reason,
+                    });
+                }
+                _ => step.events.push(RuntimeEvent::Notice(reason)),
+            }
+            return step;
+        }
         match cmd {
             UiCommand::SetMode { mode } => {
                 let previous = self.active_mode;
@@ -385,18 +427,20 @@ impl TeamRuntime {
                         )));
                     }
                     Some((id, _)) => {
-                        if let Some(state) = self.members.get_mut(&id) {
-                            state.effort = Some(effort);
-                        }
-                        if let Some(member) = self
-                            .config
-                            .members
-                            .iter_mut()
-                            .find(|member| member.id == id)
+                        let mut candidate = self.config.clone();
+                        if let Some(member) =
+                            candidate.members.iter_mut().find(|member| member.id == id)
                         {
                             member.effort = Some(effort);
                         }
-                        self.persist_snapshot_or_notice("save member effort", &mut step);
+                        if let Err(err) = self.persist_conversation_snapshot_for(&candidate) {
+                            self.report_store_error("save member effort", err, &mut step);
+                            return step;
+                        }
+                        self.config = candidate;
+                        if let Some(state) = self.members.get_mut(&id) {
+                            state.effort = Some(effort);
+                        }
                         step.events.push(RuntimeEvent::MemberEffort {
                             member: id.clone(),
                             effort,
@@ -420,9 +464,17 @@ impl TeamRuntime {
             UiCommand::ResumeConversation { conversation } => {
                 self.handle_resume_conversation(conversation, &mut step)
             }
-            UiCommand::ImportTranscript { member, items } => {
-                self.handle_import_transcript(member, items, &mut step)
-            }
+            // Transcript import is valid only through the transport's matching
+            // AttachFinished reservation. Keep the public legacy command from
+            // bypassing that trust boundary when the core is used directly.
+            UiCommand::ImportTranscript { .. } => step.events.push(RuntimeEvent::Notice(
+                "ignored direct transcript import without an attach reservation".to_string(),
+            )),
+            UiCommand::RequestAttach { member } => self.handle_request_attach(member, &mut step),
+            // The transport owns the attach reservation. A stray completion
+            // delivered directly to the synchronous core is intentionally a
+            // no-op.
+            UiCommand::AttachFinished { .. } => {}
             UiCommand::ContinueRun { run_id, note } => {
                 self.handle_continue_run(run_id, note, &mut step)
             }
@@ -461,6 +513,18 @@ impl TeamRuntime {
             UiCommand::RunMode { mode, task } => self.handle_run_mode(mode, task, &mut step),
             UiCommand::Shutdown => self.handle_cancel(None, &mut step),
         }
+        step
+    }
+
+    /// Import the transcript owned by a transport-validated attach completion.
+    /// The transport calls this only while the matching reservation is held.
+    pub(super) fn import_attached_transcript(
+        &mut self,
+        member: MemberId,
+        items: Vec<ImportedMessage>,
+    ) -> RuntimeStep {
+        let mut step = RuntimeStep::default();
+        self.handle_import_transcript(member, items, &mut step);
         step
     }
 
@@ -614,6 +678,8 @@ impl TeamRuntime {
                     self.block_mode_run(run_id, "aborted by user", step);
                 }
                 cancelled_route_turns.extend(self.paused_routes.drain(..).map(|route| route.turn));
+                step.events
+                    .push(RuntimeEvent::RouteQueueUpdated { queued: 0 });
                 for (id, held) in std::mem::take(&mut self.held_approvals) {
                     cancelled_approval_turns.push(held.turn);
                     if let Err(err) = self.store.resolve_approval(id, ApprovalDecision::Reject) {
@@ -677,7 +743,14 @@ impl TeamRuntime {
         }
         // A fresh chat: a new conversation (so the transcript starts clean and
         // restart shows only this chat) plus new backend sessions for everyone.
-        match self.store.create_and_set_conversation() {
+        let mut snapshot_team = strip_team_protocols(self.config.clone());
+        for member in &mut snapshot_team.members {
+            member.session_id = None;
+        }
+        match self
+            .store
+            .create_fresh_conversation(&snapshot_team, TerminalMode::Normal)
+        {
             Ok(_) => {}
             Err(err) => {
                 step.events.push(RuntimeEvent::Notice(format!(
@@ -688,16 +761,14 @@ impl TeamRuntime {
         }
         let previous_mode = self.active_mode;
         self.active_mode = TerminalMode::Normal;
-        for id in self.config.all_member_ids() {
-            self.sessions.clear(&id);
-            if let Err(err) = self.store.delete_session(&id) {
-                self.report_store_error("clear a member session", err, step);
-            }
+        self.sessions = SessionRegistry::new();
+        for member in &mut self.config.members {
+            member.session_id = None;
         }
         // Drop any in-flight turn state from the previous chat.
         self.paused_routes.clear();
         self.held_approvals.clear();
-        self.persist_snapshot_or_notice("save the new chat", step);
+        self.last_user = None;
         if previous_mode != TerminalMode::Normal {
             step.events.push(RuntimeEvent::ModeChanged {
                 mode: TerminalMode::Normal,
@@ -841,12 +912,18 @@ impl TeamRuntime {
     }
 
     fn persist_conversation_snapshot(&self) -> crate::store::sqlite::Result<()> {
+        self.persist_conversation_snapshot_for(&self.config)
+    }
+
+    fn persist_conversation_snapshot_for(
+        &self,
+        config: &TeamConfig,
+    ) -> crate::store::sqlite::Result<()> {
         if self.store.active_conversation() <= 0 {
             return Ok(());
         }
-        let team = strip_team_protocols(self.config.clone());
-        let sessions = self
-            .config
+        let team = strip_team_protocols(config.clone());
+        let sessions = config
             .members
             .iter()
             .filter_map(|member| {
@@ -882,6 +959,24 @@ impl TeamRuntime {
             || !self.held_approvals.is_empty()
             || !self.run_turns.is_empty()
             || !self.mode_sessions.is_empty()
+    }
+
+    fn handle_request_attach(&self, member: MemberId, step: &mut RuntimeStep) {
+        if self.config.member(&member).is_none() {
+            let reason = format!("cannot attach: unknown member {member}");
+            step.events
+                .push(RuntimeEvent::AttachDenied { member, reason });
+            return;
+        }
+        if self.has_active_work() {
+            step.events.push(RuntimeEvent::AttachDenied {
+                member,
+                reason: "cannot attach while member work, verification, routing, approval, or a run is active; use /abort or resolve it first"
+                    .to_string(),
+            });
+            return;
+        }
+        step.events.push(RuntimeEvent::AttachGranted { member });
     }
 
     fn handle_replace_team(
@@ -1123,7 +1218,39 @@ impl TeamRuntime {
                 .push(RuntimeEvent::Notice(format!("unknown member: {member}")));
             return;
         };
-        if items.is_empty() {
+        let original_count = items.len();
+        let mut retained_bytes = 0_usize;
+        let mut truncated = false;
+        let mut oversized_items = 0_usize;
+        let mut retained = Vec::with_capacity(original_count.min(MAX_IMPORTED_ITEMS));
+        for (index, item) in items.into_iter().enumerate() {
+            if index == MAX_IMPORTED_ITEMS {
+                truncated = true;
+                break;
+            }
+            if item.text.len() > MAX_IMPORTED_ITEM_BYTES {
+                truncated = true;
+                oversized_items = oversized_items.saturating_add(1);
+                continue;
+            }
+            let remaining = MAX_IMPORTED_TOTAL_BYTES.saturating_sub(retained_bytes);
+            if remaining == 0 || item.text.len() > remaining {
+                truncated = true;
+                break;
+            }
+            retained_bytes = retained_bytes.saturating_add(item.text.len());
+            retained.push(item);
+            if retained_bytes == MAX_IMPORTED_TOTAL_BYTES {
+                truncated |= retained.len() < original_count;
+                break;
+            }
+        }
+        if retained.is_empty() {
+            if truncated {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "attached transcript from {id} exceeded import limits and contained no retainable messages (skipped {oversized_items} oversized message(s))"
+                )));
+            }
             return;
         }
         let turn = match self.store.create_turn() {
@@ -1136,9 +1263,9 @@ impl TeamRuntime {
         };
         let display = self.member_display(&id);
         let backend = self.member_backend(&id);
-        let count = items.len();
+        let count = retained.len();
         step.events.push(RuntimeEvent::TurnStarted { turn });
-        for item in items {
+        for item in retained {
             if item.from_user {
                 if let Err(err) =
                     self.store
@@ -1175,6 +1302,11 @@ impl TeamRuntime {
         step.events.push(RuntimeEvent::Notice(format!(
             "imported {count} message(s) from {id}'s attached session"
         )));
+        if truncated || count < original_count {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "attached transcript from {id} was truncated to {count} message(s) and {retained_bytes} bytes; skipped {oversized_items} oversized message(s)"
+            )));
+        }
         step.events.push(RuntimeEvent::TurnFinished { turn });
     }
 
@@ -1309,9 +1441,14 @@ impl TeamRuntime {
     fn resolve_next_paused_route(&mut self, resume: bool, step: &mut RuntimeStep) {
         let Some(route) = self.paused_routes.pop_front() else {
             step.events
+                .push(RuntimeEvent::RouteQueueUpdated { queued: 0 });
+            step.events
                 .push(RuntimeEvent::Notice("no paused routes".to_string()));
             return;
         };
+        step.events.push(RuntimeEvent::RouteQueueUpdated {
+            queued: self.paused_routes.len(),
+        });
         if resume {
             step.events.push(RuntimeEvent::Notice(format!(
                 "resumed route {} -> {}",
@@ -1356,10 +1493,14 @@ impl TeamRuntime {
                     step.events.push(RuntimeEvent::MessageDelta { msg, text });
                 }
             }
-            AgentEvent::Reasoning(text) => step.events.push(RuntimeEvent::Reasoning {
-                member: member.clone(),
-                text: bounded_text(&text, MAX_MESSAGE_TEXT_BYTES),
-            }),
+            AgentEvent::Reasoning(text) => {
+                if let Some(text) = self.append_reasoning(member, &text) {
+                    step.events.push(RuntimeEvent::Reasoning {
+                        member: member.clone(),
+                        text,
+                    });
+                }
+            }
             AgentEvent::MessageCompleted(text) => self.complete_message(member, text, &mut step),
             AgentEvent::ToolStarted { id, name, summary } => {
                 if let Some(state) = self.members.get_mut(member) {
@@ -1435,15 +1576,16 @@ impl TeamRuntime {
                     output,
                 });
             }
-            AgentEvent::FileChange { files, ok: _ } => {
+            AgentEvent::FileChange { files, ok } => {
                 if let Some(turn) = self.running_turn(member)
-                    && let Err(err) = self.store.record_diff(turn, member, &files)
+                    && let Err(err) = self.store.record_diff(turn, member, &files, ok)
                 {
                     self.report_store_error("save a file change", err, &mut step);
                 }
                 step.events.push(RuntimeEvent::FileChange {
                     member: member.clone(),
                     files,
+                    ok,
                 });
             }
             AgentEvent::SessionDiscovered(session) => {
@@ -1463,7 +1605,22 @@ impl TeamRuntime {
                 }
             }
             AgentEvent::Raw(line) => {
+                let persistence_disabled = self
+                    .members
+                    .get(member)
+                    .and_then(|state| state.running.as_ref())
+                    .is_some_and(|running| running.raw_persistence_failed);
+                if persistence_disabled {
+                    return step;
+                }
                 if let Err(err) = self.store.record_stream_event(member, &line) {
+                    if let Some(running) = self
+                        .members
+                        .get_mut(member)
+                        .and_then(|state| state.running.as_mut())
+                    {
+                        running.raw_persistence_failed = true;
+                    }
                     self.report_store_error("save a raw stream event", err, &mut step);
                 }
             }
@@ -1517,6 +1674,7 @@ impl TeamRuntime {
     }
 
     fn log(&self, _member: &MemberId, entry: LogEntry, step: &mut RuntimeStep) {
+        let entry = entry.bounded();
         if let Err(err) = self.store.record_log(&entry) {
             step.events.push(RuntimeEvent::Log(LogEntry::error(
                 "store",
@@ -1567,6 +1725,32 @@ impl TeamRuntime {
             );
         }
 
+        let has_controls = !parsed.messages.is_empty()
+            || !parsed.members.is_empty()
+            || !parsed.run_steps.is_empty()
+            || !parsed.reviews.is_empty()
+            || !parsed.brainstorm_votes.is_empty()
+            || !parsed.brainstorm_cards.is_empty();
+        if has_controls {
+            let raw_persistence_failed = self
+                .members
+                .get(member)
+                .and_then(|state| state.running.as_ref())
+                .is_some_and(|running| running.raw_persistence_failed);
+            if raw_persistence_failed {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "ignored controls from {member} because their raw source could not be saved"
+                )));
+                self.fail_completed_message(member, msg, step);
+                return;
+            }
+            if let Err(err) = self.store.record_agent_control_source(turn, member, &text) {
+                self.report_store_error("save an agent control source", err, step);
+                self.fail_completed_message(member, msg, step);
+                return;
+            }
+        }
+
         let visible_text =
             render_brainstorm_response(&parsed.visible_text, &parsed.brainstorm_cards);
         if !visible_text.is_empty() {
@@ -1577,20 +1761,10 @@ impl TeamRuntime {
                     .record_agent(turn, member, &display, backend, &visible_text)
             {
                 self.report_store_error("save an agent message", err, step);
-                if let Some(state) = self.members.get_mut(member)
-                    && let Some(running) = &mut state.running
-                {
-                    running.failed = true;
-                    running.message = None;
-                    running.text.clear();
-                }
                 // Streaming deltas are provisional until the canonical message
                 // is durable. Clear them and do not execute controls from an
                 // output that is absent from the audit trail.
-                step.events.push(RuntimeEvent::MessageCompleted {
-                    msg,
-                    text: String::new(),
-                });
+                self.fail_completed_message(member, msg, step);
                 return;
             }
         }
@@ -1617,6 +1791,25 @@ impl TeamRuntime {
         for tmsg in parsed.messages {
             self.route_team_message(member, turn, tmsg, step);
         }
+    }
+
+    fn fail_completed_message(
+        &mut self,
+        member: &MemberId,
+        msg: MessageId,
+        step: &mut RuntimeStep,
+    ) {
+        if let Some(state) = self.members.get_mut(member)
+            && let Some(running) = &mut state.running
+        {
+            running.failed = true;
+            running.message = None;
+            running.text.clear();
+        }
+        step.events.push(RuntimeEvent::MessageCompleted {
+            msg,
+            text: String::new(),
+        });
     }
 
     fn request_team_member_from_agent(
@@ -2103,7 +2296,9 @@ impl TeamRuntime {
                 turn,
                 message: None,
                 text: String::new(),
+                reasoning: String::new(),
                 failed: false,
+                raw_persistence_failed: false,
             });
             state.status = MemberStatus::Running;
             state.tools.clear();
@@ -2265,6 +2460,30 @@ impl TeamRuntime {
             .and_then(|state| state.running.as_mut())
             .and_then(|running| {
                 append_bounded_text(&mut running.text, text, MAX_MESSAGE_TEXT_BYTES)
+            })
+    }
+
+    fn append_reasoning(&mut self, member: &MemberId, text: &str) -> Option<String> {
+        let text = bounded_text(text, MAX_ACTIVE_REASONING_BYTES);
+        if text.is_empty() {
+            return None;
+        }
+        self.members
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+            .and_then(|running| {
+                if text.starts_with(running.reasoning.as_str()) {
+                    if text == running.reasoning {
+                        return None;
+                    }
+                    running.reasoning = text;
+                    return Some(running.reasoning.clone());
+                }
+                if running.reasoning.ends_with(&text) {
+                    return None;
+                }
+                append_bounded_text(&mut running.reasoning, &text, MAX_ACTIVE_REASONING_BYTES)
+                    .map(|_| running.reasoning.clone())
             })
     }
 

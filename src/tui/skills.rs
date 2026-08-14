@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -101,6 +101,12 @@ fn collect_skill_files(
     if depth > MAX_SKILL_DEPTH || budget.exhausted() {
         return;
     }
+    if std::fs::symlink_metadata(root)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -110,9 +116,15 @@ fn collect_skill_files(
         }
         budget.entries_remaining -= 1;
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_skill_files(&path, depth + 1, budget, visit);
-        } else if path.file_name() == Some(OsStr::new("SKILL.md")) && budget.skills_remaining > 0 {
+        } else if file_type.is_file()
+            && path.file_name() == Some(OsStr::new("SKILL.md"))
+            && budget.skills_remaining > 0
+        {
             budget.skills_remaining -= 1;
             visit(&path);
         }
@@ -123,8 +135,21 @@ fn collect_skill_files(
 }
 
 fn read_skill(path: &Path) -> Option<SkillInfo> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
     let mut content = String::new();
-    File::open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
         .ok()?
         .take(MAX_SKILL_READ_BYTES)
         .read_to_string(&mut content)

@@ -82,7 +82,9 @@ impl StreamAdapter for ClaudeStreamAdapter {
             args.push(mode.claude_arg().to_string());
         }
         if !self.allowed_tools.is_empty() {
-            args.push("--allowed-tools".to_string());
+            // Claude's `--allowed-tools` only pre-approves tools; `--tools`
+            // actually removes every unlisted built-in tool from the session.
+            args.push("--tools".to_string());
             args.push(self.allowed_tools.join(","));
         }
         if let Some(system_prompt) = &self.system_prompt {
@@ -396,8 +398,9 @@ mod tests {
             command
                 .args
                 .windows(2)
-                .any(|w| w == ["--allowed-tools", "Read,Bash"])
+                .any(|w| w == ["--tools", "Read,Bash"])
         );
+        assert!(!command.args.iter().any(|arg| arg == "--allowed-tools"));
         assert_eq!(command.stdin.as_deref(), Some("hello"));
         assert!(!command.args.iter().any(|arg| arg == "hello"));
         // The product path never disables session persistence.

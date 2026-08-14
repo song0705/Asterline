@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::domain::event::MemberStatus;
-use crate::tui::app_state::{AppState, MemberView};
+use crate::tui::app_state::{AppState, MemberView, member_status_is_active};
 use crate::tui::runs_view::run_footer_hint;
 use crate::tui::status_indicator;
 use crate::tui::theme;
@@ -49,7 +49,9 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             chips.push(Span::styled("  ·  ", theme::muted()));
         }
         let glyph = match member.status {
-            MemberStatus::Running | MemberStatus::Queued => status_indicator::spinner(),
+            MemberStatus::Running | MemberStatus::Queued | MemberStatus::Waiting => {
+                status_indicator::spinner()
+            }
             MemberStatus::NeedsApproval => "⚠",
             MemberStatus::Failed => "✘",
             _ => "○",
@@ -100,6 +102,19 @@ fn chip_profile(member: &MemberView) -> Option<String> {
 }
 
 pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // A disconnected runtime is terminal for this TUI instance. Do not leave
+    // stale run/verification hints suggesting that /abort is still usable.
+    if !state.runtime_available() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "runtime stopped · input disabled · Ctrl+C quit",
+                theme::error(),
+            ))),
+            area,
+        );
+        return;
+    }
+
     // Reverse history search (Ctrl+R) takes over the footer while active.
     if let Some((query, matched)) = state.history_search() {
         let mut spans = vec![
@@ -156,36 +171,58 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         ));
     }
 
-    let running_members: Vec<&MemberView> = state
+    let active_members: Vec<&MemberView> = state
         .members()
         .iter()
-        .filter(|member| member.status == MemberStatus::Running)
+        .filter(|member| member_status_is_active(member.status))
         .collect();
-    let running = running_members.len();
-    if running > 0 {
+    let active = active_members.len();
+    if active > 0 {
         if !parts.is_empty() {
             parts.push(Span::raw("   "));
         }
-        let elapsed = running_members
+        let elapsed = active_members
             .iter()
             .filter_map(|member| state.member_elapsed_secs(&member.id))
             .max();
-        let mut names: Vec<String> = running_members
+        let mut names: Vec<String> = active_members
             .iter()
             .take(3)
-            .map(|member| member.display_name.clone())
+            .map(|member| {
+                if member.status == MemberStatus::Running {
+                    member.display_name.clone()
+                } else {
+                    format!(
+                        "{} {}",
+                        member.display_name,
+                        theme::status_label(member.status)
+                    )
+                }
+            })
             .collect();
-        if running > names.len() {
-            names.push(format!("+{}", running - names.len()));
+        if active > names.len() {
+            names.push(format!("+{}", active - names.len()));
         }
-        parts.push(Span::styled(
+        let text = if active_members
+            .iter()
+            .all(|member| member.status == MemberStatus::Running)
+        {
             status_indicator::running_footer_text(
-                running,
+                active,
                 elapsed,
                 &names,
                 status_indicator::spinner(),
             )
-            .unwrap_or_default(),
+        } else {
+            status_indicator::active_footer_text(
+                active,
+                elapsed,
+                &names,
+                status_indicator::spinner(),
+            )
+        };
+        parts.push(Span::styled(
+            text.unwrap_or_default(),
             theme::warning_bold(),
         ));
     } else if let Some((text, color)) = run_footer_hint(state) {

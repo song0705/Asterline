@@ -4,10 +4,13 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+pub(crate) const MAX_COMPOSER_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Default)]
 pub struct Composer {
     chars: Vec<char>,
     cursor: usize,
+    bytes: usize,
 }
 
 impl Composer {
@@ -28,29 +31,44 @@ impl Composer {
         self.cursor
     }
 
-    pub fn insert(&mut self, ch: char) {
+    /// Insert one scalar, returning whether it fit within the hard input cap.
+    pub fn insert(&mut self, ch: char) -> bool {
+        if self.bytes.saturating_add(ch.len_utf8()) > MAX_COMPOSER_BYTES {
+            return false;
+        }
         self.chars.insert(self.cursor, ch);
+        self.bytes += ch.len_utf8();
         self.cursor += 1;
         self.cursor = self.grapheme_boundary_at_or_after(self.cursor);
+        true
     }
 
-    /// Insert a complete paste in one operation, leaving the cursor after it.
-    pub fn insert_text(&mut self, text: &str) {
-        let inserted = text.chars().collect::<Vec<_>>();
+    /// Insert a paste in one operation, leaving the cursor after the retained
+    /// UTF-8 prefix. Returns false when the input had to be truncated.
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        let remaining = MAX_COMPOSER_BYTES.saturating_sub(self.bytes);
+        let end = utf8_prefix_len(text, remaining);
+        let inserted = text[..end].chars().collect::<Vec<_>>();
         let count = inserted.len();
         self.chars.splice(self.cursor..self.cursor, inserted);
+        self.bytes += end;
         self.cursor += count;
         self.cursor = self.grapheme_boundary_at_or_after(self.cursor);
+        end == text.len()
     }
 
     /// Insert a hard line break at the cursor (multi-line composer).
-    pub fn insert_newline(&mut self) {
-        self.insert('\n');
+    pub fn insert_newline(&mut self) -> bool {
+        self.insert('\n')
     }
 
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             let start = self.previous_grapheme_boundary(self.cursor);
+            self.bytes -= self.chars[start..self.cursor]
+                .iter()
+                .map(|ch| ch.len_utf8())
+                .sum::<usize>();
             self.chars.drain(start..self.cursor);
             self.cursor = start;
         }
@@ -66,6 +84,10 @@ impl Composer {
         while start > 0 && !self.chars[start - 1].is_whitespace() {
             start -= 1;
         }
+        self.bytes -= self.chars[start..self.cursor]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum::<usize>();
         self.chars.drain(start..self.cursor);
         self.cursor = start;
     }
@@ -73,6 +95,7 @@ impl Composer {
     pub fn clear(&mut self) {
         self.chars.clear();
         self.cursor = 0;
+        self.bytes = 0;
     }
 
     pub fn left(&mut self) {
@@ -176,16 +199,23 @@ impl Composer {
 
     /// Replace the characters in `start..cursor` with `insert`, leaving the
     /// cursor at the end of the inserted text. Used to accept a completion.
-    pub fn replace_token(&mut self, start: usize, insert: &str) {
+    pub fn replace_token(&mut self, start: usize, insert: &str) -> bool {
         let end = self.cursor.min(self.chars.len());
         let start = start.min(end);
+        let removed_bytes = self.chars[start..end]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum::<usize>();
         self.chars.drain(start..end);
-        let inserted: Vec<char> = insert.chars().collect();
+        self.bytes -= removed_bytes;
+        let available = MAX_COMPOSER_BYTES.saturating_sub(self.bytes);
+        let insert_end = utf8_prefix_len(insert, available);
+        let inserted: Vec<char> = insert[..insert_end].chars().collect();
         let count = inserted.len();
-        for (offset, ch) in inserted.into_iter().enumerate() {
-            self.chars.insert(start + offset, ch);
-        }
+        self.chars.splice(start..start, inserted);
+        self.bytes += insert_end;
         self.cursor = self.grapheme_boundary_at_or_after(start + count);
+        insert_end == insert.len()
     }
 
     /// Take the current text and clear the composer.
@@ -197,9 +227,12 @@ impl Composer {
 
     /// Replace the entire contents, leaving the cursor at the end. Used by
     /// prompt-history recall to load a previous submission into the composer.
-    pub fn set_text(&mut self, text: &str) {
-        self.chars = text.chars().collect();
+    pub fn set_text(&mut self, text: &str) -> bool {
+        let end = utf8_prefix_len(text, MAX_COMPOSER_BYTES);
+        self.chars = text[..end].chars().collect();
+        self.bytes = end;
         self.cursor = self.chars.len();
+        end == text.len()
     }
 
     fn grapheme_boundaries(&self) -> Vec<usize> {
@@ -307,6 +340,14 @@ impl Composer {
     }
 }
 
+fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +425,34 @@ mod tests {
         c.set_text("recalled");
         assert_eq!(c.text(), "recalled");
         assert_eq!(c.cursor(), 8);
+    }
+
+    #[test]
+    fn all_write_paths_obey_utf8_byte_limit() {
+        let oversized = "你".repeat(MAX_COMPOSER_BYTES);
+        let mut composer = Composer::new();
+        assert!(!composer.insert_text(&oversized));
+        let text = composer.text();
+        assert!(text.len() <= MAX_COMPOSER_BYTES);
+        assert!(text.is_char_boundary(text.len()));
+        assert!(!composer.insert('界'));
+
+        assert!(!composer.set_text(&oversized));
+        assert!(composer.text().len() <= MAX_COMPOSER_BYTES);
+        composer.home();
+        assert!(!composer.replace_token(0, &oversized));
+        assert!(composer.text().len() <= MAX_COMPOSER_BYTES);
+    }
+
+    #[test]
+    fn deleting_text_releases_byte_budget() {
+        let mut composer = Composer::new();
+        composer.set_text(&"x".repeat(MAX_COMPOSER_BYTES));
+        composer.backspace();
+        composer.backspace();
+        composer.backspace();
+        assert!(composer.insert('你'));
+        assert_eq!(composer.text().len(), MAX_COMPOSER_BYTES);
     }
 
     #[test]
