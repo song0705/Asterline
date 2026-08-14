@@ -353,10 +353,11 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     assert!(AUR_SRCINFO.contains(source_sha256));
     assert!(!AUR_SRCINFO.contains("SKIP"));
 
-    assert!(PACKAGING_README.contains("published Homebrew tap"));
-    assert!(PACKAGING_README.contains("v0.2.5 is the first\nRelease"));
+    let packaging_readme = PACKAGING_README.replace("\r\n", "\n");
+    assert!(packaging_readme.contains("published Homebrew tap"));
+    assert!(packaging_readme.contains("v0.2.5 is the first\nRelease"));
     assert!(
-        PACKAGING_README
+        packaging_readme
             .contains("brew audit --strict --online --formula song0705/asterline/asterline")
     );
     assert!(PACKAGING_README.contains("GLIBC_2.39"));
