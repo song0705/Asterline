@@ -1,43 +1,45 @@
 # Third-party package definitions
 
 This directory keeps version-pinned definitions for package-manager maintainers.
-They install both `asterline` and its short `ast` alias. These files are not a
-published tap or AUR entry: publishing still requires pushing them to the
-respective external Git repositories.
+They install both `asterline` and its short `ast` alias. The Homebrew Formula
+mirrors the published Homebrew tap; the AUR definition remains ready to submit
+when that external service is available.
 
-While the next Asterline version is being prepared, these definitions remain
-pinned to the most recently published Release. Advance an external package only
-after that Release's versioned asset, checksum, and provenance are available.
+Advance an external package only after its Release's versioned asset, checksum,
+and provenance are available. The package managers can intentionally be on
+different versions.
 
 ## Homebrew (macOS)
 
-`homebrew/Formula/asterline.rb` is a tap-ready, macOS-only Formula. It pins the
-Apple silicon and Intel portable archives by SHA-256. It deliberately does not
-support Linuxbrew until the Linux release ABI is independently verified.
+`homebrew/Formula/asterline.rb` mirrors the published v0.2.5 macOS-only
+Formula in the public `song0705/homebrew-asterline` tap. It pins the Apple
+silicon and Intel portable archives by SHA-256. It deliberately does not support
+Linuxbrew until the Linux release ABI is independently verified.
 
-To publish, create the public tap `song0705/homebrew-asterline`, copy the
-Formula to its `Formula/` directory, and push it. After that, users can run:
+Users can install it with:
 
 ```bash
 brew install song0705/asterline/asterline
 ```
 
-Validate a proposed Formula locally with:
+Validate the published Formula with:
 
 ```bash
-brew audit --strict --online --formula packaging/homebrew/Formula/asterline.rb
-brew install --formula packaging/homebrew/Formula/asterline.rb
-asterline --help
-ast --help
+brew tap song0705/asterline
+brew audit --strict --online --formula song0705/asterline/asterline
+brew install --formula song0705/asterline/asterline
+brew test song0705/asterline/asterline
 ```
 
 ## Arch User Repository
 
 `aur/asterline` is a ready-to-submit stable source package for `x86_64` and
-`aarch64`. It pins the exact source commit and SHA-256, then asserts that the
-source manifest reports the expected package version before building. The
-v0.2.3 tag is annotated but not GPG-signed, so the package intentionally pins
-its resolved release commit rather than trusting a mutable tag reference.
+`aarch64`. It intentionally remains pinned to v0.2.3 rather than advancing
+with Homebrew automatically. It pins the exact source commit and SHA-256, then
+asserts that the source manifest reports the expected package version before
+building. The v0.2.3 tag is annotated but not GPG-signed, so the package
+intentionally pins its resolved release commit rather than trusting a mutable
+tag reference.
 
 The source package is preferred over v0.2.3's Linux binary archives: those
 historical archives require `GLIBC_2.39` and dynamically link `libsqlite3`.
@@ -79,8 +81,8 @@ sudo apt install ./asterline_<version>_amd64.deb
 ast --help
 ```
 
-The existing v0.2.3 Release predates these `.deb` assets. The first release
-made from the updated workflow is the first one that will contain them.
+The existing v0.2.3 Release predates these `.deb` assets. v0.2.5 is the first
+Release made from the updated workflow and contains them.
 
 ## Release update checklist
 

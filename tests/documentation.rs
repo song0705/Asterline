@@ -20,7 +20,8 @@ const PACKAGING_README: &str = include_str!("../packaging/README.md");
 const MACOS_PACKAGE_README: &str = include_str!("../packaging/macos/README.txt");
 const PACKAGE_DEB: &str = include_str!("../scripts/package-deb.sh");
 const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
-const PACKAGED_RELEASE_VERSION: &str = "0.2.3";
+const HOMEBREW_RELEASE_VERSION: &str = "0.2.5";
+const AUR_RELEASE_VERSION: &str = "0.2.3";
 const INSTALLATION_DOCS: &[(&str, &str)] = &[
     (
         "docs/installation.md",
@@ -314,14 +315,7 @@ fn debian_packages_are_pinned_and_release_gated() {
 
 #[test]
 fn third_party_package_definitions_are_version_pinned_and_safe() {
-    let package_version = PACKAGED_RELEASE_VERSION;
-    assert_ne!(
-        package_version,
-        manifest_package_version(),
-        "package definitions must only advance after their release assets exist"
-    );
-
-    assert!(HOMEBREW_FORMULA.contains(&format!("version \"{package_version}\"")));
+    assert!(HOMEBREW_FORMULA.contains(&format!("releases/download/v{HOMEBREW_RELEASE_VERSION}")));
     assert!(HOMEBREW_FORMULA.contains("depends_on :macos"));
     assert!(!HOMEBREW_FORMULA.contains("on_linux"));
     assert!(HOMEBREW_FORMULA.contains("bin.install \"asterline\", \"ast\""));
@@ -329,11 +323,11 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     for (target, checksum) in [
         (
             "aarch64-apple-darwin.tar.gz",
-            "c9ec97ea35d1644a72d6fb31c8f639e552972084de33195007f0b951c9ccebce",
+            "9fe038680d0e3a380b4bbb190865c46b5b6dc4348314f067f8c0fdd732d957a6",
         ),
         (
             "x86_64-apple-darwin.tar.gz",
-            "adaff07aa7902a1545aaf8a20411525c5d0f79495aed0cfc0940af7f24dd362a",
+            "1970b9ea724481ee54b49ea306aabb3cf7e81bcb09d6e5a6aee1cd80516d412f",
         ),
     ] {
         assert!(
@@ -342,7 +336,7 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
         );
     }
 
-    assert!(AUR_PKGBUILD.contains(&format!("pkgver={package_version}")));
+    assert!(AUR_PKGBUILD.contains(&format!("pkgver={AUR_RELEASE_VERSION}")));
     assert!(AUR_PKGBUILD.contains("archive/${_commit}.tar.gz"));
     assert!(AUR_PKGBUILD.contains("cargo build --frozen --release --bins"));
     assert!(AUR_PKGBUILD.contains("cargo test --frozen --all-targets"));
@@ -355,14 +349,15 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     }
     let source_sha256 = "2f24699cc4d17dc7f075fcebe56df0253e94eb25bcf3f00526f366ef1b926fc2";
     assert!(AUR_PKGBUILD.contains(source_sha256));
-    assert!(AUR_SRCINFO.contains(&format!("pkgver = {package_version}")));
+    assert!(AUR_SRCINFO.contains(&format!("pkgver = {AUR_RELEASE_VERSION}")));
     assert!(AUR_SRCINFO.contains(source_sha256));
     assert!(!AUR_SRCINFO.contains("SKIP"));
 
+    assert!(PACKAGING_README.contains("published Homebrew tap"));
+    assert!(PACKAGING_README.contains("v0.2.5 is the first\nRelease"));
     assert!(
         PACKAGING_README
-            .replace("\r\n", "\n")
-            .contains("not a\npublished tap or AUR entry")
+            .contains("brew audit --strict --online --formula song0705/asterline/asterline")
     );
     assert!(PACKAGING_README.contains("GLIBC_2.39"));
     assert!(
@@ -545,17 +540,6 @@ fn first_json_fence(document: &str) -> Option<String> {
     normalized
         .split_once("```json\n")
         .and_then(|(_, rest)| rest.split_once("\n```").map(|(json, _)| json.to_string()))
-}
-
-fn manifest_package_version() -> &'static str {
-    CARGO_MANIFEST
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("version = \"")
-                .and_then(|version| version.strip_suffix('"'))
-        })
-        .expect("Cargo manifest must declare a package version")
 }
 
 fn is_table_row(line: &str) -> bool {
