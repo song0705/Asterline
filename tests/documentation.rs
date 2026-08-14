@@ -17,6 +17,7 @@ const AUR_PKGBUILD: &str = include_str!("../packaging/aur/asterline/PKGBUILD");
 const AUR_SRCINFO: &str = include_str!("../packaging/aur/asterline/.SRCINFO");
 const DEB_CONTROL: &str = include_str!("../packaging/deb/control.in");
 const PACKAGING_README: &str = include_str!("../packaging/README.md");
+const MACOS_PACKAGE_README: &str = include_str!("../packaging/macos/README.txt");
 const PACKAGE_DEB: &str = include_str!("../scripts/package-deb.sh");
 const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
 const PACKAGED_RELEASE_VERSION: &str = "0.2.3";
@@ -418,7 +419,7 @@ fn rust_and_dependency_policy_is_explicit_and_gated() {
 }
 
 #[test]
-fn stable_release_is_fail_closed_and_immutable_ready() {
+fn release_keeps_integrity_gates_with_unsigned_macos_fallback() {
     let release_workflow = RELEASE_WORKFLOW.replace("\r\n", "\n");
 
     assert!(RELEASE_WORKFLOW.contains("Verify tag provenance and publication state"));
@@ -429,10 +430,10 @@ fn stable_release_is_fail_closed_and_immutable_ready() {
     assert!(RELEASE_WORKFLOW.contains("manylinux_2_28_aarch64@sha256:"));
     assert!(RELEASE_WORKFLOW.contains("ar bash cc curl git objdump readelf strip tar"));
     assert!(RELEASE_WORKFLOW.contains("./scripts/verify-linux-release.sh"));
-    assert!(
-        RELEASE_WORKFLOW.contains("Stable releases require Developer ID signing and notarization")
-    );
-    assert!(!RELEASE_WORKFLOW.contains("building an unsigned DMG"));
+    assert!(RELEASE_WORKFLOW.contains("Publishing unsigned and unnotarized macOS DMG"));
+    assert!(RELEASE_WORKFLOW.contains("if: steps.signing.outputs.enabled == 'true'"));
+    assert!(MACOS_PACKAGE_README.contains("only when the Release notes say"));
+    assert!(MACOS_PACKAGE_README.contains("unsigned and unnotarized"));
 
     let draft = RELEASE_WORKFLOW
         .find("Rebuild a clean draft GitHub Release")
@@ -483,8 +484,8 @@ fn stable_release_is_fail_closed_and_immutable_ready() {
     for (path, document) in INSTALLATION_DOCS {
         assert!(
             document.contains("v0.2.3")
-                && (document.contains("historical exception") || document.contains("历史例外")),
-            "{path} must identify the unsigned v0.2.3 DMG as a historical exception"
+                && (document.contains("unsigned") || document.contains("未签名")),
+            "{path} must identify that an unsigned v0.2.3 DMG needs an explicit override"
         );
     }
 

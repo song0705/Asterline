@@ -314,7 +314,8 @@ jobs:
           pattern: release-*-apple-darwin
           path: dist/macos-input
           merge-multiple: true
-      - name: Require and prepare Developer ID signing
+      - name: Prepare optional Developer ID signing
+        id: signing
         shell: bash
         env:
           CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -335,8 +336,9 @@ jobs:
           test -n "$NOTARY_KEY_ID" || missing+=(APPLE_NOTARY_KEY_ID)
           test -n "$NOTARY_ISSUER_ID" || missing+=(APPLE_NOTARY_ISSUER_ID)
           if test "${#missing[@]}" -ne 0; then
-            printf 'Stable releases require Developer ID signing and notarization; missing: %s\n' "${missing[*]}" >&2
-            exit 1
+            printf '::warning::Publishing unsigned and unnotarized macOS DMG; missing: %s\n' "${missing[*]}"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           encoded="$RUNNER_TEMP/asterline-certificate.txt"
           certificate="$RUNNER_TEMP/asterline-certificate.p12"
@@ -357,6 +359,7 @@ jobs:
           echo "ASTERLINE_MACOS_APPLICATION_IDENTITY=$APPLICATION_IDENTITY" >> "$GITHUB_ENV"
           echo "ASTERLINE_MACOS_INSTALLER_IDENTITY=$INSTALLER_IDENTITY" >> "$GITHUB_ENV"
           echo "ASTERLINE_MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
       - name: Build universal installer DMG
         shell: bash
         run: |
@@ -376,6 +379,7 @@ jobs:
             "$arm_dir" \
             "dist/asterline-$version-macos-universal.dmg"
       - name: Notarize and staple DMG
+        if: steps.signing.outputs.enabled == 'true'
         shell: bash
         env:
           NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}

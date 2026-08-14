@@ -48,12 +48,11 @@ If a new terminal cannot find `ast`, add `$HOME/.local/bin` to `PATH` in
 
 ### macOS security prompt
 
-The v0.2.3 DMG is a historical exception: it was published unsigned before the
-fail-closed signing policy. Stable Releases produced by the hardened workflow
-after v0.2.3 must be Developer ID signed and notarized; the workflow fails
-instead of publishing a DMG when either credential set is unavailable. Verify
-v0.2.3's checksum before using the security override. A locally built, unsigned
-preview may also require an explicit override:
+The v0.2.3 DMG is known to be unsigned. New Release DMGs are Developer ID
+signed and notarized only when the release workflow has Apple credentials;
+otherwise they are published unsigned and unnotarized. Verify the release
+checksum and provenance before using the security override for any unsigned
+DMG:
 
 1. Control-click `Install Asterline.pkg` and choose **Open**.
 2. Confirm **Open** in the security dialog.

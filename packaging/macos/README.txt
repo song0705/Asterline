@@ -9,7 +9,7 @@ Asterline @VERSION@
 
 The package installs both `ast` and `asterline` into /usr/local/bin.
 
-The v0.2.3 DMG was an unsigned historical artifact. Stable releases produced
-by the hardened workflow after v0.2.3 are Developer ID signed and notarized.
-Release checksums and GitHub build provenance attestations are published beside
-the DMG.
+This DMG is Developer ID signed and notarized only when the Release notes say
+so. If macOS presents an unidentified-developer warning, treat this artifact as
+unsigned and unnotarized; override it only after verifying the Release checksum
+and GitHub build provenance attestation published beside the DMG.

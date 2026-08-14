@@ -111,8 +111,8 @@ their names.
 
 The macOS job always verifies the DMG, mounts it, expands the package payload,
 checks both Mach-O architectures, and runs the installed-layout `ast --help`.
-Stable releases are fail closed: all of these repository secrets must be
-present before the DMG is built, or the job fails and `publish` cannot run:
+When all of these repository secrets are present, it Developer ID-signs the
+binaries, package, and DMG, then notarizes and staples the DMG:
 
 - `MACOS_CERTIFICATE_P12_BASE64`
 - `MACOS_CERTIFICATE_PASSWORD`
@@ -123,10 +123,10 @@ present before the DMG is built, or the job fails and `publish` cannot run:
 - `APPLE_NOTARY_ISSUER_ID`
 
 The P12 must contain the named Developer ID Application and Developer ID
-Installer identities. The workflow signs the binaries, package, and DMG,
-submits the DMG with `notarytool`, and staples the ticket before upload. Local
-preview packaging may still be ad-hoc signed, but an unsigned preview is never
-accepted as a stable Release asset.
+Installer identities. If any secret is absent, the workflow emits a warning and
+publishes an unsigned, unnotarized DMG instead; its binaries are ad-hoc signed
+only. `SHA256SUMS` and GitHub artifact attestations still cover that file, but
+they do not replace Developer ID signing or Apple notarization.
 
 The Linux archives intentionally target `*-unknown-linux-gnu`, not musl. The
 release workflow uses PyPA's maintained `manylinux_2_28` images, which provide a

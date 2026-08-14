@@ -43,10 +43,9 @@ install -m 755 ast "$HOME/.local/bin/ast"
 
 ### macOS 安全提示
 
-v0.2.3 DMG 是历史例外：它发布于 fail-closed 签名策略生效前，未经过签名。
-v0.2.3 之后由加固 workflow 生成的稳定 Release 必须使用 Developer ID 签名并
-通过公证；任一凭据缺失时 workflow 会失败，不会上传 DMG。对 v0.2.3 使用安全
-绕过前，请先核对校验和。本地构建的未签名预览包也可能要求用户明确允许：
+v0.2.3 DMG 已知未签名。只有在发布 workflow 配置了 Apple 凭据时，新的 Release
+DMG 才会使用 Developer ID 签名并通过公证；否则会以未签名、未公证的形式发布。
+对任何未签名 DMG 使用安全绕过前，请先核对 Release 校验和和 provenance：
 
 1. 按住 Control 点击 `Install Asterline.pkg`，选择“打开”。
 2. 在安全提示中再次确认“打开”。
