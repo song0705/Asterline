@@ -180,10 +180,9 @@ gh run watch --exit-status
 
 Workflow actions are pinned to full commit SHAs. Rust's normal toolchain is also
 pinned to 1.93.1 instead of the drifting `stable` channel, while the MSRV job is
-pinned to 1.88.0. Dependabot tracks both the `cargo` and `github-actions`
-ecosystems in `.github/dependabot.yml`; review release notes and keep the
-human-readable Action version comment beside each SHA when accepting an update.
-Rust toolchain and manylinux digest updates remain deliberate maintainer work.
+pinned to 1.88.0. Review release notes and keep the human-readable Action
+version comment beside each SHA when accepting an update. Rust toolchain and
+manylinux digest updates remain deliberate maintainer work.
 
 Do not move or reuse a published version tag. Fix the issue, increment the
 version, and publish a new tag instead.

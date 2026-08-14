@@ -10,7 +10,6 @@ const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const RELEASING_DOC: &str = include_str!("../docs/releasing.md");
 const REAL_SMOKE_DOC: &str = include_str!("../docs/real-smoke.md");
 const JUSTFILE: &str = include_str!("../justfile");
-const DEPENDABOT: &str = include_str!("../.github/dependabot.yml");
 const WINDOWS_INSTALLER_SMOKE: &str = include_str!("../scripts/smoke-windows-installer.ps1");
 const HOMEBREW_FORMULA: &str = include_str!("../packaging/homebrew/Formula/asterline.rb");
 const AUR_PKGBUILD: &str = include_str!("../packaging/aur/asterline/PKGBUILD");
@@ -431,9 +430,6 @@ fn rust_and_dependency_policy_is_explicit_and_gated() {
         assert!(JUSTFILE.contains(command), "just check must run {command}");
         assert!(CI_WORKFLOW.contains(command), "CI must run {command}");
     }
-
-    assert!(DEPENDABOT.contains("package-ecosystem: cargo"));
-    assert!(DEPENDABOT.contains("package-ecosystem: github-actions"));
 
     for (path, document) in DOCUMENTS {
         assert!(
