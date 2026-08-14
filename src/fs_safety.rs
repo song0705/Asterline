@@ -203,6 +203,7 @@ fn restrict_existing_file(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]
