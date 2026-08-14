@@ -130,12 +130,15 @@ the extracted directory.
 
 ## Linux
 
-Download the `.tar.gz` archive matching the machine:
+Download the asset matching the machine:
 
-| Architecture        | Release target              |
-| ------------------- | --------------------------- |
-| Intel or AMD 64-bit | `x86_64-unknown-linux-gnu`  |
-| ARM64               | `aarch64-unknown-linux-gnu` |
+- **ARM64:** `asterline-v<version>-Linux-arm64.tar.gz`,
+  `asterline-v<version>-Linux-arm64.deb`, or
+  `asterline-v<version>-Linux-arm64.rpm`.
+- **Intel or AMD 64-bit (`x86_64`):**
+  `asterline-v<version>-Linux-x86_64.tar.gz`,
+  `asterline-v<version>-Linux-x86_64.deb`, or
+  `asterline-v<version>-Linux-x86_64.rpm`.
 
 These are GNU/Linux builds produced on a maintained glibc 2.28 baseline. They
 require glibc 2.28 or newer, so they do not run on Alpine/musl. SQLite is built
@@ -159,6 +162,30 @@ open a new shell and run `ast --help`.
 
 To uninstall a portable Linux copy, remove `$HOME/.local/bin/ast` and
 `$HOME/.local/bin/asterline`.
+
+### Debian and Ubuntu
+
+The `.deb` files are smoke-tested on Debian 12 and Ubuntu 24.04. Download the
+matching architecture, then install it locally:
+
+```bash
+sudo apt install ./asterline-v<version>-Linux-x86_64.deb
+ast --help
+```
+
+### Fedora and Rocky Linux
+
+The `.rpm` files are built on Rocky Linux 8 and smoke-tested again on Fedora
+44. Download the matching architecture, then install it locally:
+
+```bash
+sudo dnf install ./asterline-v<version>-Linux-x86_64.rpm
+ast --help
+```
+
+These are versioned GitHub Release assets, not configured APT or DNF
+repositories. Verify the file against `SHA256SUMS` and its GitHub artifact
+attestation before installing it.
 
 ## Build from source
 

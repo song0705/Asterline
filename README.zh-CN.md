@@ -25,11 +25,11 @@ Asterline 统一调度电脑上已经安装的 Codex、Claude、Grok 和 Agy 官
 
 Asterline 支持 macOS、Linux 和 Windows 10/11。使用前，至少需要安装并登录一个受支持的 CLI。
 
-| 平台    | 推荐安装方式                                                                         |
-| ------- | ------------------------------------------------------------------------------------ |
-| macOS   | 下载 `asterline-<version>-macos-universal.dmg`，打开后运行 `Install Asterline.pkg`。 |
-| Windows | 下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。                          |
-| Linux   | 下载 `x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu` 对应的压缩包。        |
+- **macOS：**下载 `asterline-<version>-macos-universal.dmg`，打开后运行
+  `Install Asterline.pkg`。
+- **Windows：**下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。
+- **Linux：**按 CPU 架构选择 `asterline-v<version>-Linux-x86_64` 或
+  `asterline-v<version>-Linux-arm64` 的 `.tar.gz`、`.deb` 或 `.rpm`。
 
 Linux 发布包要求 GNU/glibc 2.28 或更高版本，并内置 SQLite；目前不提供 Alpine/musl 发布目标。
 
@@ -139,7 +139,7 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 - [命令与键盘参考](docs/commands.zh-CN.md)
 - [配置与本地数据](docs/configuration.md)
 - [审批与工具控制](docs/approvals.md)
-- [版本发布说明](docs/releases/v0.2.5.md)
+- [版本发布说明](docs/releases/v0.2.6.md)
 - [维护者发布流程](docs/releasing.md)
 
 程序内可通过 `/help` 和 `asterline --help` 查看帮助。

@@ -35,11 +35,11 @@ work as structured Runs.
 Asterline supports macOS, Linux, and Windows 10/11. At least one supported CLI
 must already be installed and authenticated.
 
-| Platform | Recommended installation                                                                      |
-| -------- | --------------------------------------------------------------------------------------------- |
-| macOS    | Download `asterline-<version>-macos-universal.dmg`, open it, and run `Install Asterline.pkg`. |
-| Windows  | Download and run `asterline-<version>-x86_64-windows-setup.exe`.                              |
-| Linux    | Download the archive for `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`.           |
+- **macOS:** Download `asterline-<version>-macos-universal.dmg`, open it, and
+  run `Install Asterline.pkg`.
+- **Windows:** Download and run `asterline-<version>-x86_64-windows-setup.exe`.
+- **Linux:** Choose `asterline-v<version>-Linux-x86_64` or
+  `asterline-v<version>-Linux-arm64` as a `.tar.gz`, `.deb`, or `.rpm`.
 
 Linux archives target GNU/glibc 2.28 or newer and embed SQLite; Alpine/musl is
 not a supported release target.
@@ -169,7 +169,7 @@ attach, navigation, Run steps, Skills, logs, search, and diffs.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration and local data](docs/configuration.md)
 - [Approvals and tool control](docs/approvals.md)
-- [Release notes](docs/releases/v0.2.5.md)
+- [Release notes](docs/releases/v0.2.6.md)
 - [Maintainer release process](docs/releasing.md)
 
 Built-in help is available through `/help` and `asterline --help`.

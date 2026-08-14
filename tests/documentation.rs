@@ -20,6 +20,9 @@ const PACKAGING_README: &str = include_str!("../packaging/README.md");
 const MACOS_PACKAGE_README: &str = include_str!("../packaging/macos/README.txt");
 const PACKAGE_DEB: &str = include_str!("../scripts/package-deb.sh");
 const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
+const RPM_SPEC: &str = include_str!("../packaging/rpm/asterline.spec.in");
+const PACKAGE_RPM: &str = include_str!("../scripts/package-rpm.sh");
+const SMOKE_RPM_PACKAGE: &str = include_str!("../scripts/smoke-rpm-package.sh");
 const HOMEBREW_RELEASE_VERSION: &str = "0.2.5";
 const AUR_RELEASE_VERSION: &str = "0.2.3";
 const INSTALLATION_DOCS: &[(&str, &str)] = &[
@@ -201,7 +204,7 @@ fn installers_are_tested_checksummed_and_attested() {
     assert!(RELEASE_WORKFLOW.contains("./scripts/smoke-windows-installer.ps1"));
     assert!(
         RELEASE_WORKFLOW.contains(
-            "needs: [quality, build, build-linux, package-debian, smoke-deb-ubuntu, package-macos, smoke-windows-installer]"
+            "needs: [quality, build, build-linux, package-debian, smoke-deb-ubuntu, package-rpm, smoke-rpm-fedora, package-macos, smoke-windows-installer]"
         )
     );
     assert!(RELEASE_WORKFLOW.contains("sha256sum \"${assets[@]}\" > SHA256SUMS"));
@@ -215,10 +218,12 @@ fn installers_are_tested_checksummed_and_attested() {
         "asterline-$version-aarch64-apple-darwin.tar.gz",
         "asterline-$version-x86_64-apple-darwin.tar.gz",
         "asterline-$version-macos-universal.dmg",
-        "asterline-$version-aarch64-unknown-linux-gnu.tar.gz",
-        "asterline-$version-x86_64-unknown-linux-gnu.tar.gz",
-        "asterline_${version}_arm64.deb",
-        "asterline_${version}_amd64.deb",
+        "asterline-v$version-Linux-arm64.tar.gz",
+        "asterline-v$version-Linux-arm64.deb",
+        "asterline-v$version-Linux-arm64.rpm",
+        "asterline-v$version-Linux-x86_64.tar.gz",
+        "asterline-v$version-Linux-x86_64.deb",
+        "asterline-v$version-Linux-x86_64.rpm",
         "asterline-$version-x86_64-pc-windows-msvc.zip",
         "asterline-$version-x86_64-windows-setup.exe",
     ];
@@ -238,12 +243,13 @@ fn installers_are_tested_checksummed_and_attested() {
             .lines()
             .filter(|line| line.trim_start().starts_with('"'))
             .count(),
-        9
+        11
     );
     assert!(RELEASE_WORKFLOW.contains("$RUNNER_TEMP/release-assets.txt"));
     assert!(RELEASE_WORKFLOW.contains("gh release upload \"$GITHUB_REF_NAME\" \"${files[@]}\""));
     assert!(RELEASE_WORKFLOW.contains("dist/*.exe"));
     assert!(RELEASE_WORKFLOW.contains("dist/*.deb"));
+    assert!(RELEASE_WORKFLOW.contains("dist/*.rpm"));
     assert!(RELEASE_WORKFLOW.contains("./scripts/build-macos-dmg.sh"));
     assert!(RELEASE_WORKFLOW.contains("Smoke test DMG and package payload"));
     assert!(RELEASE_WORKFLOW.contains("dist/*.dmg"));
@@ -272,6 +278,12 @@ fn installers_are_tested_checksummed_and_attested() {
             document.contains("Install Asterline.pkg"),
             "{path} must explain the native macOS installer"
         );
+        for linux_architecture in ["Linux-arm64", "Linux-x86_64"] {
+            assert!(
+                document.contains(linux_architecture),
+                "{path} must name the Linux asset architecture as {linux_architecture}"
+            );
+        }
     }
 
     for (path, document) in &DOCUMENTS[..2] {
@@ -303,14 +315,38 @@ fn debian_packages_are_pinned_and_release_gated() {
     assert!(PACKAGE_DEB.contains("--root-owner-group --build"));
     assert!(PACKAGE_DEB.contains("x86_64-unknown-linux-gnu:amd64"));
     assert!(PACKAGE_DEB.contains("aarch64-unknown-linux-gnu:arm64"));
+    assert!(PACKAGE_DEB.contains("asterline-v${version}-Linux-${asset_arch}.deb"));
     assert!(SMOKE_DEB_PACKAGE.contains("apt-get install --yes"));
     assert!(SMOKE_DEB_PACKAGE.contains("apt-get purge --yes asterline"));
     assert!(RELEASE_WORKFLOW.contains("package-debian:"));
     assert!(RELEASE_WORKFLOW.contains("smoke-deb-ubuntu:"));
     assert!(RELEASE_WORKFLOW.contains("debian@sha256:"));
     assert!(RELEASE_WORKFLOW.contains("dist/*.deb"));
-    assert!(PACKAGING_README.contains("Debian and Ubuntu"));
-    assert!(PACKAGING_README.contains("v0.2.3 Release predates these `.deb` assets"));
+    assert!(PACKAGING_README.contains("Debian / Ubuntu"));
+    assert!(PACKAGING_README.contains("v0.2.3 Release predates all Linux package assets"));
+}
+
+#[test]
+fn rpm_packages_are_pinned_and_release_gated() {
+    for placeholder in ["@VERSION@", "@TARGET@", "@ARCH@"] {
+        assert!(RPM_SPEC.contains(placeholder));
+    }
+    assert!(RPM_SPEC.contains("BuildArch:      @ARCH@"));
+    assert!(RPM_SPEC.contains("%global debug_package %{nil}"));
+    assert!(!RPM_SPEC.contains("Requires:"));
+    assert!(PACKAGE_RPM.contains("x86_64-unknown-linux-gnu:x86_64"));
+    assert!(PACKAGE_RPM.contains("aarch64-unknown-linux-gnu:aarch64"));
+    assert!(PACKAGE_RPM.contains("rpmbuild"));
+    assert!(PACKAGE_RPM.contains("--checksig --nogpg"));
+    assert!(PACKAGE_RPM.contains("asterline-v${version}-Linux-${asset_arch}.rpm"));
+    assert!(SMOKE_RPM_PACKAGE.contains("dnf install --assumeyes"));
+    assert!(SMOKE_RPM_PACKAGE.contains("dnf remove --assumeyes asterline"));
+    assert!(RELEASE_WORKFLOW.contains("package-rpm:"));
+    assert!(RELEASE_WORKFLOW.contains("smoke-rpm-fedora:"));
+    assert!(RELEASE_WORKFLOW.contains("rockylinux/rockylinux:8@sha256:"));
+    assert!(RELEASE_WORKFLOW.contains("fedora:44@sha256:"));
+    assert!(RELEASE_WORKFLOW.contains("dist/*.rpm"));
+    assert!(PACKAGING_README.contains("matching RPM packages"));
 }
 
 #[test]
@@ -355,7 +391,8 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
 
     let packaging_readme = PACKAGING_README.replace("\r\n", "\n");
     assert!(packaging_readme.contains("published Homebrew tap"));
-    assert!(packaging_readme.contains("v0.2.5 is the first\nRelease"));
+    assert!(packaging_readme.contains("v0.2.5 contains\nthe earlier Debian-only pair"));
+    assert!(packaging_readme.contains("v0.2.6 is the first Release with the visible"));
     assert!(
         packaging_readme
             .contains("brew audit --strict --online --formula song0705/asterline/asterline")
@@ -452,7 +489,7 @@ fn release_keeps_integrity_gates_with_unsigned_macos_fallback() {
     assert!(draft < upload && upload < verify && verify < publish);
     assert!(RELEASE_WORKFLOW.contains("gh release delete \"$GITHUB_REF_NAME\""));
     assert!(!RELEASE_WORKFLOW.contains("--cleanup-tag"));
-    assert_eq!(RELEASE_WORKFLOW.matches("overwrite: true").count(), 4);
+    assert_eq!(RELEASE_WORKFLOW.matches("overwrite: true").count(), 5);
     assert_eq!(
         RELEASE_WORKFLOW
             .matches("EXPECTED_TAG_OBJECT: ${{ needs.quality.outputs.tag_object }}")

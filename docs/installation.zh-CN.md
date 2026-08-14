@@ -113,12 +113,15 @@ ast --no-auto-update
 
 ## Linux
 
-根据机器架构下载对应的 `.tar.gz`：
+根据机器架构下载对应的资产：
 
-| 架构               | 发布目标                    |
-| ------------------ | --------------------------- |
-| Intel 或 AMD 64 位 | `x86_64-unknown-linux-gnu`  |
-| ARM64              | `aarch64-unknown-linux-gnu` |
+- **ARM64：**`asterline-v<version>-Linux-arm64.tar.gz`、
+  `asterline-v<version>-Linux-arm64.deb` 或
+  `asterline-v<version>-Linux-arm64.rpm`。
+- **Intel 或 AMD 64 位（`x86_64`）：**
+  `asterline-v<version>-Linux-x86_64.tar.gz`、
+  `asterline-v<version>-Linux-x86_64.deb` 或
+  `asterline-v<version>-Linux-x86_64.rpm`。
 
 这些 GNU/Linux 发布包使用仍受维护的 glibc 2.28 基线构建，要求 glibc 2.28
 或更高版本，因此不能在 Alpine/musl 上运行。SQLite 由内置源码静态构建，
@@ -139,6 +142,28 @@ install -m 755 ast "$HOME/.local/bin/ast"
 如有需要，请把 `$HOME/.local/bin` 加入 shell 的 `PATH` 配置，然后打开新 shell 并运行 `ast --help`。
 
 卸载 Linux 便携版时，删除 `$HOME/.local/bin/ast` 和 `$HOME/.local/bin/asterline` 即可。
+
+### Debian 和 Ubuntu
+
+`.deb` 包已在 Debian 12 和 Ubuntu 24.04 上完成冒烟验证。下载匹配的架构后，在本地安装：
+
+```bash
+sudo apt install ./asterline-v<version>-Linux-x86_64.deb
+ast --help
+```
+
+### Fedora 和 Rocky Linux
+
+`.rpm` 包在 Rocky Linux 8 上构建，并在 Fedora 44 上再次完成冒烟验证。下载匹配的架构后，
+在本地安装：
+
+```bash
+sudo dnf install ./asterline-v<version>-Linux-x86_64.rpm
+ast --help
+```
+
+这些文件是带版本号的 GitHub Release 附件，而不是配置好的 APT 或 DNF 软件源。安装前请先用
+`SHA256SUMS` 和 GitHub artifact attestation 校验下载文件。
 
 ## 从源码构建
 

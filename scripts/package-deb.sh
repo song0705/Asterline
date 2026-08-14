@@ -13,7 +13,12 @@ archive=$4
 output_dir=$5
 
 case "$target:$deb_arch" in
-  x86_64-unknown-linux-gnu:amd64 | aarch64-unknown-linux-gnu:arm64) ;;
+  x86_64-unknown-linux-gnu:amd64)
+    asset_arch=x86_64
+    ;;
+  aarch64-unknown-linux-gnu:arm64)
+    asset_arch=arm64
+    ;;
   *)
     echo "unsupported target/DEB architecture pair: $target / $deb_arch" >&2
     exit 64
@@ -90,7 +95,7 @@ sed \
   -e "s/@DEPENDS@/$dependencies/g" \
   packaging/deb/control.in > "$staging_dir/DEBIAN/control"
 
-package_path="$output_dir/asterline_${version}_${deb_arch}.deb"
+package_path="$output_dir/asterline-v${version}-Linux-${asset_arch}.deb"
 dpkg-deb --root-owner-group --build "$staging_dir" "$package_path" >/dev/null
 dpkg-deb --info "$package_path" >/dev/null
 printf '%s\n' "$package_path"

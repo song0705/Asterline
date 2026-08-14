@@ -76,10 +76,12 @@ Pushing the tag starts `.github/workflows/release.yml`. The workflow:
    `manylinux_2_28` containers, and builds macOS Intel, macOS Apple silicon, and
    Windows x86-64 MSVC on native runners;
 4. packages Unix targets as portable `.tar.gz` archives, Windows as a portable
-   `.zip`, and the verified GNU/Linux archives as `amd64` and `arm64` Debian
-   packages;
-5. installs and runs each Debian package in Debian 12 and Ubuntu 24.04 before
-   it can be published;
+   `.zip`, and each verified GNU/Linux architecture as a portable archive,
+   Debian package, and RPM package with the same visible `Linux-arm64` or
+   `Linux-x86_64` prefix;
+5. installs, runs, and removes each Debian package in Debian 12 and Ubuntu
+   24.04, and each RPM package in Rocky Linux 8 and Fedora 44, before it can be
+   published;
 6. combines the Intel and Apple silicon binaries into one universal macOS DMG
    containing a native `Install Asterline.pkg` for `/usr/local/bin`, and builds
    the Windows binaries as a per-user Setup `.exe`;
@@ -140,11 +142,19 @@ matrix](https://github.com/pypa/manylinux#manylinux_2_28-almalinux-8-based).
 
 After the GNU/Linux archives pass that gate, `package-debian` unpacks each one
 inside a digest-pinned Debian 12 container, uses `dpkg-shlibdeps` to derive its
-runtime `Depends`, and builds `asterline_<version>_amd64.deb` or
-`asterline_<version>_arm64.deb`. It installs, executes, and purges each package
-there, then `smoke-deb-ubuntu` repeats that test on native Ubuntu 24.04 runners.
-The resulting files are Release assets only; do not describe them as an APT
-repository until a separately managed signing key and repository are in place.
+runtime `Depends`, and builds `asterline-v<version>-Linux-arm64.deb` or
+`asterline-v<version>-Linux-x86_64.deb`. It installs, executes, and purges each
+package there, then `smoke-deb-ubuntu` repeats that test on native Ubuntu 24.04
+runners.
+
+`package-rpm` packages those same verified archives in digest-pinned Rocky Linux
+8 containers as `asterline-v<version>-Linux-arm64.rpm` or
+`asterline-v<version>-Linux-x86_64.rpm`. The RPM spec retains automatic shared
+library requirements and rejects a system SQLite dependency. `smoke-rpm-fedora`
+then installs, executes, and removes each asset in a fresh digest-pinned Fedora
+44 container. The resulting `.deb` and `.rpm` files are Release assets only; do
+not describe them as APT or DNF repositories until separately managed signing
+keys and repositories are in place.
 
 The Windows build runs on `windows-latest` and links the bundled SQLite source,
 so it does not rely on a runner- or user-installed `sqlite3.lib`. Inno Setup

@@ -1,0 +1,30 @@
+# These verified release binaries are already stripped; do not split debug data
+# or create build-id links while repackaging them.
+%global debug_package %{nil}
+%global _build_id_links none
+
+Name:           asterline
+Version:        @VERSION@
+Release:        1
+Summary:        Local-first terminal workspace for coordinating coding agents
+License:        MIT
+URL:            https://github.com/song0705/Asterline
+Source0:        asterline-@VERSION@-@TARGET@.tar.gz
+BuildArch:      @ARCH@
+
+%description
+A chat-first terminal workspace for coordinating Codex, Claude, Grok, and Agy
+coding agents. It includes both the asterline command and its ast alias.
+
+%prep
+%setup -q -n asterline-@VERSION@-@TARGET@
+
+%install
+install -D -m 0755 asterline %{buildroot}%{_bindir}/asterline
+install -D -m 0755 ast %{buildroot}%{_bindir}/ast
+install -D -m 0644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
+
+%files
+%{_bindir}/asterline
+%{_bindir}/ast
+%license %{_licensedir}/%{name}/LICENSE
