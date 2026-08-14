@@ -92,7 +92,7 @@ ast --help
 ```
 
 The existing v0.2.3 Release predates all Linux package assets. v0.2.5 contains
-the earlier Debian-only pair; v0.2.6 is the first Release with the visible
+the earlier Debian-only pair; v0.2.7 is the first Release with the visible
 architecture naming and matching RPM packages.
 
 ## Release update checklist

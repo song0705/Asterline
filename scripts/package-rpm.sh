@@ -72,7 +72,7 @@ if grep -F 'libsqlite3.so' <<< "$requirements" >/dev/null; then
   exit 1
 fi
 
-rpm --checksig --nogpg "$built_package" >/dev/null
+rpm --checksig "$built_package" >/dev/null
 package_path="$output_dir/asterline-v${version}-Linux-${asset_arch}.rpm"
 cp "$built_package" "$package_path"
 printf '%s\n' "$package_path"

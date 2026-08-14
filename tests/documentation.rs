@@ -337,7 +337,7 @@ fn rpm_packages_are_pinned_and_release_gated() {
     assert!(PACKAGE_RPM.contains("x86_64-unknown-linux-gnu:x86_64"));
     assert!(PACKAGE_RPM.contains("aarch64-unknown-linux-gnu:aarch64"));
     assert!(PACKAGE_RPM.contains("rpmbuild"));
-    assert!(PACKAGE_RPM.contains("--checksig --nogpg"));
+    assert!(PACKAGE_RPM.contains("rpm --checksig \"$built_package\""));
     assert!(PACKAGE_RPM.contains("asterline-v${version}-Linux-${asset_arch}.rpm"));
     assert!(SMOKE_RPM_PACKAGE.contains("dnf install --assumeyes"));
     assert!(SMOKE_RPM_PACKAGE.contains("dnf remove --assumeyes asterline"));
@@ -392,7 +392,7 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     let packaging_readme = PACKAGING_README.replace("\r\n", "\n");
     assert!(packaging_readme.contains("published Homebrew tap"));
     assert!(packaging_readme.contains("v0.2.5 contains\nthe earlier Debian-only pair"));
-    assert!(packaging_readme.contains("v0.2.6 is the first Release with the visible"));
+    assert!(packaging_readme.contains("v0.2.7 is the first Release with the visible"));
     assert!(
         packaging_readme
             .contains("brew audit --strict --online --formula song0705/asterline/asterline")
