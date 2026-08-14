@@ -9,6 +9,7 @@ Asterline @VERSION@
 
 The package installs both `ast` and `asterline` into /usr/local/bin.
 
-If this release is not Developer ID signed, control-click the package, choose
-Open, then confirm Open once. Official release checksums and GitHub build
-provenance attestations are published beside the DMG.
+The v0.2.3 DMG was an unsigned historical artifact. Stable releases produced
+by the hardened workflow after v0.2.3 are Developer ID signed and notarized.
+Release checksums and GitHub build provenance attestations are published beside
+the DMG.

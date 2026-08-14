@@ -1,0 +1,11 @@
+Package: asterline
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: @ARCH@
+Depends: @DEPENDS@
+Maintainer: Asterline contributors <asterline@users.noreply.github.com>
+Homepage: https://github.com/song0705/Asterline
+Description: Local-first terminal workspace for coordinating coding agents
+ A chat-first terminal workspace for coordinating Codex, Claude, Grok, and Agy
+ coding agents. It includes both the asterline command and its ast alias.

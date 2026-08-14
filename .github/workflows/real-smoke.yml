@@ -1,0 +1,119 @@
+name: Real backend smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Provider CLI to exercise (tests may consume paid usage)
+        required: true
+        type: choice
+        options:
+          - codex
+          - claude
+          - grok
+          - agy
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-smoke-${{ inputs.backend }}
+  cancel-in-progress: false
+
+jobs:
+  validate-dispatch:
+    name: Require the default branch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject workflow code from another ref
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: test "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH"
+
+  hosted-provider:
+    name: Smoke ${{ inputs.backend }} on a hosted runner
+    if: inputs.backend != 'agy'
+    needs: validate-dispatch
+    runs-on: ubuntu-24.04
+    environment: real-smoke
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-09
+        with:
+          toolchain: 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: real-smoke-${{ inputs.backend }}
+      - name: Install the provider's official CLI
+        shell: bash
+        env:
+          BACKEND: ${{ inputs.backend }}
+        run: |
+          set -euo pipefail
+          case "$BACKEND" in
+            codex) curl -fsSL https://chatgpt.com/codex/install.sh | sh ;;
+            claude) curl -fsSL https://claude.ai/install.sh | bash ;;
+            grok) curl -fsSL https://x.ai/cli/install.sh | bash ;;
+            *) echo "unsupported hosted backend: $BACKEND" >&2; exit 2 ;;
+          esac
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Authenticate Codex with its official CI flow
+        if: inputs.backend == 'codex'
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$OPENAI_API_KEY"
+          printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key
+      - name: Verify the selected CLI
+        shell: bash
+        env:
+          BACKEND: ${{ inputs.backend }}
+        run: |
+          command -v "$BACKEND"
+          "$BACKEND" --version
+      - name: Run Codex tests serially
+        if: inputs.backend == 'codex'
+        run: ASTERLINE_SMOKE_CODEX=1 cargo test --locked --test real_smoke real_codex_ -- --ignored --nocapture --test-threads=1
+      - name: Run Claude tests serially
+        if: inputs.backend == 'claude'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          test -n "$ANTHROPIC_API_KEY"
+          ASTERLINE_SMOKE_CLAUDE=1 cargo test --locked --test real_smoke real_claude_ -- --ignored --nocapture --test-threads=1
+      - name: Run Grok tests serially
+        if: inputs.backend == 'grok'
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: |
+          test -n "$XAI_API_KEY"
+          ASTERLINE_SMOKE_GROK=1 cargo test --locked --test real_smoke real_grok_ -- --ignored --nocapture --test-threads=1
+      - name: Remove ephemeral Codex login
+        if: always() && inputs.backend == 'codex'
+        run: codex logout || true
+
+  agy-provider:
+    name: Smoke Agy on a pre-authenticated runner
+    if: inputs.backend == 'agy'
+    needs: validate-dispatch
+    runs-on: [self-hosted, asterline-real-smoke]
+    environment: real-smoke
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the pre-authenticated CLI and pinned runner toolchain
+        shell: bash
+        run: |
+          command -v agy
+          agy --version
+          test "$(rustup run 1.93.1 rustc --version | awk '{print $2}')" = 1.93.1
+      - name: Run ignored Agy tests serially
+        shell: bash
+        run: ASTERLINE_SMOKE_AGY=1 rustup run 1.93.1 cargo test --locked --test real_smoke real_agy_ -- --ignored --nocapture --test-threads=1

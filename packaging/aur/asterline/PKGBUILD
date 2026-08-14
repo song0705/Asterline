@@ -1,0 +1,53 @@
+# Maintainer: Asterline contributors <https://github.com/song0705/Asterline>
+
+pkgname=asterline
+pkgver=0.2.3
+pkgrel=1
+pkgdesc='Local-first terminal workspace for coordinating coding agents'
+arch=('x86_64' 'aarch64')
+url='https://github.com/song0705/Asterline'
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'sqlite')
+makedepends=('cargo')
+conflicts=('asterline-bin' 'asterline-git')
+
+# v0.2.3 is an annotated but unsigned tag. Pin the resolved release commit so
+# the package source cannot change if the tag is ever moved.
+_commit=6eeeb19f1eee36b593848519eb5264c699e66181
+_srcdir="Asterline-${_commit}"
+source=(
+  "${pkgname}-${pkgver}.tar.gz::${url}/archive/${_commit}.tar.gz"
+)
+sha256sums=(
+  '2f24699cc4d17dc7f075fcebe56df0253e94eb25bcf3f00526f366ef1b926fc2'
+)
+
+prepare() {
+  cd "${srcdir}/${_srcdir}"
+
+  local manifest_version
+  manifest_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+  test "${manifest_version}" = "${pkgver}"
+  cargo fetch --locked
+}
+
+build() {
+  cd "${srcdir}/${_srcdir}"
+  cargo build --frozen --release --bins
+}
+
+check() {
+  cd "${srcdir}/${_srcdir}"
+  cargo test --frozen --all-targets
+}
+
+package() {
+  local source_dir="${srcdir}/${_srcdir}"
+
+  install -Dm755 "${source_dir}/target/release/asterline" \
+    "${pkgdir}/usr/bin/asterline"
+  install -Dm755 "${source_dir}/target/release/ast" \
+    "${pkgdir}/usr/bin/ast"
+  install -Dm644 "${source_dir}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

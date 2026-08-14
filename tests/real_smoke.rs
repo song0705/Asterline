@@ -114,6 +114,7 @@ fn real_codex_smoke() {
     let member = TeamMember::new("codex", "Codex", BackendKind::Codex, "smoke");
     let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
     assert_healthy_turn("codex", &events);
+    assert_completed_contains("codex", &events, "ASTERLINE_OK");
 }
 
 #[test]
@@ -133,8 +134,8 @@ fn real_codex_resume_smoke() {
         })
         .expect("a session id to resume");
 
-    // Resume the same session — this is the path that previously sent
-    // exec-only flags to `codex exec resume` and exited with code 2.
+    // Resume the same session with exec-level cwd/sandbox flags before the
+    // `resume` subcommand so the current member policy still applies.
     let runner = runner_for(&member, Path::new(env!("CARGO_MANIFEST_DIR")));
     let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
@@ -148,6 +149,7 @@ fn real_codex_resume_smoke() {
     );
     let resumed: Vec<AgentEvent> = rx.iter().collect();
     assert_healthy_turn("codex-resume", &resumed);
+    assert_completed_contains("codex-resume", &resumed, "ORANGE");
 }
 
 #[test]
@@ -159,6 +161,7 @@ fn real_claude_smoke() {
     let member = TeamMember::new("claude", "Claude", BackendKind::Claude, "smoke");
     let events = run_once(&member, "Reply with exactly: ASTERLINE_OK");
     assert_healthy_turn("claude", &events);
+    assert_completed_contains("claude", &events, "ASTERLINE_OK");
 }
 
 #[test]

@@ -8,20 +8,21 @@ run *ARGS:
 
 # Install `asterline` and the short `ast` alias into ~/.cargo/bin.
 install:
-    cargo install --path . --force
+    cargo install --path . --locked --force
 
 # Build an optimized release binary.
 build:
-    cargo build --release
+    cargo build --release --locked
 
 test:
-    cargo test
+    cargo test --all-targets --locked --no-fail-fast
 
 fmt:
     cargo fmt
 
-# The full CI gate, run locally.
+# The portable code-quality gate used by CI. Platform packaging stays in Actions.
 check:
     cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --all-targets --locked --no-fail-fast
+    cargo audit

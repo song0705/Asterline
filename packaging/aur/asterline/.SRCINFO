@@ -1,0 +1,18 @@
+pkgbase = asterline
+	pkgdesc = Local-first terminal workspace for coordinating coding agents
+	pkgver = 0.2.3
+	pkgrel = 1
+	url = https://github.com/song0705/Asterline
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	depends = gcc-libs
+	depends = glibc
+	depends = sqlite
+	conflicts = asterline-bin
+	conflicts = asterline-git
+	source = asterline-0.2.3.tar.gz::https://github.com/song0705/Asterline/archive/6eeeb19f1eee36b593848519eb5264c699e66181.tar.gz
+	sha256sums = 2f24699cc4d17dc7f075fcebe56df0253e94eb25bcf3f00526f366ef1b926fc2
+
+pkgname = asterline

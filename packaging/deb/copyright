@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Asterline
+Source: https://github.com/song0705/Asterline
+
+Files: *
+Copyright: 2026 Asterline contributors
+License: MIT
+ The full license text is installed as /usr/share/doc/asterline/LICENSE.
