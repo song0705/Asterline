@@ -191,6 +191,8 @@ fn markdown_strong_markers_are_not_rendered_literally() {
 
 #[test]
 fn installers_are_tested_checksummed_and_attested() {
+    let release_workflow = RELEASE_WORKFLOW.replace("\r\n", "\n");
+
     assert!(CI_WORKFLOW.contains("Smoke test Windows installer"));
     assert!(CI_WORKFLOW.contains("./scripts/smoke-windows-installer.ps1"));
     assert!(RELEASE_WORKFLOW.contains("./scripts/build-windows-installer.ps1 -Version $version"));
@@ -202,7 +204,7 @@ fn installers_are_tested_checksummed_and_attested() {
     );
     assert!(RELEASE_WORKFLOW.contains("sha256sum \"${assets[@]}\" > SHA256SUMS"));
     assert!(RELEASE_WORKFLOW.contains("Validate the exact release asset set"));
-    let exact_assets = RELEASE_WORKFLOW
+    let exact_assets = release_workflow
         .split_once("          expected=(\n")
         .and_then(|(_, rest)| rest.split_once("          )\n"))
         .map(|(assets, _)| assets)
@@ -354,7 +356,11 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     assert!(AUR_SRCINFO.contains(source_sha256));
     assert!(!AUR_SRCINFO.contains("SKIP"));
 
-    assert!(PACKAGING_README.contains("not a\npublished tap or AUR entry"));
+    assert!(
+        PACKAGING_README
+            .replace("\r\n", "\n")
+            .contains("not a\npublished tap or AUR entry")
+    );
     assert!(PACKAGING_README.contains("GLIBC_2.39"));
     assert!(
         INSTALLATION_DOCS[0]
@@ -413,6 +419,8 @@ fn rust_and_dependency_policy_is_explicit_and_gated() {
 
 #[test]
 fn stable_release_is_fail_closed_and_immutable_ready() {
+    let release_workflow = RELEASE_WORKFLOW.replace("\r\n", "\n");
+
     assert!(RELEASE_WORKFLOW.contains("Verify tag provenance and publication state"));
     assert!(RELEASE_WORKFLOW.contains("git cat-file -t"));
     assert!(RELEASE_WORKFLOW.contains("published version tags are never reused"));
@@ -459,7 +467,7 @@ fn stable_release_is_fail_closed_and_immutable_ready() {
         2
     );
     assert_eq!(
-        RELEASE_WORKFLOW.matches("          verify_tag\n").count(),
+        release_workflow.matches("          verify_tag\n").count(),
         2
     );
     assert_eq!(
