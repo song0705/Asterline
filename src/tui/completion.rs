@@ -2,6 +2,10 @@
 //! text before the cursor. Pure logic so it is fully unit-tested; the popup is
 //! rendered and navigated by the TUI.
 
+use std::collections::HashMap;
+
+use crate::domain::team::BackendKind;
+
 /// One suggestion: a label shown in the popup and the text to insert in place
 /// of the current token.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,17 +28,23 @@ pub struct Completion {
 pub struct AgentSkill {
     pub name: String,
     pub description: String,
+    /// The native CLI that can invoke this skill.
+    pub backend: BackendKind,
+    /// Exact text accepted by that backend, including any plugin namespace.
+    pub invocation: String,
 }
 
 /// (name, hint, takes_argument). Also feeds the `/help` palette drawer.
 pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("ask", "send to one member", true),
     ("all", "send to everyone", true),
+    ("attach", "open a member's native CLI session", true),
     ("abort", "cancel running members", false),
     ("approve", "approve first pending", false),
     ("block", "mark a run blocked", true),
     ("continue", "resume latest or selected run", true),
     ("diff", "show working-tree git diff", false),
+    ("exit", "exit Asterline", false),
     (
         "effort",
         "set reasoning effort (low…ultra; model-dependent)",
@@ -45,6 +55,7 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("help", "show commands", false),
     ("logs", "raw logs · stderr · warnings", false),
     ("mode", "set the mode for subsequent messages", true),
+    ("model", "choose or set a member's model", true),
     (
         "new",
         "start a fresh chat (new session, cleared transcript)",
@@ -78,7 +89,7 @@ const MODES: &[(&str, &str)] = &[
 
 /// Compute the completion for `head` (composer text up to the cursor).
 pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
-    compute_with_agent_skills(head, members, &[])
+    compute_with_agent_skills(head, members, &[], &HashMap::new())
 }
 
 /// Compute completion, including backend-native skills after `@member /`.
@@ -86,10 +97,11 @@ pub fn compute_with_agent_skills(
     head: &str,
     members: &[String],
     skills: &[AgentSkill],
+    member_backends: &HashMap<String, BackendKind>,
 ) -> Option<Completion> {
     let chars: Vec<char> = head.chars().collect();
 
-    if let Some(completion) = targeted_skill_completion(&chars, members, skills) {
+    if let Some(completion) = targeted_skill_completion(&chars, skills, member_backends) {
         return Some(completion);
     }
 
@@ -133,7 +145,12 @@ pub fn compute_with_agent_skills(
                         .collect();
                     return non_empty("modes", space + 1, items);
                 }
-                if cmd != "ask" && cmd != "effort" && cmd != "focus" {
+                if cmd != "ask"
+                    && cmd != "attach"
+                    && cmd != "effort"
+                    && cmd != "focus"
+                    && cmd != "model"
+                {
                     return None;
                 }
                 let arg: Vec<char> = chars[space + 1..].to_vec();
@@ -142,7 +159,10 @@ pub fn compute_with_agent_skills(
                     return None;
                 }
                 let prefix: String = arg.iter().collect();
-                let mut candidates = vec!["all".to_string()];
+                let mut candidates: Vec<String> = (cmd != "model" && cmd != "attach")
+                    .then(|| "all".to_string())
+                    .into_iter()
+                    .collect();
                 candidates.extend(members.iter().cloned());
                 member_completion(
                     &prefix,
@@ -186,17 +206,20 @@ fn slash_command_matches(name: &str, query: &str) -> bool {
 
 fn targeted_skill_completion(
     chars: &[char],
-    members: &[String],
     skills: &[AgentSkill],
+    member_backends: &HashMap<String, BackendKind>,
 ) -> Option<Completion> {
-    if chars.first() != Some(&'@') || skills.is_empty() {
+    if chars.first() != Some(&'@') {
         return None;
     }
     let member_end = chars.iter().position(|c| c.is_whitespace())?;
     let member: String = chars[1..member_end].iter().collect();
-    if !members.iter().any(|candidate| candidate == &member) {
-        return None;
-    }
+    // Composer routing accepts both a stable member ID and the member's
+    // display name, case-insensitively. Completion must mirror that path so
+    // `@Claude /` exposes the same actions that `@claude-primary /` does.
+    let target_backend = member_backends.iter().find_map(|(candidate, backend)| {
+        candidate.eq_ignore_ascii_case(&member).then_some(*backend)
+    })?;
     let command_start = chars[member_end..]
         .iter()
         .position(|c| !c.is_whitespace())?
@@ -209,15 +232,37 @@ fn targeted_skill_completion(
 
     let prefix: String = chars[command_start + 1..].iter().collect();
     let lower = prefix.to_lowercase();
-    let items = skills
-        .iter()
-        .filter(|skill| skill.name.to_lowercase().starts_with(&lower))
-        .map(|skill| CompletionItem {
-            label: format!("/{} — {}", skill.name, skill.description),
-            insert: format!("/{} ", skill.name),
-        })
-        .collect();
-    non_empty("agent skills", command_start, items)
+    let mut items = Vec::new();
+    if "attach".starts_with(&lower) {
+        items.push(CompletionItem {
+            label: "/attach — open this member's native CLI session".to_string(),
+            insert: "/attach".to_string(),
+        });
+    }
+    if "model".starts_with(&lower) {
+        items.push(CompletionItem {
+            label: "/model — choose this member's model and reasoning effort".to_string(),
+            insert: "/model".to_string(),
+        });
+    }
+    items.extend(
+        skills
+            .iter()
+            .filter(|skill| skill.backend == target_backend)
+            .filter(|skill| {
+                skill.name.to_lowercase().starts_with(&lower)
+                    || skill
+                        .invocation
+                        .trim_start_matches(['/', '$'])
+                        .to_lowercase()
+                        .starts_with(&lower)
+            })
+            .map(|skill| CompletionItem {
+                label: format!("{} — {}", skill.invocation, skill.description),
+                insert: format!("{} ", skill.invocation),
+            }),
+    );
+    non_empty("member actions & skills", command_start, items)
 }
 
 fn member_completion(
@@ -277,6 +322,8 @@ mod tests {
         assert!(c.items.iter().any(|i| i.insert == "/ask "));
         assert!(c.items.iter().any(|i| i.insert == "/team"));
         assert!(c.items.iter().any(|i| i.insert == "/mode "));
+        assert!(c.items.iter().any(|i| i.insert == "/exit"));
+        assert!(c.items.iter().any(|i| i.insert == "/attach "));
         assert!(!c.items.iter().any(|i| i.insert == "/plan "));
         assert!(!c.items.iter().any(|i| i.insert == "/review "));
         assert!(c.items.iter().any(|i| i.insert == "/continue "));
@@ -306,7 +353,10 @@ mod tests {
     #[test]
     fn slash_prefix_filters() {
         assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
-        assert_eq!(inserts("/mo"), vec!["/mode ".to_string()]);
+        assert_eq!(
+            inserts("/mo"),
+            vec!["/mode ".to_string(), "/model ".to_string()]
+        );
         assert!(inserts("/pl").is_empty());
         assert_eq!(inserts("/con"), vec!["/continue ".to_string()]);
         assert_eq!(inserts("/no"), vec!["/note ".to_string()]);
@@ -377,6 +427,17 @@ mod tests {
     fn other_commands_do_not_complete_args() {
         assert!(compute("/all hello", &members()).is_none());
         assert!(compute("/team ", &members()).is_none());
+
+        let attach = compute("/attach rev", &members()).expect("attach member completion");
+        assert_eq!(
+            attach
+                .items
+                .iter()
+                .map(|item| item.insert.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviewer "]
+        );
+        assert!(compute("/attach all", &members()).is_none());
     }
 
     #[test]
@@ -435,18 +496,76 @@ mod tests {
             AgentSkill {
                 name: "review-patch".to_string(),
                 description: "Review a patch carefully".to_string(),
+                backend: BackendKind::Codex,
+                invocation: "$review-patch".to_string(),
             },
             AgentSkill {
                 name: "write-tests".to_string(),
                 description: "Add regression tests".to_string(),
+                backend: BackendKind::Codex,
+                invocation: "$write-tests".to_string(),
             },
         ];
 
-        let completion = compute_with_agent_skills("@builder /rev", &members(), &skills).unwrap();
-        assert_eq!(completion.title, "agent skills");
+        let completion = compute_with_agent_skills(
+            "@builder /rev",
+            &members(),
+            &skills,
+            &HashMap::from([("builder".to_string(), BackendKind::Codex)]),
+        )
+        .unwrap();
+        assert_eq!(completion.title, "member actions & skills");
         assert_eq!(completion.token_start, 9);
-        assert_eq!(completion.items.len(), 1);
-        assert_eq!(completion.items[0].insert, "/review-patch ");
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.insert.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$review-patch "]
+        );
+    }
+
+    #[test]
+    fn targeted_slash_offers_the_local_model_control_without_skills() {
+        let completion = compute_with_agent_skills(
+            "@builder /mo",
+            &members(),
+            &[],
+            &HashMap::from([("builder".to_string(), BackendKind::Codex)]),
+        )
+        .expect("model control");
+
+        assert_eq!(completion.items[0].insert, "/model");
+        assert_eq!(
+            completion.items[0].label,
+            "/model — choose this member's model and reasoning effort"
+        );
+    }
+
+    #[test]
+    fn targeted_completion_offers_native_attach_and_local_model_controls() {
+        let completion = compute_with_agent_skills(
+            "@builder /",
+            &members(),
+            &[],
+            &HashMap::from([("builder".to_string(), BackendKind::Codex)]),
+        )
+        .expect("member controls");
+
+        assert_eq!(completion.title, "member actions & skills");
+        assert!(
+            completion.items.iter().any(|item| {
+                item.insert == "/attach" && item.label.contains("native CLI session")
+            })
+        );
+        assert!(completion.items.iter().any(|item| item.insert == "/model"));
+        for command in ["/fast", "/permissions", "/compact", "/status", "/review"] {
+            assert!(
+                !completion.items.iter().any(|item| item.insert == command),
+                "native control {command} must not be presented as a noninteractive action"
+            );
+        }
     }
 
     #[test]
@@ -454,10 +573,101 @@ mod tests {
         let skills = vec![AgentSkill {
             name: "review-patch".to_string(),
             description: "Review a patch carefully".to_string(),
+            backend: BackendKind::Codex,
+            invocation: "$review-patch".to_string(),
         }];
 
-        assert!(compute_with_agent_skills("/rev", &members(), &skills).is_none());
-        assert!(compute_with_agent_skills("@unknown /rev", &members(), &skills).is_none());
-        assert!(compute_with_agent_skills("@builder /rev now", &members(), &skills).is_none());
+        assert!(compute_with_agent_skills("/rev", &members(), &skills, &HashMap::new()).is_none());
+        assert!(
+            compute_with_agent_skills("@unknown /rev", &members(), &skills, &HashMap::new())
+                .is_none()
+        );
+        assert!(
+            compute_with_agent_skills("@builder /rev now", &members(), &skills, &HashMap::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn targeted_skill_completion_only_shows_the_target_backend() {
+        let members = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "grok".to_string(),
+            "agy".to_string(),
+        ];
+        let backends = HashMap::from([
+            ("claude".to_string(), BackendKind::Claude),
+            ("codex".to_string(), BackendKind::Codex),
+            ("grok".to_string(), BackendKind::Grok),
+            ("agy".to_string(), BackendKind::Agy),
+        ]);
+        let skills = vec![
+            AgentSkill {
+                name: "wake".to_string(),
+                description: "Claude only".to_string(),
+                backend: BackendKind::Claude,
+                invocation: "/wake".to_string(),
+            },
+            AgentSkill {
+                name: "review".to_string(),
+                description: "Codex only".to_string(),
+                backend: BackendKind::Codex,
+                invocation: "$review".to_string(),
+            },
+            AgentSkill {
+                name: "inspect".to_string(),
+                description: "Grok only".to_string(),
+                backend: BackendKind::Grok,
+                invocation: "/inspect".to_string(),
+            },
+            AgentSkill {
+                name: "plan".to_string(),
+                description: "Agy only".to_string(),
+                backend: BackendKind::Agy,
+                invocation: "/plan".to_string(),
+            },
+        ];
+
+        let claude = compute_with_agent_skills("@claude /", &members, &skills, &backends)
+            .expect("Claude skills");
+        assert_eq!(
+            claude
+                .items
+                .iter()
+                .map(|item| item.insert.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/attach", "/model", "/wake "]
+        );
+
+        let codex = compute_with_agent_skills("@codex /", &members, &skills, &backends)
+            .expect("Codex skills");
+        let codex_inserts = codex
+            .items
+            .iter()
+            .map(|item| item.insert.as_str())
+            .collect::<Vec<_>>();
+        assert!(codex_inserts.contains(&"/attach"));
+        assert!(codex_inserts.contains(&"/model"));
+        assert!(codex_inserts.contains(&"$review "));
+        assert!(!codex_inserts.contains(&"/fast"));
+        assert!(!codex_inserts.contains(&"/review"));
+        assert!(!codex_inserts.contains(&"/wake "));
+        assert!(!codex_inserts.contains(&"/inspect "));
+        assert!(!codex_inserts.contains(&"/plan "));
+
+        for (member, expected) in [("grok", "/inspect "), ("agy", "/plan ")] {
+            let completion =
+                compute_with_agent_skills(&format!("@{member} /"), &members, &skills, &backends)
+                    .unwrap();
+            assert_eq!(
+                completion
+                    .items
+                    .iter()
+                    .map(|item| item.insert.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["/attach", "/model", expected]
+            );
+        }
     }
 }

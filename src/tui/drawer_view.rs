@@ -107,6 +107,13 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
                 "↑↓ choose Agent · Enter apply · Esc cancel"
             }
             Drawer::Team
+                if state.team_editor().is_some_and(|editor| {
+                    editor.model_picker().is_some() && editor.model_picker_applies_immediately()
+                }) =>
+            {
+                "↑↓ model · ←→ effort · type filter · Enter apply & close · Esc cancel"
+            }
+            Drawer::Team
                 if state
                     .team_editor()
                     .is_some_and(|editor| editor.model_picker().is_some()) =>
@@ -609,18 +616,18 @@ fn drawer_palette() -> Vec<Line<'static>> {
 }
 
 fn drawer_skills(state: &AppState) -> Vec<Line<'static>> {
-    if state.skills().is_empty() {
+    if state.target_skills().next().is_none() {
         return vec![Line::styled(
-            " No SKILL.md files found in workspace or user skill directories.",
+            " No compatible SKILL.md files found for the selected member.",
             theme::muted(),
         )];
     }
     let mut lines = vec![Line::styled(
-        " Select a skill; Asterline stages a targeted draft for one request.",
+        " Select a compatible skill; Asterline stages a targeted draft for one request.",
         theme::muted(),
     )];
     lines.push(Line::raw(""));
-    for (idx, skill) in state.skills().iter().enumerate() {
+    for (idx, skill) in state.target_skills().enumerate() {
         let selected = idx == state.selected_skill();
         lines.push(Line::from(vec![
             Span::styled(
@@ -877,6 +884,8 @@ mod tests {
             name: "review".to_string(),
             description: "Review a patch".to_string(),
             path: PathBuf::from("/tmp/review/SKILL.md"),
+            backend: BackendKind::Codex,
+            invocation: "$review".to_string(),
         }]);
 
         let lines = drawer_skills(&state);

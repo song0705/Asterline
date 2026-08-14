@@ -443,11 +443,130 @@ impl TeamRuntime {
                         }
                         step.events.push(RuntimeEvent::MemberEffort {
                             member: id.clone(),
-                            effort,
+                            effort: Some(effort),
                         });
                         step.events.push(RuntimeEvent::Notice(format!(
                             "{id} reasoning effort → {}",
                             effort.as_str()
+                        )));
+                    }
+                    None => step
+                        .events
+                        .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
+                }
+            }
+            UiCommand::SetMemberModel { member, model } => {
+                let model = model.and_then(|model| {
+                    let model = model.trim();
+                    (!model.is_empty() && !model.eq_ignore_ascii_case("default"))
+                        .then(|| model.to_string())
+                });
+                match self
+                    .config
+                    .find(member.as_str())
+                    .map(|member| member.id.clone())
+                {
+                    Some(id) => {
+                        let mut candidate = self.config.clone();
+                        let member = {
+                            let Some(member) =
+                                candidate.members.iter_mut().find(|member| member.id == id)
+                            else {
+                                unreachable!("member was found in the cloned team config");
+                            };
+                            member.model = model.clone();
+                            member.clone()
+                        };
+                        if let Err(err) = self.persist_conversation_snapshot_for(&candidate) {
+                            self.report_store_error("save member model", err, &mut step);
+                            return step;
+                        }
+                        self.config = candidate;
+                        step.runner_changes.push(RunnerChange::Upsert {
+                            member,
+                            workspace: self.config.workspace.clone(),
+                        });
+                        step.events.push(RuntimeEvent::MemberModel {
+                            member: id.clone(),
+                            model: model.clone(),
+                        });
+                        let display = model.unwrap_or_else(|| "CLI default".to_string());
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} model → {display} (applies to the next run)"
+                        )));
+                    }
+                    None => step
+                        .events
+                        .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
+                }
+            }
+            UiCommand::SetMemberModelAndEffort {
+                member,
+                model,
+                effort,
+            } => {
+                let model = model.and_then(|model| {
+                    let model = model.trim();
+                    (!model.is_empty() && !model.eq_ignore_ascii_case("default"))
+                        .then(|| model.to_string())
+                });
+                match self
+                    .config
+                    .find(member.as_str())
+                    .map(|member| (member.id.clone(), member.backend))
+                {
+                    Some((id, BackendKind::Agy))
+                        if effort.is_some_and(|effort| {
+                            !matches!(effort, Effort::Low | Effort::Medium | Effort::High)
+                        }) =>
+                    {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} uses agy, which supports low, medium, or high effort"
+                        )));
+                    }
+                    Some((id, backend))
+                        if effort == Some(Effort::Ultra) && backend != BackendKind::Codex =>
+                    {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} uses {backend}, which does not support ultra effort"
+                        )));
+                    }
+                    Some((id, _)) => {
+                        let mut candidate = self.config.clone();
+                        let member = {
+                            let Some(member) =
+                                candidate.members.iter_mut().find(|member| member.id == id)
+                            else {
+                                unreachable!("member was found in the cloned team config");
+                            };
+                            member.model = model.clone();
+                            member.effort = effort;
+                            member.clone()
+                        };
+                        if let Err(err) = self.persist_conversation_snapshot_for(&candidate) {
+                            self.report_store_error("save member model and effort", err, &mut step);
+                            return step;
+                        }
+                        self.config = candidate;
+                        if let Some(state) = self.members.get_mut(&id) {
+                            state.effort = effort;
+                        }
+                        step.runner_changes.push(RunnerChange::Upsert {
+                            member,
+                            workspace: self.config.workspace.clone(),
+                        });
+                        step.events.push(RuntimeEvent::MemberModel {
+                            member: id.clone(),
+                            model: model.clone(),
+                        });
+                        step.events.push(RuntimeEvent::MemberEffort {
+                            member: id.clone(),
+                            effort,
+                        });
+                        let display = model.unwrap_or_else(|| "CLI default".to_string());
+                        let effort_display = effort.map_or("default", Effort::as_str);
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "{id} model → {display}; reasoning effort → {effort_display} (applies to the next run)"
                         )));
                     }
                     None => step
@@ -521,9 +640,13 @@ impl TeamRuntime {
     pub(super) fn import_attached_transcript(
         &mut self,
         member: MemberId,
+        session: Option<AgentSessionId>,
         items: Vec<ImportedMessage>,
     ) -> RuntimeStep {
         let mut step = RuntimeStep::default();
+        if let Some(session) = session {
+            self.record_member_session(&member, session, &mut step);
+        }
         self.handle_import_transcript(member, items, &mut step);
         step
     }
@@ -1589,20 +1712,7 @@ impl TeamRuntime {
                 });
             }
             AgentEvent::SessionDiscovered(session) => {
-                // Backends may report the session id more than once per turn;
-                // only persist and surface it when it actually changes.
-                if self.sessions.get(member).as_ref() != Some(&session) {
-                    let backend = self.member_backend(member);
-                    self.sessions.set(member.clone(), session.clone());
-                    if let Err(err) = self.store.upsert_session(member, backend, &session) {
-                        self.report_store_error("save a member session", err, &mut step);
-                    }
-                    self.persist_snapshot_or_notice("save the chat session", &mut step);
-                    step.events.push(RuntimeEvent::SessionUpdated {
-                        member: member.clone(),
-                        session,
-                    });
-                }
+                self.record_member_session(member, session, &mut step);
             }
             AgentEvent::Raw(line) => {
                 let persistence_disabled = self
@@ -1671,6 +1781,29 @@ impl TeamRuntime {
             AgentEvent::Exited { code, ok } => self.finalize_run(member, code, ok, &mut step),
         }
         step
+    }
+
+    /// Persist and surface a backend session only when it changed. Both stream
+    /// events and a transcript-proven native attach use this path.
+    fn record_member_session(
+        &mut self,
+        member: &MemberId,
+        session: AgentSessionId,
+        step: &mut RuntimeStep,
+    ) {
+        if self.sessions.get(member).as_ref() == Some(&session) {
+            return;
+        }
+        let backend = self.member_backend(member);
+        self.sessions.set(member.clone(), session.clone());
+        if let Err(err) = self.store.upsert_session(member, backend, &session) {
+            self.report_store_error("save a member session", err, step);
+        }
+        self.persist_snapshot_or_notice("save the chat session", step);
+        step.events.push(RuntimeEvent::SessionUpdated {
+            member: member.clone(),
+            session,
+        });
     }
 
     fn log(&self, _member: &MemberId, entry: LogEntry, step: &mut RuntimeStep) {
@@ -2559,15 +2692,10 @@ fn strip_routing_prefix(prompt: &str) -> String {
     prompt.to_string()
 }
 
-/// Asterline exposes a consistent `@member /skill` composer syntax. Codex's
-/// non-interactive skill invocation uses `$skill`; the other backends accept
-/// the slash form directly.
-fn normalize_backend_command(backend: BackendKind, prompt: String) -> String {
-    if backend == BackendKind::Codex
-        && let Some(command) = prompt.strip_prefix('/')
-    {
-        return format!("${command}");
-    }
+/// Do not rewrite a member's text based only on its first character. Native
+/// controls and skills have different grammars; the TUI inserts an exact skill
+/// invocation (for example `$review` for Codex) when it knows one.
+fn normalize_backend_command(_backend: BackendKind, prompt: String) -> String {
     prompt
 }
 

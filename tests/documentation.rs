@@ -351,8 +351,8 @@ fn rpm_packages_are_pinned_and_release_gated() {
 #[test]
 fn third_party_package_definitions_are_version_pinned_and_safe() {
     assert!(HOMEBREW_FORMULA.contains(&format!("releases/download/v{HOMEBREW_RELEASE_VERSION}")));
-    assert!(HOMEBREW_FORMULA.contains("depends_on :macos"));
-    assert!(!HOMEBREW_FORMULA.contains("on_linux"));
+    assert!(HOMEBREW_FORMULA.contains("on_macos"));
+    assert!(HOMEBREW_FORMULA.contains("on_linux"));
     assert!(HOMEBREW_FORMULA.contains("bin.install \"asterline\", \"ast\""));
     assert!(HOMEBREW_FORMULA.contains("doc.install \"LICENSE\""));
     for (target, checksum) in [
@@ -363,6 +363,14 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
         (
             "x86_64-apple-darwin.tar.gz",
             "8880b6beef6515399b0bf11b64804e3ed6e10a14dfc783f97fde3598e81ec6d0",
+        ),
+        (
+            "asterline-v0.2.7-Linux-arm64.tar.gz",
+            "63426c8a145c878d899d3581dac2b75dceee356cd006223fefdb8c72e8b50d26",
+        ),
+        (
+            "asterline-v0.2.7-Linux-x86_64.tar.gz",
+            "a847b4875ca727f92755737ef55b93787f9945c6e83ba5f71a79c62ce7b694d4",
         ),
     ] {
         assert!(

@@ -56,15 +56,16 @@ fn remove_sqlite_test_files(path: &std::path::Path) {
 }
 
 #[test]
-fn targeted_slash_skill_uses_backend_native_syntax() {
-    assert_eq!(
-        normalize_backend_command(BackendKind::Codex, "/review-patch staged".to_string()),
-        "$review-patch staged"
-    );
-    for backend in [BackendKind::Claude, BackendKind::Grok, BackendKind::Agy] {
+fn backend_commands_are_never_rewritten_from_text_alone() {
+    for backend in [
+        BackendKind::Codex,
+        BackendKind::Claude,
+        BackendKind::Grok,
+        BackendKind::Agy,
+    ] {
         assert_eq!(
-            normalize_backend_command(backend, "/review-patch staged".to_string()),
-            "/review-patch staged"
+            normalize_backend_command(backend, "/model next".to_string()),
+            "/model next"
         );
     }
 }
@@ -1458,11 +1459,115 @@ fn set_effort_updates_member_and_carries_into_runs() {
     });
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::MemberEffort { effort, .. } if *effort == Effort::High
+        RuntimeEvent::MemberEffort { effort, .. } if *effort == Some(Effort::High)
     )));
 
     let step = rt.on_ui_command(user("go"));
     assert_eq!(step.actions[0].effort, Some(Effort::High));
+}
+
+#[test]
+fn set_member_model_persists_and_rebuilds_the_next_runner() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+
+    let step = rt.on_ui_command(UiCommand::SetMemberModel {
+        member: builder.clone(),
+        model: Some("gpt-5.6-sol".to_string()),
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MemberModel { member, model }
+            if member == &builder && model.as_deref() == Some("gpt-5.6-sol")
+    )));
+    assert!(step.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. }
+            if member.id == builder && member.model.as_deref() == Some("gpt-5.6-sol")
+    )));
+    assert_eq!(
+        rt.config
+            .member(&builder)
+            .and_then(|member| member.model.as_deref()),
+        Some("gpt-5.6-sol")
+    );
+}
+
+#[test]
+fn model_picker_configuration_persists_model_and_effort_with_one_runner_update() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+
+    let step = rt.on_ui_command(UiCommand::SetMemberModelAndEffort {
+        member: builder.clone(),
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some(Effort::High),
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MemberModel { member, model }
+            if member == &builder && model.as_deref() == Some("gpt-5.6-sol")
+    )));
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MemberEffort { member, effort }
+            if member == &builder && *effort == Some(Effort::High)
+    )));
+    assert_eq!(
+        step.runner_changes
+            .iter()
+            .filter(|change| matches!(change, RunnerChange::Upsert { .. }))
+            .count(),
+        1
+    );
+    let member = rt.config.member(&builder).unwrap();
+    assert_eq!(member.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(member.effort, Some(Effort::High));
+}
+
+#[test]
+fn model_picker_configuration_keeps_both_values_when_snapshot_persistence_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-model-picker-snapshot-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut config = team();
+    config.members[0].model = Some("gpt-5.4".to_string());
+    config.members[0].effort = Some(Effort::Low);
+    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let external = Connection::open(&path).unwrap();
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_model_picker_snapshot
+             BEFORE UPDATE OF team_json ON conversation_snapshots
+             BEGIN SELECT RAISE(ABORT, 'snapshot unavailable'); END;",
+        )
+        .unwrap();
+
+    let changed = rt.on_ui_command(UiCommand::SetMemberModelAndEffort {
+        member: MemberId::new("builder"),
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some(Effort::High),
+    });
+
+    assert!(!changed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MemberModel { .. } | RuntimeEvent::MemberEffort { .. }
+    )));
+    assert!(changed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not save member model and effort")
+    )));
+    let member = rt.config.member(&MemberId::new("builder")).unwrap();
+    assert_eq!(member.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(member.effort, Some(Effort::Low));
+
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
 }
 
 #[test]

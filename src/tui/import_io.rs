@@ -11,6 +11,17 @@ pub(crate) const MAX_IMPORTED_MESSAGE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_IMPORTED_ITEMS: usize = 1_000;
 pub(crate) const MAX_IMPORTED_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
+/// Accept a native session identifier only when it is safe to persist and
+/// later hand back to a CLI or use in a transcript filename lookup.
+pub(crate) fn safe_session_id(value: &str) -> Option<crate::domain::event::AgentSessionId> {
+    let valid = !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    valid.then(|| crate::domain::event::AgentSessionId(value.to_string()))
+}
+
 /// Append one imported message while enforcing the same aggregate budget as
 /// the runtime trust boundary. Returning `false` tells streaming parsers to
 /// stop scanning once no additional message can be retained.
@@ -166,6 +177,17 @@ mod tests {
         }
         assert_eq!(out.len(), MAX_IMPORTED_ITEMS);
         assert!(retained_bytes <= MAX_IMPORTED_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn safe_session_ids_cannot_be_paths_or_controls() {
+        assert_eq!(
+            safe_session_id("session-123_abc").unwrap().as_str(),
+            "session-123_abc"
+        );
+        for unsafe_id in ["", "../secret", "a/b", "a\\b", "id\nnext"] {
+            assert!(safe_session_id(unsafe_id).is_none(), "{unsafe_id:?}");
+        }
     }
 
     #[cfg(unix)]

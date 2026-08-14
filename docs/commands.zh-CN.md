@@ -162,9 +162,13 @@ asterline --help
 @builder /asterline-team 检查当前运行
 ```
 
-对于 Codex，Asterline 会转换成原生 `$skill` 语法；Claude、Grok 和 Agy 保持
-`/skill`。单独输入 `/skill` 不是 Asterline 命令，前面必须有明确的成员目标。
-原生模型选择器等交互式后端命令只能通过[接入原生会话](#接入原生会话)使用。
+补全和 Skill 选择器会填入该成员实际发现的原生调用语法：Codex 使用 `$skill`，
+Claude 插件 Skill 保留 `/插件名:skill` 命名空间。为兼容手动输入，只有精确匹配已发现
+Codex Skill 的 `@<Codex 成员> /skill` 才会转换。`@member /` 会列出本地 `/model`、
+真正的 `/attach`，以及仅属于该成员的已发现 Skill。`/attach` 会打开[原生会话](#接入原生会话)，
+在其中可以使用后端自己的交互式斜杠命令菜单。除非精确匹配已发现的 Skill，未知定向 slash
+命令不会进入非交互 runner。Slash 控制命令必须指定一个成员；Asterline 会拒绝 `@all /…`，
+不会把它广播出去。
 
 ## 消息与对话命令
 
@@ -240,6 +244,29 @@ asterline --help
 运行会以“用户中止”为原因标记为 blocked。工作仍在进行而需要 `/resume` 时，应
 先执行本命令。
 
+### `/attach`
+
+```text
+/attach <member>
+@member /attach
+```
+
+暂时挂起 Asterline，打开该成员真正的原生交互式 CLI；存在会话时会恢复该后端会话。
+使用该原生 CLI 支持的退出方式（通常是它自己的 `/exit`）后，Asterline 会自动恢复。
+接入 Codex 或 Claude 期间的消息，只有在 Asterline 能安全识别已绑定原生会话，或能由该
+会话既有记录唯一证明谱系的 Claude fork 时才会导入。新的或存在歧义的会话不会靠猜测导入；
+Asterline 会提示你先在 `/team` 选择 session ID，再进行后续接入。Grok 和 Agy 可以恢复会话，
+但目前尚不会导入接入期间的消息。
+
+### `/exit`
+
+```text
+/exit
+```
+
+立即退出 Asterline。正常退出路径会取消正在执行的后端工作并恢复终端。它仅是
+Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 会返回 Asterline。
+
 ### `/approve`
 
 ```text
@@ -265,8 +292,8 @@ asterline --help
 ```
 
 打开实时 Team 编辑器。打开时会刷新系统中可用的 Codex、Claude、Grok、Agy
-可执行文件，并自动发现每个已安装后端支持的模型和 reasoning effort。缺失的 CLI
-仍会显示以便诊断，但不能被选中。
+可执行文件。打开某个成员的 Model 字段后，才会异步加载该后端支持的模型和 reasoning
+effort 目录，因此编辑器不会卡住。缺失的 CLI 仍会显示以便诊断，但不能被选中。
 
 可编辑成员列表、后端、角色、模型、effort、工作目录、原生 session ID、审批行为
 和默认目标。修改先保存在草稿中，按 `s` 才会应用并保存。完整按键见
@@ -291,15 +318,43 @@ asterline --help
 优先使用 `/team` 的模型列表：它会同时应用模型和该模型实际发现的 effort。
 不支持的级别或不存在的成员会被拒绝。
 
+### `/model`
+
+```text
+/model
+/model <member>
+@member /model
+/model <member> <model>
+@member /model <model>
+```
+
+不带模型值时，异步打开已发现模型目录，可同时选择模型和 reasoning effort。裸 `/model`
+使用已配置的默认成员（或唯一成员）；默认目标为 `all` 时，必须明确指定成员。选择器会
+立即保存选择，并在该成员下一次运行时生效。
+
+带模型值时，设置 Asterline 在该成员后续运行时传给 CLI 的模型。指定成员的写法适合从
+成员菜单直接使用；两种写法都会随当前对话保存。此内联写法只能带一个模型 ID；reasoning
+effort 请在选择器中设置。模型值写成 `default` 会同时恢复该 CLI 的默认模型和默认 effort。
+
+```text
+@builder /model gpt-5.6-sol
+/model reviewer sonnet
+```
+
+这是 Asterline 的控制命令，复用 Team 编辑器同一份已发现模型目录，而不是伪造 Codex
+TUI 的 `/model`；`@member /model` 两种形式也会被本地接管。若要使用后端原生交互式
+控制命令，请通过 `/attach <member>` 或 `@member /attach` 进入其会话；Asterline 不会
+假装这些控制命令能通过非交互提示词执行。
+
 ### `/skills`
 
 ```text
 /skills
 ```
 
-重新扫描工作区和用户 Skill 目录，然后打开 Skill 选择器。按 `Enter` 或 `Tab`
-只会把所选 Skill 调用填入输入框，并使用默认目标（没有时使用第一个成员）；再次
-提交后才真正执行。
+重新扫描工作区和用户 Skill 目录，以及已经启用的 Claude 插件标准位置中的 Skill 和旧式
+命令文件，然后打开 Skill 选择器。按 `Enter` 或 `Tab` 只会把所选 Skill 调用填入输入框，
+并使用默认目标（没有时使用第一个成员）；再次提交后才真正执行。
 
 ### `/focus`
 
@@ -598,9 +653,8 @@ Team 编辑器包含“选择成员”和“选择字段”两层。
 | `e`       | —                                | 手动输入模型或 session ID        |
 
 文本字段会打开专用输入框；`Enter` 提交，`Esc` 取消。模型列表用 `↑`、`↓`
-选择模型，用 `←`、`→` 选择该模型的 effort，按 `Enter` 同时应用。发现结果
-非空时，初始项是 CLI 标记的默认模型，否则取第一个发现的模型；只有没有发现任何
-模型时才显示 `default`。
+选择模型，用 `←`、`→` 选择该模型的 effort，按 `Enter` 同时应用。第一项始终恢复
+CLI 的默认模型和 effort，后面才是发现的模型。
 
 在 `session id` 字段按 `Enter` 会打开 Asterline 原生会话表。它读取本地 Codex、
 Claude 或 Grok 历史，显示标题、项目、更新时间和原生 ID，并只保留属于该成员
@@ -631,9 +685,11 @@ Claude 或 Grok 历史，显示标题、项目、更新时间和原生 ID，并�
 ## 接入原生会话
 
 按 `Ctrl+N` 或 `Ctrl+B` 聚焦顶部成员栏，用 `←`、`→` 移动，再按 `Enter`。
-Asterline 会暂时挂起 TUI，打开所选成员的原生交互式 CLI。通过 `/exit` 或
-Unix 上的 `Ctrl+D` 退出后返回；Windows 上请使用 `/exit`，或按 `Ctrl+Z` 后再按
-`Enter`。
+也可以使用 `/attach <member>` 或 `@member /attach`。Asterline 会暂时挂起 TUI，打开
+所选成员的原生交互式 CLI。请使用该 CLI 支持的退出方式（通常是 `/exit`）；只有后端接受
+EOF 时，EOF 才会返回 Asterline。
 
-接入 Codex 或 Claude 时产生的消息会导回 Asterline 聊天记录。Grok 和 Agy
-可以恢复原生会话，但目前不会导入接入期间的消息。
+接入 Codex 或 Claude 时，只有已绑定且可安全识别的会话消息，或由其既有记录唯一证明谱系的
+Claude fork 消息，才会导回 Asterline 聊天记录。新的或有歧义的原生会话不会靠猜测导入；
+先在 `/team` 选择其 session ID，再进行后续接入。Grok 和 Agy 可以恢复原生会话，
+但目前不会导入接入期间的消息。

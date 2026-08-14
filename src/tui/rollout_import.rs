@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use crate::domain::{config, event::ImportedMessage};
+use crate::tui::attach::AttachOutcome;
 use crate::tui::import_io;
 
 const MAX_ROLLOUT_FILES: usize = 10_000;
@@ -24,8 +25,6 @@ const MAX_ROLLOUT_SCAN_ENTRIES: usize = 50_000;
 pub struct RolloutSnapshot {
     /// The Codex session id being attached, if Asterline knows it.
     session_id: Option<String>,
-    /// Workspace cwd for fresh Codex sessions where no session id exists yet.
-    cwd: Option<String>,
     /// The rollout file identified for this session (if found up front).
     path: Option<PathBuf>,
     /// Number of `message` items already present in `path` before the attach.
@@ -35,12 +34,13 @@ pub struct RolloutSnapshot {
 }
 
 /// Snapshot the codex rollout for `session_id` (if any) before attaching.
-pub fn snapshot(session_id: Option<&str>, cwd: &str) -> RolloutSnapshot {
-    let path = session_id.and_then(find_rollout);
+pub fn snapshot(session_id: Option<&str>, _cwd: &str) -> RolloutSnapshot {
+    // A fresh attach is fail-closed and does not inspect nearby rollouts, so
+    // avoid walking the entire Codex history until there is a bound id to diff.
+    let path = session_id.and_then(|id| newest_rollout_for_session(&all_rollouts(), id));
     let before = path.as_deref().map(count_messages).unwrap_or(0);
     RolloutSnapshot {
         session_id: session_id.map(str::to_string),
-        cwd: (!cwd.trim().is_empty()).then(|| cwd.to_string()),
         path,
         before,
         started: SystemTime::now(),
@@ -49,26 +49,34 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> RolloutSnapshot {
 
 /// After the attach exits, return the messages added during it (codex only).
 pub fn imported_since(snapshot: RolloutSnapshot) -> Vec<ImportedMessage> {
+    imported_attach_since(snapshot).items
+}
+
+/// Return messages from the already-bound native session. A fresh native
+/// session is deliberately not guessed from nearby rollout files: another
+/// concurrent CLI in the same workspace cannot be distinguished reliably.
+pub(crate) fn imported_attach_since(snapshot: RolloutSnapshot) -> AttachOutcome {
     import_from_rollouts(snapshot, all_rollouts())
 }
 
-fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> Vec<ImportedMessage> {
+fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> AttachOutcome {
     // When resuming a known Codex session, only consider rollout files whose
     // names contain that session id. Otherwise a concurrent Codex session can
     // become the newest rollout and be imported into the wrong Asterline member.
-    let target = match snapshot.session_id.as_deref() {
-        Some(session_id) => {
-            newest_rollout_for_session_since(&rollouts, session_id, snapshot.started)
-                .or(snapshot.path)
-        }
-        None => snapshot
-            .cwd
-            .as_deref()
-            .and_then(|cwd| newest_rollout_for_cwd_since(&rollouts, cwd, snapshot.started))
-            .or(snapshot.path),
+    let Some(session_id) = snapshot.session_id.as_deref() else {
+        return AttachOutcome {
+            notice: Some(
+                "the fresh Codex session is not yet bound to this member, so its transcript was not imported; select its session ID in /team before the next attach"
+                    .to_string(),
+            ),
+            ..AttachOutcome::default()
+        };
     };
+    let target =
+        newest_rollout_for_session_since(&rollouts, session_id, snapshot.started).or(snapshot.path);
+    let fallback_session = import_io::safe_session_id(session_id);
     let Some(path) = target else {
-        return Vec::new();
+        return AttachOutcome::default();
     };
     let mut imported = Vec::new();
     let mut retained_bytes = 0_usize;
@@ -87,7 +95,13 @@ fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> Ve
         };
         import_io::push_imported_bounded(&mut imported, &mut retained_bytes, message)
     });
-    imported
+    AttachOutcome {
+        items: imported,
+        // The session was selected before attach, so preserve that established
+        // identity instead of trusting uncorrelated transcript metadata.
+        session: fallback_session,
+        notice: None,
+    }
 }
 
 /// `$CODEX_HOME/sessions`, or the platform user profile's `.codex/sessions`.
@@ -145,10 +159,6 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, entries_remaining: &mut usi
     }
 }
 
-fn find_rollout(session_id: &str) -> Option<PathBuf> {
-    newest_rollout_for_session(&all_rollouts(), session_id)
-}
-
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
@@ -183,43 +193,6 @@ fn rollout_matches_session(path: &Path, session_id: &str) -> bool {
     let suffix = format!("-{session_id}.jsonl");
     path.file_name()
         .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
-}
-
-fn newest_rollout_for_cwd_since(
-    rollouts: &[PathBuf],
-    cwd: &str,
-    since: SystemTime,
-) -> Option<PathBuf> {
-    rollouts
-        .iter()
-        .filter(|p| {
-            rollout_cwd(p)
-                .is_some_and(|actual| config::paths_equivalent(Path::new(&actual), Path::new(cwd)))
-        })
-        .filter_map(|p| modified(p).map(|m| (m, p.clone())))
-        .filter(|(m, _)| *m >= since)
-        .max_by_key(|(m, _)| *m)
-        .map(|(_, p)| p)
-}
-
-fn rollout_cwd(path: &Path) -> Option<String> {
-    let mut found = None;
-    import_io::for_each_json_value(path, |value| {
-        let event_type = value.get("type").and_then(Value::as_str);
-        if event_type != Some("session_meta") && event_type != Some("turn_context") {
-            return true;
-        }
-        if let Some(cwd) = value
-            .get("payload")
-            .and_then(|payload| payload.get("cwd"))
-            .and_then(Value::as_str)
-        {
-            found = Some(cwd.to_string());
-            return false;
-        }
-        true
-    });
-    found
 }
 
 /// One parsed `message` response item from the rollout.
@@ -419,7 +392,6 @@ mod tests {
         let imported = import_from_rollouts(
             RolloutSnapshot {
                 session_id: Some("session-abc".to_string()),
-                cwd: Some("/tmp/attached".to_string()),
                 path: Some(attached.clone()),
                 before: 1,
                 started: SystemTime::UNIX_EPOCH,
@@ -428,11 +400,15 @@ mod tests {
         );
 
         assert_eq!(
-            imported,
+            imported.items,
             vec![ImportedMessage {
                 from_user: true,
                 text: "typed while attached".to_string()
             }]
+        );
+        assert_eq!(
+            imported.session.as_ref().map(|session| session.as_str()),
+            Some("session-abc")
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -448,51 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn fresh_attach_imports_only_rollout_from_matching_cwd() {
-        let dir = std::env::temp_dir().join(format!("ast-rollout-cwd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let attached = dir.join("rollout-2026-session-new.jsonl");
-        let unrelated = dir.join("rollout-2026-session-other-cwd.jsonl");
-
-        std::fs::write(
-            &attached,
-            [
-                session_meta_line("session-new", "/tmp/attached"),
-                message_line("user", "fresh attach message"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            &unrelated,
-            [
-                session_meta_line("session-other", "/tmp/other"),
-                message_line("user", "wrong cwd"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-
+    fn fresh_attach_never_guesses_a_rollout_or_session() {
+        let path = PathBuf::from("rollout-2026-session-unrelated.jsonl");
         let imported = import_from_rollouts(
             RolloutSnapshot {
                 session_id: None,
-                cwd: Some("/tmp/attached".to_string()),
                 path: None,
                 before: 0,
                 started: SystemTime::UNIX_EPOCH,
             },
-            vec![unrelated, attached],
+            vec![path],
         );
 
-        assert_eq!(
-            imported,
-            vec![ImportedMessage {
-                from_user: true,
-                text: "fresh attach message".to_string()
-            }]
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(imported.items.is_empty());
+        assert!(imported.session.is_none());
+        assert!(imported.notice.is_some());
     }
 
     #[test]
@@ -510,7 +456,6 @@ mod tests {
         let imported = import_from_rollouts(
             RolloutSnapshot {
                 session_id: Some("session-budget".to_string()),
-                cwd: Some("/tmp/attached".to_string()),
                 path: Some(path.clone()),
                 before: 0,
                 started: SystemTime::UNIX_EPOCH,
@@ -518,52 +463,14 @@ mod tests {
             vec![path],
         );
 
-        assert_eq!(imported.len(), import_io::MAX_IMPORTED_ITEMS);
-        assert_eq!(imported.last().unwrap().text, "message-999");
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn fresh_attach_matches_windows_cwd_case_and_separators() {
-        let dir =
-            std::env::temp_dir().join(format!("ast-rollout-windows-cwd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let attached = dir.join("rollout-2026-session-new.jsonl");
-        std::fs::write(
-            &attached,
-            [
-                session_meta_line("session-new", "c:/work/asterline"),
-                message_line("user", "windows attach message"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-
-        let imported = import_from_rollouts(
-            RolloutSnapshot {
-                session_id: None,
-                cwd: Some(r"C:\Work\Asterline".to_string()),
-                path: None,
-                before: 0,
-                started: SystemTime::UNIX_EPOCH,
-            },
-            vec![attached],
-        );
-
-        assert_eq!(imported[0].text, "windows attach message");
+        assert_eq!(imported.items.len(), import_io::MAX_IMPORTED_ITEMS);
+        assert_eq!(imported.items.last().unwrap().text, "message-999");
         std::fs::remove_dir_all(dir).ok();
     }
 
     fn message_line(role: &str, text: &str) -> String {
         format!(
             r#"{{"type":"response_item","payload":{{"type":"message","role":"{role}","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
-        )
-    }
-
-    fn session_meta_line(session_id: &str, cwd: &str) -> String {
-        format!(
-            r#"{{"type":"session_meta","payload":{{"session_id":"{session_id}","cwd":"{cwd}"}}}}"#
         )
     }
 }

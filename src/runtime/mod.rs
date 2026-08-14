@@ -100,8 +100,24 @@ impl RuntimeHandle {
     /// for the small control lane is preferable to leaking a reservation when
     /// that lane is momentarily full.
     pub fn finish_attach(&self, member: MemberId, items: Vec<ImportedMessage>) -> bool {
+        self.finish_attach_with_session(member, None, items)
+    }
+
+    /// Finish an attach while atomically carrying a session identity recovered
+    /// from the native transcript. The runtime accepts it only for the member
+    /// that currently owns the attach reservation.
+    pub fn finish_attach_with_session(
+        &self,
+        member: MemberId,
+        session: Option<crate::domain::event::AgentSessionId>,
+        items: Vec<ImportedMessage>,
+    ) -> bool {
         self.control_tx
-            .send(UiCommand::AttachFinished { member, items })
+            .send(UiCommand::AttachFinished {
+                member,
+                session,
+                items,
+            })
             .is_ok()
     }
 
@@ -505,7 +521,11 @@ fn run_loop(
                 )],
                 ..RuntimeStep::default()
             },
-            RuntimeInput::Ui(UiCommand::AttachFinished { member, items }) => {
+            RuntimeInput::Ui(UiCommand::AttachFinished {
+                member,
+                session,
+                items,
+            }) => {
                 match attach_in_progress.as_ref() {
                     Some(reserved) if reserved == &member => {
                         // Execute transcript persistence and build its events
@@ -513,7 +533,7 @@ fn run_loop(
                         // reservation is released only after those events are
                         // enqueued below.
                         release_attach_after_step = true;
-                        runtime.import_attached_transcript(member, items)
+                        runtime.import_attached_transcript(member, session, items)
                     }
                     Some(reserved) => {
                         stray_attach_finished_noticed_during_backpressure = true;
@@ -1007,8 +1027,8 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::adapter::FakeRunner;
-    use crate::domain::event::MessageTarget;
     use crate::domain::event::RunStatus;
+    use crate::domain::event::{AgentSessionId, MessageTarget};
     use crate::domain::team::{BackendKind, TeamMember};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
@@ -1672,6 +1692,7 @@ mod tests {
         assert_eq!(
             handle.try_send(UiCommand::AttachFinished {
                 member: MemberId::new("ghost"),
+                session: None,
                 items: vec![ImportedMessage {
                     from_user: true,
                     text: "must not import".to_string(),
@@ -1687,6 +1708,7 @@ mod tests {
         assert_eq!(
             handle.try_send(UiCommand::AttachFinished {
                 member: MemberId::new("builder"),
+                session: None,
                 items: vec![ImportedMessage {
                     from_user: true,
                     text: "typed while attached".to_string(),
@@ -1782,8 +1804,10 @@ mod tests {
             }),
             RuntimeCommandSend::Sent
         );
-        assert!(handle.finish_attach(
-            builder,
+        let attached_session = AgentSessionId("native-attached-session".to_string());
+        assert!(handle.finish_attach_with_session(
+            builder.clone(),
+            Some(attached_session.clone()),
             vec![ImportedMessage {
                 from_user: true,
                 text: "validated attached message".to_string(),
@@ -1793,7 +1817,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut saw_validated = false;
         let mut saw_rejection = false;
-        while std::time::Instant::now() < deadline && !saw_rejection {
+        let mut saw_session = false;
+        while std::time::Instant::now() < deadline
+            && !(saw_validated && saw_rejection && saw_session)
+        {
             match evt_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(RuntimeEvent::UserMessage { body, .. })
                     if body == "validated attached message" =>
@@ -1808,11 +1835,16 @@ mod tests {
                 {
                     saw_rejection = true;
                 }
+                Ok(RuntimeEvent::SessionUpdated { member, session })
+                    if member == builder && session == attached_session =>
+                {
+                    saw_session = true;
+                }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        assert!(saw_validated && saw_rejection);
+        assert!(saw_validated && saw_rejection && saw_session);
 
         let bypassed: i64 = external
             .query_row(
@@ -1830,6 +1862,14 @@ mod tests {
             .unwrap();
         assert_eq!(bypassed, 0);
         assert_eq!(validated, 1);
+        let persisted_session: String = external
+            .query_row(
+                "SELECT session_id FROM agent_sessions WHERE member_id = ?1",
+                ["builder"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_session, attached_session.0);
 
         assert!(handle.shutdown());
         join.join().unwrap();

@@ -9,6 +9,17 @@ use crate::tui::drawers::Drawer;
 /// What submitting the composer should do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Submission {
+    /// Exit the Asterline TUI and begin normal runtime shutdown.
+    Exit,
+    /// Open the discovered model and reasoning-effort picker for one member.
+    /// With no explicit member, the current default member is used.
+    ModelPicker { member: Option<MemberId> },
+    /// Open one member's native interactive CLI session.
+    Attach { member: MemberId },
+    /// A targeted slash invocation resolved only against the target backend's
+    /// discovered prompt-invocable skills before any prompt is sent to a
+    /// noninteractive backend runner.
+    TargetedSlash { member: MemberId, body: String },
     /// Send a command to the runtime.
     Runtime(UiCommand),
     /// Open a drawer (a local UI action).
@@ -42,6 +53,9 @@ pub fn parse(input: &str) -> Submission {
         if member.is_empty() || body.is_empty() {
             return Submission::Empty;
         }
+        if let Some(submission) = parse_targeted_slash(member, body) {
+            return submission;
+        }
         let target = if member == "all" {
             MessageTarget::All
         } else {
@@ -63,6 +77,8 @@ fn parse_slash(rest: &str) -> Submission {
             let (member, body) = split_first_word(arg);
             if member.is_empty() || body.is_empty() {
                 Submission::Help
+            } else if let Some(submission) = parse_targeted_slash(member, body) {
+                submission
             } else {
                 let target = if member == "all" {
                     MessageTarget::All
@@ -78,6 +94,10 @@ fn parse_slash(rest: &str) -> Submission {
         "all" => {
             if arg.is_empty() {
                 Submission::Help
+            } else if arg.trim_start().starts_with('/') {
+                Submission::Invalid(
+                    "slash commands need one member; use @member /command (draft kept)".to_string(),
+                )
             } else {
                 Submission::Runtime(UiCommand::UserMessage {
                     target: MessageTarget::All,
@@ -90,9 +110,24 @@ fn parse_slash(rest: &str) -> Submission {
         "logs" if arg.is_empty() => Submission::Drawer(Drawer::Logs),
         "diff" if arg.is_empty() => Submission::Drawer(Drawer::Diff),
         "skills" if arg.is_empty() => Submission::Drawer(Drawer::Skills),
+        "attach" => {
+            let (member, extra) = split_first_word(arg);
+            if member.is_empty() {
+                Submission::Help
+            } else if member == "all" {
+                Submission::Invalid("/attach needs one member; use /attach <member>".to_string())
+            } else if !extra.is_empty() {
+                Submission::Invalid("/attach does not accept arguments; draft kept".to_string())
+            } else {
+                Submission::Attach {
+                    member: MemberId::new(member),
+                }
+            }
+        }
         "new" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
         "resume" if arg.is_empty() => Submission::Runtime(UiCommand::RequestResume),
         "abort" if arg.is_empty() => Submission::Runtime(UiCommand::Cancel { member: None }),
+        "exit" if arg.is_empty() => Submission::Exit,
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
         "reject" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Reject),
@@ -104,6 +139,28 @@ fn parse_slash(rest: &str) -> Submission {
                     effort,
                 }),
                 _ => Submission::Help,
+            }
+        }
+        "model" => {
+            let (member, rest) = split_first_word(arg);
+            let (model, extra) = split_first_word(rest);
+            if member.is_empty() {
+                Submission::ModelPicker { member: None }
+            } else if member == "all" {
+                Submission::Invalid(
+                    "/model needs one member; use /model <member> <model>".to_string(),
+                )
+            } else if model.is_empty() {
+                Submission::ModelPicker {
+                    member: Some(MemberId::new(member)),
+                }
+            } else if !extra.is_empty() {
+                Submission::Invalid(
+                    "/model accepts one model ID; use /model <member> to choose model and effort"
+                        .to_string(),
+                )
+            } else {
+                Submission::Runtime(set_member_model_command(member, model))
             }
         }
         "mode" => parse_mode_selector(arg),
@@ -173,11 +230,93 @@ fn parse_slash(rest: &str) -> Submission {
             }
         }
         "help" if arg.is_empty() => Submission::Help,
-        "team" | "runs" | "logs" | "diff" | "skills" | "new" | "resume" | "abort" | "retry"
-        | "approve" | "reject" | "help" => {
+        "team" | "runs" | "logs" | "diff" | "skills" | "new" | "resume" | "abort" | "exit"
+        | "retry" | "approve" | "reject" | "help" => {
             Submission::Invalid(format!("/{cmd} does not accept arguments; draft kept"))
         }
         _ => Submission::Help,
+    }
+}
+
+/// Parse a slash command aimed at one explicit member. Returning `None` means
+/// `body` is ordinary prompt text, not a slash command. Both `@member …` and
+/// `/ask member …` use this path so the latter cannot bypass the native-session
+/// and discovered-skill safeguards.
+fn parse_targeted_slash(member: &str, body: &str) -> Option<Submission> {
+    if !body.trim_start().starts_with('/') {
+        return None;
+    }
+    if let Some(rest) = targeted_command_rest(body, "attach") {
+        return Some(match (member, rest.is_empty()) {
+            ("all", _) => {
+                Submission::Invalid("/attach needs one member; use @member /attach".to_string())
+            }
+            (_, true) => Submission::Attach {
+                member: MemberId::new(member),
+            },
+            _ => Submission::Invalid("/attach does not accept arguments; draft kept".to_string()),
+        });
+    }
+    if let Some(rest) = targeted_model_rest(body) {
+        let (model, extra) = split_first_word(rest);
+        if !extra.is_empty() {
+            return Some(Submission::Invalid(
+                "/model accepts one model ID; use @member /model to choose model and effort"
+                    .to_string(),
+            ));
+        }
+        return Some(match (member, model.is_empty()) {
+            ("all", _) => Submission::Invalid(
+                "/model needs one member; use @member /model <model>".to_string(),
+            ),
+            (_, true) => Submission::ModelPicker {
+                member: Some(MemberId::new(member)),
+            },
+            (_, false) => Submission::Runtime(set_member_model_command(member, model)),
+        });
+    }
+    Some(if member == "all" {
+        Submission::Invalid(
+            "slash commands need one member; use @member /<discovered-skill> or /attach <member> (draft kept)"
+                .to_string(),
+        )
+    } else {
+        Submission::TargetedSlash {
+            member: MemberId::new(member),
+            body: body.to_string(),
+        }
+    })
+}
+
+fn targeted_command_rest<'a>(body: &'a str, command: &str) -> Option<&'a str> {
+    let rest = body.strip_prefix('/')?.strip_prefix(command)?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+/// Return the text after a targeted `/model`, only when `/model` is a whole
+/// command token rather than a prefix of another slash command.
+fn targeted_model_rest(body: &str) -> Option<&str> {
+    targeted_command_rest(body, "model")
+}
+
+fn set_member_model_command(member: &str, model: &str) -> UiCommand {
+    let member = MemberId::new(member);
+    if model.eq_ignore_ascii_case("default") {
+        // Resetting to the CLI default should also clear a model-specific
+        // effort override. The picker uses the same atomic command.
+        UiCommand::SetMemberModelAndEffort {
+            member,
+            model: None,
+            effort: None,
+        }
+    } else {
+        UiCommand::SetMemberModel {
+            member,
+            model: Some(model.to_string()),
+        }
     }
 }
 
@@ -444,6 +583,7 @@ mod tests {
             parse("/abort"),
             Submission::Runtime(UiCommand::Cancel { member: None })
         );
+        assert_eq!(parse("/exit"), Submission::Exit);
         assert_eq!(parse("/retry"), Submission::Runtime(UiCommand::Retry));
         assert_eq!(
             parse("/approve"),
@@ -462,6 +602,7 @@ mod tests {
             "/new extra",
             "/resume extra",
             "/abort extra",
+            "/exit extra",
             "/retry extra",
             "/approve extra",
             "/reject extra",
@@ -509,6 +650,111 @@ mod tests {
         );
         assert_eq!(parse("/effort builder"), Submission::Help);
         assert_eq!(parse("/effort builder bogus"), Submission::Help);
+    }
+
+    #[test]
+    fn model_command_sets_one_member_or_opens_its_discovered_picker() {
+        let expected = Submission::Runtime(UiCommand::SetMemberModel {
+            member: MemberId::new("builder"),
+            model: Some("gpt-5.6-sol".to_string()),
+        });
+        assert_eq!(parse("/model builder gpt-5.6-sol"), expected);
+        assert_eq!(
+            parse("@builder /model gpt-5.6-sol"),
+            Submission::Runtime(UiCommand::SetMemberModel {
+                member: MemberId::new("builder"),
+                model: Some("gpt-5.6-sol".to_string()),
+            })
+        );
+        assert!(matches!(
+            parse("@all /model gpt-5.6-sol"),
+            Submission::Invalid(_)
+        ));
+        assert_eq!(parse("/model"), Submission::ModelPicker { member: None });
+        assert_eq!(
+            parse("/model builder"),
+            Submission::ModelPicker {
+                member: Some(MemberId::new("builder")),
+            }
+        );
+        assert_eq!(
+            parse("@builder /model"),
+            Submission::ModelPicker {
+                member: Some(MemberId::new("builder")),
+            }
+        );
+        assert!(matches!(parse("@all /model"), Submission::Invalid(_)));
+        assert!(matches!(
+            parse("/model builder gpt-5.6-sol high"),
+            Submission::Invalid(message) if message.contains("one model ID")
+        ));
+        assert!(matches!(
+            parse("@builder /model gpt-5.6-sol high"),
+            Submission::Invalid(message) if message.contains("one model ID")
+        ));
+        assert_eq!(
+            parse("/model builder default"),
+            Submission::Runtime(UiCommand::SetMemberModelAndEffort {
+                member: MemberId::new("builder"),
+                model: None,
+                effort: None,
+            })
+        );
+    }
+
+    #[test]
+    fn targeted_slashes_are_resolved_before_reaching_a_backend_prompt() {
+        assert_eq!(
+            parse("@builder /attach"),
+            Submission::Attach {
+                member: MemberId::new("builder"),
+            }
+        );
+        assert_eq!(
+            parse("/attach builder"),
+            Submission::Attach {
+                member: MemberId::new("builder"),
+            }
+        );
+        assert_eq!(
+            parse("@builder /unrecognized with args"),
+            Submission::TargetedSlash {
+                member: MemberId::new("builder"),
+                body: "/unrecognized with args".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("/ask builder /fast"),
+            Submission::TargetedSlash {
+                member: MemberId::new("builder"),
+                body: "/fast".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("/ask builder /attach"),
+            Submission::Attach {
+                member: MemberId::new("builder"),
+            }
+        );
+        for input in ["@all /attach", "/ask all /fast", "/all /fast"] {
+            assert!(
+                matches!(parse(input), Submission::Invalid(message) if message.contains("one member")),
+                "{input} must not broadcast a native-looking slash command"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_rejects_missing_or_extra_arguments() {
+        assert!(matches!(parse("/attach"), Submission::Help));
+        assert!(matches!(
+            parse("/attach builder extra"),
+            Submission::Invalid(_)
+        ));
+        assert!(matches!(
+            parse("@builder /attach extra"),
+            Submission::Invalid(_)
+        ));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use crate::domain::{config, event::ImportedMessage};
+use crate::tui::attach::AttachOutcome;
 use crate::tui::import_io;
 
 /// Clock-skew grace: import rows whose timestamp is up to this much earlier
@@ -57,10 +58,17 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
 
 /// After the attach exits, return the messages added during it.
 pub fn imported_since(snapshot: ClaudeSnapshot) -> Vec<ImportedMessage> {
+    imported_attach_since(snapshot).items
+}
+
+/// Return both the messages added while attached and the session identity when
+/// the transcript itself proves it. Fresh sessions are never guessed from
+/// files that merely appeared beside the project transcript.
+pub(crate) fn imported_attach_since(snapshot: ClaudeSnapshot) -> AttachOutcome {
     let Some(root) = default_projects_root() else {
-        return Vec::new();
+        return AttachOutcome::default();
     };
-    imported_since_with_root(snapshot, &root)
+    imported_attach_since_with_root(snapshot, &root)
 }
 
 /// The platform user profile's `.claude/projects` directory (may not exist).
@@ -110,38 +118,65 @@ fn claude_session_path(project: &Path, session_id: &str) -> Option<PathBuf> {
     valid.then(|| project.join(format!("{session_id}.jsonl")))
 }
 
+#[cfg(test)]
 fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<ImportedMessage> {
+    imported_attach_since_with_root(snapshot, root).items
+}
+
+fn imported_attach_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> AttachOutcome {
     let project = projects_dir_for(root, &snapshot.cwd);
     if let Some(path) = snapshot.path.as_deref() {
         let original = import_original_delta(path, snapshot.before);
         if original.saw_delta {
-            return original.items;
+            return AttachOutcome {
+                items: original.items,
+                session: session_id_from_path(path),
+                notice: None,
+            };
         }
     }
 
-    let Some(anchor) = snapshot.lineage_anchor.as_deref() else {
-        // A same-directory file is not evidence of lineage. Without an anchor,
-        // importing it could merge a parallel Claude session into this member.
-        return Vec::new();
-    };
-
-    let mut fork_delta = None;
-    for path in candidate_files(&snapshot, &project) {
-        if snapshot.path.as_ref() == Some(&path) {
-            continue;
+    if let Some(anchor) = snapshot.lineage_anchor.as_deref() {
+        let mut fork_delta = None;
+        for path in candidate_files(&snapshot, &project) {
+            if snapshot.path.as_ref() == Some(&path) {
+                continue;
+            }
+            let candidate = import_fork_delta(&path, anchor);
+            if !candidate.saw_delta {
+                continue;
+            }
+            if fork_delta.is_some() {
+                // Multiple descendants are ambiguous: do not guess which branch
+                // the interactive CLI used.
+                return AttachOutcome {
+                    notice: Some(
+                        "could not safely identify the forked Claude session; its attached transcript was not imported"
+                            .to_string(),
+                    ),
+                    ..AttachOutcome::default()
+                };
+            }
+            fork_delta = Some((candidate.items, path));
         }
-        let candidate = import_fork_delta(&path, anchor);
-        if !candidate.saw_delta {
-            continue;
-        }
-        if fork_delta.is_some() {
-            // Multiple descendants are ambiguous: do not guess which branch
-            // the interactive CLI used.
-            return Vec::new();
-        }
-        fork_delta = Some(candidate.items);
+        return fork_delta.map_or_else(AttachOutcome::default, |(items, path)| AttachOutcome {
+            items,
+            session: session_id_from_path(&path),
+            notice: None,
+        });
     }
-    fork_delta.unwrap_or_default()
+
+    // A first native session has no pre-existing id or lineage anchor. A
+    // pre/post directory diff cannot prove which local CLI created a new file,
+    // so do not import or claim it. Once the user binds the session in `/team`,
+    // later attaches use the original-session delta above.
+    AttachOutcome {
+        notice: Some(
+            "the fresh Claude session is not yet bound to this member, so its transcript was not imported; select its session ID in /team before the next attach"
+                .to_string(),
+        ),
+        ..AttachOutcome::default()
+    }
 }
 
 struct ImportDelta {
@@ -186,6 +221,11 @@ fn import_fork_delta(path: &Path, anchor: &str) -> ImportDelta {
         import_io::push_imported_bounded(&mut items, &mut retained_bytes, message)
     });
     ImportDelta { items, saw_delta }
+}
+
+fn session_id_from_path(path: &Path) -> Option<crate::domain::event::AgentSessionId> {
+    let stem = path.file_stem()?.to_str()?;
+    import_io::safe_session_id(stem)
 }
 
 /// Candidate session files: the snapshot path (if present) plus every `.jsonl`
@@ -588,6 +628,18 @@ mod tests {
                 },
             ]
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fresh_attach_never_guesses_a_claude_session() {
+        let root = fixture_root("fresh-attach");
+        let snapshot = snapshot_with_root(&root, None, "/tmp/ws-fresh-claude");
+        let imported = imported_attach_since_with_root(snapshot, &root);
+        assert!(imported.items.is_empty());
+        assert!(imported.session.is_none());
+        assert!(imported.notice.is_some());
 
         std::fs::remove_dir_all(&root).ok();
     }

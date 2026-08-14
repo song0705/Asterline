@@ -9,12 +9,11 @@ Advance an external package only after its Release's versioned asset, checksum,
 and provenance are available. The package managers can intentionally be on
 different versions.
 
-## Homebrew (macOS)
+## Homebrew (macOS and Linux)
 
-`homebrew/Formula/asterline.rb` mirrors the published v0.2.7 macOS-only
-Formula in the public `song0705/homebrew-asterline` tap. It pins the Apple
-silicon and Intel portable archives by SHA-256. It deliberately does not support
-Linuxbrew until the Linux release ABI is independently verified.
+`homebrew/Formula/asterline.rb` pins v0.2.7 macOS and GNU/Linux archives for
+Apple silicon / Intel macOS and ARM64 / x86_64 Linux by SHA-256. The Linux
+archives are the verified glibc 2.28-baseline Release assets.
 
 Users can install it with:
 

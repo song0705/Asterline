@@ -477,6 +477,7 @@ mod tests {
                 "fourth line here".into(),
                 "fifth".into(),
             ],
+            completion_area: None,
         }
     }
 

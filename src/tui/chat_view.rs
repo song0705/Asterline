@@ -32,6 +32,9 @@ pub struct ChatLayout {
     pub width: usize,
     /// Plain text of ALL flattened lines (unstyled).
     pub lines: Vec<String>,
+    /// Completion popup bounds when it is visible. This uses screen-space
+    /// selection because popup rows do not belong to chat history.
+    pub completion_area: Option<Rect>,
 }
 
 impl ChatLayout {
@@ -127,10 +130,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         .split(frame.area());
 
     render_header(frame, chunks[0], state);
-    let layout = render_chat(frame, chunks[1], state);
+    let mut layout = render_chat(frame, chunks[1], state);
     render_composer(frame, chunks[2], state);
     if let Some(completion) = completion {
         render_popup(frame, chunks[3], &completion, state.popup_selected());
+        layout.completion_area = Some(chunks[3]);
     } else {
         render_footer(frame, chunks[3], state);
     }
@@ -177,44 +181,31 @@ fn render_popup(frame: &mut Frame<'_>, area: Rect, completion: &Completion, sele
         .map(|(i, item)| {
             let (name, description) = completion_parts(&item.label);
             let is_selected = i == selected;
-            let selected_name_style = theme::selection();
-            let selected_text_style = theme::selection();
             let name_style = if is_selected {
-                selected_name_style
-            } else {
                 theme::accent()
+            } else {
+                theme::emphasis()
             };
             let marker_style = if is_selected {
-                selected_name_style
+                theme::accent()
             } else {
                 Style::default()
             };
             let marker = if is_selected { "› " } else { "  " };
-            let mut used_width = theme::display_width(marker) + theme::display_width(name);
             let mut spans = vec![
                 Span::styled(marker, marker_style),
                 Span::styled(name.to_string(), name_style),
             ];
             if let Some(description) = description {
                 let padding = name_width.saturating_sub(theme::display_width(name)) + 2;
-                used_width += padding + theme::display_width(description);
-                let padding_style = if is_selected {
-                    selected_text_style
-                } else {
-                    Style::default()
-                };
-                let description_style = if is_selected {
-                    selected_text_style
-                } else {
-                    theme::muted()
-                };
-                spans.push(Span::styled(" ".repeat(padding), padding_style));
-                spans.push(Span::styled(description.to_string(), description_style));
-            }
-            if is_selected {
+                spans.push(Span::raw(" ".repeat(padding)));
                 spans.push(Span::styled(
-                    " ".repeat((area.width as usize).saturating_sub(used_width)),
-                    selected_text_style,
+                    description.to_string(),
+                    if is_selected {
+                        theme::accent()
+                    } else {
+                        theme::muted()
+                    },
                 ));
             }
             Line::from(spans)
@@ -324,6 +315,7 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
         first_line: start,
         width,
         lines: plain,
+        completion_area: None,
     }
 }
 
@@ -830,6 +822,7 @@ mod tests {
     use crate::tui::drawers::Drawer;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn member_summary(
         id: &str,
@@ -1016,9 +1009,10 @@ mod tests {
         }
 
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        let mut layout = None;
         terminal
             .draw(|frame| {
-                let _ = render(frame, &state);
+                layout = render(frame, &state);
             })
             .unwrap();
         let view = format!("{}", terminal.backend());
@@ -1026,9 +1020,48 @@ mod tests {
 
         assert!(view.contains("/ask"));
         assert!(view.contains("/all"));
+        assert!(view.contains("/attach"));
         assert!(!view.contains("╭"));
         assert!(!view.contains("@member to send"));
         assert!(view.contains("› /ask      send to one member"));
+        assert_eq!(
+            layout.and_then(|layout| layout.completion_area),
+            Some(Rect::new(0, 9, 70, 5))
+        );
+    }
+
+    #[test]
+    fn completion_popup_uses_text_only_selection() {
+        let completion = Completion {
+            title: "commands",
+            token_start: 0,
+            items: vec![
+                crate::tui::completion::CompletionItem {
+                    label: "/ask — send to one member".to_string(),
+                    insert: "/ask ".to_string(),
+                },
+                crate::tui::completion::CompletionItem {
+                    label: "/all — send to everyone".to_string(),
+                    insert: "/all ".to_string(),
+                },
+            ],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        terminal
+            .draw(|frame| render_popup(frame, frame.area(), &completion, 0))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selected_name = buffer.cell((2, 0)).unwrap();
+        let selected_hint = buffer.cell((8, 0)).unwrap();
+        let unselected_name = buffer.cell((2, 1)).unwrap();
+
+        assert_eq!(selected_name.fg, theme::accent_color());
+        assert_eq!(selected_name.bg, Color::Reset);
+        assert_eq!(selected_hint.fg, theme::accent_color());
+        assert_eq!(selected_hint.bg, Color::Reset);
+        assert_eq!(unselected_name.fg, theme::emphasis_color());
+        assert_eq!(unselected_name.bg, Color::Reset);
     }
 
     #[test]
@@ -1950,6 +1983,7 @@ mod tests {
                 "fourth line here".into(),
                 "fifth".into(),
             ],
+            completion_area: None,
         };
         // Top-left of area → first_line, col 0.
         assert_eq!(

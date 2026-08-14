@@ -5,8 +5,19 @@
 //! real interactive CLI resuming that member's session — exactly like opening
 //! `codex` yourself — and returns to Asterline when that CLI exits.
 
-use crate::domain::team::BackendKind;
-use crate::domain::team::MemberId;
+use crate::domain::event::{AgentSessionId, ImportedMessage};
+use crate::domain::team::{BackendKind, MemberId};
+
+/// Transcript and session identity recovered after an interactive attach.
+///
+/// The session is present only when the backend transcript proves which native
+/// session was used. Ambiguous fresh sessions intentionally remain unclaimed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AttachOutcome {
+    pub items: Vec<ImportedMessage>,
+    pub session: Option<AgentSessionId>,
+    pub notice: Option<String>,
+}
 
 /// A request to attach to a member's live backend session.
 #[derive(Clone, Debug, Eq, PartialEq)]

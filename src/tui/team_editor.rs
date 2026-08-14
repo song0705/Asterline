@@ -20,6 +20,8 @@ use crate::tui::team_builder::{
 pub(crate) enum TeamEditorOutcome {
     Ignored,
     Consumed(Option<UiCommand>),
+    /// Apply a narrow picker-originated update, then return to the chat.
+    ApplyAndClose(UiCommand),
     Close,
 }
 
@@ -39,6 +41,9 @@ pub(crate) struct TeamEditor {
     backend_picker: Option<BackendPicker>,
     model_picker: Option<ModelPicker>,
     model_picker_pending: bool,
+    /// `/model` uses the same picker as `/team`, but applies its selected
+    /// model and effort immediately instead of leaving a draft to save.
+    model_picker_apply_immediately: bool,
     session_picker: Option<SessionPicker>,
     backend_detection: Option<Receiver<DetectedBackends>>,
     dirty: bool,
@@ -46,11 +51,31 @@ pub(crate) struct TeamEditor {
 }
 
 impl TeamEditor {
+    #[cfg(test)]
     pub(crate) fn new(
         team: impl Into<String>,
         workspace: impl Into<PathBuf>,
         default_target: Option<DefaultTarget>,
         members: Vec<TeamMember>,
+    ) -> Self {
+        Self::with_model_catalog(
+            team,
+            workspace,
+            default_target,
+            members,
+            ModelCatalog::default(),
+        )
+    }
+
+    /// Construct an editor with a catalog retained by the surrounding TUI.
+    /// The catalog is safe to move between drawers: it owns its worker
+    /// receivers and is already keyed by backend plus member working directory.
+    pub(crate) fn with_model_catalog(
+        team: impl Into<String>,
+        workspace: impl Into<PathBuf>,
+        default_target: Option<DefaultTarget>,
+        members: Vec<TeamMember>,
+        model_catalog: ModelCatalog,
     ) -> Self {
         Self {
             team: team.into(),
@@ -68,15 +93,21 @@ impl TeamEditor {
             field: 0,
             field_mode: false,
             editing: None,
-            model_catalog: ModelCatalog::default(),
+            model_catalog,
             backend_picker: None,
             model_picker: None,
             model_picker_pending: false,
+            model_picker_apply_immediately: false,
             session_picker: None,
             backend_detection: None,
             dirty: false,
             notice: None,
         }
+    }
+
+    /// Return the reusable catalog when this short-lived editor closes.
+    pub(crate) fn into_model_catalog(self) -> ModelCatalog {
+        self.model_catalog
     }
 
     pub(crate) fn members(&self) -> &[TeamMember] {
@@ -117,6 +148,37 @@ impl TeamEditor {
 
     pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
         self.model_picker.as_ref()
+    }
+
+    pub(crate) fn model_picker_applies_immediately(&self) -> bool {
+        self.model_picker_apply_immediately
+    }
+
+    /// Focus one member's discovered model catalog. This is shared by the
+    /// `/model` command and the normal Team editor field, so it retains the
+    /// same async discovery and model-specific effort choices.
+    pub(crate) fn open_model_picker_for(&mut self, member: &MemberId) -> Result<(), String> {
+        let Some(selected) = self
+            .members
+            .iter()
+            .position(|candidate| &candidate.id == member)
+        else {
+            return Err(format!("unknown member: {member}"));
+        };
+        self.selected = selected;
+        self.field = Field::ALL
+            .iter()
+            .position(|field| *field == Field::Model)
+            .expect("Model is a Team editor field");
+        self.field_mode = true;
+        self.editing = None;
+        self.backend_picker = None;
+        self.session_picker = None;
+        self.model_picker = None;
+        self.model_picker_pending = false;
+        self.model_picker_apply_immediately = true;
+        self.cycle_model(true);
+        Ok(())
     }
 
     pub(crate) fn backend_picker(&self) -> Option<&BackendPicker> {
@@ -262,8 +324,10 @@ impl TeamEditor {
             return TeamEditorOutcome::Consumed(None);
         }
         if self.model_picker.is_some() {
-            self.handle_model_picker_key(code, modifiers);
-            return TeamEditorOutcome::Consumed(None);
+            return match self.handle_model_picker_key(code, modifiers) {
+                Some(command) => TeamEditorOutcome::ApplyAndClose(command),
+                None => TeamEditorOutcome::Consumed(None),
+            };
         }
         if self.editing.is_some() {
             self.handle_edit_key(code, modifiers);
@@ -276,6 +340,7 @@ impl TeamEditor {
             KeyCode::Esc if self.field_mode => {
                 self.field_mode = false;
                 self.model_picker_pending = false;
+                self.model_picker_apply_immediately = false;
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Esc | KeyCode::Char('q') => TeamEditorOutcome::Close,
@@ -283,6 +348,7 @@ impl TeamEditor {
                 if self.field_mode {
                     self.prev_field();
                     self.model_picker_pending = false;
+                    self.model_picker_apply_immediately = false;
                 } else {
                     self.selected = self.selected.saturating_sub(1);
                 }
@@ -292,6 +358,7 @@ impl TeamEditor {
                 if self.field_mode {
                     self.next_field();
                     self.model_picker_pending = false;
+                    self.model_picker_apply_immediately = false;
                 } else if self.selected + 1 < self.members.len() {
                     self.selected += 1;
                 }
@@ -383,7 +450,11 @@ impl TeamEditor {
         }
     }
 
-    fn handle_model_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+    fn handle_model_picker_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<UiCommand> {
         match code {
             KeyCode::Up => {
                 if let Some(picker) = &mut self.model_picker {
@@ -403,16 +474,26 @@ impl TeamEditor {
                     .as_ref()
                     .is_none_or(|picker| picker.visible_len() == 0)
                 {
-                    return;
+                    return None;
                 }
                 let value = self.model_picker.as_ref().and_then(ModelPicker::value);
                 let effort = self.model_picker.as_ref().and_then(ModelPicker::effort);
+                let member_id = self.selected_member().map(|member| member.id.clone());
                 if let Some(member) = self.selected_member_mut() {
-                    member.model = value;
+                    member.model = value.clone();
                     member.effort = effort;
                 }
                 self.model_picker = None;
                 self.dirty = true;
+                if self.model_picker_apply_immediately {
+                    self.model_picker_apply_immediately = false;
+                    self.notice = Some("applying model and effort…".to_string());
+                    return member_id.map(|member| UiCommand::SetMemberModelAndEffort {
+                        member,
+                        model: value,
+                        effort,
+                    });
+                }
                 self.notice = Some("model and effort selected · press s to apply".to_string());
             }
             KeyCode::Backspace => self.model_picker.as_mut().unwrap().pop_query(),
@@ -422,9 +503,13 @@ impl TeamEditor {
             KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
                 self.model_picker.as_mut().unwrap().push_query(ch);
             }
-            KeyCode::Esc => self.model_picker = None,
+            KeyCode::Esc => {
+                self.model_picker = None;
+                self.model_picker_apply_immediately = false;
+            }
             _ => {}
         }
+        None
     }
 
     fn handle_session_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -598,16 +683,15 @@ impl TeamEditor {
     }
 
     fn cycle_model(&mut self, retry_failed: bool) {
-        if self.backend_detection.is_some() {
-            self.model_picker_pending = true;
-            self.notice = Some("still checking installed Agent CLIs…".to_string());
-            return;
-        }
         let Some(member) = self.selected_member() else {
             return;
         };
         let backend = member.backend;
-        if !self.detected.contains(backend) {
+        // A configured member is enough to begin its model lookup. Do not make
+        // `/model` wait behind an unrelated CLI probe (notably `agy --version`,
+        // which can take several seconds). Once detection has completed, keep
+        // its useful missing-CLI diagnostic.
+        if self.backend_detection.is_none() && !self.detected.contains(backend) {
             self.notice = Some(format!("{} is not installed on PATH", backend.as_str()));
             return;
         }
@@ -951,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_model_picker_waits_for_backend_detection() {
+    fn requested_model_picker_uses_a_ready_catalog_without_waiting_for_detection() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut editor = editor();
         editor.field_mode = true;
@@ -967,8 +1051,8 @@ mod tests {
         );
 
         editor.activate_field();
-        assert!(editor.model_picker_pending);
-        assert!(editor.model_picker().is_none());
+        assert!(editor.model_picker().is_some());
+        assert!(!editor.model_picker_pending);
 
         tx.send(DetectedBackends {
             codex: true,
@@ -978,9 +1062,6 @@ mod tests {
         })
         .unwrap();
         editor.poll_agent_catalog();
-
-        assert!(editor.model_picker().is_some());
-        assert!(!editor.model_picker_pending);
     }
 
     #[test]
@@ -1220,5 +1301,70 @@ mod tests {
         editor.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(editor.members[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn slash_model_picker_applies_one_atomic_member_update() {
+        let mut editor = editor();
+        editor.detected.codex = true;
+        editor.model_catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-5.6-sol".to_string()],
+        );
+
+        editor
+            .open_model_picker_for(&MemberId::new("builder"))
+            .unwrap();
+        assert!(editor.model_picker().is_some());
+        assert!(editor.model_picker_applies_immediately());
+        // The first row intentionally restores the CLI default. Choose the
+        // explicit discovered model for this assertion.
+        editor.handle_model_picker_key(KeyCode::Down, KeyModifiers::NONE);
+
+        let TeamEditorOutcome::ApplyAndClose(UiCommand::SetMemberModelAndEffort {
+            member,
+            model,
+            effort,
+        }) = editor.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+        else {
+            panic!("expected an immediate model configuration command");
+        };
+        assert_eq!(member, MemberId::new("builder"));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(effort, None);
+        assert!(editor.model_picker().is_none());
+    }
+
+    #[test]
+    fn slash_model_picker_can_restore_cli_default_and_clear_effort() {
+        let mut editor = editor();
+        editor.members[0].model = Some("gpt-5.6-sol".to_string());
+        editor.members[0].effort = Some(crate::domain::team::Effort::High);
+        editor.detected.codex = true;
+        editor.model_catalog.seed(
+            BackendKind::Codex,
+            Path::new("/tmp/ws"),
+            vec!["gpt-5.6-sol".to_string()],
+        );
+
+        editor
+            .open_model_picker_for(&MemberId::new("builder"))
+            .unwrap();
+        let picker = editor.model_picker.as_mut().expect("model picker");
+        // Opening on an explicitly configured model selects that model. Move
+        // up to the always-present CLI-default row.
+        picker.up();
+
+        let TeamEditorOutcome::ApplyAndClose(UiCommand::SetMemberModelAndEffort {
+            model,
+            effort,
+            ..
+        }) = editor.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+        else {
+            panic!("expected an immediate default reset");
+        };
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
     }
 }

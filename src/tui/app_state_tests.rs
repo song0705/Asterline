@@ -1280,6 +1280,8 @@ fn skill_picker_stages_one_shot_targeted_prompt() {
         name: "review".to_string(),
         description: "Review changes".to_string(),
         path: PathBuf::from("/tmp/review/SKILL.md"),
+        backend: BackendKind::Codex,
+        invocation: "$review".to_string(),
     }]);
     state.toggle_drawer(Drawer::Skills);
 
@@ -1289,18 +1291,49 @@ fn skill_picker_stages_one_shot_targeted_prompt() {
 }
 
 #[test]
-fn skill_invocation_matches_backend_native_syntax() {
+fn skill_picker_preserves_the_discovered_invocation() {
     let skill = crate::tui::skills::SkillInfo {
+        name: "frontend-design".to_string(),
+        description: String::new(),
+        path: PathBuf::from("/tmp/frontend-design/SKILL.md"),
+        backend: BackendKind::Claude,
+        invocation: "/frontend-design:frontend-design".to_string(),
+    };
+
+    assert_eq!(skill.invocation, "/frontend-design:frontend-design");
+}
+
+#[test]
+fn manual_known_codex_slash_skill_is_normalized_without_touching_unknown_commands() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.set_skills(vec![crate::tui::skills::SkillInfo {
         name: "review".to_string(),
         description: String::new(),
         path: PathBuf::from("/tmp/review/SKILL.md"),
+        backend: BackendKind::Codex,
+        invocation: "$review".to_string(),
+    }]);
+    let known = UiCommand::UserMessage {
+        target: MessageTarget::Member(MemberId::new("builder")),
+        body: "@builder /review focus on tests".to_string(),
+    };
+    let unknown = UiCommand::UserMessage {
+        target: MessageTarget::Member(MemberId::new("builder")),
+        body: "@builder /compact".to_string(),
     };
 
-    assert_eq!(skill_invocation(BackendKind::Codex, &skill), "$review");
-    assert_eq!(skill_invocation(BackendKind::Claude, &skill), "/review");
-    for backend in [BackendKind::Grok, BackendKind::Agy] {
-        assert_eq!(skill_invocation(backend, &skill), "/review");
-    }
+    assert_eq!(
+        state.normalize_known_skill_invocation(known),
+        UiCommand::UserMessage {
+            target: MessageTarget::Member(MemberId::new("builder")),
+            body: "@builder $review focus on tests".to_string(),
+        }
+    );
+    assert_eq!(
+        state.normalize_known_skill_invocation(unknown.clone()),
+        unknown
+    );
 }
 
 #[test]
@@ -1597,6 +1630,25 @@ fn duplicate_attach_request_is_suppressed_until_runtime_resolves_it() {
 }
 
 #[test]
+fn named_attach_resolves_a_display_name_to_the_member_id() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    let builder = MemberId::new("builder");
+
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("BUILDER")),
+        Some(builder.clone())
+    );
+    state.apply(RuntimeEvent::AttachGranted {
+        member: builder.clone(),
+    });
+
+    let request = state.take_attach_request().expect("attached request");
+    assert_eq!(request.member, builder);
+    assert_eq!(request.display_name, "Builder");
+}
+
+#[test]
 fn pending_attach_is_cancelable_and_late_grants_are_released() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -1783,6 +1835,119 @@ fn team_drawer_editor_can_add_and_apply_member() {
 }
 
 #[test]
+fn slash_model_picker_opens_the_default_members_catalog() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+
+    state.open_model_picker(None).unwrap();
+
+    assert_eq!(state.drawer(), Some(Drawer::Team));
+    let editor = state.team_editor().expect("Team editor");
+    assert_eq!(
+        editor.selected_member().map(|member| &member.id),
+        Some(&MemberId::new("builder"))
+    );
+    assert_eq!(
+        editor.selected_field(),
+        crate::tui::team_builder::Field::Model
+    );
+    assert!(editor.field_mode());
+    assert!(editor.model_picker_applies_immediately());
+}
+
+#[test]
+fn targeted_completion_accepts_a_member_display_name_case_insensitively() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.insert_text("@BUILDER /");
+
+    let completion = state
+        .completion()
+        .expect("Codex completion for display name");
+    assert_eq!(completion.title, "member actions & skills");
+    assert!(completion.items.iter().any(|item| item.insert == "/attach"));
+    assert!(completion.items.iter().any(|item| item.insert == "/model"));
+    assert!(!completion.items.iter().any(|item| item.insert == "/fast"));
+}
+
+#[test]
+fn slash_model_picker_reuses_catalog_after_the_drawer_closes() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.model_catalog.seed(
+        BackendKind::Codex,
+        Path::new("/tmp/ws"),
+        vec!["gpt-5.6-sol".to_string()],
+    );
+
+    state.open_model_picker(None).unwrap();
+    assert!(
+        state
+            .team_editor()
+            .and_then(|editor| editor.model_picker())
+            .is_some()
+    );
+    state.close_drawer();
+    assert!(
+        state
+            .model_catalog
+            .contains(BackendKind::Codex, Path::new("/tmp/ws"))
+    );
+
+    state.open_model_picker(None).unwrap();
+    assert!(
+        state
+            .team_editor()
+            .and_then(|editor| editor.model_picker())
+            .is_some()
+    );
+}
+
+#[test]
+fn local_member_controls_resolve_display_names_before_runtime_delivery() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+
+    let command = state.normalize_member_control(UiCommand::SetMemberModelAndEffort {
+        member: MemberId::new("Builder"),
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some(Effort::High),
+    });
+
+    assert_eq!(
+        command,
+        UiCommand::SetMemberModelAndEffort {
+            member: MemberId::new("builder"),
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some(Effort::High),
+        }
+    );
+}
+
+#[test]
+fn bare_model_picker_requires_an_explicit_member_for_all_default() {
+    let mut event = ready();
+    if let RuntimeEvent::Ready {
+        default_target,
+        members,
+        ..
+    } = &mut event
+    {
+        *default_target = Some(DefaultTarget::All);
+        let mut reviewer = members[0].clone();
+        reviewer.id = MemberId::new("reviewer");
+        reviewer.display_name = "Reviewer".to_string();
+        members.push(reviewer);
+    }
+    let mut state = AppState::new(Vec::new());
+    state.apply(event);
+
+    assert!(
+        matches!(state.open_model_picker(None), Err(message) if message.contains("needs a member"))
+    );
+}
+
+#[test]
 fn slash_opens_command_popup_and_accept_inserts() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -1793,6 +1958,66 @@ fn slash_opens_command_popup_and_accept_inserts() {
     assert_eq!(completion.items[0].insert, "/ask ");
     assert!(state.accept_completion());
     assert_eq!(state.composer().text(), "/ask ");
+}
+
+#[test]
+fn targeted_skill_completion_and_picker_exclude_other_backends() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.members.push(MemberView {
+        id: MemberId::new("claude"),
+        display_name: "Claude".to_string(),
+        backend: BackendKind::Claude,
+        role: "review".to_string(),
+        status: MemberStatus::Idle,
+        session: None,
+        cwd: String::new(),
+        model: None,
+        effort: None,
+        sandbox: SandboxPolicy::ReadOnly,
+        permission_mode: Some(PermissionMode::Default),
+        session_policy: SessionPolicy::Resume,
+    });
+    state.default_target = Some(DefaultTarget::Member(MemberId::new("claude")));
+    state.set_skills(vec![
+        crate::tui::skills::SkillInfo {
+            name: "review".to_string(),
+            description: "Codex only".to_string(),
+            path: PathBuf::from("/tmp/codex/SKILL.md"),
+            backend: BackendKind::Codex,
+            invocation: "$review".to_string(),
+        },
+        crate::tui::skills::SkillInfo {
+            name: "wake".to_string(),
+            description: "Claude only".to_string(),
+            path: PathBuf::from("/tmp/claude/SKILL.md"),
+            backend: BackendKind::Claude,
+            invocation: "/plugin:wake".to_string(),
+        },
+    ]);
+
+    state.insert_text("@claude /");
+    let completion = state.completion().expect("Claude skill completion");
+    assert_eq!(
+        completion
+            .items
+            .iter()
+            .map(|item| item.insert.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/attach", "/model", "/plugin:wake "]
+    );
+
+    state.clear_composer();
+    state.toggle_drawer(Drawer::Skills);
+    assert_eq!(
+        state
+            .target_skills()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wake"]
+    );
+    assert!(state.stage_selected_skill());
+    assert_eq!(state.composer().text(), "@claude /plugin:wake ");
 }
 
 #[test]

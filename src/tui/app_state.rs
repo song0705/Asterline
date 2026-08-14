@@ -25,6 +25,7 @@ use crate::tui::completion::{self, AgentSkill, Completion};
 use crate::tui::composer::{Composer, MAX_COMPOSER_BYTES};
 use crate::tui::drawers::Drawer;
 use crate::tui::skills::SkillInfo;
+use crate::tui::team_builder::ModelCatalog;
 use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
 
 const MAX_LOGS: usize = 4_000;
@@ -172,6 +173,10 @@ pub struct AppState {
     diff_text: Option<String>,
     /// Editable draft shown by the `/team` drawer.
     team_editor: Option<TeamEditor>,
+    /// Cross-drawer cache for asynchronously discovered backend models. The
+    /// transient editor borrows it by ownership while open, then returns it on
+    /// close so `/model` does not rerun CLI discovery every time.
+    model_catalog: ModelCatalog,
     skills: Vec<SkillInfo>,
     selected_skill: usize,
     resume_choices: Vec<ConversationSummary>,
@@ -234,6 +239,7 @@ impl AppState {
             drawer_scroll: 0,
             diff_text: None,
             team_editor: None,
+            model_catalog: ModelCatalog::default(),
             skills: Vec::new(),
             selected_skill: 0,
             resume_choices: Vec::new(),
@@ -262,6 +268,9 @@ impl AppState {
                 members,
                 runs,
             } => {
+                // A refreshed roster invalidates any unsaved Team draft, but
+                // its completed/in-flight model lookups remain reusable.
+                self.stash_team_editor_catalog();
                 self.team = team;
                 self.skills = crate::tui::skills::discover(Path::new(&workspace));
                 self.workspace = workspace;
@@ -321,7 +330,12 @@ impl AppState {
             }
             RuntimeEvent::MemberEffort { member, effort } => {
                 if let Some(view) = self.members.iter_mut().find(|m| m.id == member) {
-                    view.effort = Some(effort);
+                    view.effort = effort;
+                }
+            }
+            RuntimeEvent::MemberModel { member, model } => {
+                if let Some(view) = self.members.iter_mut().find(|m| m.id == member) {
+                    view.model = model;
                 }
             }
             RuntimeEvent::MessageStarted { msg, member, .. } => {
@@ -677,13 +691,14 @@ impl AppState {
                 self.scroll = 0;
                 self.drawer = None;
                 self.drawer_scroll = 0;
+                self.stash_team_editor_catalog();
             }
             RuntimeEvent::ResumeChoices { conversations } => {
                 self.resume_choices = conversations;
                 self.selected_resume = 0;
                 self.drawer = Some(Drawer::Resume);
                 self.drawer_scroll = 0;
-                self.team_editor = None;
+                self.stash_team_editor_catalog();
             }
             RuntimeEvent::ConversationResumed { chat, .. } => {
                 self.chat = chat;
@@ -701,6 +716,7 @@ impl AppState {
                 self.scroll = 0;
                 self.drawer = None;
                 self.drawer_scroll = 0;
+                self.stash_team_editor_catalog();
             }
         }
     }
@@ -1093,6 +1109,94 @@ impl AppState {
         resolved
     }
 
+    fn resolve_member_id(&self, requested: &MemberId) -> Option<MemberId> {
+        self.members
+            .iter()
+            .find(|member| {
+                member.id == *requested
+                    || member.display_name.eq_ignore_ascii_case(requested.as_str())
+            })
+            .map(|member| member.id.clone())
+    }
+
+    pub(crate) fn member_backend(&self, requested: &MemberId) -> Option<BackendKind> {
+        let id = self.resolve_member_id(requested)?;
+        self.members
+            .iter()
+            .find(|member| member.id == id)
+            .map(|member| member.backend)
+    }
+
+    /// Open the shared, asynchronously populated model picker for the named
+    /// member. A bare `/model` resolves a concrete default member; it never
+    /// guesses when the default target is `all`.
+    pub(crate) fn open_model_picker(&mut self, requested: Option<&MemberId>) -> Result<(), String> {
+        let member = match requested {
+            Some(member) => self
+                .resolve_member_id(member)
+                .ok_or_else(|| format!("unknown member: {member}"))?,
+            None if self.members.len() == 1 => self.members[0].id.clone(),
+            None => match self.default_target.as_ref() {
+                Some(DefaultTarget::Member(member)) => self
+                    .resolve_member_id(member)
+                    .or_else(|| self.members.first().map(|member| member.id.clone()))
+                    .ok_or_else(|| "no team members are available".to_string())?,
+                Some(DefaultTarget::All) => {
+                    return Err(
+                        "/model needs a member while the default target is all; use /model <member> or @member /model"
+                            .to_string(),
+                    );
+                }
+                None => self
+                    .members
+                    .first()
+                    .map(|member| member.id.clone())
+                    .ok_or_else(|| "no team members are available".to_string())?,
+            },
+        };
+
+        self.disarm_quit();
+        if self.drawer != Some(Drawer::Team) {
+            self.stash_team_editor_catalog();
+            self.drawer = Some(Drawer::Team);
+        }
+        if self.team_editor.is_none() {
+            self.open_team_editor();
+        }
+        self.drawer_scroll = 0;
+        self.team_editor
+            .as_mut()
+            .expect("opening the Team drawer creates its editor")
+            .open_model_picker_for(&member)
+    }
+
+    /// Return a target-safe prompt invocation only when the slash spelling is
+    /// one Asterline actually discovered for that member's backend. This keeps
+    /// unknown interactive controls out of noninteractive `codex exec`.
+    pub(crate) fn targeted_skill_command(
+        &self,
+        requested: &MemberId,
+        body: &str,
+    ) -> Option<UiCommand> {
+        let member = self.resolve_member_id(requested)?;
+        let backend = self.member_backend(&member)?;
+        let token = body.split_whitespace().next()?;
+        let invocation = if backend == BackendKind::Codex && token.starts_with('/') {
+            format!("${}", token.trim_start_matches('/'))
+        } else {
+            token.to_string()
+        };
+        self.skills
+            .iter()
+            .find(|skill| skill.backend == backend && skill.invocation == invocation)?;
+        Some(
+            self.normalize_known_skill_invocation(UiCommand::UserMessage {
+                target: MessageTarget::Member(member.clone()),
+                body: format!("@{member} {body}"),
+            }),
+        )
+    }
+
     // --- accessors for the renderer -------------------------------------
 
     pub fn team(&self) -> &str {
@@ -1242,6 +1346,23 @@ impl AppState {
     /// synchronous attach pauses event consumption, so it is disabled while
     /// any runtime work could still produce events.
     pub fn request_attach(&mut self, idx: usize) -> Option<MemberId> {
+        let Some(member) = self.members.get(idx).map(|member| member.id.clone()) else {
+            self.header_selected = None;
+            return None;
+        };
+        self.request_attach_member(member)
+    }
+
+    /// Request a named member's existing native interactive session.
+    pub(crate) fn request_attach_member_by_name(
+        &mut self,
+        requested: &MemberId,
+    ) -> Option<MemberId> {
+        let member = self.resolve_member_id(requested)?;
+        self.request_attach_member(member)
+    }
+
+    fn request_attach_member(&mut self, member: MemberId) -> Option<MemberId> {
         self.disarm_quit();
         if !self.runtime_available {
             self.push(ChatItem::Notice {
@@ -1257,10 +1378,6 @@ impl AppState {
             self.header_selected = None;
             return None;
         }
-        let Some(member) = self.members.get(idx).map(|member| member.id.clone()) else {
-            self.header_selected = None;
-            return None;
-        };
         if self.has_cancelable_work() {
             self.push(ChatItem::Notice {
                 text: "Cannot attach while member work, verification, routing, or approval is active — /abort or resolve it first."
@@ -1314,15 +1431,32 @@ impl AppState {
         if self.popup_dismissed {
             return None;
         }
+        let member_backends = self
+            .members
+            .iter()
+            .flat_map(|member| {
+                [
+                    (member.id.to_string(), member.backend),
+                    (member.display_name.clone(), member.backend),
+                ]
+            })
+            .collect::<HashMap<_, _>>();
         let skills = self
             .skills
             .iter()
             .map(|skill| AgentSkill {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
+                backend: skill.backend,
+                invocation: skill.invocation.clone(),
             })
             .collect::<Vec<_>>();
-        completion::compute_with_agent_skills(&self.composer.head(), &self.member_ids(), &skills)
+        completion::compute_with_agent_skills(
+            &self.composer.head(),
+            &self.member_ids(),
+            &skills,
+            &member_backends,
+        )
     }
 
     pub fn popup_selected(&self) -> usize {
@@ -1468,6 +1602,22 @@ impl AppState {
         self.composer.replace_token(completion.token_start, &insert);
         self.reset_popup();
         self.composer.text() != before
+    }
+
+    /// Whether accepting the highlighted completion should immediately open
+    /// Asterline's model picker instead of waiting for a second Enter. This
+    /// applies only to the no-argument `/model` action; member/model text
+    /// completions retain the usual insert-then-submit behavior.
+    pub(crate) fn selected_completion_is_model_picker(&self) -> bool {
+        self.completion().is_some_and(|completion| {
+            completion
+                .items
+                .get(
+                    self.popup_selected
+                        .min(completion.items.len().saturating_sub(1)),
+                )
+                .is_some_and(|item| item.insert == "/model")
+        })
     }
 
     // --- prompt history (shell-style ↑/↓ recall) ------------------------
@@ -1759,18 +1909,16 @@ impl AppState {
     pub fn toggle_drawer(&mut self, drawer: Drawer) {
         self.disarm_quit();
         self.drawer = if self.drawer.as_ref() == Some(&drawer) {
-            self.team_editor = None;
+            self.stash_team_editor_catalog();
             None
         } else {
+            self.stash_team_editor_catalog();
             match drawer {
                 Drawer::Team => self.open_team_editor(),
                 Drawer::Runs => {
-                    self.team_editor = None;
                     self.ensure_selected_run();
                 }
-                _ => {
-                    self.team_editor = None;
-                }
+                _ => {}
             }
             Some(drawer)
         };
@@ -1784,6 +1932,113 @@ impl AppState {
 
     pub fn skills(&self) -> &[SkillInfo] {
         &self.skills
+    }
+
+    /// Resolve a member display name used in a local composer control before
+    /// sending it to the runtime, whose configuration is keyed by stable ID.
+    /// This keeps `/model Builder …` and `@Builder /model …` equivalent to
+    /// their lower-case member-ID forms.
+    pub(crate) fn normalize_member_control(&self, command: UiCommand) -> UiCommand {
+        match command {
+            UiCommand::SetEffort { member, effort } => UiCommand::SetEffort {
+                member: self.resolve_member_id(&member).unwrap_or(member),
+                effort,
+            },
+            UiCommand::SetMemberModel { member, model } => UiCommand::SetMemberModel {
+                member: self.resolve_member_id(&member).unwrap_or(member),
+                model,
+            },
+            UiCommand::SetMemberModelAndEffort {
+                member,
+                model,
+                effort,
+            } => UiCommand::SetMemberModelAndEffort {
+                member: self.resolve_member_id(&member).unwrap_or(member),
+                model,
+                effort,
+            },
+            other => other,
+        }
+    }
+
+    /// Keep the old convenient `@codex /skill` spelling only when it matches
+    /// a discovered Codex skill. Unknown slash commands and native controls
+    /// remain untouched; the runtime must not guess from a leading slash.
+    pub(crate) fn normalize_known_skill_invocation(&self, command: UiCommand) -> UiCommand {
+        let UiCommand::UserMessage {
+            target: MessageTarget::Member(member),
+            mut body,
+        } = command
+        else {
+            return command;
+        };
+        let Some(view) = self.members.iter().find(|view| view.id == member) else {
+            return UiCommand::UserMessage {
+                target: MessageTarget::Member(member),
+                body,
+            };
+        };
+        if view.backend != BackendKind::Codex {
+            return UiCommand::UserMessage {
+                target: MessageTarget::Member(member),
+                body,
+            };
+        }
+
+        let prefix = format!("@{member}");
+        let Some(after_member) = body.strip_prefix(&prefix) else {
+            return UiCommand::UserMessage {
+                target: MessageTarget::Member(member),
+                body,
+            };
+        };
+        let Some(after_slash) = after_member.trim_start().strip_prefix('/') else {
+            return UiCommand::UserMessage {
+                target: MessageTarget::Member(member),
+                body,
+            };
+        };
+        let end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
+        let name = &after_slash[..end];
+        if name.is_empty() {
+            return UiCommand::UserMessage {
+                target: MessageTarget::Member(member),
+                body,
+            };
+        }
+        let invocation = format!("${name}");
+        let Some(skill) = self
+            .skills
+            .iter()
+            .find(|skill| skill.backend == BackendKind::Codex && skill.invocation == invocation)
+        else {
+            return UiCommand::UserMessage {
+                target: MessageTarget::Member(member),
+                body,
+            };
+        };
+        body = format!("{prefix} {}{}", skill.invocation, &after_slash[end..]);
+        UiCommand::UserMessage {
+            target: MessageTarget::Member(member),
+            body,
+        }
+    }
+
+    fn skill_target_member(&self) -> Option<&MemberView> {
+        match self.default_target.as_ref() {
+            Some(DefaultTarget::Member(id)) => self.members.iter().find(|member| &member.id == id),
+            _ => self.members.first(),
+        }
+    }
+
+    /// Skills that can be invoked by the same member the picker will target.
+    pub(crate) fn target_skills(&self) -> impl Iterator<Item = &SkillInfo> {
+        let backend = self.skill_target_member().map(|member| member.backend);
+        self.skills
+            .iter()
+            .filter(move |skill| Some(skill.backend) == backend)
     }
 
     pub fn resume_choices(&self) -> &[ConversationSummary] {
@@ -1824,7 +2079,7 @@ impl AppState {
     }
 
     pub fn select_next_skill(&mut self) {
-        if self.selected_skill + 1 < self.skills.len() {
+        if self.selected_skill + 1 < self.target_skills().count() {
             self.selected_skill += 1;
         }
     }
@@ -1833,19 +2088,14 @@ impl AppState {
         if self.drawer != Some(Drawer::Skills) {
             return false;
         }
-        let Some(skill) = self.skills.get(self.selected_skill).cloned() else {
+        let Some(member) = self.skill_target_member().map(|member| member.id.clone()) else {
             return false;
         };
-        let member = match self.default_target.as_ref() {
-            Some(DefaultTarget::Member(id)) => self.members.iter().find(|member| &member.id == id),
-            _ => self.members.first(),
-        };
-        let Some(member) = member else {
+        let Some(skill) = self.target_skills().nth(self.selected_skill).cloned() else {
             return false;
         };
-        let invocation = skill_invocation(member.backend, &skill);
         self.composer
-            .set_text(&format!("@{} {invocation} ", member.id));
+            .set_text(&format!("@{member} {} ", skill.invocation));
         self.history_cursor = None;
         self.close_drawer();
         true
@@ -1855,7 +2105,7 @@ impl AppState {
         self.disarm_quit();
         self.drawer = None;
         self.drawer_scroll = 0;
-        self.team_editor = None;
+        self.stash_team_editor_catalog();
     }
 
     pub fn stage_selected_run_action(&mut self) -> bool {
@@ -2068,6 +2318,10 @@ impl AppState {
     pub(crate) fn poll_team_editor_catalog(&mut self) {
         if let Some(editor) = self.team_editor.as_mut() {
             editor.poll_agent_catalog();
+        } else {
+            // A model worker may still be completing after its picker closed.
+            // Poll it here so a later `/model` can use the ready result.
+            self.model_catalog.poll();
         }
     }
 
@@ -2077,14 +2331,22 @@ impl AppState {
             .iter()
             .map(|view| self.view_to_member(view))
             .collect();
-        let mut editor = TeamEditor::new(
+        let model_catalog = std::mem::take(&mut self.model_catalog);
+        let mut editor = TeamEditor::with_model_catalog(
             self.team.clone(),
             PathBuf::from(self.workspace.clone()),
             self.default_target.clone(),
             members,
+            model_catalog,
         );
         editor.load_agent_catalog();
         self.team_editor = Some(editor);
+    }
+
+    fn stash_team_editor_catalog(&mut self) {
+        if let Some(editor) = self.team_editor.take() {
+            self.model_catalog = editor.into_model_catalog();
+        }
     }
 
     fn view_to_member(&self, view: &MemberView) -> TeamMember {
@@ -2190,15 +2452,6 @@ impl AppState {
         self.running_since
             .get(member)
             .map(|t| t.elapsed().as_secs())
-    }
-}
-
-fn skill_invocation(backend: BackendKind, skill: &SkillInfo) -> String {
-    match backend {
-        BackendKind::Codex => format!("${}", skill.name),
-        BackendKind::Claude | BackendKind::Grok | BackendKind::Agy => {
-            format!("/{}", skill.name)
-        }
     }
 }
 

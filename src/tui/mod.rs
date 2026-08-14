@@ -333,8 +333,11 @@ fn run_loop(
                 legacy_keyboard_reset,
             );
             match result {
-                Ok(items) => {
-                    if !handle.finish_attach(member, items) {
+                Ok(outcome) => {
+                    if let Some(notice) = outcome.notice {
+                        state.apply(RuntimeEvent::Notice(notice));
+                    }
+                    if !handle.finish_attach_with_session(member, outcome.session, outcome.items) {
                         state.mark_runtime_unavailable();
                     }
                 }
@@ -358,6 +361,12 @@ fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
         TeamEditorOutcome::Consumed(command) => {
             if let Some(command) = command {
                 send_runtime(state, handle, command);
+            }
+            true
+        }
+        TeamEditorOutcome::ApplyAndClose(command) => {
+            if send_runtime(state, handle, command) {
+                state.close_drawer();
             }
             true
         }
@@ -427,6 +436,14 @@ fn handle_mouse(
                         if let Some(point) = layout.screen_to_content(mouse.column, mouse.row) {
                             chat_selection.begin(point, layout.width);
                         }
+                    } else if let Some(bounds) = layout.completion_area.filter(|bounds| {
+                        mouse.column >= bounds.x
+                            && mouse.column < bounds.x.saturating_add(bounds.width)
+                            && mouse.row >= bounds.y
+                            && mouse.row < bounds.y.saturating_add(bounds.height)
+                    }) {
+                        chat_selection.clear();
+                        drawer_selection.begin_bounded(mouse.column, mouse.row, bounds);
                     } else if let Some(bounds) =
                         status_bar_at(screen.area, layout, mouse.column, mouse.row)
                     {
@@ -542,7 +559,7 @@ fn attach_to_member(
     req: &attach::AttachRequest,
     keyboard_enhancement: bool,
     legacy_keyboard_reset: bool,
-) -> io::Result<Vec<crate::domain::event::ImportedMessage>> {
+) -> io::Result<attach::AttachOutcome> {
     let (program, args) = req.command();
     let exit_hint = attach_exit_hint();
 
@@ -552,7 +569,7 @@ fn attach_to_member(
         state.apply(RuntimeEvent::Notice(format!(
             "could not attach: {program} is not on PATH"
         )));
-        return Ok(Vec::new());
+        return Ok(attach::AttachOutcome::default());
     };
 
     // Snapshot the backend transcript so we can import whatever is typed during
@@ -602,6 +619,7 @@ fn attach_to_member(
         .args(&args)
         .current_dir(&req.cwd)
         .status();
+    let attached_cli_ran = result.is_ok();
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
@@ -641,13 +659,13 @@ fn attach_to_member(
     // Import any messages exchanged in the attached session so they appear in
     // (and persist to) the Asterline transcript. The runtime records them and
     // emits the events the main loop renders.
-    let imported = if let Some(snapshot) = snapshot {
+    let imported = if attached_cli_ran && let Some(snapshot) = snapshot {
         match snapshot {
-            AttachSnapshot::Codex(s) => rollout_import::imported_since(s),
-            AttachSnapshot::Claude(s) => claude_import::imported_since(s),
+            AttachSnapshot::Codex(s) => rollout_import::imported_attach_since(s),
+            AttachSnapshot::Claude(s) => claude_import::imported_attach_since(s),
         }
     } else {
-        Vec::new()
+        attach::AttachOutcome::default()
     };
     Ok(imported)
 }
@@ -822,8 +840,14 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
             // With the popup open, Enter accepts the highlighted item; if the
             // token is already complete (no change), fall through to submit.
-            if state.completion().is_some() && state.accept_completion() {
-                return;
+            if state.completion().is_some() {
+                let opens_model_picker = state.selected_completion_is_model_picker();
+                if state.accept_completion() {
+                    if opens_model_picker {
+                        submit(state, handle);
+                    }
+                    return;
+                }
             }
             if let Some(idx) = state.header_selected() {
                 // Selecting a member and pressing Enter attaches to its live
@@ -1038,7 +1062,44 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.composer().text();
     let mut reset_scroll = true;
     match commands::parse(&text) {
+        Submission::Exit => {
+            state.take_composer();
+            state.quit();
+        }
+        Submission::ModelPicker { member } => match state.open_model_picker(member.as_ref()) {
+            Ok(()) => {
+                state.record_submission(&text);
+                state.take_composer();
+            }
+            Err(message) => state.apply(RuntimeEvent::Notice(message)),
+        },
+        Submission::Attach { member } => {
+            if state.member_backend(&member).is_none() {
+                state.apply(RuntimeEvent::Notice(format!("unknown member: {member}")));
+            } else if let Some(member) = state.request_attach_member_by_name(&member) {
+                if send_runtime(state, handle, UiCommand::RequestAttach { member }) {
+                    state.record_submission(&text);
+                    state.take_composer();
+                } else {
+                    state.attach_request_send_failed();
+                }
+            }
+        }
+        Submission::TargetedSlash { member, body } => {
+            if let Some(command) = state.targeted_skill_command(&member, &body) {
+                if send_runtime(state, handle, command) {
+                    state.record_submission(&text);
+                    state.take_composer();
+                }
+            } else {
+                state.apply(RuntimeEvent::Notice(format!(
+                    "{body} is not a discovered prompt-invocable skill for {member}; use /attach <member> for that backend's native CLI"
+                )));
+            }
+        }
         Submission::Runtime(command) => {
+            let command = state.normalize_member_control(command);
+            let command = state.normalize_known_skill_invocation(command);
             // `/mode` and `/new` can be rejected by the runtime (for example,
             // when persistence fails or work is still active). Apply their UI
             // state only after the corresponding runtime event arrives.
@@ -1197,9 +1258,13 @@ fn notify_title_for(event: &RuntimeEvent) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::domain::event::{
-        ChatItem, RunId, RunStatus, RunStepStatus, RunStepSummary, RunSummary,
+        ChatItem, MemberStatus, MemberSummary, RunId, RunStatus, RunStepStatus, RunStepSummary,
+        RunSummary,
     };
-    use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
+    use crate::domain::team::{
+        BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
+        TeamConfig, TeamMember,
+    };
     use crate::runtime::{self, Runners};
     use crate::store::sqlite::SqliteStore;
     use crate::tui::drawers::Drawer;
@@ -1374,6 +1439,132 @@ mod tests {
 
         assert!(!state.runtime_available());
         assert_eq!(state.composer().text(), "/retry");
+    }
+
+    #[test]
+    fn exit_command_quits_the_tui_without_waiting_for_runtime_input() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("/exit");
+
+        submit(&mut state, &handle);
+
+        assert!(state.should_quit());
+        assert!(state.composer().is_empty());
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn targeted_attach_opens_the_members_native_session() {
+        let config = TeamConfig::new("test", "/tmp/ws").with_member(TeamMember::new(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "implementation",
+        ));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            config,
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            event_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "implementation".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
+            }],
+        });
+        state.insert_text("@Builder /attach");
+
+        submit(&mut state, &handle);
+
+        assert!(state.composer().is_empty());
+        let granted = (0..4)
+            .filter_map(|_| event_rx.recv_timeout(Duration::from_secs(1)).ok())
+            .find(|event| matches!(event, RuntimeEvent::AttachGranted { .. }))
+            .expect("attach grant");
+        state.apply(granted);
+        let request = state.take_attach_request().expect("native attach request");
+        assert_eq!(request.member, MemberId::new("builder"));
+        assert_eq!(request.display_name, "Builder");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn unknown_targeted_slash_stays_out_of_noninteractive_prompt_delivery() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            event_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "implementation".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
+            }],
+        });
+        state.insert_text("@builder /not-a-native-command");
+
+        submit(&mut state, &handle);
+
+        assert_eq!(state.composer().text(), "@builder /not-a-native-command");
+        assert!(matches!(
+            state.chat().last(),
+            Some(ChatItem::Notice { text }) if text.contains("not a discovered prompt-invocable skill")
+        ));
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
     }
 
     #[test]
@@ -1568,6 +1759,7 @@ mod tests {
             first_line: 0,
             width: 78,
             lines: (0..40).map(|i| format!("line {i}")).collect(),
+            completion_area: None,
         };
         let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
         let mouse = |kind| MouseEvent {
@@ -1609,6 +1801,7 @@ mod tests {
             first_line: 0,
             width: 78,
             lines: (0..40).map(|i| format!("line {i}")).collect(),
+            completion_area: None,
         };
         chat_selection.begin((2, 0), layout.width);
         chat_selection.update((5, 3));
@@ -1642,6 +1835,7 @@ mod tests {
             first_line: 0,
             width: 78,
             lines: vec!["chat".to_string()],
+            completion_area: None,
         };
         let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
         let down = |row| MouseEvent {
@@ -1673,6 +1867,39 @@ mod tests {
             &screen,
         )
         .unwrap();
+        assert!(screen_selection.is_active());
+        assert!(!chat_selection.is_active());
+    }
+
+    #[test]
+    fn completion_popup_starts_screen_selection() {
+        let mut state = AppState::new(Vec::new());
+        let mut screen_selection = MouseSelection::default();
+        let mut chat_selection = ChatSelection::default();
+        let layout = ChatLayout {
+            area: ratatui::layout::Rect::new(1, 3, 78, 17),
+            first_line: 0,
+            width: 78,
+            lines: vec!["chat".to_string()],
+            completion_area: Some(ratatui::layout::Rect::new(0, 22, 80, 2)),
+        };
+        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 22,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &mut state,
+            &mut screen_selection,
+            &mut chat_selection,
+            Some(&layout),
+            &screen,
+        )
+        .unwrap();
+
         assert!(screen_selection.is_active());
         assert!(!chat_selection.is_active());
     }

@@ -249,6 +249,18 @@ pub enum UiCommand {
     ResolvePausedRoute { resume: bool },
     /// Set a member's reasoning effort.
     SetEffort { member: MemberId, effort: Effort },
+    /// Set or clear the model used for a member's subsequent runs.
+    SetMemberModel {
+        member: MemberId,
+        model: Option<String>,
+    },
+    /// Atomically set both model and reasoning effort after choosing them from
+    /// the discovered model catalog. `None` means use the backend default.
+    SetMemberModelAndEffort {
+        member: MemberId,
+        model: Option<String>,
+        effort: Option<Effort>,
+    },
     /// Replace the editable team roster while the TUI is running.
     ReplaceTeam {
         members: Vec<TeamMember>,
@@ -276,6 +288,9 @@ pub enum UiCommand {
     /// processed while ordinary work consumption is paused.
     AttachFinished {
         member: MemberId,
+        /// A session identity recovered from the attached transcript, when it
+        /// can be proven without guessing among concurrent native sessions.
+        session: Option<AgentSessionId>,
         items: Vec<ImportedMessage>,
     },
     /// Continue an existing run, usually after a blocker or failed
@@ -598,7 +613,11 @@ pub enum RuntimeEvent {
     },
     MemberEffort {
         member: MemberId,
-        effort: Effort,
+        effort: Option<Effort>,
+    },
+    MemberModel {
+        member: MemberId,
+        model: Option<String>,
     },
     /// A new agent message cell begins.
     MessageStarted {

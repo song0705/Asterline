@@ -361,14 +361,13 @@ impl ModelPicker {
         current_effort: Option<Effort>,
         models: Vec<DiscoveredModel>,
     ) -> Self {
-        let has_discovered_models = !models.is_empty();
-        let mut options = Vec::new();
-        if !has_discovered_models {
-            options.push(ModelChoice {
-                value: None,
-                model: None,
-            });
-        }
+        // "CLI default" and "pin the currently discovered default model" are
+        // distinct choices. Always retain the former so a user can undo a
+        // previous explicit model choice even when discovery succeeds.
+        let mut options = vec![ModelChoice {
+            value: None,
+            model: None,
+        }];
         if let Some(current) = current
             && !models.iter().any(|model| model.id == current)
         {
@@ -387,11 +386,9 @@ impl ModelPicker {
                     .iter()
                     .position(|choice| choice.value.as_deref() == Some(current))
             })
-            .or_else(|| {
-                options
-                    .iter()
-                    .position(|choice| choice.model.as_ref().is_some_and(|model| model.is_default))
-            })
+            // With no explicit configuration, make the semantic default
+            // visible: leave model choice to the CLI rather than pinning the
+            // catalog's current default as an explicit member setting.
             .unwrap_or(0);
         let mut picker = Self {
             backend,
@@ -550,6 +547,16 @@ impl ModelPicker {
     }
 
     fn normalize_effort(&mut self) {
+        if self
+            .selected_choice()
+            .is_some_and(|choice| choice.value.is_none())
+        {
+            // Selecting the CLI-default row resets both overrides. Otherwise
+            // a stale model-specific effort would remain hidden behind a
+            // seemingly-default selection.
+            self.effort = None;
+            return;
+        }
         if self
             .effort
             .is_some_and(|effort| !self.selected_efforts().contains(&effort))
@@ -2145,7 +2152,7 @@ mod tests {
         );
 
         assert_eq!(picker.value().as_deref(), Some("company-model"));
-        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.selected(), 1);
         assert_eq!(picker.effort(), Some(Effort::High));
     }
 
@@ -2260,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_and_picker_use_first_detected_model_when_none_is_marked_default() {
+    fn catalog_uses_first_detected_model_but_picker_keeps_cli_default_explicit() {
         let mut catalog = ModelCatalog::default();
         catalog.seed(
             BackendKind::Claude,
@@ -2281,24 +2288,31 @@ mod tests {
             catalog.model_label(&member, Path::new("/tmp/ws")),
             "claude-sonnet-4-6"
         );
-        assert_eq!(picker.visible_len(), 2);
-        assert_eq!(picker.value().as_deref(), Some("claude-sonnet-4-6"));
-        assert_ne!(
+        assert_eq!(picker.visible_len(), 3);
+        assert_eq!(picker.value(), None);
+        assert_eq!(
             picker.selected_choice().map(ModelChoice::name),
             Some("default")
         );
     }
 
     #[test]
-    fn model_picker_keeps_default_only_when_discovery_is_empty() {
-        let picker = ModelPicker::new(BackendKind::Claude, None, None, Vec::new());
+    fn model_picker_always_keeps_cli_default_as_a_choice() {
+        let mut picker = ModelPicker::new(
+            BackendKind::Claude,
+            None,
+            None,
+            vec![DiscoveredModel::simple("claude-sonnet-4-6")],
+        );
 
-        assert_eq!(picker.visible_len(), 1);
+        assert_eq!(picker.visible_len(), 2);
         assert_eq!(picker.value(), None);
         assert_eq!(
             picker.selected_choice().map(ModelChoice::name),
             Some("default")
         );
+        picker.down();
+        assert_eq!(picker.value().as_deref(), Some("claude-sonnet-4-6"));
     }
 
     #[test]
