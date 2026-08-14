@@ -19,6 +19,7 @@ const DEB_CONTROL: &str = include_str!("../packaging/deb/control.in");
 const PACKAGING_README: &str = include_str!("../packaging/README.md");
 const PACKAGE_DEB: &str = include_str!("../scripts/package-deb.sh");
 const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
+const PACKAGED_RELEASE_VERSION: &str = "0.2.3";
 const INSTALLATION_DOCS: &[(&str, &str)] = &[
     (
         "docs/installation.md",
@@ -308,9 +309,14 @@ fn debian_packages_are_pinned_and_release_gated() {
 
 #[test]
 fn third_party_package_definitions_are_version_pinned_and_safe() {
-    let version = manifest_package_version();
+    let package_version = PACKAGED_RELEASE_VERSION;
+    assert_ne!(
+        package_version,
+        manifest_package_version(),
+        "package definitions must only advance after their release assets exist"
+    );
 
-    assert!(HOMEBREW_FORMULA.contains(&format!("version \"{version}\"")));
+    assert!(HOMEBREW_FORMULA.contains(&format!("version \"{package_version}\"")));
     assert!(HOMEBREW_FORMULA.contains("depends_on :macos"));
     assert!(!HOMEBREW_FORMULA.contains("on_linux"));
     assert!(HOMEBREW_FORMULA.contains("bin.install \"asterline\", \"ast\""));
@@ -331,7 +337,7 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
         );
     }
 
-    assert!(AUR_PKGBUILD.contains(&format!("pkgver={version}")));
+    assert!(AUR_PKGBUILD.contains(&format!("pkgver={package_version}")));
     assert!(AUR_PKGBUILD.contains("archive/${_commit}.tar.gz"));
     assert!(AUR_PKGBUILD.contains("cargo build --frozen --release --bins"));
     assert!(AUR_PKGBUILD.contains("cargo test --frozen --all-targets"));
@@ -344,7 +350,7 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     }
     let source_sha256 = "2f24699cc4d17dc7f075fcebe56df0253e94eb25bcf3f00526f366ef1b926fc2";
     assert!(AUR_PKGBUILD.contains(source_sha256));
-    assert!(AUR_SRCINFO.contains(&format!("pkgver = {version}")));
+    assert!(AUR_SRCINFO.contains(&format!("pkgver = {package_version}")));
     assert!(AUR_SRCINFO.contains(source_sha256));
     assert!(!AUR_SRCINFO.contains("SKIP"));
 
