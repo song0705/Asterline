@@ -114,6 +114,27 @@ Print a compact startup banner before entering the TUI.
 asterline --banner
 ```
 
+### `--update`
+
+On a Windows Setup-managed installation, force a stable-release check, verify a
+new Setup executable against that Release's `SHA256SUMS`, schedule it to run
+after Asterline exits, print the result, and exit. Portable copies, source
+builds, macOS, and Linux report that installer updates are unavailable and exit.
+
+```powershell
+ast --update
+```
+
+### `--no-auto-update`
+
+Skip the once-per-24-hours background update check for this launch of a Windows
+Setup-managed copy. It does not disable future checks or affect an explicit
+`--update`; it has no effect on platforms and copies that never self-update.
+
+```powershell
+ast --no-auto-update
+```
+
 ### `-h`, `--help`
 
 Print command-line help and exit. This is different from the in-product

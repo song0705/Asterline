@@ -31,6 +31,8 @@ Asterline 支持 macOS、Linux 和 Windows 10/11。使用前，至少需要安�
 | Windows | 下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。                          |
 | Linux   | 下载 `x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu` 对应的压缩包。        |
 
+Linux 发布包要求 GNU/glibc 2.28 或更高版本，并内置 SQLite；目前不提供 Alpine/musl 发布目标。
+
 安装器会同时提供完整命令 `asterline` 和短命令 `ast`。便携安装、源码构建、版本校验、自动更新、卸载与故障排查请参阅[安装指南](docs/installation.zh-CN.md)。
 
 ## 开始使用
@@ -156,9 +158,10 @@ cargo run -- --fake
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked --no-fail-fast
+cargo audit
 ```
 
-源码构建需要 Rust 1.85 或更高版本。真实后端 smoke 测试需要显式启用。可复现的问题和范围明确的建议请提交到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
+完整质量检查需要 Rust 1.88 或更高版本以及 `cargo-audit` 0.22.2。真实后端 smoke 测试需要显式启用，受控的本地与 Actions 入口见[说明文档](docs/real-smoke.md)。可复现的问题和范围明确的建议请提交到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
 
 ## 项目状态
 

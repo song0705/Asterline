@@ -41,6 +41,9 @@ must already be installed and authenticated.
 | Windows  | Download and run `asterline-<version>-x86_64-windows-setup.exe`.                              |
 | Linux    | Download the archive for `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`.           |
 
+Linux archives target GNU/glibc 2.28 or newer and embed SQLite; Alpine/musl is
+not a supported release target.
+
 The installers provide both `asterline` and the shorter `ast` command. See the
 [installation guide](docs/installation.md) for portable packages, source builds,
 release verification, updates, uninstallation, and troubleshooting.
@@ -185,9 +188,12 @@ Run the local quality gate:
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked --no-fail-fast
+cargo audit
 ```
 
-Rust 1.85 or newer is required. Real-backend smoke tests are opt-in. Please use
+Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate.
+Real-backend smoke tests are opt-in; see the [controlled local and Actions
+entrypoints](docs/real-smoke.md). Please use
 [GitHub Issues](https://github.com/song0705/Asterline/issues) for reproducible
 bugs and focused proposals.
 

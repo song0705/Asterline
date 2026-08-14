@@ -35,13 +35,16 @@ Once a member runs, tool-by-tool enforcement belongs to the backend CLI:
 | Backend | Controls passed through by Asterline                                              |
 | ------- | --------------------------------------------------------------------------------- |
 | codex   | `sandbox` (`read-only` / `workspace-write` / `danger-full-access`)                |
-| claude  | `permission_mode`, `allowed_tools`, plus `.claude/settings.json` allowlists       |
+| claude  | `permission_mode`, hard `allowed_tools`, plus `.claude/settings.json` policies    |
 | grok    | `sandbox`, `permission_mode`, and ACP permission responses; tool list is advisory |
 | agy     | `--sandbox`; `accept-edits`/`plan` modes; bypass only when configured             |
 
 Configure these per member in the Team editor (`/team`) or `team.json`. A
 member with `sandbox: read-only` cannot write regardless of what a prompt asks;
 a claude member with `allowed_tools: ["Read", "Grep"]` cannot run Bash at all.
+Claude tool lists are passed with `--tools`; `--allowed-tools` is not used
+because that vendor flag only removes permission prompts rather than tools.
+Agy requires CLI 1.1.12 or newer so headless `--mode plan` is actually applied.
 
 ## Interactive per-tool behavior
 

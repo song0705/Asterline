@@ -48,8 +48,12 @@ If a new terminal cannot find `ast`, add `$HOME/.local/bin` to `PATH` in
 
 ### macOS security prompt
 
-Developer ID signed and notarized releases open through the standard Installer
-flow. For an unsigned preview build, macOS may require an explicit override:
+The v0.2.3 DMG is a historical exception: it was published unsigned before the
+fail-closed signing policy. Stable Releases produced by the hardened workflow
+after v0.2.3 must be Developer ID signed and notarized; the workflow fails
+instead of publishing a DMG when either credential set is unavailable. Verify
+v0.2.3's checksum before using the security override. A locally built, unsigned
+preview may also require an explicit override:
 
 1. Control-click `Install Asterline.pkg` and choose **Open**.
 2. Confirm **Open** in the security dialog.
@@ -134,6 +138,15 @@ Download the `.tar.gz` archive matching the machine:
 | Intel or AMD 64-bit | `x86_64-unknown-linux-gnu`  |
 | ARM64               | `aarch64-unknown-linux-gnu` |
 
+These are GNU/Linux builds produced on a maintained glibc 2.28 baseline. They
+require glibc 2.28 or newer, so they do not run on Alpine/musl. SQLite is built
+from bundled source and does not require a system `libsqlite3` package.
+
+> Historical exception: the existing v0.2.3 Linux archives predate this release
+> guarantee. They require glibc 2.39 and dynamically link system `libsqlite3`.
+> Use them only with those runtime dependencies; otherwise build from source or
+> use a distribution package.
+
 Extract the archive, then install the commands for the current user:
 
 ```bash
@@ -150,7 +163,7 @@ To uninstall a portable Linux copy, remove `$HOME/.local/bin/ast` and
 
 ## Build from source
 
-Install Rust 1.85 or newer, clone the repository, and run:
+Install Rust 1.88 or newer, clone the repository, and run:
 
 ```bash
 cargo install --path . --locked --force

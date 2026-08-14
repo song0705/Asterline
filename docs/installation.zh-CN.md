@@ -43,7 +43,10 @@ install -m 755 ast "$HOME/.local/bin/ast"
 
 ### macOS 安全提示
 
-使用 Developer ID 签名并通过公证的版本可以直接进入标准安装流程。对于未签名的预览构建，macOS 可能要求用户明确允许：
+v0.2.3 DMG 是历史例外：它发布于 fail-closed 签名策略生效前，未经过签名。
+v0.2.3 之后由加固 workflow 生成的稳定 Release 必须使用 Developer ID 签名并
+通过公证；任一凭据缺失时 workflow 会失败，不会上传 DMG。对 v0.2.3 使用安全
+绕过前，请先核对校验和。本地构建的未签名预览包也可能要求用户明确允许：
 
 1. 按住 Control 点击 `Install Asterline.pkg`，选择“打开”。
 2. 在安全提示中再次确认“打开”。
@@ -118,6 +121,14 @@ ast --no-auto-update
 | Intel 或 AMD 64 位 | `x86_64-unknown-linux-gnu`  |
 | ARM64              | `aarch64-unknown-linux-gnu` |
 
+这些 GNU/Linux 发布包使用仍受维护的 glibc 2.28 基线构建，要求 glibc 2.28
+或更高版本，因此不能在 Alpine/musl 上运行。SQLite 由内置源码静态构建，
+无需系统提供 `libsqlite3`。
+
+> 历史例外：现有的 v0.2.3 Linux 归档早于上述发布保证，实际要求 glibc 2.39，
+> 并动态链接系统的 `libsqlite3`。仅应在具备这些运行时依赖时使用；否则请从源码
+> 构建或使用发行版软件包。
+
 解压后，为当前用户安装两个命令：
 
 ```bash
@@ -132,7 +143,7 @@ install -m 755 ast "$HOME/.local/bin/ast"
 
 ## 从源码构建
 
-安装 Rust 1.85 或更高版本，克隆仓库后运行：
+安装 Rust 1.88 或更高版本，克隆仓库后运行：
 
 ```bash
 cargo install --path . --locked --force

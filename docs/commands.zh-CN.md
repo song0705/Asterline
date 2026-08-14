@@ -104,6 +104,26 @@ asterline --fake
 asterline --banner
 ```
 
+### `--update`
+
+对于由 Windows Setup 管理的安装，立即检查最新稳定 Release，使用同一
+Release 的 `SHA256SUMS` 校验新 Setup，安排它在 Asterline 退出后运行，输出结果
+并退出。便携版、源码构建、macOS 和 Linux 会提示安装器更新不可用并退出。
+
+```powershell
+ast --update
+```
+
+### `--no-auto-update`
+
+本次启动跳过 Windows Setup 管理版本每 24 小时一次的后台更新检查。它不会永久
+关闭更新，也不会阻止显式 `--update`；对于本就不会自动更新的平台和安装方式没有
+效果。
+
+```powershell
+ast --no-auto-update
+```
+
 ### `-h`、`--help`
 
 打印命令行帮助并退出。它与产品内的 `/help` 不是同一个功能。

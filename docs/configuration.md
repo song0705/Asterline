@@ -225,19 +225,22 @@ Team editor.
 
 | Setting                | Codex                                                              | Claude                                      | Grok ACP                                                        | Agy                                                                          |
 | ---------------------- | ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `cwd`                  | Process cwd and `-C` on a fresh session                            | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
+| `cwd`                  | Process cwd and exec-level `-C`, including resumed sessions        | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
 | `model`                | `-m`                                                               | `--model`                                   | Agent `--model`                                                 | `--model`                                                                    |
 | `effort`               | `model_reasoning_effort`; picker follows model metadata            | `--effort` (through `max`)                  | Agent `--reasoning-effort`                                      | `--effort` (`low`, `medium`, or `high`)                                      |
-| `sandbox`              | `-s` on fresh sessions; resumed sessions restore their own sandbox | Not passed                                  | Top-level `--sandbox` with an Asterline profile mapping         | `--sandbox` unless configured as `danger-full-access`                        |
+| `sandbox`              | Exec-level `-s`, including resumed sessions                        | Not passed                                  | Top-level `--sandbox` with an Asterline profile mapping         | `--sandbox` unless configured as `danger-full-access`                        |
 | `permission_mode`      | Not passed                                                         | `--permission-mode` (omitted for `default`) | Top-level mode plus ACP permission responses                    | `acceptEdits` → `--mode accept-edits`; `plan` → `--mode plan`; bypass → flag |
-| `allowed_tools`        | Not passed                                                         | `--allowed-tools`                           | Added to ACP session rules; not a hard protocol-level allowlist | Not passed                                                                   |
+| `allowed_tools`        | Not passed                                                         | `--tools` (hard built-in-tool allowlist)    | Added to ACP session rules; not a hard protocol-level allowlist | Not passed                                                                   |
 | custom `system_prompt` | `-c developer_instructions=…`                                      | `--append-system-prompt`                    | ACP session `rules`                                             | Prepended to the print prompt                                                |
 | `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                             | Resume or fresh conversation                                                 |
-| `session_id`           | `codex exec resume <id>`                                           | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
+| `session_id`           | `codex exec [options] resume <id>`                                 | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
 
 For Claude and Grok, choose only permission modes accepted by the installed CLI
 version. Asterline serializes the configured value but does not negotiate
-vendor-version compatibility before launch. Recent Claude CLIs no longer list
+vendor-version compatibility before launch. Agy 1.1.12 or newer is required;
+older versions are excluded from backend detection and rejected before a run
+because earlier releases either lack structured streaming or ignore headless
+`--mode` enforcement. Recent Claude CLIs no longer list
 `default` as a `--permission-mode` choice; Asterline omits the flag when the
 configured mode is `default` so the CLI default applies.
 
