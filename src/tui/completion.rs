@@ -39,23 +39,16 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("ask", "send to one member", true),
     ("all", "send to everyone", true),
     ("attach", "open a member's native CLI session", true),
-    ("abort", "cancel running members", false),
     ("approve", "approve first pending", false),
     ("block", "mark a run blocked", true),
     ("continue", "resume latest or selected run", true),
     ("diff", "show working-tree git diff", false),
     ("exit", "exit Asterline", false),
-    (
-        "effort",
-        "set reasoning effort (low…ultra; model-dependent)",
-        true,
-    ),
     ("find", "search the transcript", true),
     ("focus", "view a member's logs", true),
     ("help", "show commands", false),
     ("logs", "raw logs · stderr · warnings", false),
     ("mode", "set the mode for subsequent messages", true),
-    ("model", "choose or set a member's model", true),
     (
         "new",
         "start a fresh chat (new session, cleared transcript)",
@@ -66,7 +59,6 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("resume", "choose and restore a saved chat", false),
     ("retry", "re-send the latest user request", false),
     ("runs", "run status · next action", false),
-    ("skills", "choose a skill for the next prompt", false),
     ("step", "manage run checklist", true),
     ("team", "edit roster · sessions · approvals", false),
     ("verify", "verify latest or selected run", true),
@@ -114,13 +106,13 @@ pub fn compute_with_agent_skills(
                 let items: Vec<CompletionItem> = COMMANDS
                     .iter()
                     .filter(|(name, _, _)| slash_command_matches(name, &lower))
-                    .map(|(name, hint, takes_arg)| CompletionItem {
+                    .map(|(name, hint, _)| CompletionItem {
                         label: format!("/{name} — {hint}"),
-                        insert: if *takes_arg {
-                            format!("/{name} ")
-                        } else {
-                            format!("/{name}")
-                        },
+                        // Keep the cursor in command-entry mode after any
+                        // accepted command. This also makes no-argument
+                        // commands such as `/team` behave consistently with
+                        // commands that take an argument.
+                        insert: format!("/{name} "),
                     })
                     .collect();
                 non_empty("commands", 0, items)
@@ -145,12 +137,7 @@ pub fn compute_with_agent_skills(
                         .collect();
                     return non_empty("modes", space + 1, items);
                 }
-                if cmd != "ask"
-                    && cmd != "attach"
-                    && cmd != "effort"
-                    && cmd != "focus"
-                    && cmd != "model"
-                {
+                if cmd != "ask" && cmd != "attach" && cmd != "focus" {
                     return None;
                 }
                 let arg: Vec<char> = chars[space + 1..].to_vec();
@@ -159,7 +146,7 @@ pub fn compute_with_agent_skills(
                     return None;
                 }
                 let prefix: String = arg.iter().collect();
-                let mut candidates: Vec<String> = (cmd != "model" && cmd != "attach")
+                let mut candidates: Vec<String> = (cmd != "attach")
                     .then(|| "all".to_string())
                     .into_iter()
                     .collect();
@@ -236,13 +223,7 @@ fn targeted_skill_completion(
     if "attach".starts_with(&lower) {
         items.push(CompletionItem {
             label: "/attach — open this member's native CLI session".to_string(),
-            insert: "/attach".to_string(),
-        });
-    }
-    if "model".starts_with(&lower) {
-        items.push(CompletionItem {
-            label: "/model — choose this member's model and reasoning effort".to_string(),
-            insert: "/model".to_string(),
+            insert: "/attach ".to_string(),
         });
     }
     items.extend(
@@ -320,9 +301,9 @@ mod tests {
         let c = compute("/", &members()).unwrap();
         assert_eq!(c.token_start, 0);
         assert!(c.items.iter().any(|i| i.insert == "/ask "));
-        assert!(c.items.iter().any(|i| i.insert == "/team"));
+        assert!(c.items.iter().any(|i| i.insert == "/team "));
         assert!(c.items.iter().any(|i| i.insert == "/mode "));
-        assert!(c.items.iter().any(|i| i.insert == "/exit"));
+        assert!(c.items.iter().any(|i| i.insert == "/exit "));
         assert!(c.items.iter().any(|i| i.insert == "/attach "));
         assert!(!c.items.iter().any(|i| i.insert == "/plan "));
         assert!(!c.items.iter().any(|i| i.insert == "/review "));
@@ -330,7 +311,8 @@ mod tests {
         assert!(c.items.iter().any(|i| i.insert == "/note "));
         assert!(c.items.iter().any(|i| i.insert == "/block "));
         assert!(c.items.iter().any(|i| i.insert == "/step "));
-        assert!(c.items.iter().any(|i| i.insert == "/skills"));
+        assert!(!c.items.iter().any(|i| i.insert == "/skills"));
+        assert!(!c.items.iter().any(|i| i.insert == "/abort"));
     }
 
     #[test]
@@ -353,10 +335,7 @@ mod tests {
     #[test]
     fn slash_prefix_filters() {
         assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
-        assert_eq!(
-            inserts("/mo"),
-            vec!["/mode ".to_string(), "/model ".to_string()]
-        );
+        assert_eq!(inserts("/mo"), vec!["/mode ".to_string()]);
         assert!(inserts("/pl").is_empty());
         assert_eq!(inserts("/con"), vec!["/continue ".to_string()]);
         assert_eq!(inserts("/no"), vec!["/note ".to_string()]);
@@ -368,14 +347,14 @@ mod tests {
         assert_eq!(
             re,
             vec![
-                "/reject".to_string(),
-                "/resume".to_string(),
-                "/retry".to_string()
+                "/reject ".to_string(),
+                "/resume ".to_string(),
+                "/retry ".to_string()
             ]
         );
         assert!(inserts("/find").contains(&"/find ".to_string()));
-        assert_eq!(inserts("/cl"), vec!["/new".to_string()]);
-        assert_eq!(inserts("/clear"), vec!["/new".to_string()]);
+        assert_eq!(inserts("/cl"), vec!["/new ".to_string()]);
+        assert_eq!(inserts("/clear"), vec!["/new ".to_string()]);
         assert!(inserts("/lead").is_empty());
         assert!(inserts("/round").is_empty());
     }
@@ -527,24 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn targeted_slash_offers_the_local_model_control_without_skills() {
-        let completion = compute_with_agent_skills(
-            "@builder /mo",
-            &members(),
-            &[],
-            &HashMap::from([("builder".to_string(), BackendKind::Codex)]),
-        )
-        .expect("model control");
-
-        assert_eq!(completion.items[0].insert, "/model");
-        assert_eq!(
-            completion.items[0].label,
-            "/model — choose this member's model and reasoning effort"
-        );
-    }
-
-    #[test]
-    fn targeted_completion_offers_native_attach_and_local_model_controls() {
+    fn targeted_completion_offers_native_attach_and_skills_only() {
         let completion = compute_with_agent_skills(
             "@builder /",
             &members(),
@@ -554,13 +516,17 @@ mod tests {
         .expect("member controls");
 
         assert_eq!(completion.title, "member actions & skills");
-        assert!(
-            completion.items.iter().any(|item| {
-                item.insert == "/attach" && item.label.contains("native CLI session")
-            })
-        );
-        assert!(completion.items.iter().any(|item| item.insert == "/model"));
-        for command in ["/fast", "/permissions", "/compact", "/status", "/review"] {
+        assert!(completion.items.iter().any(|item| {
+            item.insert == "/attach " && item.label.contains("native CLI session")
+        }));
+        for command in [
+            "/model",
+            "/fast",
+            "/permissions",
+            "/compact",
+            "/status",
+            "/review",
+        ] {
             assert!(
                 !completion.items.iter().any(|item| item.insert == command),
                 "native control {command} must not be presented as a noninteractive action"
@@ -637,7 +603,7 @@ mod tests {
                 .iter()
                 .map(|item| item.insert.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/attach", "/model", "/wake "]
+            vec!["/attach ", "/wake "]
         );
 
         let codex = compute_with_agent_skills("@codex /", &members, &skills, &backends)
@@ -647,8 +613,8 @@ mod tests {
             .iter()
             .map(|item| item.insert.as_str())
             .collect::<Vec<_>>();
-        assert!(codex_inserts.contains(&"/attach"));
-        assert!(codex_inserts.contains(&"/model"));
+        assert!(codex_inserts.contains(&"/attach "));
+        assert!(!codex_inserts.contains(&"/model"));
         assert!(codex_inserts.contains(&"$review "));
         assert!(!codex_inserts.contains(&"/fast"));
         assert!(!codex_inserts.contains(&"/review"));
@@ -666,7 +632,7 @@ mod tests {
                     .iter()
                     .map(|item| item.insert.as_str())
                     .collect::<Vec<_>>(),
-                vec!["/attach", "/model", expected]
+                vec!["/attach ", expected]
             );
         }
     }

@@ -245,8 +245,10 @@ fn parse_rollout_message(value: &Value) -> Option<RolloutMessage> {
     Some(RolloutMessage { role, text })
 }
 
-/// Join the text of a message's content parts, dropping codex's injected
-/// context blocks (environment, AGENTS.md, user-instructions wrappers).
+/// Join the text of a message's content parts, dropping Codex's injected
+/// context blocks (environment, plugin inventory, AGENTS.md, and
+/// user-instructions wrappers). These are encoded as `user` messages in a
+/// rollout but are not user-authored chat content.
 fn join_text(items: &[Value]) -> String {
     let mut parts = Vec::new();
     for item in items {
@@ -264,6 +266,7 @@ fn join_text(items: &[Value]) -> String {
 fn is_injected_context(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("<environment_context>")
+        || t.starts_with("<recommended_plugins>")
         || t.starts_with("<user_instructions>")
         || t.starts_with("# AGENTS.md")
         || t.starts_with("<INSTRUCTIONS>")
@@ -308,11 +311,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ast-rollout-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout-x-abc.jsonl");
-        // session_meta, an injected user context, a real user msg, an assistant
-        // reply, a developer message (skipped), and a reasoning item (skipped).
+        // session_meta, injected user context/plugin inventory, a real user
+        // message, an assistant reply, a developer message (skipped), and a
+        // reasoning item (skipped).
         let lines = [
             r#"{"type":"session_meta","payload":{"id":"abc"}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n cwd </environment_context>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>\n plugin list </recommended_plugins>"}]}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi there"}]}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello back"}]}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"sys"}]}}"#,
@@ -320,8 +325,8 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        // 4 message items total (3 user/assistant/developer + 1 injected user).
-        assert_eq!(count_messages(&path), 4);
+        // 5 message items total (4 user/assistant/developer + 2 injected user).
+        assert_eq!(count_messages(&path), 5);
 
         // Import everything: injected context dropped, developer dropped.
         let imported: Vec<ImportedMessage> = parse_messages(&path)

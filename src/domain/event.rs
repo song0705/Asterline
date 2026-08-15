@@ -247,20 +247,6 @@ pub enum UiCommand {
     SetRelayPaused(bool),
     /// Continue (`true`) or drop (`false`) the next paused relay.
     ResolvePausedRoute { resume: bool },
-    /// Set a member's reasoning effort.
-    SetEffort { member: MemberId, effort: Effort },
-    /// Set or clear the model used for a member's subsequent runs.
-    SetMemberModel {
-        member: MemberId,
-        model: Option<String>,
-    },
-    /// Atomically set both model and reasoning effort after choosing them from
-    /// the discovered model catalog. `None` means use the backend default.
-    SetMemberModelAndEffort {
-        member: MemberId,
-        model: Option<String>,
-        effort: Option<Effort>,
-    },
     /// Replace the editable team roster while the TUI is running.
     ReplaceTeam {
         members: Vec<TeamMember>,
@@ -377,6 +363,13 @@ pub enum AgentEvent {
     },
     /// The backend session/thread id was discovered or updated.
     SessionDiscovered(AgentSessionId),
+    /// Codex App Server needs an explicit user decision before it can continue
+    /// the active turn. `request_id` is scoped to the currently live runner.
+    NativeApprovalRequested {
+        request_id: u64,
+        action: String,
+        body: String,
+    },
     /// A raw, unparsed stdout line from the backend (persisted to `stream_events`
     /// for later parser fixes; not shown in the chat).
     Raw(String),
@@ -610,14 +603,6 @@ pub enum RuntimeEvent {
     MemberStatus {
         member: MemberId,
         status: MemberStatus,
-    },
-    MemberEffort {
-        member: MemberId,
-        effort: Option<Effort>,
-    },
-    MemberModel {
-        member: MemberId,
-        model: Option<String>,
     },
     /// A new agent message cell begins.
     MessageStarted {

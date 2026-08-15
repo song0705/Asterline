@@ -367,7 +367,6 @@ impl<'de> Deserialize<'de> for TeamMember {
             allowed_tools: Vec<String>,
             #[serde(default)]
             session_policy: SessionPolicy,
-            #[serde(default)]
             session_id: Option<String>,
             #[serde(default)]
             effort: Option<Effort>,

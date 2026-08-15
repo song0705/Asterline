@@ -840,7 +840,14 @@ impl SqliteStore {
                     c.created_at,
                     COALESCE(
                         (SELECT text FROM messages
-                         WHERE conversation_id = c.id AND kind = 'user'
+                         WHERE conversation_id = c.id
+                           AND kind = 'user'
+                           AND TRIM(text) != ''
+                           -- Older Codex attach imports could persist this
+                           -- native bootstrap block as a user message. It is
+                           -- not a useful conversation title; pick the first
+                           -- actual user request instead.
+                           AND LOWER(LTRIM(text)) NOT LIKE '<recommended_plugins>%'
                          ORDER BY id ASC LIMIT 1),
                         ''
                     ),

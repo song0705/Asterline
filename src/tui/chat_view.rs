@@ -947,7 +947,7 @@ mod tests {
         eprintln!("\n{view}");
 
         assert!(view.contains("Asterline"));
-        assert!(view.contains("Builder"));
+        assert!(view.contains("Builder · codex"));
         assert!(view.contains("builder → reviewer"));
         // The running member surfaces a working indicator + interrupt hint.
         assert!(view.contains("Working"));
@@ -1026,7 +1026,7 @@ mod tests {
         assert!(view.contains("› /ask      send to one member"));
         assert_eq!(
             layout.and_then(|layout| layout.completion_area),
-            Some(Rect::new(0, 9, 70, 5))
+            Some(Rect::new(0, 10, 70, 4))
         );
     }
 
@@ -1093,10 +1093,9 @@ mod tests {
         let view = format!("{}", terminal.backend());
         eprintln!("\n{view}");
 
-        // The activity line spells the profile out; the header chip abbreviates.
+        // The activity line spells the profile out; the header stays compact.
         assert!(view.contains("model: gpt-5-codex"));
         assert!(view.contains("effort: high"));
-        assert!(view.contains("·gpt-5-codex/high"));
     }
 
     #[test]

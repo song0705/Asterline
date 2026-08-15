@@ -62,8 +62,9 @@ pub fn imported_since(snapshot: ClaudeSnapshot) -> Vec<ImportedMessage> {
 }
 
 /// Return both the messages added while attached and the session identity when
-/// the transcript itself proves it. Fresh sessions are never guessed from
-/// files that merely appeared beside the project transcript.
+/// the transcript itself proves it. Fresh sessions are safe when their caller
+/// supplied Claude with a session UUID; unnamed sessions are never guessed
+/// from files that merely appeared beside the project transcript.
 pub(crate) fn imported_attach_since(snapshot: ClaudeSnapshot) -> AttachOutcome {
     let Some(root) = default_projects_root() else {
         return AttachOutcome::default();
@@ -166,13 +167,13 @@ fn imported_attach_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Att
         });
     }
 
-    // A first native session has no pre-existing id or lineage anchor. A
+    // An unnamed native session has no pre-existing id or lineage anchor. A
     // pre/post directory diff cannot prove which local CLI created a new file,
-    // so do not import or claim it. Once the user binds the session in `/team`,
-    // later attaches use the original-session delta above.
+    // so do not import or claim it. Asterline's fresh Claude attach supplies
+    // `--session-id`, so it takes the deterministic path above instead.
     AttachOutcome {
         notice: Some(
-            "the fresh Claude session is not yet bound to this member, so its transcript was not imported; select its session ID in /team before the next attach"
+            "could not identify an unnamed Claude session, so its transcript was not imported"
                 .to_string(),
         ),
         ..AttachOutcome::default()
@@ -633,13 +634,46 @@ mod tests {
     }
 
     #[test]
-    fn fresh_attach_never_guesses_a_claude_session() {
+    fn unnamed_fresh_attach_never_guesses_a_claude_session() {
         let root = fixture_root("fresh-attach");
         let snapshot = snapshot_with_root(&root, None, "/tmp/ws-fresh-claude");
         let imported = imported_attach_since_with_root(snapshot, &root);
         assert!(imported.items.is_empty());
         assert!(imported.session.is_none());
         assert!(imported.notice.is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn supplied_fresh_session_id_imports_and_binds_without_guessing() {
+        let root = fixture_root("supplied-fresh-id");
+        let cwd = "/tmp/ws-supplied-fresh-id";
+        let session_id = "3e2f3488-c08a-4d09-9cac-fc64f632a590";
+        let snapshot = snapshot_with_root(&root, Some(session_id), cwd);
+        let user = user_line("new user", "2099-06-01T00:00:00Z");
+        let assistant = assistant_line("new assistant", "2099-06-01T00:00:01Z");
+        write_session(&root, cwd, session_id, &[&user, &assistant]);
+
+        let imported = imported_attach_since_with_root(snapshot, &root);
+        assert_eq!(
+            imported.session,
+            Some(crate::domain::event::AgentSessionId(session_id.to_string()))
+        );
+        assert_eq!(
+            imported.items,
+            vec![
+                ImportedMessage {
+                    from_user: true,
+                    text: "new user".to_string(),
+                },
+                ImportedMessage {
+                    from_user: false,
+                    text: "new assistant".to_string(),
+                },
+            ]
+        );
+        assert!(imported.notice.is_none());
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -8,5 +8,6 @@ pub mod runtime;
 pub mod store;
 pub mod tui;
 
+mod managed_update;
 #[cfg(windows)]
 mod update;

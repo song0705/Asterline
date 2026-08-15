@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "asterline"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "crossterm",
  "libc",
@@ -57,6 +57,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "ureq",
+ "uuid",
  "windows-sys",
 ]
 

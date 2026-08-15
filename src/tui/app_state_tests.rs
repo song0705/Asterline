@@ -36,6 +36,37 @@ fn ready_populates_header() {
 }
 
 #[test]
+fn model_catalog_is_warmed_once_per_ast_process() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    // Seed the expected first-roster key so this unit test verifies lifecycle
+    // semantics without launching a real CLI model discovery subprocess.
+    state.model_catalog.seed(
+        BackendKind::Codex,
+        Path::new("/tmp/ws"),
+        vec!["gpt-test".to_string()],
+    );
+
+    state.warm_model_catalog_once();
+    assert!(state.model_catalog_warmed);
+    assert!(
+        state
+            .model_catalog
+            .contains(BackendKind::Codex, Path::new("/tmp/ws"))
+    );
+
+    // A later roster refresh in the same process must not launch a second
+    // catalog lookup, even if it now contains another backend.
+    state.members[0].backend = BackendKind::Claude;
+    state.warm_model_catalog_once();
+    assert!(
+        !state
+            .model_catalog
+            .contains(BackendKind::Claude, Path::new("/tmp/ws"))
+    );
+}
+
+#[test]
 fn runtime_unavailable_is_visible_and_idempotent() {
     let mut state = AppState::new(Vec::new());
 
@@ -393,10 +424,9 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
     state.toggle_drawer(Drawer::Runs);
 
     assert_eq!(state.selected_run_step(), None);
-    assert_eq!(
-        state.selected_run_stage_command().as_deref(),
-        Some("/abort")
-    );
+    assert_eq!(state.selected_run_stage_command(), None);
+    assert!(!state.stage_selected_run_action());
+    assert_eq!(state.drawer(), Some(Drawer::Runs));
 
     assert!(state.select_next_run_step());
     assert_eq!(state.selected_run_step(), Some(1));
@@ -413,10 +443,7 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
 
     state.select_newer_run();
     assert_eq!(state.selected_run_step(), None);
-    assert_eq!(
-        state.selected_run_stage_command().as_deref(),
-        Some("/abort")
-    );
+    assert_eq!(state.selected_run_stage_command(), None);
 
     assert!(state.select_next_run_step());
 
@@ -1273,24 +1300,6 @@ fn same_backend_tool_id_is_isolated_by_member() {
 }
 
 #[test]
-fn skill_picker_stages_one_shot_targeted_prompt() {
-    let mut state = AppState::new(Vec::new());
-    state.apply(ready());
-    state.set_skills(vec![crate::tui::skills::SkillInfo {
-        name: "review".to_string(),
-        description: "Review changes".to_string(),
-        path: PathBuf::from("/tmp/review/SKILL.md"),
-        backend: BackendKind::Codex,
-        invocation: "$review".to_string(),
-    }]);
-    state.toggle_drawer(Drawer::Skills);
-
-    assert!(state.stage_selected_skill());
-    assert_eq!(state.composer().text(), "@builder $review ");
-    assert_eq!(state.drawer(), None);
-}
-
-#[test]
 fn skill_picker_preserves_the_discovered_invocation() {
     let skill = crate::tui::skills::SkillInfo {
         name: "frontend-design".to_string(),
@@ -1541,6 +1550,32 @@ fn queued_member_remains_busy_and_cannot_attach() {
         member: MemberId::new("builder"),
     });
     assert!(state.take_attach_request().is_some());
+}
+
+#[test]
+fn fresh_claude_attach_is_given_a_deterministic_session_id() {
+    let mut ready_event = ready();
+    if let RuntimeEvent::Ready { members, .. } = &mut ready_event {
+        members[0].backend = BackendKind::Claude;
+        members[0].session = None;
+    }
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready_event);
+
+    assert_eq!(state.request_attach(0), Some(MemberId::new("builder")));
+    state.apply(RuntimeEvent::AttachGranted {
+        member: MemberId::new("builder"),
+    });
+    let request = state
+        .take_attach_request()
+        .expect("fresh Claude attach request");
+    assert!(request.session.is_none());
+    let fresh = request
+        .fresh_session
+        .as_ref()
+        .expect("Asterline-owned Claude UUID");
+    assert!(uuid::Uuid::parse_str(fresh.as_str()).is_ok());
+    assert_eq!(request.transcript_session(), Some(fresh.as_str()));
 }
 
 #[test]
@@ -1835,27 +1870,6 @@ fn team_drawer_editor_can_add_and_apply_member() {
 }
 
 #[test]
-fn slash_model_picker_opens_the_default_members_catalog() {
-    let mut state = AppState::new(Vec::new());
-    state.apply(ready());
-
-    state.open_model_picker(None).unwrap();
-
-    assert_eq!(state.drawer(), Some(Drawer::Team));
-    let editor = state.team_editor().expect("Team editor");
-    assert_eq!(
-        editor.selected_member().map(|member| &member.id),
-        Some(&MemberId::new("builder"))
-    );
-    assert_eq!(
-        editor.selected_field(),
-        crate::tui::team_builder::Field::Model
-    );
-    assert!(editor.field_mode());
-    assert!(editor.model_picker_applies_immediately());
-}
-
-#[test]
 fn targeted_completion_accepts_a_member_display_name_case_insensitively() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -1865,13 +1879,18 @@ fn targeted_completion_accepts_a_member_display_name_case_insensitively() {
         .completion()
         .expect("Codex completion for display name");
     assert_eq!(completion.title, "member actions & skills");
-    assert!(completion.items.iter().any(|item| item.insert == "/attach"));
-    assert!(completion.items.iter().any(|item| item.insert == "/model"));
+    assert!(
+        completion
+            .items
+            .iter()
+            .any(|item| item.insert == "/attach ")
+    );
+    assert!(!completion.items.iter().any(|item| item.insert == "/model"));
     assert!(!completion.items.iter().any(|item| item.insert == "/fast"));
 }
 
 #[test]
-fn slash_model_picker_reuses_catalog_after_the_drawer_closes() {
+fn team_editor_reuses_model_catalog_after_the_drawer_closes() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
     state.model_catalog.seed(
@@ -1880,13 +1899,8 @@ fn slash_model_picker_reuses_catalog_after_the_drawer_closes() {
         vec!["gpt-5.6-sol".to_string()],
     );
 
-    state.open_model_picker(None).unwrap();
-    assert!(
-        state
-            .team_editor()
-            .and_then(|editor| editor.model_picker())
-            .is_some()
-    );
+    state.toggle_drawer(Drawer::Team);
+    assert!(state.team_editor().is_some());
     state.close_drawer();
     assert!(
         state
@@ -1894,57 +1908,12 @@ fn slash_model_picker_reuses_catalog_after_the_drawer_closes() {
             .contains(BackendKind::Codex, Path::new("/tmp/ws"))
     );
 
-    state.open_model_picker(None).unwrap();
-    assert!(
-        state
-            .team_editor()
-            .and_then(|editor| editor.model_picker())
-            .is_some()
-    );
-}
-
-#[test]
-fn local_member_controls_resolve_display_names_before_runtime_delivery() {
-    let mut state = AppState::new(Vec::new());
-    state.apply(ready());
-
-    let command = state.normalize_member_control(UiCommand::SetMemberModelAndEffort {
-        member: MemberId::new("Builder"),
-        model: Some("gpt-5.6-sol".to_string()),
-        effort: Some(Effort::High),
-    });
-
-    assert_eq!(
-        command,
-        UiCommand::SetMemberModelAndEffort {
-            member: MemberId::new("builder"),
-            model: Some("gpt-5.6-sol".to_string()),
-            effort: Some(Effort::High),
-        }
-    );
-}
-
-#[test]
-fn bare_model_picker_requires_an_explicit_member_for_all_default() {
-    let mut event = ready();
-    if let RuntimeEvent::Ready {
-        default_target,
-        members,
-        ..
-    } = &mut event
-    {
-        *default_target = Some(DefaultTarget::All);
-        let mut reviewer = members[0].clone();
-        reviewer.id = MemberId::new("reviewer");
-        reviewer.display_name = "Reviewer".to_string();
-        members.push(reviewer);
-    }
-    let mut state = AppState::new(Vec::new());
-    state.apply(event);
-
-    assert!(
-        matches!(state.open_model_picker(None), Err(message) if message.contains("needs a member"))
-    );
+    state.toggle_drawer(Drawer::Team);
+    assert!(state.team_editor().is_some_and(|editor| {
+        editor
+            .model_catalog()
+            .contains(BackendKind::Codex, Path::new("/tmp/ws"))
+    }));
 }
 
 #[test]
@@ -1961,7 +1930,17 @@ fn slash_opens_command_popup_and_accept_inserts() {
 }
 
 #[test]
-fn targeted_skill_completion_and_picker_exclude_other_backends() {
+fn accepting_a_no_argument_command_still_leaves_a_trailing_space() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.insert_text("/te");
+
+    assert!(state.accept_completion());
+    assert_eq!(state.composer().text(), "/team ");
+}
+
+#[test]
+fn targeted_skill_completion_excludes_other_backends() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
     state.members.push(MemberView {
@@ -2004,20 +1983,8 @@ fn targeted_skill_completion_and_picker_exclude_other_backends() {
             .iter()
             .map(|item| item.insert.as_str())
             .collect::<Vec<_>>(),
-        vec!["/attach", "/model", "/plugin:wake "]
+        vec!["/attach ", "/plugin:wake "]
     );
-
-    state.clear_composer();
-    state.toggle_drawer(Drawer::Skills);
-    assert_eq!(
-        state
-            .target_skills()
-            .map(|skill| skill.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["wake"]
-    );
-    assert!(state.stage_selected_skill());
-    assert_eq!(state.composer().text(), "@claude /plugin:wake ");
 }
 
 #[test]

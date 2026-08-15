@@ -45,10 +45,10 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
     match run.status {
         RunStatus::Running => Some((
             if let Some(head) = mode_head {
-                format!("{head}{progress} · /runs details · /abort cancel")
+                format!("{head}{progress} · /runs details · Esc cancel")
             } else {
                 format!(
-                    "● {} running{progress} · /runs details · /abort cancel",
+                    "● {} running{progress} · /runs details · Esc cancel",
                     run.id
                 )
             },
@@ -56,10 +56,10 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
         )),
         RunStatus::Verifying => Some((
             if let Some(head) = mode_head {
-                format!("{head}{progress} · /runs details · /abort cancel")
+                format!("{head}{progress} · /runs details · Esc cancel")
             } else {
                 format!(
-                    "⏳ {} verifying{progress} · /runs details · /abort cancel",
+                    "⏳ {} verifying{progress} · /runs details · Esc cancel",
                     run.id
                 )
             },
@@ -298,13 +298,12 @@ pub(crate) fn drawer_runs(state: &AppState, width: usize) -> Vec<Line<'static>> 
                 Span::styled(run_next_action(selected), theme::text()),
             ]));
         }
-        if !is_completed_brainstorm(selected) {
+        if !is_completed_brainstorm(selected)
+            && let Some(action) = state.selected_run_stage_command()
+        {
             lines.push(Line::from(vec![
                 Span::styled(" Action: ", theme::muted()),
-                Span::styled(
-                    state.selected_run_stage_command().unwrap_or_default(),
-                    theme::accent_bold(),
-                ),
+                Span::styled(action, theme::accent_bold()),
             ]));
         }
         if let Some(dispatch) = state.selected_run_dispatch_command() {
@@ -870,11 +869,11 @@ pub(crate) fn run_next_action(run: &RunSummary) -> String {
     }
 
     match run.status {
-        RunStatus::Running => {
-            run_step_focus(run).unwrap_or_else(|| "watch the chat, or /abort to cancel".to_string())
-        }
+        RunStatus::Running => run_step_focus(run).unwrap_or_else(|| {
+            "watch the chat; close this drawer, then press Esc to cancel".to_string()
+        }),
         RunStatus::Verifying => {
-            "verification is running in the background; /abort cancels it".to_string()
+            "verification is running; close this drawer, then press Esc to cancel".to_string()
         }
         RunStatus::Done if run.verification.is_none() => {
             "run the Action command to record a check".to_string()

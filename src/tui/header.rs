@@ -19,11 +19,18 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     let width = area.width as usize;
 
     // Line 1: title on the left, workspace path on the right.
-    let title = format!(
-        " Asterline · {} · mode:{}",
-        state.team(),
-        state.active_mode()
-    );
+    // `custom` is only the bootstrap builder's placeholder team name. It is
+    // not a model, profile, or execution mode, so it should not consume the
+    // most visible part of the header.
+    let title = if state.team() == "custom" {
+        format!(" Asterline · mode:{}", state.active_mode())
+    } else {
+        format!(
+            " Asterline · {} · mode:{}",
+            state.team(),
+            state.active_mode()
+        )
+    };
     let workspace = state.workspace().to_string();
     let title_width = display_width(&title);
     let space = width.saturating_sub(title_width).saturating_sub(1);
@@ -42,34 +49,23 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         Span::styled(workspace, theme::muted()),
     ]);
 
-    // Line 2: member chips.
+    // Line 2: compact member chips. Runtime status belongs in the footer and
+    // run views, leaving this roster focused on names and backends.
     let mut chips = vec![Span::raw(" ")];
     for (i, member) in state.members().iter().enumerate() {
         if i > 0 {
-            chips.push(Span::styled("  ·  ", theme::muted()));
+            chips.push(Span::raw("  "));
         }
-        let glyph = match member.status {
-            MemberStatus::Running | MemberStatus::Queued | MemberStatus::Waiting => {
-                status_indicator::spinner()
-            }
-            MemberStatus::NeedsApproval => "⚠",
-            MemberStatus::Failed => "✘",
-            _ => "○",
-        };
-        let selected = state.header_selected() == Some(i);
-        let (glyph_style, name_style) = if selected {
-            (theme::selection(), theme::selection())
+        let name_style = if state.header_selected() == Some(i) {
+            theme::selection()
         } else {
-            (
-                ratatui::style::Style::default().fg(theme::status_color(member.status)),
-                theme::backend_bold(member.backend),
-            )
+            theme::backend_bold(member.backend)
         };
-        chips.push(Span::styled(format!("{glyph} "), glyph_style));
         chips.push(Span::styled(member.display_name.clone(), name_style));
-        if let Some(profile) = chip_profile(member) {
-            chips.push(Span::styled(format!(" ·{profile}"), theme::muted()));
-        }
+        chips.push(Span::styled(
+            format!(" · {}", member.backend.as_str()),
+            theme::muted(),
+        ));
     }
     if state.members().is_empty() {
         chips.push(Span::styled("starting…", theme::muted()));
@@ -84,26 +80,9 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     );
 }
 
-/// `model/effort` chip suffix; omitted when neither is configured.
-fn chip_profile(member: &MemberView) -> Option<String> {
-    match (member.model.as_deref(), member.effort) {
-        (None, None) => None,
-        (model, effort) => {
-            let mut parts = Vec::new();
-            if let Some(model) = model {
-                parts.push(truncate_width(model, 16));
-            }
-            if let Some(effort) = effort {
-                parts.push(effort.as_str().to_string());
-            }
-            Some(parts.join("/"))
-        }
-    }
-}
-
 pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     // A disconnected runtime is terminal for this TUI instance. Do not leave
-    // stale run/verification hints suggesting that /abort is still usable.
+    // stale run/verification hints suggesting cancellation is still available.
     if !state.runtime_available() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -233,7 +212,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     } else if parts.is_empty() {
         // Idle: one short, faint key-hint line.
         parts.push(Span::styled(
-            "@member first · Enter send · Ctrl+O tools · /skills · /help",
+            "@member first · Enter send · Ctrl+O tools · /help",
             theme::muted(),
         ));
     }

@@ -8,7 +8,7 @@ impl TeamRuntime {
         }
         if self.mode_sessions.values().next().is_some() || !self.run_turns.is_empty() {
             step.events.push(RuntimeEvent::Notice(
-                "a run is already active — /abort it first".to_string(),
+                "a run is already active — press Esc to cancel it first".to_string(),
             ));
             return;
         }
@@ -476,7 +476,7 @@ impl TeamRuntime {
         };
         if run.status == RunStatus::Verifying {
             step.events.push(RuntimeEvent::Notice(format!(
-                "{} is verifying; /abort before marking it blocked",
+                "{} is verifying; press Esc before marking it blocked",
                 run.id
             )));
             return;
@@ -510,7 +510,7 @@ impl TeamRuntime {
             || self.run_turns.values().any(|active| *active == run.id)
         {
             step.events.push(RuntimeEvent::Notice(format!(
-                "{} is an active mode run — /abort it before manual verification",
+                "{} is an active mode run — press Esc to cancel it before manual verification",
                 run.id
             )));
             return;

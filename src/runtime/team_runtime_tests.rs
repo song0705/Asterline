@@ -106,6 +106,101 @@ fn user_message_starts_a_run_for_default_member() {
 }
 
 #[test]
+fn native_codex_approval_is_persisted_and_returns_the_user_decision_to_the_runner() {
+    let mut rt = runtime();
+    rt.on_ui_command(user("make the change"));
+
+    let requested = rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::NativeApprovalRequested {
+            request_id: 41,
+            action: "Codex command".to_string(),
+            body: "git status".to_string(),
+        },
+    );
+    let id = requested
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequested {
+                id,
+                member: Some(member),
+                action,
+                body,
+            } if member == &MemberId::new("builder")
+                && action == "Codex command"
+                && body == "git status" =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("native approval should be shown to the user");
+    assert!(
+        requested.actions.is_empty(),
+        "the original turn stays paused"
+    );
+
+    let resolved = rt.on_ui_command(UiCommand::Approve {
+        id,
+        decision: ApprovalDecision::Approve,
+    });
+    assert!(
+        resolved.actions.is_empty(),
+        "do not enqueue a second prompt"
+    );
+    assert!(matches!(
+        resolved.runner_controls.as_slice(),
+        [RunnerControl::ResolveNativeApproval {
+            member,
+            request_id: 41,
+            decision: ApprovalDecision::Approve,
+        }] if member == &MemberId::new("builder")
+    ));
+}
+
+#[test]
+fn cancelling_a_member_rejects_its_native_codex_approval() {
+    let mut rt = runtime();
+    rt.on_ui_command(user("make the change"));
+    let requested = rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::NativeApprovalRequested {
+            request_id: 7,
+            action: "Codex file change".to_string(),
+            body: "write src/main.rs".to_string(),
+        },
+    );
+    let id = requested
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("native approval should be pending");
+
+    let cancelled = rt.on_ui_command(UiCommand::Cancel {
+        member: Some(MemberId::new("builder")),
+    });
+    assert!(cancelled.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalResolved {
+            id: resolved,
+            decision: ApprovalDecision::Reject,
+        } if *resolved == id
+    )));
+    assert!(matches!(
+        cancelled.runner_controls.as_slice(),
+        [RunnerControl::ResolveNativeApproval {
+            member,
+            request_id: 7,
+            decision: ApprovalDecision::Reject,
+        }] if member == &MemberId::new("builder")
+    ));
+}
+
+#[test]
 fn user_message_is_not_dispatched_when_persistence_fails() {
     let path = std::env::temp_dir().join(format!(
         "asterline-store-failure-{}.sqlite3",
@@ -481,7 +576,7 @@ fn new_chat_is_rejected_while_a_member_is_active() {
     assert!(rejected.events.iter().any(|event| matches!(
         event,
         RuntimeEvent::Notice(text)
-            if text.contains("cannot start a new chat") && text.contains("/abort")
+            if text.contains("cannot start a new chat") && text.contains("press Esc")
     )));
 }
 
@@ -1449,197 +1544,6 @@ fn codex_prompt_includes_current_team_cards() {
 }
 
 #[test]
-fn set_effort_updates_member_and_carries_into_runs() {
-    let mut rt = runtime();
-    let builder = MemberId::new("builder");
-
-    let step = rt.on_ui_command(UiCommand::SetEffort {
-        member: builder.clone(),
-        effort: Effort::High,
-    });
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::MemberEffort { effort, .. } if *effort == Some(Effort::High)
-    )));
-
-    let step = rt.on_ui_command(user("go"));
-    assert_eq!(step.actions[0].effort, Some(Effort::High));
-}
-
-#[test]
-fn set_member_model_persists_and_rebuilds_the_next_runner() {
-    let mut rt = runtime();
-    let builder = MemberId::new("builder");
-
-    let step = rt.on_ui_command(UiCommand::SetMemberModel {
-        member: builder.clone(),
-        model: Some("gpt-5.6-sol".to_string()),
-    });
-
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::MemberModel { member, model }
-            if member == &builder && model.as_deref() == Some("gpt-5.6-sol")
-    )));
-    assert!(step.runner_changes.iter().any(|change| matches!(
-        change,
-        RunnerChange::Upsert { member, .. }
-            if member.id == builder && member.model.as_deref() == Some("gpt-5.6-sol")
-    )));
-    assert_eq!(
-        rt.config
-            .member(&builder)
-            .and_then(|member| member.model.as_deref()),
-        Some("gpt-5.6-sol")
-    );
-}
-
-#[test]
-fn model_picker_configuration_persists_model_and_effort_with_one_runner_update() {
-    let mut rt = runtime();
-    let builder = MemberId::new("builder");
-
-    let step = rt.on_ui_command(UiCommand::SetMemberModelAndEffort {
-        member: builder.clone(),
-        model: Some("gpt-5.6-sol".to_string()),
-        effort: Some(Effort::High),
-    });
-
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::MemberModel { member, model }
-            if member == &builder && model.as_deref() == Some("gpt-5.6-sol")
-    )));
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::MemberEffort { member, effort }
-            if member == &builder && *effort == Some(Effort::High)
-    )));
-    assert_eq!(
-        step.runner_changes
-            .iter()
-            .filter(|change| matches!(change, RunnerChange::Upsert { .. }))
-            .count(),
-        1
-    );
-    let member = rt.config.member(&builder).unwrap();
-    assert_eq!(member.model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(member.effort, Some(Effort::High));
-}
-
-#[test]
-fn model_picker_configuration_keeps_both_values_when_snapshot_persistence_fails() {
-    let path = std::env::temp_dir().join(format!(
-        "asterline-model-picker-snapshot-failure-{}.sqlite3",
-        std::process::id()
-    ));
-    remove_sqlite_test_files(&path);
-    let mut config = team();
-    config.members[0].model = Some("gpt-5.4".to_string());
-    config.members[0].effort = Some(Effort::Low);
-    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
-    let external = Connection::open(&path).unwrap();
-    external
-        .execute_batch(
-            "CREATE TRIGGER fail_model_picker_snapshot
-             BEFORE UPDATE OF team_json ON conversation_snapshots
-             BEGIN SELECT RAISE(ABORT, 'snapshot unavailable'); END;",
-        )
-        .unwrap();
-
-    let changed = rt.on_ui_command(UiCommand::SetMemberModelAndEffort {
-        member: MemberId::new("builder"),
-        model: Some("gpt-5.6-sol".to_string()),
-        effort: Some(Effort::High),
-    });
-
-    assert!(!changed.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::MemberModel { .. } | RuntimeEvent::MemberEffort { .. }
-    )));
-    assert!(changed.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(text) if text.contains("could not save member model and effort")
-    )));
-    let member = rt.config.member(&MemberId::new("builder")).unwrap();
-    assert_eq!(member.model.as_deref(), Some("gpt-5.4"));
-    assert_eq!(member.effort, Some(Effort::Low));
-
-    drop(external);
-    drop(rt);
-    remove_sqlite_test_files(&path);
-}
-
-#[test]
-fn set_effort_does_not_commit_memory_or_success_event_when_snapshot_fails() {
-    let path = std::env::temp_dir().join(format!(
-        "asterline-effort-snapshot-failure-{}.sqlite3",
-        std::process::id()
-    ));
-    remove_sqlite_test_files(&path);
-    let mut config = team();
-    config.members[0].effort = Some(Effort::Low);
-    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
-    let external = Connection::open(&path).unwrap();
-    external
-        .execute_batch(
-            "CREATE TRIGGER fail_effort_snapshot
-             BEFORE UPDATE OF team_json ON conversation_snapshots
-             BEGIN SELECT RAISE(ABORT, 'snapshot unavailable'); END;",
-        )
-        .unwrap();
-
-    let changed = rt.on_ui_command(UiCommand::SetEffort {
-        member: MemberId::new("builder"),
-        effort: Effort::High,
-    });
-
-    assert!(
-        !changed
-            .events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::MemberEffort { .. }))
-    );
-    assert!(changed.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(text) if text.contains("could not save member effort")
-    )));
-    let run = rt.on_ui_command(user("use retained effort"));
-    assert_eq!(run.actions[0].effort, Some(Effort::Low));
-    drop(external);
-    drop(rt);
-    remove_sqlite_test_files(&path);
-}
-
-#[test]
-fn set_effort_restores_from_active_snapshot_on_restart() {
-    let path = std::env::temp_dir().join(format!(
-        "asterline-effort-restart-{}.sqlite3",
-        std::process::id()
-    ));
-    remove_sqlite_test_files(&path);
-    let mut launch = team();
-    launch.members[0].effort = Some(Effort::Low);
-    {
-        let mut rt = TeamRuntime::new(launch.clone(), SqliteStore::open(&path).unwrap())
-            .with_approvals(false);
-        rt.on_ui_command(UiCommand::SetEffort {
-            member: MemberId::new("builder"),
-            effort: Effort::High,
-        });
-    }
-
-    let store = SqliteStore::open(&path).unwrap();
-    let restored = store.restore_active_team_config(&launch).unwrap();
-    let mut rt = TeamRuntime::new(restored, store).with_approvals(false);
-    let run = rt.on_ui_command(user("use restored effort"));
-
-    assert_eq!(run.actions[0].effort, Some(Effort::High));
-    drop(rt);
-    remove_sqlite_test_files(&path);
-}
-
-#[test]
 fn replace_team_model_and_effort_carry_into_runner_and_run() {
     let mut rt = runtime();
     let mut members = team().members;
@@ -1664,25 +1568,6 @@ fn replace_team_model_and_effort_carry_into_runner_and_run() {
     )));
     let run = rt.on_ui_command(user("go"));
     assert_eq!(run.actions[0].effort, Some(Effort::Xhigh));
-}
-
-#[test]
-fn set_effort_rejects_levels_the_backend_cannot_use() {
-    let mut rt = runtime();
-    let step = rt.on_ui_command(UiCommand::SetEffort {
-        member: MemberId::new("reviewer"),
-        effort: Effort::Ultra,
-    });
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(message) if message.contains("does not support ultra")
-    )));
-    assert!(
-        !step
-            .events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::MemberEffort { .. }))
-    );
 }
 
 #[test]

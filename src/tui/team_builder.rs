@@ -24,7 +24,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::adapter::DiscoveredModel;
+use crate::adapter::{DiscoveredCatalog, DiscoveredModel};
 use crate::domain::config::{DetectedBackends, default_member, default_team};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
@@ -34,13 +34,14 @@ use crate::tui::theme;
 
 #[derive(Debug)]
 enum ModelLoad {
-    Loading(Receiver<Result<Vec<DiscoveredModel>, String>>),
-    Ready(Result<Vec<DiscoveredModel>, String>),
+    Loading(Receiver<Result<DiscoveredCatalog, String>>),
+    Ready(Result<DiscoveredCatalog, String>),
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ModelCatalog {
     loads: HashMap<(BackendKind, PathBuf), ModelLoad>,
+    frozen: bool,
 }
 
 pub(crate) enum ModelChoices {
@@ -50,6 +51,54 @@ pub(crate) enum ModelChoices {
 }
 
 impl ModelCatalog {
+    /// Begin an asynchronous lookup ahead of opening a model picker. Repeated
+    /// calls for the same backend and working directory are coalesced.
+    pub(crate) fn preload(&mut self, backend: BackendKind, cwd: &Path) {
+        if !self.frozen {
+            self.request(backend, cwd);
+        }
+    }
+
+    /// Prevent follow-up UI actions from spawning more model-list commands.
+    /// The normal Team UI freezes its initial roster catalog after startup;
+    /// the interactive first-run builder intentionally leaves its own catalog
+    /// open while the user is still composing a roster.
+    pub(crate) fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
+    /// Retry exactly one catalog that failed during this `ast` session. A
+    /// successful or still-loading catalog is retained, so every member with
+    /// the same backend and working directory continues to share it.
+    pub(crate) fn refresh_failed(
+        &mut self,
+        backend: BackendKind,
+        cwd: &Path,
+    ) -> Result<(), String> {
+        let key = (backend, cwd.to_path_buf());
+        match self.loads.get(&key) {
+            Some(ModelLoad::Ready(Err(_))) => {
+                self.loads.remove(&key);
+                // This is the sole post-startup escape hatch: an explicit
+                // retry of a failure selected by the user in the Team editor.
+                self.request(backend, cwd);
+                Ok(())
+            }
+            Some(ModelLoad::Loading(_)) => Err(format!(
+                "{} model catalog is still loading",
+                backend.as_str()
+            )),
+            Some(ModelLoad::Ready(Ok(_))) => Err(format!(
+                "{} model catalog is already loaded for this ast session",
+                backend.as_str()
+            )),
+            None => Err(format!(
+                "{} was not in the startup roster; restart ast to load its models",
+                backend.as_str()
+            )),
+        }
+    }
+
     /// Start discovery without cloning a ready model list. This is used by
     /// background warm-up paths that can be called on every TUI frame.
     fn request(&mut self, backend: BackendKind, cwd: &Path) {
@@ -60,7 +109,10 @@ impl ModelCatalog {
         let worker_cwd = cwd.to_path_buf();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(crate::adapter::discover_models(backend, &worker_cwd));
+            let _ = tx.send(crate::adapter::models::discover_catalog(
+                backend,
+                &worker_cwd,
+            ));
         });
         self.loads.insert(key, ModelLoad::Loading(rx));
     }
@@ -84,19 +136,13 @@ impl ModelCatalog {
         }
     }
 
-    /// Forget a completed failed lookup so the next explicit request starts a
-    /// fresh discovery.  Failures can be transient (for example, a CLI that
-    /// is still signing in), whereas an in-flight lookup must never be
-    /// duplicated.
-    pub(crate) fn retry(&mut self, backend: BackendKind, cwd: &Path) {
-        let key = (backend, cwd.to_path_buf());
-        if matches!(self.loads.get(&key), Some(ModelLoad::Ready(Err(_)))) {
-            self.loads.remove(&key);
-        }
-    }
-
     pub(crate) fn models(&mut self, backend: BackendKind, cwd: &Path) -> ModelChoices {
         let key = (backend, cwd.to_path_buf());
+        if self.frozen && !self.loads.contains_key(&key) {
+            return ModelChoices::Failed(
+                "not loaded for this ast session; restart to refresh models".to_string(),
+            );
+        }
         self.request(backend, cwd);
         let Some(load) = self.loads.get_mut(&key) else {
             return ModelChoices::Loading;
@@ -120,18 +166,34 @@ impl ModelCatalog {
     pub(crate) fn seed(&mut self, backend: BackendKind, cwd: &Path, models: Vec<String>) {
         self.loads.insert(
             (backend, cwd.to_path_buf()),
-            ModelLoad::Ready(Ok(models
-                .into_iter()
-                .map(DiscoveredModel::simple)
-                .collect())),
+            ModelLoad::Ready(Ok(DiscoveredCatalog {
+                models: models
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| {
+                        let mut model = DiscoveredModel::simple(id);
+                        model.is_default = index == 0;
+                        model
+                    })
+                    .collect(),
+                native_permission: None,
+            })),
         );
     }
 
     #[cfg(test)]
-    pub(crate) fn seed_error(&mut self, backend: BackendKind, cwd: &Path, error: &str) {
+    pub(crate) fn seed_with_native_permission(
+        &mut self,
+        backend: BackendKind,
+        cwd: &Path,
+        permission: &str,
+    ) {
         self.loads.insert(
             (backend, cwd.to_path_buf()),
-            ModelLoad::Ready(Err(error.to_string())),
+            ModelLoad::Ready(Ok(DiscoveredCatalog {
+                models: Vec::new(),
+                native_permission: Some(permission.to_string()),
+            })),
         );
     }
 
@@ -154,86 +216,114 @@ impl ModelCatalog {
         )
     }
 
+    fn has_ready_catalog(&self, backend: BackendKind, cwd: &Path) -> bool {
+        matches!(
+            self.loads.get(&(backend, cwd.to_path_buf())),
+            Some(ModelLoad::Ready(Ok(_)))
+        )
+    }
+
     fn discovered_model(
         &self,
         backend: BackendKind,
         cwd: &Path,
         selected: Option<&str>,
     ) -> Option<&DiscoveredModel> {
-        let ModelLoad::Ready(Ok(models)) = self.loads.get(&(backend, cwd.to_path_buf()))? else {
+        let ModelLoad::Ready(Ok(catalog)) = self.loads.get(&(backend, cwd.to_path_buf()))? else {
             return None;
         };
         match selected {
-            Some(id) => models.iter().find(|model| model.id == id),
-            None => models
-                .iter()
-                .find(|model| model.is_default)
-                .or_else(|| models.first()),
+            Some(id) => catalog.models.iter().find(|model| model.id == id),
+            None => catalog.models.iter().find(|model| model.is_default),
+        }
+    }
+
+    /// Show a backend's configured permission default when Asterline leaves it
+    /// unmodified. Codex is excluded: Asterline deliberately sends its product
+    /// default (`never`) rather than inheriting a local CLI policy.
+    pub(crate) fn native_permission_label(
+        &self,
+        member: &TeamMember,
+        workspace: &Path,
+    ) -> Option<String> {
+        if member.backend == BackendKind::Codex {
+            return None;
+        }
+        if !matches!(member.permission_mode, None | Some(PermissionMode::Default)) {
+            return None;
+        }
+        let cwd = member.resolved_cwd(workspace);
+        match self.loads.get(&(member.backend, cwd)) {
+            Some(ModelLoad::Loading(_)) => Some("loading…".to_string()),
+            Some(ModelLoad::Ready(Ok(catalog))) => catalog.native_permission.clone(),
+            Some(ModelLoad::Ready(Err(_))) => Some("unavailable".to_string()),
+            None => None,
         }
     }
 
     pub(crate) fn model_label(&self, member: &TeamMember, workspace: &Path) -> String {
         let cwd = member.resolved_cwd(workspace);
         let discovered = self.discovered_model(member.backend, &cwd, member.model.as_deref());
-        match (&member.model, discovered) {
+        let label = match (&member.model, discovered) {
             (None, Some(model)) => model.name.clone(),
             (None, None) if self.is_loading_for(member.backend, &cwd) => "loading…".to_string(),
             (None, None) if self.is_failed_for(member.backend, &cwd) => "unavailable".to_string(),
+            // A successful catalog need not nominate a default model. It
+            // still gives the picker real choices, so calling this state "not
+            // loaded" made the field contradict the picker.
+            (None, None) if self.has_ready_catalog(member.backend, &cwd) => {
+                "CLI default".to_string()
+            }
+            (None, None) if self.frozen => "not preloaded at startup".to_string(),
             (None, None) => "CLI default".to_string(),
             (Some(id), Some(model)) if model.name != *id => format!("{} · {id}", model.name),
             (Some(id), _) => id.clone(),
-        }
-    }
+        };
 
-    pub(crate) fn efforts(&self, member: &TeamMember, workspace: &Path) -> Vec<Effort> {
-        let cwd = member.resolved_cwd(workspace);
-        let discovered = self.discovered_model(member.backend, &cwd, member.model.as_deref());
-        if let Some(model) = discovered
-            && !model.supported_efforts.is_empty()
-        {
-            return model.supported_efforts.clone();
+        // Agy commonly encodes the reasoning tier in the selected model name
+        // (for example `gemini-…-high`), so showing it again is noise. Codex
+        // and Grok report it separately in their catalogs; Claude only has a
+        // value here when the member explicitly configured one.
+        let effort = if member.backend == BackendKind::Agy {
+            None
+        } else {
+            member
+                .effort
+                .or_else(|| discovered.and_then(|model| model.default_effort))
+        };
+        match effort {
+            Some(effort) => format!("{label} · {}", effort.as_str()),
+            None => label,
         }
-        backend_efforts(member.backend).to_vec()
-    }
-
-    pub(crate) fn effort_label(&self, member: &TeamMember, workspace: &Path) -> String {
-        if let Some(effort) = member.effort {
-            return effort.as_str().to_string();
-        }
-        let cwd = member.resolved_cwd(workspace);
-        if self.is_loading_for(member.backend, &cwd) {
-            return "loading…".to_string();
-        }
-        self.discovered_model(member.backend, &cwd, member.model.as_deref())
-            .and_then(|model| model.default_effort)
-            .map_or_else(
-                || "default".to_string(),
-                |effort| effort.as_str().to_string(),
-            )
     }
 
     pub(crate) fn backend_summary(&self, backend: BackendKind, cwd: &Path) -> String {
         match self.loads.get(&(backend, cwd.to_path_buf())) {
+            None if self.frozen => "installed · models not loaded this session".to_string(),
             None => "installed · models load when selected".to_string(),
             Some(ModelLoad::Loading(_)) => "installed · loading models…".to_string(),
             Some(ModelLoad::Ready(Err(err))) => {
                 format!("installed · model discovery failed: {}", one_line(err, 42))
             }
-            Some(ModelLoad::Ready(Ok(models))) => {
-                let model_names = models
+            Some(ModelLoad::Ready(Ok(catalog))) => {
+                let model_names = catalog
+                    .models
                     .iter()
                     .take(3)
                     .map(|model| model.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let suffix = if models.len() > 3 { ", …" } else { "" };
-                let mut efforts = models
+                let suffix = if catalog.models.len() > 3 {
+                    ", …"
+                } else {
+                    ""
+                };
+                let mut efforts = catalog
+                    .models
                     .iter()
                     .flat_map(|model| model.supported_efforts.iter().copied())
                     .collect::<Vec<_>>();
-                if efforts.is_empty() {
-                    efforts.extend_from_slice(backend_efforts(backend));
-                } else {
+                if !efforts.is_empty() {
                     efforts.sort_by_key(|effort| effort_rank(*effort));
                     efforts.dedup();
                 }
@@ -242,9 +332,14 @@ impl ModelCatalog {
                     .map(|effort| effort.as_str())
                     .collect::<Vec<_>>()
                     .join("/");
+                let effort_suffix = if efforts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · effort {efforts}")
+                };
                 format!(
-                    "installed · {} model(s): {model_names}{suffix} · effort {efforts}",
-                    models.len()
+                    "installed · {} model(s): {model_names}{suffix}{effort_suffix}",
+                    catalog.models.len()
                 )
             }
         }
@@ -277,9 +372,9 @@ fn one_line(value: &str, max: usize) -> String {
     }
 }
 
-fn model_choices(result: &Result<Vec<DiscoveredModel>, String>) -> ModelChoices {
+fn model_choices(result: &Result<DiscoveredCatalog, String>) -> ModelChoices {
     match result {
-        Ok(models) => ModelChoices::Ready(models.clone()),
+        Ok(catalog) => ModelChoices::Ready(catalog.models.clone()),
         Err(err) => ModelChoices::Failed(err.clone()),
     }
 }
@@ -309,11 +404,10 @@ impl ModelChoice {
         }
     }
 
-    fn supported_efforts(&self, backend: BackendKind) -> &[Effort] {
-        match &self.model {
-            Some(model) if !model.supported_efforts.is_empty() => &model.supported_efforts,
-            _ => backend_efforts(backend),
-        }
+    fn supported_efforts(&self) -> &[Effort] {
+        self.model
+            .as_ref()
+            .map_or(&[], |model| &model.supported_efforts)
     }
 
     fn default_effort(&self) -> Option<Effort> {
@@ -327,15 +421,22 @@ impl ModelChoice {
         )
     }
 
-    fn effort_choices_label(&self, backend: BackendKind) -> String {
+    fn effort_choices_label(&self) -> String {
         std::iter::once("default")
             .chain(
-                self.supported_efforts(backend)
+                self.ordered_supported_efforts()
                     .iter()
                     .map(|effort| effort.as_str()),
             )
             .collect::<Vec<_>>()
             .join(" · ")
+    }
+
+    fn ordered_supported_efforts(&self) -> Vec<Effort> {
+        let mut efforts = self.supported_efforts().to_vec();
+        efforts.sort_by_key(|effort| effort_rank(*effort));
+        efforts.dedup();
+        efforts
     }
 
     pub(crate) fn description(&self) -> Option<&str> {
@@ -361,13 +462,16 @@ impl ModelPicker {
         current_effort: Option<Effort>,
         models: Vec<DiscoveredModel>,
     ) -> Self {
-        // "CLI default" and "pin the currently discovered default model" are
-        // distinct choices. Always retain the former so a user can undo a
-        // previous explicit model choice even when discovery succeeds.
-        let mut options = vec![ModelChoice {
-            value: None,
-            model: None,
-        }];
+        // Once the CLI gives us concrete models, make its actual default the
+        // selected entry instead of obscuring it behind a generic `default`.
+        // Keep `default` only as the empty-catalog fallback.
+        let mut options = Vec::new();
+        if models.is_empty() {
+            options.push(ModelChoice {
+                value: None,
+                model: None,
+            });
+        }
         if let Some(current) = current
             && !models.iter().any(|model| model.id == current)
         {
@@ -386,9 +490,11 @@ impl ModelPicker {
                     .iter()
                     .position(|choice| choice.value.as_deref() == Some(current))
             })
-            // With no explicit configuration, make the semantic default
-            // visible: leave model choice to the CLI rather than pinning the
-            // catalog's current default as an explicit member setting.
+            .or_else(|| {
+                options
+                    .iter()
+                    .position(|choice| choice.model.as_ref().is_some_and(|model| model.is_default))
+            })
             .unwrap_or(0);
         let mut picker = Self {
             backend,
@@ -489,23 +595,40 @@ impl ModelPicker {
     }
 
     pub(crate) fn previous_effort(&mut self) {
-        let choices = self.selected_efforts().to_vec();
+        let choices = self.ordered_selected_efforts();
+        if choices.is_empty() {
+            return;
+        }
         self.effort = match self
             .effort
             .and_then(|effort| choices.iter().position(|choice| *choice == effort))
         {
-            None | Some(0) => None,
+            None => self
+                .selected_default_effort()
+                .and_then(|effort| choices.iter().position(|choice| *choice == effort))
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| choices.get(index).copied()),
+            Some(0) => None,
             Some(index) => Some(choices[index - 1]),
         };
     }
 
     pub(crate) fn next_effort(&mut self) {
-        let choices = self.selected_efforts().to_vec();
+        let choices = self.ordered_selected_efforts();
+        if choices.is_empty() {
+            return;
+        }
         self.effort = match self
             .effort
             .and_then(|effort| choices.iter().position(|choice| *choice == effort))
         {
-            None => choices.first().copied(),
+            None => match self.selected_default_effort() {
+                Some(effort) => choices
+                    .iter()
+                    .position(|choice| *choice == effort)
+                    .and_then(|index| choices.get(index + 1).copied()),
+                None => choices.first().copied(),
+            },
             Some(index) => choices
                 .get(index + 1)
                 .copied()
@@ -543,7 +666,22 @@ impl ModelPicker {
 
     fn selected_efforts(&self) -> &[Effort] {
         self.selected_choice()
-            .map_or(&[], |choice| choice.supported_efforts(self.backend))
+            .map_or(&[], ModelChoice::supported_efforts)
+    }
+
+    fn ordered_selected_efforts(&self) -> Vec<Effort> {
+        let mut efforts = self.selected_efforts().to_vec();
+        efforts.sort_by_key(|effort| effort_rank(*effort));
+        efforts.dedup();
+        efforts
+    }
+
+    fn selected_default_effort(&self) -> Option<Effort> {
+        self.selected_choice().and_then(|choice| {
+            choice
+                .default_effort()
+                .filter(|effort| choice.supported_efforts().contains(effort))
+        })
     }
 
     fn normalize_effort(&mut self) {
@@ -555,49 +693,63 @@ impl ModelPicker {
             // a stale model-specific effort would remain hidden behind a
             // seemingly-default selection.
             self.effort = None;
-            return;
         }
-        if self
-            .effort
-            .is_some_and(|effort| !self.selected_efforts().contains(&effort))
-        {
-            self.effort = None;
-        }
-        if self.effort.is_none()
-            && let Some(choice) = self.selected_choice()
-            && choice.value.is_some()
-            && let Some(effort) = choice.default_effort()
-            && choice.supported_efforts(self.backend).contains(&effort)
-        {
-            self.effort = Some(effort);
-        } else if self.effort.is_none()
-            && let Some(choice) = self.selected_choice()
-            && choice.value.is_some()
-            && let [only] = choice.supported_efforts(self.backend)
-        {
-            self.effort = Some(*only);
-        }
+        // Do not alter an existing override merely because the cursor visits a
+        // different model. In particular, `↑`/`↓` must not turn a configured
+        // `high` into that other model's `low`/`medium` default. Only ←/→ or
+        // selecting the CLI-default row changes the stored override.
     }
 
     pub(crate) fn effort(&self) -> Option<Effort> {
         self.effort
     }
 
+    /// An advertised capability list is authoritative when it is present.
+    /// An empty list means the backend did not provide a machine-readable
+    /// effort menu, so an existing explicit value must be preserved rather
+    /// than guessed away.
+    pub(crate) fn has_unsupported_effort_override(&self) -> bool {
+        let choices = self.selected_efforts();
+        !choices.is_empty() && self.effort.is_some_and(|effort| !choices.contains(&effort))
+    }
+
+    pub(crate) fn unsupported_effort_notice(&self) -> Option<String> {
+        let effort = self.effort?;
+        if !self.has_unsupported_effort_override() {
+            return None;
+        }
+        let model = self
+            .selected_choice()
+            .map(|choice| choice.id(self.backend))
+            .unwrap_or_else(|| "selected model".to_string());
+        Some(format!(
+            "{model} does not advertise {} · use ←/→ to choose an advertised effort",
+            effort.as_str()
+        ))
+    }
+
     pub(crate) fn effort_label(&self) -> String {
-        self.effort.map_or_else(
-            || {
-                self.selected_choice()
-                    .map_or_else(|| "default".to_string(), ModelChoice::default_effort_label)
-            },
-            |effort| effort.as_str().to_string(),
-        )
+        match self.effort {
+            Some(effort) if self.has_unsupported_effort_override() => {
+                format!("{} (unsupported)", effort.as_str())
+            }
+            Some(effort) => format!("{} (override)", effort.as_str()),
+            None => self.selected_choice().map_or_else(
+                || "default".to_string(),
+                |choice| format!("default {}", choice.default_effort_label()),
+            ),
+        }
     }
 
     pub(crate) fn effort_choices_label(&self) -> String {
-        self.selected_choice().map_or_else(
-            || "default".to_string(),
-            |choice| choice.effort_choices_label(self.backend),
-        )
+        self.selected_choice()
+            .map_or_else(|| "default".to_string(), ModelChoice::effort_choices_label)
+    }
+
+    pub(crate) fn has_effort_controls(&self) -> bool {
+        self.options
+            .iter()
+            .any(|choice| !choice.supported_efforts().is_empty())
     }
 }
 
@@ -743,11 +895,18 @@ pub(crate) fn model_picker_lines(
         return lines;
     }
 
-    let available = width.saturating_sub(7).max(30);
+    let show_effort = picker.has_effort_controls();
+    let available = width
+        .saturating_sub(if show_effort { 7 } else { 4 })
+        .max(30);
     let name_width = (available * 24 / 100).max(10);
-    let id_width = (available * 43 / 100).max(12);
+    let id_width = if show_effort {
+        (available * 43 / 100).max(12)
+    } else {
+        available.saturating_sub(name_width).max(12)
+    };
     let effort_width = available.saturating_sub(name_width + id_width).max(8);
-    lines.push(Line::from(vec![
+    let mut header = vec![
         Span::styled("   Model", theme::muted()),
         Span::styled(
             theme::pad_width("", name_width.saturating_sub(5)),
@@ -758,8 +917,11 @@ pub(crate) fn model_picker_lines(
             theme::pad_width("", id_width.saturating_sub(3)),
             theme::muted(),
         ),
-        Span::styled("│ Effort (←/→)", theme::muted()),
-    ]));
+    ];
+    if show_effort {
+        header.push(Span::styled("│ Effort (←/→)", theme::muted()));
+    }
+    lines.push(Line::from(header));
 
     let (start, choices) = picker.window(max_rows);
     if start > 0 {
@@ -774,7 +936,7 @@ pub(crate) fn model_picker_lines(
         } else {
             theme::text()
         };
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(
                 if selected { " ▶ " } else { "   " },
                 if selected {
@@ -795,8 +957,10 @@ pub(crate) fn model_picker_lines(
                 ),
                 row_style,
             ),
-            Span::styled("│ ", theme::muted()),
-            Span::styled(
+        ];
+        if show_effort {
+            row.push(Span::styled("│ ", theme::muted()));
+            row.push(Span::styled(
                 theme::clip_width(
                     &if selected {
                         picker.effort_label()
@@ -806,8 +970,9 @@ pub(crate) fn model_picker_lines(
                     effort_width.saturating_sub(2),
                 ),
                 if selected { row_style } else { theme::muted() },
-            ),
-        ]));
+            ));
+        }
+        lines.push(Line::from(row));
     }
     if start + max_rows.min(picker.visible_len()) < picker.visible_len() {
         lines.push(Line::styled("   …", theme::muted()));
@@ -821,15 +986,21 @@ pub(crate) fn model_picker_lines(
             ),
         ]));
     }
-    lines.push(Line::from(vec![
-        Span::styled(" Effort choices: ", theme::muted()),
-        Span::styled(
-            theme::clip_width(&picker.effort_choices_label(), width.saturating_sub(17)),
-            theme::text(),
-        ),
-    ]));
+    if show_effort {
+        lines.push(Line::from(vec![
+            Span::styled(" Effort choices: ", theme::muted()),
+            Span::styled(
+                theme::clip_width(&picker.effort_choices_label(), width.saturating_sub(17)),
+                theme::text(),
+            ),
+        ]));
+    }
     lines.push(Line::styled(
-        " Type to filter · ↑/↓ model · ←/→ effort · Enter apply both · Esc cancel",
+        if show_effort {
+            " Type to filter · ↑/↓ model · ←/→ effort · Enter apply both · Esc cancel"
+        } else {
+            " Type to filter · ↑/↓ model · Enter apply · Esc cancel"
+        },
         theme::muted_italic(),
     ));
     lines
@@ -924,27 +1095,57 @@ pub(crate) enum Field {
     Backend,
     Role,
     Model,
-    Effort,
     Sandbox,
     Permission,
     Session,
     SessionId,
-    Cwd,
 }
 
 impl Field {
-    pub(crate) const ALL: [Field; 10] = [
+    pub(crate) const ALL: &'static [Field] = &[
         Field::Name,
         Field::Backend,
         Field::Role,
         Field::Model,
-        Field::Effort,
         Field::Sandbox,
         Field::Permission,
         Field::Session,
         Field::SessionId,
-        Field::Cwd,
     ];
+
+    const CLAUDE_FIELDS: &'static [Field] = &[
+        Field::Name,
+        Field::Backend,
+        Field::Role,
+        Field::Model,
+        Field::Permission,
+        Field::Session,
+        Field::SessionId,
+    ];
+
+    const NO_SEPARATE_EFFORT_FIELDS: &'static [Field] = &[
+        Field::Name,
+        Field::Backend,
+        Field::Role,
+        Field::Model,
+        Field::Sandbox,
+        Field::Permission,
+        Field::Session,
+        Field::SessionId,
+    ];
+
+    pub(crate) fn for_backend(backend: BackendKind) -> &'static [Field] {
+        match backend {
+            BackendKind::Codex => Self::ALL,
+            // Claude has no sandbox CLI parameter. Showing Codex's three
+            // sandbox names here made a saved Team setting look effective
+            // when the adapter deliberately did not pass it.
+            BackendKind::Claude => Self::CLAUDE_FIELDS,
+            // Model selection owns effort for every backend. Keep the member
+            // form focused on independent settings only.
+            BackendKind::Grok | BackendKind::Agy => Self::NO_SEPARATE_EFFORT_FIELDS,
+        }
+    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -952,19 +1153,37 @@ impl Field {
             Self::Backend => "backend",
             Self::Role => "role",
             Self::Model => "model",
-            Self::Effort => "effort",
             Self::Sandbox => "sandbox",
             Self::Permission => "permission",
             Self::Session => "session",
             Self::SessionId => "session id",
-            Self::Cwd => "cwd",
         }
+    }
+
+    pub(crate) fn label_for_backend(self, backend: BackendKind) -> &'static str {
+        match (self, backend) {
+            (Self::Permission, BackendKind::Codex) => "approval policy",
+            (Self::Permission, BackendKind::Claude | BackendKind::Grok) => "permission mode",
+            (Self::Permission, BackendKind::Agy) => "execution mode",
+            (Self::Sandbox, BackendKind::Agy) => "terminal sandbox",
+            _ => self.label(),
+        }
+    }
+
+    /// Detail rows are rendered as `label: value`. Keep their colons aligned
+    /// even when a backend exposes longer, backend-specific field labels.
+    pub(crate) fn label_width_for_backend(backend: BackendKind) -> usize {
+        Self::for_backend(backend)
+            .iter()
+            .map(|field| field.label_for_backend(backend).len())
+            .max()
+            .unwrap_or_default()
     }
 
     pub(crate) fn is_text(self) -> bool {
         matches!(
             self,
-            Self::Name | Self::Role | Self::Model | Self::SessionId | Self::Cwd
+            Self::Name | Self::Role | Self::Model | Self::SessionId
         )
     }
 }
@@ -1239,14 +1458,17 @@ impl BuilderState {
             && self.model_picker.is_none()
             && self.editing.is_none()
         {
-            self.cycle_model(false);
+            self.cycle_model();
         }
     }
 
     fn field_value(&self, member: &TeamMember, field: Field) -> String {
         match field {
             Field::Model => self.model_catalog.model_label(member, &self.workspace),
-            Field::Effort => self.model_catalog.effort_label(member, &self.workspace),
+            Field::Permission => self
+                .model_catalog
+                .native_permission_label(member, &self.workspace)
+                .unwrap_or_else(|| field_value(member, field)),
             _ => field_value(member, field),
         }
     }
@@ -1279,6 +1501,7 @@ impl BuilderState {
                     self.model_picker_pending = false;
                 } else {
                     self.selected = self.selected.saturating_sub(1);
+                    self.normalize_field();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -1287,17 +1510,24 @@ impl BuilderState {
                     self.model_picker_pending = false;
                 } else if self.selected + 1 < self.members.len() {
                     self.selected += 1;
+                    self.normalize_field();
                 }
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {}
             KeyCode::Char('a') if !self.field_mode => self.add_member(),
             KeyCode::Char('d') if !self.field_mode => self.delete_member(),
             KeyCode::Char('s') => return true,
+            KeyCode::Char('t') if self.field_mode && self.selected_field() == Field::Model => {
+                self.refresh_failed_model_catalog()
+            }
             KeyCode::Char('e') if self.field_mode && self.selected_field() == Field::Model => {
                 self.edit_selected_field()
             }
             KeyCode::Enter if self.field_mode => self.activate_field(),
-            KeyCode::Enter => self.field_mode = true,
+            KeyCode::Enter => {
+                self.normalize_field();
+                self.field_mode = true;
+            }
             _ => {}
         }
         false
@@ -1328,6 +1558,7 @@ impl BuilderState {
                     member.session_id = None;
                     member.model = None;
                     member.effort = None;
+                    self.normalize_field();
                 }
                 self.backend_picker = None;
                 self.notice = Some("Agent CLI selected · press s to start".to_string());
@@ -1359,13 +1590,21 @@ impl BuilderState {
                 {
                     return;
                 }
+                if let Some(notice) = self
+                    .model_picker
+                    .as_ref()
+                    .and_then(ModelPicker::unsupported_effort_notice)
+                {
+                    self.notice = Some(notice);
+                    return;
+                }
                 let value = self.model_picker.as_ref().and_then(ModelPicker::value);
                 let effort = self.model_picker.as_ref().and_then(ModelPicker::effort);
                 let member = self.selected_member_mut();
                 member.model = value;
                 member.effort = effort;
                 self.model_picker = None;
-                self.notice = Some("model and effort selected · press s to start".to_string());
+                self.notice = Some("model setting selected · press s to start".to_string());
             }
             KeyCode::Backspace => self.model_picker.as_mut().unwrap().pop_query(),
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1394,19 +1633,27 @@ impl BuilderState {
     }
 
     fn next_field(&mut self) {
-        self.field = (self.field + 1) % Field::ALL.len();
+        self.field = (self.field + 1) % self.fields().len();
     }
 
     fn prev_field(&mut self) {
         self.field = if self.field == 0 {
-            Field::ALL.len() - 1
+            self.fields().len() - 1
         } else {
             self.field - 1
         };
     }
 
     fn selected_field(&self) -> Field {
-        Field::ALL[self.field]
+        self.fields()[self.field.min(self.fields().len() - 1)]
+    }
+
+    fn fields(&self) -> &'static [Field] {
+        Field::for_backend(self.selected_member().backend)
+    }
+
+    fn normalize_field(&mut self) {
+        self.field = self.field.min(self.fields().len() - 1);
     }
 
     fn selected_member(&self) -> &TeamMember {
@@ -1429,6 +1676,7 @@ impl BuilderState {
         member.display_name = unique_display_name(&member.display_name, &self.members);
         self.members.push(member);
         self.selected = self.members.len() - 1;
+        self.normalize_field();
     }
 
     fn delete_member(&mut self) {
@@ -1439,6 +1687,7 @@ impl BuilderState {
         if self.selected >= self.members.len() {
             self.selected = self.members.len() - 1;
         }
+        self.normalize_field();
     }
 
     fn activate_field(&mut self) {
@@ -1450,7 +1699,7 @@ impl BuilderState {
             ));
             self.notice = Some("↑/↓ choose an installed Agent CLI · Enter select".to_string());
         } else if field == Field::Model {
-            self.cycle_model(true);
+            self.cycle_model();
         } else if field.is_text() {
             self.edit_selected_field();
         } else {
@@ -1464,21 +1713,24 @@ impl BuilderState {
             self.model_picker_pending = false;
         }
         if field.is_text() {
-            let value = if field == Field::Model {
-                self.selected_member().model.clone().unwrap_or_default()
-            } else {
-                field_value(self.selected_member(), field)
+            let value = match field {
+                Field::Model => self.selected_member().model.clone().unwrap_or_default(),
+                // Display labels such as "select a session" must never
+                // become an editable session ID.
+                Field::SessionId => self
+                    .selected_member()
+                    .session_id
+                    .clone()
+                    .unwrap_or_default(),
+                _ => field_value(self.selected_member(), field),
             };
             self.editing = Some(EditState::new(field, value));
         }
     }
 
-    fn cycle_model(&mut self, retry_failed: bool) {
+    fn cycle_model(&mut self) {
         let backend = self.selected_member().backend;
         let cwd = self.selected_member().resolved_cwd(&self.workspace);
-        if retry_failed {
-            self.model_catalog.retry(backend, &cwd);
-        }
         match self.model_catalog.models(backend, &cwd) {
             ModelChoices::Loading => {
                 self.model_picker_pending = true;
@@ -1500,32 +1752,38 @@ impl BuilderState {
             }
             ModelChoices::Failed(err) => {
                 self.model_picker_pending = false;
-                self.notice = Some(format!("{err} · press Enter to retry"));
+                self.notice = Some(format!("{err} · focus Model and press t to retry"));
             }
+        }
+    }
+
+    fn refresh_failed_model_catalog(&mut self) {
+        let backend = self.selected_member().backend;
+        let cwd = self.selected_member().resolved_cwd(&self.workspace);
+        match self.model_catalog.refresh_failed(backend, &cwd) {
+            Ok(()) => {
+                self.model_picker_pending = true;
+                self.notice = Some(format!(
+                    "reloading {} model catalog… keep editing while it loads",
+                    backend.as_str()
+                ));
+            }
+            Err(message) => self.notice = Some(message),
         }
     }
 
     fn cycle_field(&mut self, field: Field) {
         match field {
-            Field::Effort => {
-                let choices = self
-                    .model_catalog
-                    .efforts(self.selected_member(), &self.workspace);
-                let next = cycle_effort(self.selected_member().effort, &choices);
-                self.selected_member_mut().effort = next;
-                if choices.is_empty() {
-                    self.notice = Some(format!(
-                        "{} does not support reasoning effort",
-                        self.selected_member().backend.as_str()
-                    ));
-                }
-            }
             Field::Sandbox => {
                 let next = cycle_sandbox(self.selected_member().sandbox);
                 self.selected_member_mut().sandbox = next;
             }
             Field::Permission => {
-                let next = cycle_permission(self.selected_member().permission_mode);
+                let next = cycle_permission_for_backend(
+                    self.selected_member().backend,
+                    self.selected_member().sandbox,
+                    self.selected_member().permission_mode,
+                );
                 self.selected_member_mut().permission_mode = next;
             }
             Field::Session => {
@@ -1582,13 +1840,6 @@ impl BuilderState {
                     member.session_policy = SessionPolicy::Resume;
                 }
             }
-            Field::Cwd => {
-                self.selected_member_mut().cwd = if value.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(value))
-                };
-            }
             _ => {}
         }
     }
@@ -1613,7 +1864,9 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     let model_picker_height = state
         .model_picker
         .as_ref()
-        .map(|picker| picker.window(8).1.len() as u16 + 7)
+        .map(|picker| {
+            picker.window(8).1.len() as u16 + if picker.has_effort_controls() { 7 } else { 5 }
+        })
         .unwrap_or(0);
     let backend_picker_height = state.backend_picker.as_ref().map_or(0, |_| 8);
     let picker_height = model_picker_height + backend_picker_height;
@@ -1630,7 +1883,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "Customize members, backend CLIs, model, and reasoning effort:",
+            "Customize members, backend CLIs, and model settings:",
             theme::muted(),
         )),
         Line::raw(""),
@@ -1638,7 +1891,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     ];
 
     // Distribute available width across columns dynamically.
-    // Layout: " ▶ name @handle backend role=… model=… effort=…"
+    // Layout: " ▶ name @handle backend role=… model=…"
     let name_w = avail.clamp(8, 18);
     let handle_w = avail.clamp(6, 14);
     let backend_w = 7;
@@ -1702,13 +1955,6 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
                 ),
                 muted_style,
             ),
-            Span::styled(
-                format!(
-                    "effort={}",
-                    state.model_catalog.effort_label(member, &state.workspace)
-                ),
-                muted_style,
-            ),
         ]));
     }
 
@@ -1719,12 +1965,13 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
     )));
 
     let selected = state.selected_member();
+    let label_width = Field::label_width_for_backend(selected.backend);
     lines.push(Line::from(vec![
         Span::styled("     handle: ", theme::muted()),
         Span::styled(format!("@{}", selected.id), theme::accent()),
         Span::styled(" (generated)", theme::muted()),
     ]));
-    for (idx, field) in Field::ALL.iter().enumerate() {
+    for (idx, field) in state.fields().iter().enumerate() {
         let selected_field = state.field_mode && idx == state.field;
         let style = if selected_field {
             theme::editor_field_focus()
@@ -1733,9 +1980,9 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &BuilderState) {
         };
         lines.push(Line::from(Span::styled(
             format!(
-                " {} {:>10}: {}",
+                " {} {:>label_width$}: {}",
                 if selected_field { "›" } else { " " },
-                field.label(),
+                field.label_for_backend(selected.backend),
                 state.field_value(selected, *field)
             ),
             style,
@@ -1859,67 +2106,28 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
             .model
             .clone()
             .unwrap_or_else(|| "default".to_string()),
-        Field::Effort => member
-            .effort
-            .map(|effort| effort.as_str().to_string())
-            .unwrap_or_else(|| "default".to_string()),
-        Field::Sandbox => match member.sandbox {
-            SandboxPolicy::ReadOnly => "read-only".to_string(),
-            SandboxPolicy::WorkspaceWrite => "workspace-write".to_string(),
-            SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
+        Field::Sandbox => match member.backend {
+            BackendKind::Codex => member.sandbox.codex_arg().to_string(),
+            BackendKind::Claude => "not passed".to_string(),
+            BackendKind::Grok => member.sandbox.grok_arg().to_string(),
+            BackendKind::Agy => {
+                if member.sandbox == SandboxPolicy::DangerFullAccess {
+                    "off".to_string()
+                } else {
+                    "on".to_string()
+                }
+            }
         },
-        Field::Permission => member
-            .permission_mode
-            .map(|mode| mode.claude_arg().to_string())
-            .unwrap_or_else(|| "default".to_string()),
+        Field::Permission => permission_value(member),
         Field::Session => match member.session_policy {
             SessionPolicy::Resume => "resume".to_string(),
             SessionPolicy::Fresh => "fresh".to_string(),
         },
-        Field::SessionId => member
-            .session_id
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
-        Field::Cwd => member
-            .cwd
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "workspace".to_string()),
-    }
-}
-
-pub(crate) fn backend_efforts(backend: BackendKind) -> &'static [Effort] {
-    const STANDARD: &[Effort] = &[
-        Effort::Low,
-        Effort::Medium,
-        Effort::High,
-        Effort::Xhigh,
-        Effort::Max,
-    ];
-    const CODEX: &[Effort] = &[
-        Effort::Low,
-        Effort::Medium,
-        Effort::High,
-        Effort::Xhigh,
-        Effort::Max,
-        Effort::Ultra,
-    ];
-    const AGY: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High];
-    match backend {
-        BackendKind::Codex => CODEX,
-        BackendKind::Claude | BackendKind::Grok => STANDARD,
-        BackendKind::Agy => AGY,
-    }
-}
-
-pub(crate) fn cycle_effort(current: Option<Effort>, choices: &[Effort]) -> Option<Effort> {
-    if choices.is_empty() {
-        return None;
-    }
-    match current.and_then(|effort| choices.iter().position(|choice| *choice == effort)) {
-        None => Some(choices[0]),
-        Some(index) if index + 1 < choices.len() => Some(choices[index + 1]),
-        Some(_) => None,
+        Field::SessionId => match (&member.session_policy, &member.session_id) {
+            (SessionPolicy::Resume, Some(session_id)) => session_id.clone(),
+            (SessionPolicy::Resume, None) => "select a session".to_string(),
+            (SessionPolicy::Fresh, _) => "not set (fresh)".to_string(),
+        },
     }
 }
 
@@ -1931,15 +2139,75 @@ pub(crate) fn cycle_sandbox(current: SandboxPolicy) -> SandboxPolicy {
     }
 }
 
-pub(crate) fn cycle_permission(current: Option<PermissionMode>) -> Option<PermissionMode> {
-    match current {
-        None => Some(PermissionMode::AcceptEdits),
-        Some(PermissionMode::Default) => Some(PermissionMode::AcceptEdits),
-        Some(PermissionMode::AcceptEdits) => Some(PermissionMode::Plan),
-        Some(PermissionMode::Plan) => Some(PermissionMode::Auto),
-        Some(PermissionMode::Auto) => Some(PermissionMode::DontAsk),
-        Some(PermissionMode::DontAsk) => Some(PermissionMode::BypassPermissions),
-        Some(PermissionMode::BypassPermissions) => None,
+fn permission_value(member: &TeamMember) -> String {
+    match member.backend {
+        // The stored values are an adapter compatibility layer. Render the
+        // actual App Server policy instead of leaking Claude's names into the
+        // Codex editor. `never` is Asterline's product default, rather than a
+        // deferred local Codex setting.
+        BackendKind::Codex => match member.permission_mode {
+            None | Some(PermissionMode::Default) => "never".to_string(),
+            Some(PermissionMode::AcceptEdits | PermissionMode::Plan) => "untrusted".to_string(),
+            Some(PermissionMode::Auto) => "on-request".to_string(),
+            Some(PermissionMode::DontAsk | PermissionMode::BypassPermissions) => {
+                "never".to_string()
+            }
+        },
+        BackendKind::Claude | BackendKind::Grok => member
+            .permission_mode
+            .map(|mode| mode.claude_arg().to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        BackendKind::Agy => match member.permission_mode {
+            None
+            | Some(PermissionMode::Default | PermissionMode::Auto | PermissionMode::DontAsk) => {
+                "CLI default".to_string()
+            }
+            Some(PermissionMode::AcceptEdits) => "accept-edits".to_string(),
+            Some(PermissionMode::Plan) => "plan".to_string(),
+            Some(PermissionMode::BypassPermissions)
+                if member.sandbox == SandboxPolicy::DangerFullAccess =>
+            {
+                "dangerously-skip-permissions".to_string()
+            }
+            Some(PermissionMode::BypassPermissions) => "requires terminal sandbox off".to_string(),
+        },
+    }
+}
+
+pub(crate) fn cycle_permission_for_backend(
+    backend: BackendKind,
+    sandbox: SandboxPolicy,
+    current: Option<PermissionMode>,
+) -> Option<PermissionMode> {
+    match backend {
+        BackendKind::Codex => match current {
+            None | Some(PermissionMode::Default) => Some(PermissionMode::AcceptEdits),
+            Some(PermissionMode::AcceptEdits | PermissionMode::Plan) => Some(PermissionMode::Auto),
+            Some(PermissionMode::Auto) => None,
+            Some(PermissionMode::DontAsk | PermissionMode::BypassPermissions) => {
+                Some(PermissionMode::AcceptEdits)
+            }
+        },
+        BackendKind::Claude | BackendKind::Grok => match current {
+            None | Some(PermissionMode::Default) => Some(PermissionMode::AcceptEdits),
+            Some(PermissionMode::AcceptEdits) => Some(PermissionMode::Plan),
+            Some(PermissionMode::Plan) => Some(PermissionMode::Auto),
+            Some(PermissionMode::Auto) => Some(PermissionMode::DontAsk),
+            Some(PermissionMode::DontAsk) => Some(PermissionMode::BypassPermissions),
+            Some(PermissionMode::BypassPermissions) => None,
+        },
+        BackendKind::Agy => match current {
+            None
+            | Some(PermissionMode::Default | PermissionMode::Auto | PermissionMode::DontAsk) => {
+                Some(PermissionMode::AcceptEdits)
+            }
+            Some(PermissionMode::AcceptEdits) => Some(PermissionMode::Plan),
+            Some(PermissionMode::Plan) if sandbox == SandboxPolicy::DangerFullAccess => {
+                Some(PermissionMode::BypassPermissions)
+            }
+            Some(PermissionMode::Plan) => None,
+            Some(PermissionMode::BypassPermissions) => None,
+        },
     }
 }
 
@@ -1992,6 +2260,81 @@ pub(crate) fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_fields_render_and_cycle_by_backend_capability() {
+        let mut codex = TeamMember::new("codex", "Codex", BackendKind::Codex, "impl");
+        assert_eq!(
+            Field::Permission.label_for_backend(codex.backend),
+            "approval policy"
+        );
+        assert_eq!(field_value(&codex, Field::Permission), "never");
+        codex.permission_mode = cycle_permission_for_backend(codex.backend, codex.sandbox, None);
+        assert_eq!(field_value(&codex, Field::Permission), "untrusted");
+        codex.permission_mode =
+            cycle_permission_for_backend(codex.backend, codex.sandbox, codex.permission_mode);
+        assert_eq!(field_value(&codex, Field::Permission), "on-request");
+
+        let mut claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "review");
+        assert_eq!(
+            Field::Permission.label_for_backend(claude.backend),
+            "permission mode"
+        );
+        assert!(!Field::for_backend(BackendKind::Claude).contains(&Field::Sandbox));
+        claude.permission_mode = cycle_permission_for_backend(claude.backend, claude.sandbox, None);
+        assert_eq!(field_value(&claude, Field::Permission), "acceptEdits");
+
+        let mut agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "research");
+        assert_eq!(
+            Field::Permission.label_for_backend(agy.backend),
+            "execution mode"
+        );
+        assert_eq!(field_value(&agy, Field::Sandbox), "on");
+        assert_eq!(field_value(&agy, Field::Permission), "CLI default");
+        agy.permission_mode = cycle_permission_for_backend(agy.backend, agy.sandbox, None);
+        assert_eq!(field_value(&agy, Field::Permission), "accept-edits");
+        agy.permission_mode =
+            cycle_permission_for_backend(agy.backend, agy.sandbox, agy.permission_mode);
+        assert_eq!(field_value(&agy, Field::Permission), "plan");
+        assert_eq!(
+            cycle_permission_for_backend(agy.backend, agy.sandbox, agy.permission_mode),
+            None
+        );
+        agy.sandbox = SandboxPolicy::DangerFullAccess;
+        assert_eq!(
+            cycle_permission_for_backend(agy.backend, agy.sandbox, agy.permission_mode),
+            Some(PermissionMode::BypassPermissions)
+        );
+    }
+
+    #[test]
+    fn catalog_shows_the_native_permission_when_member_has_no_override() {
+        let cwd = Path::new("/tmp/ws");
+        let mut catalog = ModelCatalog::default();
+        catalog.seed_with_native_permission(BackendKind::Claude, cwd, "bypassPermissions");
+        let member = TeamMember::new("claude", "Claude", BackendKind::Claude, "review");
+
+        assert_eq!(
+            catalog.native_permission_label(&member, cwd),
+            Some("bypassPermissions".to_string())
+        );
+    }
+
+    #[test]
+    fn effort_is_configured_only_in_the_model_picker() {
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            assert!(
+                !Field::for_backend(backend)
+                    .iter()
+                    .any(|field| field.label() == "effort")
+            );
+        }
+    }
 
     #[test]
     fn custom_builder_allows_duplicate_backends_with_unique_ids() {
@@ -2062,7 +2405,8 @@ mod tests {
     #[test]
     fn grok_model_field_opens_picker_and_selects_choice() {
         let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &[BackendKind::Grok]);
-        state.field = Field::ALL
+        state.field = state
+            .fields()
             .iter()
             .position(|field| *field == Field::Model)
             .unwrap();
@@ -2080,7 +2424,26 @@ mod tests {
         state.handle_model_picker_key(KeyCode::Right, KeyModifiers::NONE);
         state.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(state.members[0].model.as_deref(), Some("grok-4.5"));
-        assert_eq!(state.members[0].effort, Some(Effort::Medium));
+        assert_eq!(state.members[0].effort, None);
+    }
+
+    #[test]
+    fn grok_picker_hides_unreported_effort_controls() {
+        let picker = ModelPicker::new(
+            BackendKind::Grok,
+            None,
+            None,
+            vec![DiscoveredModel::simple("grok-4.5")],
+        );
+        let rendered = model_picker_lines(&picker, 90, 8)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!picker.has_effort_controls());
+        assert!(!rendered.contains("Effort"));
+        assert!(!rendered.contains("←/→"));
     }
 
     #[test]
@@ -2111,17 +2474,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_model_catalog_can_be_retried() {
-        let mut catalog = ModelCatalog::default();
-        let cwd = Path::new("/tmp/ws");
-        catalog.seed_error(BackendKind::Grok, cwd, "temporary authentication failure");
-
-        catalog.retry(BackendKind::Grok, cwd);
-
-        assert!(!catalog.contains(BackendKind::Grok, cwd));
-    }
-
-    #[test]
     fn completed_model_load_opens_requested_picker() {
         let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &[BackendKind::Codex]);
         state.field_mode = true;
@@ -2143,7 +2495,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_preserves_a_current_custom_model() {
+    fn model_picker_keeps_an_unverified_custom_model_effort() {
         let picker = ModelPicker::new(
             BackendKind::Claude,
             Some("company-model"),
@@ -2152,12 +2504,13 @@ mod tests {
         );
 
         assert_eq!(picker.value().as_deref(), Some("company-model"));
-        assert_eq!(picker.selected(), 1);
+        assert_eq!(picker.selected(), 0);
         assert_eq!(picker.effort(), Some(Effort::High));
+        assert!(!picker.has_unsupported_effort_override());
     }
 
     #[test]
-    fn agy_effort_qualified_model_applies_model_and_effort_together() {
+    fn agy_effort_qualified_model_needs_no_redundant_effort_override() {
         let mut model = DiscoveredModel::simple("gemini-3.6-flash-high");
         model.default_effort = Some(Effort::High);
         model.supported_efforts = vec![Effort::High];
@@ -2176,11 +2529,160 @@ mod tests {
             state.members[0].model.as_deref(),
             Some("gemini-3.6-flash-high")
         );
-        assert_eq!(state.members[0].effort, Some(Effort::High));
+        // The selected Agy model name already carries this setting. Persisting
+        // another `--effort high` override would make a catalog default look
+        // user-selected and can become stale after a model switch.
+        assert_eq!(state.members[0].effort, None);
     }
 
     #[test]
-    fn backend_picker_shows_installation_models_and_effort() {
+    fn model_picker_arrows_follow_increasing_effort_order() {
+        let mut model = DiscoveredModel::simple("grok-4.6");
+        model.default_effort = Some(Effort::High);
+        // This is Grok's cache/menu order. The UI must still make right mean
+        // "more", rather than walking that raw descending sequence.
+        model.supported_efforts = vec![Effort::Xhigh, Effort::High, Effort::Medium, Effort::Low];
+        let mut picker = ModelPicker::new(
+            BackendKind::Grok,
+            Some("grok-4.6"),
+            Some(Effort::High),
+            vec![model],
+        );
+
+        assert_eq!(
+            picker.effort_choices_label(),
+            "default · low · medium · high · xhigh"
+        );
+        picker.next_effort();
+        assert_eq!(picker.effort(), Some(Effort::Xhigh));
+        picker.previous_effort();
+        picker.previous_effort();
+        assert_eq!(picker.effort(), Some(Effort::Medium));
+    }
+
+    #[test]
+    fn browsing_models_keeps_native_default_effort_inherited() {
+        let mut medium = DiscoveredModel::simple("gpt-medium");
+        medium.default_effort = Some(Effort::Medium);
+        medium.supported_efforts = vec![Effort::Low, Effort::Medium, Effort::High];
+        let mut low = DiscoveredModel::simple("gpt-low");
+        low.default_effort = Some(Effort::Low);
+        low.supported_efforts = vec![Effort::Low, Effort::Medium];
+        let mut picker = ModelPicker::new(
+            BackendKind::Codex,
+            Some("gpt-medium"),
+            None,
+            vec![medium, low],
+        );
+
+        assert_eq!(picker.effort(), None);
+        assert_eq!(picker.effort_label(), "default medium");
+
+        picker.down();
+        assert_eq!(picker.effort(), None);
+        assert_eq!(picker.effort_label(), "default low");
+
+        picker.up();
+        assert_eq!(picker.effort(), None);
+        assert_eq!(picker.effort_label(), "default medium");
+    }
+
+    #[test]
+    fn effort_arrows_are_relative_to_the_native_default() {
+        let mut model = DiscoveredModel::simple("gpt-medium");
+        model.default_effort = Some(Effort::Medium);
+        model.supported_efforts = vec![Effort::Low, Effort::Medium, Effort::High];
+        let mut picker =
+            ModelPicker::new(BackendKind::Codex, Some("gpt-medium"), None, vec![model]);
+
+        assert_eq!(picker.effort(), None);
+        assert_eq!(picker.effort_label(), "default medium");
+
+        picker.next_effort();
+        assert_eq!(picker.effort(), Some(Effort::High));
+
+        let mut picker = ModelPicker::new(
+            BackendKind::Codex,
+            Some("gpt-medium"),
+            None,
+            vec![DiscoveredModel {
+                id: "gpt-medium".to_string(),
+                name: "gpt-medium".to_string(),
+                description: None,
+                default_effort: Some(Effort::Medium),
+                supported_efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+                is_default: false,
+            }],
+        );
+        picker.previous_effort();
+        assert_eq!(picker.effort(), Some(Effort::Low));
+    }
+
+    #[test]
+    fn browsing_a_different_model_never_discards_the_original_effort_override() {
+        let mut spark = DiscoveredModel::simple("gpt-5.3-codex-spark");
+        spark.default_effort = Some(Effort::High);
+        spark.supported_efforts = vec![Effort::Medium, Effort::High];
+        let mut sol = DiscoveredModel::simple("gpt-5.6-sol");
+        sol.default_effort = Some(Effort::Low);
+        sol.supported_efforts = vec![Effort::Low];
+        let mut picker = ModelPicker::new(
+            BackendKind::Codex,
+            Some("gpt-5.3-codex-spark"),
+            Some(Effort::High),
+            vec![spark, sol],
+        );
+
+        assert_eq!(picker.effort(), Some(Effort::High));
+        assert!(!picker.has_unsupported_effort_override());
+        assert_eq!(picker.effort_label(), "high (override)");
+
+        picker.down();
+        assert_eq!(picker.effort(), Some(Effort::High));
+        assert!(picker.has_unsupported_effort_override());
+        assert_eq!(picker.effort_label(), "high (unsupported)");
+        assert!(
+            picker
+                .unsupported_effort_notice()
+                .is_some_and(|notice| notice.contains("gpt-5.6-sol"))
+        );
+
+        picker.up();
+        assert_eq!(picker.effort(), Some(Effort::High));
+        assert!(!picker.has_unsupported_effort_override());
+        assert_eq!(picker.effort_label(), "high (override)");
+    }
+
+    #[test]
+    fn model_picker_requires_an_explicit_effort_choice_before_applying_an_incompatible_model() {
+        let mut spark = DiscoveredModel::simple("gpt-5.3-codex-spark");
+        spark.supported_efforts = vec![Effort::High];
+        let mut sol = DiscoveredModel::simple("gpt-5.6-sol");
+        sol.supported_efforts = vec![Effort::Low];
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &[BackendKind::Codex]);
+        state.model_picker = Some(ModelPicker::new(
+            BackendKind::Codex,
+            Some("gpt-5.3-codex-spark"),
+            Some(Effort::High),
+            vec![spark, sol],
+        ));
+        state.model_picker.as_mut().unwrap().down();
+
+        state.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(state.model_picker.is_some());
+        assert_eq!(state.members[0].model, None);
+        assert_eq!(state.members[0].effort, None);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("does not advertise high"))
+        );
+    }
+
+    #[test]
+    fn backend_picker_shows_only_reported_model_capabilities() {
         let detected = DetectedBackends {
             codex: true,
             claude: false,
@@ -2207,7 +2709,7 @@ mod tests {
             .join("\n");
         assert!(text.contains("codex"));
         assert!(text.contains("installed · 1 model(s): gpt-test"));
-        assert!(text.contains("effort low/medium/high/xhigh/max/ultra"));
+        assert!(!text.contains("effort "));
         assert!(text.contains("claude"));
         assert!(text.contains("not installed on PATH"));
     }
@@ -2239,7 +2741,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_shows_detected_model_and_effort_without_default_prefix() {
+    fn catalog_shows_detected_model_without_default_prefix() {
         let mut model = DiscoveredModel::simple("gpt-5.6-sol");
         model.name = "GPT-5.6-Sol".to_string();
         model.default_effort = Some(Effort::Medium);
@@ -2248,26 +2750,41 @@ mod tests {
         let mut catalog = ModelCatalog::default();
         catalog.loads.insert(
             (BackendKind::Codex, PathBuf::from("/tmp/ws")),
-            ModelLoad::Ready(Ok(vec![model])),
+            ModelLoad::Ready(Ok(DiscoveredCatalog {
+                models: vec![model],
+                native_permission: None,
+            })),
         );
         let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
 
         assert_eq!(
             catalog.model_label(&member, Path::new("/tmp/ws")),
-            "GPT-5.6-Sol"
-        );
-        assert_eq!(
-            catalog.effort_label(&member, Path::new("/tmp/ws")),
-            "medium"
-        );
-        assert_eq!(
-            catalog.efforts(&member, Path::new("/tmp/ws")),
-            vec![Effort::Low, Effort::Medium, Effort::High]
+            "GPT-5.6-Sol · medium"
         );
     }
 
     #[test]
-    fn catalog_uses_first_detected_model_but_picker_keeps_cli_default_explicit() {
+    fn model_label_shows_the_effective_effort_except_for_agy() {
+        let cwd = Path::new("/tmp/ws");
+        let mut catalog = ModelCatalog::default();
+        catalog.seed(BackendKind::Grok, cwd, vec!["grok-4.6".to_string()]);
+        let mut grok = TeamMember::new("grok", "Grok", BackendKind::Grok, "review");
+        grok.model = Some("grok-4.6".to_string());
+        grok.effort = Some(Effort::Xhigh);
+        assert_eq!(catalog.model_label(&grok, cwd), "grok-4.6 · xhigh");
+
+        catalog.seed(
+            BackendKind::Agy,
+            cwd,
+            vec!["gemini-3.6-flash-high".to_string()],
+        );
+        let mut agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "research");
+        agy.model = Some("gemini-3.6-flash-high".to_string());
+        assert_eq!(catalog.model_label(&agy, cwd), "gemini-3.6-flash-high");
+    }
+
+    #[test]
+    fn catalog_and_picker_show_the_detected_default_model() {
         let mut catalog = ModelCatalog::default();
         catalog.seed(
             BackendKind::Claude,
@@ -2288,31 +2805,47 @@ mod tests {
             catalog.model_label(&member, Path::new("/tmp/ws")),
             "claude-sonnet-4-6"
         );
-        assert_eq!(picker.visible_len(), 3);
-        assert_eq!(picker.value(), None);
+        assert_eq!(picker.visible_len(), 2);
+        assert_eq!(picker.value().as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(
             picker.selected_choice().map(ModelChoice::name),
-            Some("default")
+            Some("claude-sonnet-4-6")
         );
     }
 
     #[test]
-    fn model_picker_always_keeps_cli_default_as_a_choice() {
-        let mut picker = ModelPicker::new(
-            BackendKind::Claude,
-            None,
-            None,
-            vec![DiscoveredModel::simple("claude-sonnet-4-6")],
+    fn loaded_catalog_without_a_reported_default_is_not_labeled_not_loaded() {
+        let mut catalog = ModelCatalog::default();
+        catalog.loads.insert(
+            (BackendKind::Agy, PathBuf::from("/tmp/ws")),
+            ModelLoad::Ready(Ok(DiscoveredCatalog {
+                models: vec![DiscoveredModel::simple("gemini-3.6-pro")],
+                native_permission: None,
+            })),
         );
+        let member = TeamMember::new("planner", "Planner", BackendKind::Agy, "plan");
 
-        assert_eq!(picker.visible_len(), 2);
+        assert_eq!(
+            catalog.model_label(&member, Path::new("/tmp/ws")),
+            "CLI default"
+        );
+        let ModelChoices::Ready(models) = catalog.models(BackendKind::Agy, Path::new("/tmp/ws"))
+        else {
+            panic!("expected the successful catalog to stay available to the picker");
+        };
+        assert_eq!(models[0].id, "gemini-3.6-pro");
+    }
+
+    #[test]
+    fn model_picker_keeps_cli_default_only_when_no_models_are_discovered() {
+        let picker = ModelPicker::new(BackendKind::Claude, None, None, Vec::new());
+
+        assert_eq!(picker.visible_len(), 1);
         assert_eq!(picker.value(), None);
         assert_eq!(
             picker.selected_choice().map(ModelChoice::name),
             Some("default")
         );
-        picker.down();
-        assert_eq!(picker.value().as_deref(), Some("claude-sonnet-4-6"));
     }
 
     #[test]
@@ -2327,10 +2860,6 @@ mod tests {
 
         assert_eq!(
             catalog.model_label(&member, Path::new("/tmp/ws")),
-            "loading…"
-        );
-        assert_eq!(
-            catalog.effort_label(&member, Path::new("/tmp/ws")),
             "loading…"
         );
     }
@@ -2356,28 +2885,36 @@ mod tests {
     }
 
     #[test]
-    fn unset_model_effort_and_session_use_default_label() {
-        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+    fn frozen_catalog_never_starts_a_late_lookup() {
+        let mut catalog = ModelCatalog::default();
+        let cwd = Path::new("/tmp/new-member-workspace");
+        catalog.freeze();
 
-        assert_eq!(field_value(&member, Field::Model), "default");
-        assert_eq!(field_value(&member, Field::Effort), "default");
-        assert_eq!(field_value(&member, Field::SessionId), "default");
+        let ModelChoices::Failed(message) = catalog.models(BackendKind::Agy, cwd) else {
+            panic!("a frozen catalog must not start a new lookup");
+        };
+        assert!(message.contains("restart"));
+        assert!(!catalog.contains(BackendKind::Agy, cwd));
+
+        let member = TeamMember::new("planner", "Planner", BackendKind::Agy, "plan");
+        assert_eq!(
+            catalog.model_label(&member, cwd),
+            "not preloaded at startup"
+        );
     }
 
     #[test]
-    fn effort_cycle_uses_only_available_levels() {
-        let choices = [Effort::Low, Effort::High];
-        assert_eq!(cycle_effort(None, &choices), Some(Effort::Low));
-        assert_eq!(
-            cycle_effort(Some(Effort::Low), &choices),
-            Some(Effort::High)
-        );
-        assert_eq!(cycle_effort(Some(Effort::High), &choices), None);
-        assert_eq!(
-            cycle_effort(Some(Effort::Ultra), &choices),
-            Some(Effort::Low)
-        );
-        assert_eq!(cycle_effort(None, &[]), None);
+    fn session_id_field_shows_a_real_resume_id_or_an_honest_unbound_state() {
+        let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+
+        assert_eq!(field_value(&member, Field::Model), "default");
+        assert_eq!(field_value(&member, Field::SessionId), "select a session");
+
+        member.session_id = Some("thread-abc123".to_string());
+        assert_eq!(field_value(&member, Field::SessionId), "thread-abc123");
+
+        member.session_policy = SessionPolicy::Fresh;
+        assert_eq!(field_value(&member, Field::SessionId), "not set (fresh)");
     }
 
     #[test]
@@ -2397,7 +2934,7 @@ mod tests {
 
     #[test]
     fn edit_state_windows_long_values_around_cursor() {
-        let mut edit = EditState::new(Field::Cwd, "/very/long/project/path".to_string());
+        let mut edit = EditState::new(Field::SessionId, "/very/long/session-id".to_string());
         edit.apply_key(KeyCode::Home, KeyModifiers::NONE);
         edit.apply_key(KeyCode::Right, KeyModifiers::NONE);
         let (visible, cursor) = edit.visible_window(8);

@@ -244,6 +244,44 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
 }
 
 #[test]
+fn resume_preview_skips_imported_codex_plugin_inventory() {
+    let store = store();
+    let saved = store.create_conversation().unwrap();
+    store.set_conversation(saved).unwrap();
+    let team = TeamConfig::new("saved", "/tmp/ws").with_member(TeamMember::new(
+        "builder",
+        "Builder",
+        BackendKind::Codex,
+        "build",
+    ));
+    store
+        .save_conversation_snapshot(&team, &[], TerminalMode::Normal)
+        .unwrap();
+    let turn = store.create_turn().unwrap();
+    store
+        .record_user(
+            turn,
+            &[MemberId::new("builder")],
+            "<recommended_plugins>\nplugin inventory\n</recommended_plugins>",
+        )
+        .unwrap();
+    store
+        .record_user(turn, &[MemberId::new("builder")], "implement resume titles")
+        .unwrap();
+
+    let active = store.create_conversation().unwrap();
+    store.set_conversation(active).unwrap();
+    store
+        .save_conversation_snapshot(&team, &[], TerminalMode::Normal)
+        .unwrap();
+
+    let choices = store.resumable_conversations().unwrap();
+    assert_eq!(choices.len(), 1);
+    assert_eq!(choices[0].id, saved);
+    assert_eq!(choices[0].preview, "implement resume titles");
+}
+
+#[test]
 fn current_conversation_also_updates_the_in_memory_selection() {
     let store = store();
     let conversation = store.current_conversation().unwrap();

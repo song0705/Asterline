@@ -38,10 +38,10 @@ where
         return Ok(());
     }
     if config.update {
-        #[cfg(windows)]
-        println!("{}", crate::update::update_now().map_err(io::Error::other)?);
-        #[cfg(not(windows))]
-        println!("automatic updates are currently available for the Windows Setup installation");
+        println!(
+            "{}",
+            crate::managed_update::run().map_err(io::Error::other)?
+        );
         return Ok(());
     }
 
@@ -319,6 +319,16 @@ impl AppConfig {
     {
         let mut config = AppConfig::default();
         let args: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
+        if args.first().is_some_and(|argument| argument == "update") {
+            if args.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "update does not accept options or arguments",
+                ));
+            }
+            config.update = true;
+            return Ok(config);
+        }
         let mut index = 0;
         while index < args.len() {
             let arg = args[index].as_str();
@@ -371,6 +381,7 @@ impl AppConfig {
         "Asterline — a chat-first multi-agent coding console.\n\
          \n\
          Usage: asterline [OPTIONS]\n\
+         \x20\x20\x20\x20\x20\x20 asterline update\n\
          \n\
          Options:\n\
          \x20 --team <PATH>       Load a team config (JSON). Skips the team builder.\n\
@@ -381,7 +392,8 @@ impl AppConfig {
          \x20 --debug             Disable the approval gate (developer mode).\n\
          \x20 --fake              Use offline fake agents instead of real CLIs.\n\
          \x20 --banner            Print a compact startup banner before the TUI.\n\
-         \x20 --update            Check now and schedule a Windows installer update.\n\
+         \x20 update              Update via Windows Setup or an owning Homebrew Formula.\n\
+         \x20 --update            Backward-compatible alias for `update`.\n\
          \x20 --no-auto-update    Skip the Windows installer update check.\n\
          \x20 -h, --help          Show this help.\n\
          \n\
@@ -431,6 +443,7 @@ mod tests {
         assert!(AppConfig::help().contains("--banner"));
         assert!(AppConfig::help().contains("compact startup banner"));
         assert!(AppConfig::help().contains("--update"));
+        assert!(AppConfig::help().contains("asterline update"));
         assert!(AppConfig::help().contains("--no-auto-update"));
     }
 
@@ -439,6 +452,17 @@ mod tests {
         let config = AppConfig::parse(["--update"]).unwrap();
         assert!(config.update);
         assert!(!config.no_auto_update);
+    }
+
+    #[test]
+    fn parses_update_subcommand_without_starting_the_tui() {
+        let config = AppConfig::parse(["update"]).unwrap();
+        assert!(config.update);
+    }
+
+    #[test]
+    fn update_subcommand_rejects_extra_arguments() {
+        assert!(AppConfig::parse(["update", "--fake"]).is_err());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use crate::domain::event::{ApprovalDecision, MessageTarget, RunId, RunStepStatus, UiCommand};
 use crate::domain::mode::TerminalMode;
-use crate::domain::team::{Effort, MemberId};
+use crate::domain::team::MemberId;
 use crate::tui::drawers::Drawer;
 
 /// What submitting the composer should do.
@@ -11,9 +11,6 @@ use crate::tui::drawers::Drawer;
 pub enum Submission {
     /// Exit the Asterline TUI and begin normal runtime shutdown.
     Exit,
-    /// Open the discovered model and reasoning-effort picker for one member.
-    /// With no explicit member, the current default member is used.
-    ModelPicker { member: Option<MemberId> },
     /// Open one member's native interactive CLI session.
     Attach { member: MemberId },
     /// A targeted slash invocation resolved only against the target backend's
@@ -109,7 +106,6 @@ fn parse_slash(rest: &str) -> Submission {
         "runs" if arg.is_empty() => Submission::Drawer(Drawer::Runs),
         "logs" if arg.is_empty() => Submission::Drawer(Drawer::Logs),
         "diff" if arg.is_empty() => Submission::Drawer(Drawer::Diff),
-        "skills" if arg.is_empty() => Submission::Drawer(Drawer::Skills),
         "attach" => {
             let (member, extra) = split_first_word(arg);
             if member.is_empty() {
@@ -126,43 +122,10 @@ fn parse_slash(rest: &str) -> Submission {
         }
         "new" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
         "resume" if arg.is_empty() => Submission::Runtime(UiCommand::RequestResume),
-        "abort" if arg.is_empty() => Submission::Runtime(UiCommand::Cancel { member: None }),
         "exit" if arg.is_empty() => Submission::Exit,
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
         "reject" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Reject),
-        "effort" => {
-            let (member, level) = split_first_word(arg);
-            match Effort::parse(level) {
-                Some(effort) if !member.is_empty() => Submission::Runtime(UiCommand::SetEffort {
-                    member: MemberId::new(member),
-                    effort,
-                }),
-                _ => Submission::Help,
-            }
-        }
-        "model" => {
-            let (member, rest) = split_first_word(arg);
-            let (model, extra) = split_first_word(rest);
-            if member.is_empty() {
-                Submission::ModelPicker { member: None }
-            } else if member == "all" {
-                Submission::Invalid(
-                    "/model needs one member; use /model <member> <model>".to_string(),
-                )
-            } else if model.is_empty() {
-                Submission::ModelPicker {
-                    member: Some(MemberId::new(member)),
-                }
-            } else if !extra.is_empty() {
-                Submission::Invalid(
-                    "/model accepts one model ID; use /model <member> to choose model and effort"
-                        .to_string(),
-                )
-            } else {
-                Submission::Runtime(set_member_model_command(member, model))
-            }
-        }
         "mode" => parse_mode_selector(arg),
         "find" => Submission::FindInChat(arg.to_string()),
         "continue" => {
@@ -230,8 +193,8 @@ fn parse_slash(rest: &str) -> Submission {
             }
         }
         "help" if arg.is_empty() => Submission::Help,
-        "team" | "runs" | "logs" | "diff" | "skills" | "new" | "resume" | "abort" | "exit"
-        | "retry" | "approve" | "reject" | "help" => {
+        "team" | "runs" | "logs" | "diff" | "new" | "resume" | "exit" | "retry" | "approve"
+        | "reject" | "help" => {
             Submission::Invalid(format!("/{cmd} does not accept arguments; draft kept"))
         }
         _ => Submission::Help,
@@ -257,24 +220,6 @@ fn parse_targeted_slash(member: &str, body: &str) -> Option<Submission> {
             _ => Submission::Invalid("/attach does not accept arguments; draft kept".to_string()),
         });
     }
-    if let Some(rest) = targeted_model_rest(body) {
-        let (model, extra) = split_first_word(rest);
-        if !extra.is_empty() {
-            return Some(Submission::Invalid(
-                "/model accepts one model ID; use @member /model to choose model and effort"
-                    .to_string(),
-            ));
-        }
-        return Some(match (member, model.is_empty()) {
-            ("all", _) => Submission::Invalid(
-                "/model needs one member; use @member /model <model>".to_string(),
-            ),
-            (_, true) => Submission::ModelPicker {
-                member: Some(MemberId::new(member)),
-            },
-            (_, false) => Submission::Runtime(set_member_model_command(member, model)),
-        });
-    }
     Some(if member == "all" {
         Submission::Invalid(
             "slash commands need one member; use @member /<discovered-skill> or /attach <member> (draft kept)"
@@ -294,30 +239,6 @@ fn targeted_command_rest<'a>(body: &'a str, command: &str) -> Option<&'a str> {
         return None;
     }
     Some(rest.trim())
-}
-
-/// Return the text after a targeted `/model`, only when `/model` is a whole
-/// command token rather than a prefix of another slash command.
-fn targeted_model_rest(body: &str) -> Option<&str> {
-    targeted_command_rest(body, "model")
-}
-
-fn set_member_model_command(member: &str, model: &str) -> UiCommand {
-    let member = MemberId::new(member);
-    if model.eq_ignore_ascii_case("default") {
-        // Resetting to the CLI default should also clear a model-specific
-        // effort override. The picker uses the same atomic command.
-        UiCommand::SetMemberModelAndEffort {
-            member,
-            model: None,
-            effort: None,
-        }
-    } else {
-        UiCommand::SetMemberModel {
-            member,
-            model: Some(model.to_string()),
-        }
-    }
 }
 
 fn parse_mode_selector(arg: &str) -> Submission {
@@ -578,11 +499,8 @@ mod tests {
         assert_eq!(parse("/logs"), Submission::Drawer(Drawer::Logs));
         assert_eq!(parse("/runs"), Submission::Drawer(Drawer::Runs));
         assert_eq!(parse("/team"), Submission::Drawer(Drawer::Team));
+        assert_eq!(parse("/team "), Submission::Drawer(Drawer::Team));
         assert_eq!(parse("/diff"), Submission::Drawer(Drawer::Diff));
-        assert_eq!(
-            parse("/abort"),
-            Submission::Runtime(UiCommand::Cancel { member: None })
-        );
         assert_eq!(parse("/exit"), Submission::Exit);
         assert_eq!(parse("/retry"), Submission::Runtime(UiCommand::Retry));
         assert_eq!(
@@ -598,10 +516,8 @@ mod tests {
             "/runs extra",
             "/logs extra",
             "/diff extra",
-            "/skills extra",
             "/new extra",
             "/resume extra",
-            "/abort extra",
             "/exit extra",
             "/retry extra",
             "/approve extra",
@@ -640,65 +556,15 @@ mod tests {
     }
 
     #[test]
-    fn effort_command_sets_member_effort() {
-        assert_eq!(
-            parse("/effort builder high"),
-            Submission::Runtime(UiCommand::SetEffort {
-                member: MemberId::new("builder"),
-                effort: Effort::High,
-            })
-        );
-        assert_eq!(parse("/effort builder"), Submission::Help);
-        assert_eq!(parse("/effort builder bogus"), Submission::Help);
-    }
-
-    #[test]
-    fn model_command_sets_one_member_or_opens_its_discovered_picker() {
-        let expected = Submission::Runtime(UiCommand::SetMemberModel {
-            member: MemberId::new("builder"),
-            model: Some("gpt-5.6-sol".to_string()),
-        });
-        assert_eq!(parse("/model builder gpt-5.6-sol"), expected);
+    fn model_is_not_a_composer_control() {
+        assert_eq!(parse("/model"), Submission::Help);
+        assert_eq!(parse("/model builder gpt-5.6-sol"), Submission::Help);
         assert_eq!(
             parse("@builder /model gpt-5.6-sol"),
-            Submission::Runtime(UiCommand::SetMemberModel {
+            Submission::TargetedSlash {
                 member: MemberId::new("builder"),
-                model: Some("gpt-5.6-sol".to_string()),
-            })
-        );
-        assert!(matches!(
-            parse("@all /model gpt-5.6-sol"),
-            Submission::Invalid(_)
-        ));
-        assert_eq!(parse("/model"), Submission::ModelPicker { member: None });
-        assert_eq!(
-            parse("/model builder"),
-            Submission::ModelPicker {
-                member: Some(MemberId::new("builder")),
+                body: "/model gpt-5.6-sol".to_string(),
             }
-        );
-        assert_eq!(
-            parse("@builder /model"),
-            Submission::ModelPicker {
-                member: Some(MemberId::new("builder")),
-            }
-        );
-        assert!(matches!(parse("@all /model"), Submission::Invalid(_)));
-        assert!(matches!(
-            parse("/model builder gpt-5.6-sol high"),
-            Submission::Invalid(message) if message.contains("one model ID")
-        ));
-        assert!(matches!(
-            parse("@builder /model gpt-5.6-sol high"),
-            Submission::Invalid(message) if message.contains("one model ID")
-        ));
-        assert_eq!(
-            parse("/model builder default"),
-            Submission::Runtime(UiCommand::SetMemberModelAndEffort {
-                member: MemberId::new("builder"),
-                model: None,
-                effort: None,
-            })
         );
     }
 
@@ -969,8 +835,14 @@ mod tests {
     }
 
     #[test]
-    fn skills_command_opens_picker() {
-        assert_eq!(parse("/skills"), Submission::Drawer(Drawer::Skills));
+    fn removed_skills_command_falls_back_to_help() {
+        assert_eq!(parse("/skills"), Submission::Help);
         assert_eq!(parse("/skill"), Submission::Help);
+    }
+
+    #[test]
+    fn removed_abort_command_falls_back_to_help() {
+        assert_eq!(parse("/abort"), Submission::Help);
+        assert_eq!(parse("/abort extra"), Submission::Help);
     }
 }

@@ -33,7 +33,7 @@ use crate::domain::team::{MemberId, TeamConfig, TeamMember};
 use crate::store::sqlite::SqliteStore;
 
 pub use team_runtime::{
-    RunAction, RunnerChange, RuntimeStep, TeamRuntime, VerifyAction, VerifyOutput,
+    RunAction, RunnerChange, RunnerControl, RuntimeStep, TeamRuntime, VerifyAction, VerifyOutput,
 };
 
 /// Everything the runtime loop consumes: UI commands and tagged agent events.
@@ -64,7 +64,10 @@ impl RuntimeHandle {
     pub fn try_send(&self, command: UiCommand) -> RuntimeCommandSend {
         if matches!(
             &command,
-            UiCommand::Cancel { .. } | UiCommand::AttachFinished { .. } | UiCommand::Shutdown
+            UiCommand::Cancel { .. }
+                | UiCommand::AttachFinished { .. }
+                | UiCommand::Approve { .. }
+                | UiCommand::Shutdown
         ) {
             match self.control_tx.try_send(command) {
                 Ok(()) => RuntimeCommandSend::Sent,
@@ -87,7 +90,10 @@ impl RuntimeHandle {
     pub fn send(&self, command: UiCommand) -> bool {
         if matches!(
             &command,
-            UiCommand::Cancel { .. } | UiCommand::AttachFinished { .. } | UiCommand::Shutdown
+            UiCommand::Cancel { .. }
+                | UiCommand::AttachFinished { .. }
+                | UiCommand::Approve { .. }
+                | UiCommand::Shutdown
         ) {
             self.control_tx.send(command).is_ok()
         } else {
@@ -315,7 +321,7 @@ fn spawn_inner(
     team_save_path: Option<PathBuf>,
 ) -> (RuntimeHandle, JoinHandle<()>) {
     // UI commands are low-volume control traffic and must remain enqueueable
-    // while workers are backpressured. In particular, /abort and Shutdown
+    // while workers are backpressured. In particular, cancellation and Shutdown
     // cannot share a full token/event queue with the work they must cancel.
     let (ui_tx, ui_rx) = mpsc::sync_channel(RUNTIME_UI_QUEUE_CAPACITY);
     let (control_tx, control_rx) = mpsc::sync_channel(RUNTIME_CONTROL_QUEUE_CAPACITY);
@@ -481,7 +487,7 @@ fn run_loop(
             RuntimeInput::Ui(UiCommand::NewSession) if !active_verifications.is_empty() => {
                 RuntimeStep {
                     events: vec![RuntimeEvent::Notice(
-                        "cannot start a new chat while verification is active; use /abort first"
+                        "cannot start a new chat while verification is active; press Esc to cancel it first"
                             .to_string(),
                     )],
                     ..RuntimeStep::default()
@@ -492,7 +498,7 @@ fn run_loop(
             {
                 RuntimeStep {
                     events: vec![RuntimeEvent::Notice(
-                        "cannot resume another chat while verification is active; use /abort first"
+                        "cannot resume another chat while verification is active; press Esc to cancel it first"
                             .to_string(),
                     )],
                     ..RuntimeStep::default()
@@ -506,7 +512,7 @@ fn run_loop(
                     RuntimeStep {
                         events: vec![RuntimeEvent::AttachDenied {
                             member,
-                            reason: "cannot attach while a runtime worker or verification is active; use /abort first"
+                            reason: "cannot attach while a runtime worker or verification is active; press Esc to cancel it first"
                                 .to_string(),
                         }],
                         ..RuntimeStep::default()
@@ -609,6 +615,26 @@ fn run_loop(
             }
         }
 
+        for control in step.runner_controls.drain(..) {
+            match control {
+                RunnerControl::ResolveNativeApproval {
+                    member,
+                    request_id,
+                    decision,
+                } => {
+                    let delivered = runners
+                        .get(&member)
+                        .is_some_and(|runner| runner.resolve_native_approval(request_id, decision));
+                    if !delivered {
+                        step.events.push(RuntimeEvent::Notice(format!(
+                            "could not deliver approval {} to {member}; its native session ended",
+                            decision.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+
         if let Some(member) = step.events.iter().find_map(|event| match event {
             RuntimeEvent::AttachGranted { member } => Some(member.clone()),
             _ => None,
@@ -706,6 +732,7 @@ fn merge_runtime_step(target: &mut RuntimeStep, mut source: RuntimeStep) {
     target.actions.append(&mut source.actions);
     target.verify_actions.append(&mut source.verify_actions);
     target.runner_changes.append(&mut source.runner_changes);
+    target.runner_controls.append(&mut source.runner_controls);
     if source.persist_team.is_some() {
         target.persist_team = source.persist_team;
     }
@@ -1358,7 +1385,7 @@ mod tests {
         assert!(handle.send(UiCommand::Cancel { member: None }));
         cancelled_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("/abort reached the active runner despite output backpressure");
+            .expect("global cancellation reached the active runner despite output backpressure");
         assert!(handle.send(UiCommand::Shutdown));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

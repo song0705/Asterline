@@ -1,4 +1,4 @@
-//! Local skill discovery for the one-shot skill picker.
+//! Local skill discovery for targeted member completion.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -72,8 +72,8 @@ const AGY_BACKENDS: &[BackendKind] = &[BackendKind::Agy];
 // Workspace `.agents` skills are recognized by Codex and Agy. Claude and
 // Grok have their own project-level skill roots.
 const WORKSPACE_AGENTS_BACKENDS: &[BackendKind] = &[BackendKind::Codex, BackendKind::Agy];
-// Agy only reads workspace `.agents`; its user-level skills live below
-// `~/.gemini/config/skills`.
+// Agy exposes workspace `.agents` plus its own global, shared, and builtin
+// roots. The latter is listed by the local `skills.json` registry.
 const USER_AGENTS_BACKENDS: &[BackendKind] = &[BackendKind::Codex, BackendKind::Grok];
 
 pub fn discover(workspace: &Path) -> Vec<SkillInfo> {
@@ -389,7 +389,12 @@ fn discovery_roots(
         roots.extend([
             user_skill_root(home.join(".grok/skills"), GROK_BACKENDS),
             user_skill_root(home.join(".grok/bundled/skills"), GROK_BACKENDS),
-            user_skill_root(home.join(".gemini/config/skills"), AGY_BACKENDS),
+            user_skill_root(home.join(".gemini/antigravity-cli/skills"), AGY_BACKENDS),
+            user_skill_root(home.join(".gemini/skills"), AGY_BACKENDS),
+            user_skill_root(
+                home.join(".gemini/antigravity-cli/builtin/skills"),
+                AGY_BACKENDS,
+            ),
         ]);
     }
     if let Some(home) = codex_home {
@@ -1332,15 +1337,67 @@ mod tests {
             root.path == Path::new("/workspace/.agents/skills")
                 && root.backends == WORKSPACE_AGENTS_BACKENDS
         }));
-        assert!(roots.iter().any(|root| {
-            root.path == Path::new("/home/tester/.gemini/config/skills")
-                && root.backends == AGY_BACKENDS
-        }));
+        for path in [
+            "/home/tester/.gemini/antigravity-cli/skills",
+            "/home/tester/.gemini/skills",
+            "/home/tester/.gemini/antigravity-cli/builtin/skills",
+        ] {
+            assert!(
+                roots
+                    .iter()
+                    .any(|root| { root.path == Path::new(path) && root.backends == AGY_BACKENDS })
+            );
+        }
         assert!(!roots.iter().any(|root| {
             root.path.to_string_lossy().contains(".augment")
                 || root.path.to_string_lossy().contains("plugins/cache")
                 || root.path.to_string_lossy().ends_with(".grok/plugins")
         }));
+    }
+
+    #[test]
+    fn discovers_all_documented_agy_skill_roots() {
+        let root =
+            std::env::temp_dir().join(format!("asterline-agy-skill-roots-{}", std::process::id()));
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        let locations = [
+            (
+                workspace.join(".agents/skills/workspace-skill"),
+                "workspace-skill",
+            ),
+            (
+                home.join(".gemini/antigravity-cli/skills/global-skill"),
+                "global-skill",
+            ),
+            (home.join(".gemini/skills/shared-skill"), "shared-skill"),
+            (
+                home.join(".gemini/antigravity-cli/builtin/skills/builtin-skill"),
+                "builtin-skill",
+            ),
+        ];
+        std::fs::remove_dir_all(&root).ok();
+        for (directory, name) in locations {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Agy {name}.\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let found = discover_with_homes(&workspace, Some(&home), None);
+        for name in [
+            "workspace-skill",
+            "global-skill",
+            "shared-skill",
+            "builtin-skill",
+        ] {
+            assert!(found.iter().any(|skill| {
+                skill.backend == BackendKind::Agy && skill.invocation == format!("/{name}")
+            }));
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1356,7 +1413,7 @@ mod tests {
             .expect("workspace shared root");
         let agy_global = roots
             .iter()
-            .position(|root| root.path == Path::new("/home/tester/.gemini/config/skills"))
+            .position(|root| root.path == Path::new("/home/tester/.gemini/antigravity-cli/skills"))
             .expect("Agy global root");
         let codex_global = roots
             .iter()

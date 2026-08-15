@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::adapter::parser::{append_bounded_text, bounded_text};
 use crate::domain::event::{
-    ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId, MessageTarget,
-    RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
+    AgentSessionId, ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId,
+    MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
 };
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::{
@@ -27,6 +27,7 @@ use crate::tui::drawers::Drawer;
 use crate::tui::skills::SkillInfo;
 use crate::tui::team_builder::ModelCatalog;
 use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
+use uuid::Uuid;
 
 const MAX_LOGS: usize = 4_000;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
@@ -175,10 +176,12 @@ pub struct AppState {
     team_editor: Option<TeamEditor>,
     /// Cross-drawer cache for asynchronously discovered backend models. The
     /// transient editor borrows it by ownership while open, then returns it on
-    /// close so `/model` does not rerun CLI discovery every time.
+    /// close so reopening `/team` does not rerun CLI discovery every time.
     model_catalog: ModelCatalog,
+    /// The active `ast` process probes its roster once at startup. Keeping
+    /// this fixed avoids model-list subprocess churn while the Team changes.
+    model_catalog_warmed: bool,
     skills: Vec<SkillInfo>,
-    selected_skill: usize,
     resume_choices: Vec<ConversationSummary>,
     selected_resume: usize,
 }
@@ -240,8 +243,8 @@ impl AppState {
             diff_text: None,
             team_editor: None,
             model_catalog: ModelCatalog::default(),
+            model_catalog_warmed: false,
             skills: Vec::new(),
-            selected_skill: 0,
             resume_choices: Vec::new(),
             selected_resume: 0,
         }
@@ -327,16 +330,6 @@ impl AppState {
                     self.finish_incomplete_cells_for_member(&member);
                 }
                 self.set_status(&member, status);
-            }
-            RuntimeEvent::MemberEffort { member, effort } => {
-                if let Some(view) = self.members.iter_mut().find(|m| m.id == member) {
-                    view.effort = effort;
-                }
-            }
-            RuntimeEvent::MemberModel { member, model } => {
-                if let Some(view) = self.members.iter_mut().find(|m| m.id == member) {
-                    view.model = model;
-                }
             }
             RuntimeEvent::MessageStarted { msg, member, .. } => {
                 if self.message_index.contains_key(&msg) {
@@ -601,11 +594,18 @@ impl AppState {
                     self.attach_release_pending = Some(member);
                     return;
                 };
+                // Claude can create a session with a caller-provided UUID.
+                // Supplying it up front gives the transcript importer an exact
+                // file to read after attach; it never needs to guess among
+                // other Claude sessions created in the same workspace.
+                let fresh_session = (backend == BackendKind::Claude && session.is_none())
+                    .then(|| AgentSessionId(Uuid::new_v4().to_string()));
                 self.attach_request = Some(AttachRequest {
                     member,
                     display_name,
                     backend,
                     session,
+                    fresh_session,
                     cwd,
                 });
             }
@@ -1127,49 +1127,6 @@ impl AppState {
             .map(|member| member.backend)
     }
 
-    /// Open the shared, asynchronously populated model picker for the named
-    /// member. A bare `/model` resolves a concrete default member; it never
-    /// guesses when the default target is `all`.
-    pub(crate) fn open_model_picker(&mut self, requested: Option<&MemberId>) -> Result<(), String> {
-        let member = match requested {
-            Some(member) => self
-                .resolve_member_id(member)
-                .ok_or_else(|| format!("unknown member: {member}"))?,
-            None if self.members.len() == 1 => self.members[0].id.clone(),
-            None => match self.default_target.as_ref() {
-                Some(DefaultTarget::Member(member)) => self
-                    .resolve_member_id(member)
-                    .or_else(|| self.members.first().map(|member| member.id.clone()))
-                    .ok_or_else(|| "no team members are available".to_string())?,
-                Some(DefaultTarget::All) => {
-                    return Err(
-                        "/model needs a member while the default target is all; use /model <member> or @member /model"
-                            .to_string(),
-                    );
-                }
-                None => self
-                    .members
-                    .first()
-                    .map(|member| member.id.clone())
-                    .ok_or_else(|| "no team members are available".to_string())?,
-            },
-        };
-
-        self.disarm_quit();
-        if self.drawer != Some(Drawer::Team) {
-            self.stash_team_editor_catalog();
-            self.drawer = Some(Drawer::Team);
-        }
-        if self.team_editor.is_none() {
-            self.open_team_editor();
-        }
-        self.drawer_scroll = 0;
-        self.team_editor
-            .as_mut()
-            .expect("opening the Team drawer creates its editor")
-            .open_model_picker_for(&member)
-    }
-
     /// Return a target-safe prompt invocation only when the slash spelling is
     /// one Asterline actually discovered for that member's backend. This keeps
     /// unknown interactive controls out of noninteractive `codex exec`.
@@ -1228,7 +1185,7 @@ impl AppState {
     }
     pub fn latest_run_action_command(&self) -> Option<String> {
         self.latest_run()
-            .map(|run| run_action_command(run, &self.workspace, false))
+            .and_then(|run| run_action_command(run, &self.workspace, false))
     }
     pub fn selected_run(&self) -> Option<&RunSummary> {
         self.selected_run
@@ -1242,13 +1199,13 @@ impl AppState {
     }
     pub fn selected_run_action_command(&self) -> Option<String> {
         self.selected_run()
-            .map(|run| run_action_command(run, &self.workspace, true))
+            .and_then(|run| run_action_command(run, &self.workspace, true))
     }
     pub fn selected_run_stage_command(&self) -> Option<String> {
         let run = self.selected_run()?;
         self.selected_run_step()
             .and_then(|step| run_step_action_command(run, step))
-            .or_else(|| Some(run_action_command(run, &self.workspace, true)))
+            .or_else(|| run_action_command(run, &self.workspace, true))
     }
     pub fn selected_run_dispatch_command(&self) -> Option<String> {
         let run = self.selected_run()?;
@@ -1380,7 +1337,7 @@ impl AppState {
         }
         if self.has_cancelable_work() {
             self.push(ChatItem::Notice {
-                text: "Cannot attach while member work, verification, routing, or approval is active — /abort or resolve it first."
+                text: "Cannot attach while member work, verification, routing, or approval is active — press Esc to cancel it or resolve it first."
                     .to_string(),
             });
             self.header_selected = None;
@@ -1602,22 +1559,6 @@ impl AppState {
         self.composer.replace_token(completion.token_start, &insert);
         self.reset_popup();
         self.composer.text() != before
-    }
-
-    /// Whether accepting the highlighted completion should immediately open
-    /// Asterline's model picker instead of waiting for a second Enter. This
-    /// applies only to the no-argument `/model` action; member/model text
-    /// completions retain the usual insert-then-submit behavior.
-    pub(crate) fn selected_completion_is_model_picker(&self) -> bool {
-        self.completion().is_some_and(|completion| {
-            completion
-                .items
-                .get(
-                    self.popup_selected
-                        .min(completion.items.len().saturating_sub(1)),
-                )
-                .is_some_and(|item| item.insert == "/model")
-        })
     }
 
     // --- prompt history (shell-style ↑/↓ recall) ------------------------
@@ -1925,40 +1866,9 @@ impl AppState {
         self.drawer_scroll = 0;
     }
 
+    #[cfg(test)]
     pub fn set_skills(&mut self, skills: Vec<SkillInfo>) {
         self.skills = skills;
-        self.selected_skill = 0;
-    }
-
-    pub fn skills(&self) -> &[SkillInfo] {
-        &self.skills
-    }
-
-    /// Resolve a member display name used in a local composer control before
-    /// sending it to the runtime, whose configuration is keyed by stable ID.
-    /// This keeps `/model Builder …` and `@Builder /model …` equivalent to
-    /// their lower-case member-ID forms.
-    pub(crate) fn normalize_member_control(&self, command: UiCommand) -> UiCommand {
-        match command {
-            UiCommand::SetEffort { member, effort } => UiCommand::SetEffort {
-                member: self.resolve_member_id(&member).unwrap_or(member),
-                effort,
-            },
-            UiCommand::SetMemberModel { member, model } => UiCommand::SetMemberModel {
-                member: self.resolve_member_id(&member).unwrap_or(member),
-                model,
-            },
-            UiCommand::SetMemberModelAndEffort {
-                member,
-                model,
-                effort,
-            } => UiCommand::SetMemberModelAndEffort {
-                member: self.resolve_member_id(&member).unwrap_or(member),
-                model,
-                effort,
-            },
-            other => other,
-        }
     }
 
     /// Keep the old convenient `@codex /skill` spelling only when it matches
@@ -2026,21 +1936,6 @@ impl AppState {
         }
     }
 
-    fn skill_target_member(&self) -> Option<&MemberView> {
-        match self.default_target.as_ref() {
-            Some(DefaultTarget::Member(id)) => self.members.iter().find(|member| &member.id == id),
-            _ => self.members.first(),
-        }
-    }
-
-    /// Skills that can be invoked by the same member the picker will target.
-    pub(crate) fn target_skills(&self) -> impl Iterator<Item = &SkillInfo> {
-        let backend = self.skill_target_member().map(|member| member.backend);
-        self.skills
-            .iter()
-            .filter(move |skill| Some(skill.backend) == backend)
-    }
-
     pub fn resume_choices(&self) -> &[ConversationSummary] {
         &self.resume_choices
     }
@@ -2068,37 +1963,6 @@ impl AppState {
             .map(|conversation| UiCommand::ResumeConversation {
                 conversation: conversation.id,
             })
-    }
-
-    pub fn selected_skill(&self) -> usize {
-        self.selected_skill
-    }
-
-    pub fn select_previous_skill(&mut self) {
-        self.selected_skill = self.selected_skill.saturating_sub(1);
-    }
-
-    pub fn select_next_skill(&mut self) {
-        if self.selected_skill + 1 < self.target_skills().count() {
-            self.selected_skill += 1;
-        }
-    }
-
-    pub fn stage_selected_skill(&mut self) -> bool {
-        if self.drawer != Some(Drawer::Skills) {
-            return false;
-        }
-        let Some(member) = self.skill_target_member().map(|member| member.id.clone()) else {
-            return false;
-        };
-        let Some(skill) = self.target_skills().nth(self.selected_skill).cloned() else {
-            return false;
-        };
-        self.composer
-            .set_text(&format!("@{member} {} ", skill.invocation));
-        self.history_cursor = None;
-        self.close_drawer();
-        true
     }
 
     pub fn close_drawer(&mut self) {
@@ -2320,9 +2184,36 @@ impl AppState {
             editor.poll_agent_catalog();
         } else {
             // A model worker may still be completing after its picker closed.
-            // Poll it here so a later `/model` can use the ready result.
+            // Poll it here so the next `/team` open can use the ready result.
             self.model_catalog.poll();
         }
+    }
+
+    /// Warm only the catalogs used by the initial roster. The TUI invokes this
+    /// after it has received `Ready`, so construction and unit tests stay free
+    /// of subprocess side effects.
+    pub(crate) fn warm_model_catalog_once(&mut self) {
+        if self.model_catalog_warmed || self.members.is_empty() {
+            return;
+        }
+        let workspace = PathBuf::from(&self.workspace);
+        let requests = self
+            .members
+            .iter()
+            .map(|member| {
+                let cwd = if member.cwd.is_empty() {
+                    workspace.clone()
+                } else {
+                    PathBuf::from(&member.cwd)
+                };
+                (member.backend, cwd)
+            })
+            .collect::<Vec<_>>();
+        for (backend, cwd) in requests {
+            self.model_catalog.preload(backend, &cwd);
+        }
+        self.model_catalog.freeze();
+        self.model_catalog_warmed = true;
     }
 
     fn open_team_editor(&mut self) {
@@ -2459,9 +2350,9 @@ pub(crate) fn run_action_command(
     run: &RunSummary,
     workspace: &str,
     include_run_id: bool,
-) -> String {
+) -> Option<String> {
     match run.status {
-        RunStatus::Running | RunStatus::Verifying => "/abort".to_string(),
+        RunStatus::Running | RunStatus::Verifying => None,
         RunStatus::Done if run.verification.is_none() => {
             let workspace = if workspace.is_empty() {
                 Path::new(".")
@@ -2473,25 +2364,25 @@ pub(crate) fn run_action_command(
                 command.push(' ');
                 command.push_str(check);
             }
-            command
+            Some(command)
         }
         RunStatus::Done => run
             .mode
             .as_ref()
             .map(|mode| format!("/mode {}", mode.mode.as_str()))
-            .unwrap_or_else(|| "/mode plan".to_string()),
+            .or_else(|| Some("/mode plan".to_string())),
         RunStatus::Failed if run.verification.is_some() => {
             let mut command = continue_command_prefix(run, include_run_id);
             command.push_str(" fix failing verification");
-            command
+            Some(command)
         }
-        RunStatus::Failed => continue_command_prefix(run, include_run_id),
+        RunStatus::Failed => Some(continue_command_prefix(run, include_run_id)),
         RunStatus::Blocked => {
             let mut command = continue_command_prefix(run, include_run_id);
             command.push_str(" blocker resolved");
-            command
+            Some(command)
         }
-        RunStatus::Planned => "/retry".to_string(),
+        RunStatus::Planned => Some("/retry".to_string()),
     }
 }
 

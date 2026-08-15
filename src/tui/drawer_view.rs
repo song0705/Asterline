@@ -54,7 +54,6 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
         Drawer::Runs => drawer_runs(state, content.width as usize),
         Drawer::Palette => drawer_palette(),
         Drawer::Diff => drawer_diff(state),
-        Drawer::Skills => drawer_skills(state),
         Drawer::Resume => drawer_resume(state, content.width as usize),
         Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
     };
@@ -90,7 +89,6 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             Drawer::Runs => {
                 "x details · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close"
             }
-            Drawer::Skills => "↑↓ choose · Enter/Tab use for next prompt · Esc close",
             Drawer::Resume => "↑↓ choose · Enter resume · Esc close",
             Drawer::Team
                 if state
@@ -107,18 +105,11 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
                 "↑↓ choose Agent · Enter apply · Esc cancel"
             }
             Drawer::Team
-                if state.team_editor().is_some_and(|editor| {
-                    editor.model_picker().is_some() && editor.model_picker_applies_immediately()
-                }) =>
-            {
-                "↑↓ model · ←→ effort · type filter · Enter apply & close · Esc cancel"
-            }
-            Drawer::Team
                 if state
                     .team_editor()
                     .is_some_and(|editor| editor.model_picker().is_some()) =>
             {
-                "↑↓ model · ←→ effort · type filter · Enter apply both · Esc cancel"
+                "↑↓ model · ←→ effort · type filter · Enter choose both · Esc cancel"
             }
             Drawer::Team
                 if state
@@ -362,7 +353,10 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-const EDITOR_COLUMNS: [usize; 5] = [17, 9, 15, 15, 7];
+// The roster is an identity overview. Configuration and live state belong in
+// the selected-member detail below it; repeating them here made the drawer
+// wide without helping selection.
+const EDITOR_COLUMNS: [usize; 2] = [17, 9];
 
 fn drawer_team_editor(
     state: &AppState,
@@ -384,7 +378,7 @@ fn drawer_team_editor(
     ]));
     lines.push(Line::styled(
         if editor.field_mode() {
-            " ↑/↓ field · Enter edit/choose · e manual model/session · s apply · Esc members"
+            " ↑/↓ field · Enter edit/choose · t retry failed model · e manual model/session · s apply · Esc members"
         } else {
             " ↑/↓ member · Enter fields · a add · d delete · t target · * all · s apply · Esc close"
         },
@@ -402,11 +396,7 @@ fn drawer_team_editor(
         lines.push(Line::styled(format!(" {notice}"), theme::warning()));
     }
     lines.push(Line::raw(""));
-    let (header, rule) = table_header(
-        &["   Member", "Backend", "Role", "Model", "Target"],
-        &EDITOR_COLUMNS,
-        "Status",
-    );
+    let (header, rule) = table_header(&["   Member", "Backend"], &EDITOR_COLUMNS, "Role");
     lines.push(header);
     lines.push(rule);
 
@@ -418,14 +408,6 @@ fn drawer_team_editor(
         } else {
             Style::default().fg(color)
         };
-        let model = editor.field_value(member, Field::Model);
-        let target = editor.default_marker(member);
-        let status = state
-            .members()
-            .iter()
-            .find(|view| view.id == member.id)
-            .map(|view| theme::status_label(view.status))
-            .unwrap_or("new");
         let sep = Span::styled("│ ", theme::muted());
         lines.push(Line::from(vec![
             Span::raw(" "),
@@ -446,14 +428,8 @@ fn drawer_team_editor(
                 pad_width(member.backend.as_str(), EDITOR_COLUMNS[1]),
                 row_style,
             ),
-            sep.clone(),
-            Span::styled(pad_width(&member.role, EDITOR_COLUMNS[2]), row_style),
-            sep.clone(),
-            Span::styled(pad_width(&model, EDITOR_COLUMNS[3]), row_style),
-            sep.clone(),
-            Span::styled(pad_width(target, EDITOR_COLUMNS[4]), row_style),
             sep,
-            Span::styled(status.to_string(), theme::muted()),
+            Span::styled(member.role.clone(), row_style),
         ]));
     }
 
@@ -472,7 +448,8 @@ fn drawer_team_editor(
             Span::styled(format!("@{}", member.id), theme::accent()),
             Span::styled(" (generated)", theme::muted()),
         ]));
-        for (idx, field) in Field::ALL.iter().enumerate() {
+        let label_width = Field::label_width_for_backend(member.backend);
+        for (idx, field) in editor.fields().iter().enumerate() {
             let selected = editor.field_mode() && idx == editor.field_index();
             let style = if selected {
                 theme::editor_field_focus()
@@ -481,9 +458,9 @@ fn drawer_team_editor(
             };
             lines.push(Line::from(Span::styled(
                 format!(
-                    " {} {:>10}: {}",
+                    " {} {:>label_width$}: {}",
                     if selected { "›" } else { " " },
-                    field.label(),
+                    field.label_for_backend(member.backend),
                     editor.field_value(member, *field)
                 ),
                 style,
@@ -615,49 +592,6 @@ fn drawer_palette() -> Vec<Line<'static>> {
     lines
 }
 
-fn drawer_skills(state: &AppState) -> Vec<Line<'static>> {
-    if state.target_skills().next().is_none() {
-        return vec![Line::styled(
-            " No compatible SKILL.md files found for the selected member.",
-            theme::muted(),
-        )];
-    }
-    let mut lines = vec![Line::styled(
-        " Select a compatible skill; Asterline stages a targeted draft for one request.",
-        theme::muted(),
-    )];
-    lines.push(Line::raw(""));
-    for (idx, skill) in state.target_skills().enumerate() {
-        let selected = idx == state.selected_skill();
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { " › " } else { "   " },
-                if selected {
-                    theme::editor_focus()
-                } else {
-                    theme::muted()
-                },
-            ),
-            Span::styled(
-                skill.name.clone(),
-                if selected {
-                    theme::accent_bold()
-                } else {
-                    theme::emphasis()
-                },
-            ),
-            Span::styled(format!("  {}", skill.description), theme::text()),
-        ]));
-        if selected {
-            lines.push(Line::styled(
-                format!("     {}", skill.path.display()),
-                theme::muted(),
-            ));
-        }
-    }
-    lines
-}
-
 /// Render the captured working-tree diff: structural lines stay colored by role,
 /// while added/removed/context code is syntax-highlighted by the file's type.
 fn drawer_diff(state: &AppState) -> Vec<Line<'static>> {
@@ -763,10 +697,12 @@ mod tests {
     use crate::domain::team::{
         BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     };
-    use crate::tui::skills::SkillInfo;
-    use std::path::PathBuf;
 
     fn ready_state() -> AppState {
+        ready_state_for(BackendKind::Codex)
+    }
+
+    fn ready_state_for(backend: BackendKind) -> AppState {
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
             team: "t".to_string(),
@@ -776,7 +712,7 @@ mod tests {
             members: vec![MemberSummary {
                 id: MemberId::new("builder"),
                 display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
+                backend,
                 role: "implementation".to_string(),
                 status: MemberStatus::Idle,
                 session: None,
@@ -789,6 +725,45 @@ mod tests {
             }],
         });
         state
+    }
+
+    #[test]
+    fn team_editor_detail_field_colons_align_for_long_backend_labels() {
+        let mut state = ready_state();
+        state.toggle_drawer(Drawer::Team);
+
+        let field_lines = drawer_team(&state, 100)
+            .into_iter()
+            .filter_map(|line| {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                text.contains(':').then_some(text)
+            })
+            .filter(|line| {
+                [
+                    "name:",
+                    "role:",
+                    "sandbox:",
+                    "approval policy:",
+                    "session id:",
+                ]
+                .iter()
+                .any(|label| line.contains(label))
+            })
+            .collect::<Vec<_>>();
+        let colon_positions = field_lines
+            .iter()
+            .map(|line| {
+                let byte = line.find(':').expect("field value separator");
+                theme::display_width(&line[..byte])
+            })
+            .collect::<Vec<_>>();
+
+        assert!(colon_positions.len() >= 5);
+        assert!(colon_positions.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]
@@ -871,35 +846,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let expected = vec![17, 28, 45, 62, 71];
+        let expected = vec![17, 28];
         assert_eq!(positions(&header, '│'), expected);
         assert_eq!(positions(&rule, '┼'), expected);
         assert_eq!(positions(&row, '│'), expected);
-    }
-
-    #[test]
-    fn skills_drawer_marks_selection_without_background_fill() {
-        let mut state = ready_state();
-        state.set_skills(vec![SkillInfo {
-            name: "review".to_string(),
-            description: "Review a patch".to_string(),
-            path: PathBuf::from("/tmp/review/SKILL.md"),
-            backend: BackendKind::Codex,
-            invocation: "$review".to_string(),
-        }]);
-
-        let lines = drawer_skills(&state);
-        let selected = lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == "review")
-            .expect("selected skill");
-
-        assert_eq!(selected.style.bg, None);
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("/tmp/review/SKILL.md"))
-        }));
     }
 }

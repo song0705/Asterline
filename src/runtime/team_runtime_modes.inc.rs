@@ -20,7 +20,7 @@ impl TeamRuntime {
         }
         if let Some(existing) = self.mode_sessions.values().next() {
             step.events.push(RuntimeEvent::Notice(format!(
-                "a {} run is already active — /abort it first",
+                "a {} run is already active — press Esc to cancel it first",
                 existing.mode
             )));
             return;

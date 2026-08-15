@@ -18,7 +18,6 @@ pub mod markdown;
 pub mod notify;
 pub mod rollout_import;
 pub mod runs_view;
-pub mod selection;
 pub mod session_picker;
 pub mod skills;
 pub mod status_indicator;
@@ -27,17 +26,16 @@ pub mod team_editor;
 pub mod theme;
 
 use std::io::{self, Read, Write};
+#[cfg(test)]
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -52,10 +50,8 @@ use crate::domain::mode::TerminalMode;
 use crate::domain::team::BackendKind;
 use crate::runtime::{RuntimeCommandSend, RuntimeHandle};
 use crate::tui::app_state::AppState;
-use crate::tui::chat_view::ChatLayout;
 use crate::tui::commands::Submission;
 use crate::tui::keymap::Action;
-use crate::tui::selection::{ChatSelection, MouseSelection};
 use crate::tui::team_editor::TeamEditorOutcome;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -78,7 +74,6 @@ struct TerminalRestore {
     raw_mode: bool,
     keyboard_enhancement: bool,
     alternate_screen: bool,
-    mouse_capture: bool,
     bracketed_paste: bool,
     legacy_keyboard_reset: bool,
 }
@@ -91,10 +86,6 @@ impl TerminalRestore {
         if self.keyboard_enhancement {
             record_cleanup(&mut first_error, execute!(out, PopKeyboardEnhancementFlags));
             self.keyboard_enhancement = false;
-        }
-        if self.mouse_capture {
-            record_cleanup(&mut first_error, execute!(out, DisableMouseCapture));
-            self.mouse_capture = false;
         }
         if self.bracketed_paste {
             record_cleanup(&mut first_error, execute!(out, DisableBracketedPaste));
@@ -159,14 +150,10 @@ pub fn run(
     enable_raw_mode()?;
     restore.raw_mode = true;
     restore.alternate_screen = true;
-    restore.mouse_capture = true;
     restore.bracketed_paste = true;
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    // Do not enable mouse reporting. It would intercept the terminal's native
+    // I-beam cursor and text selection, including the terminal's own copy UI.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     // Kitty keeps separate keyboard-mode stacks for the main and alternate
     // screens. Push only after entering the alternate screen so cleanup pops
     // the same stack before leaving it.
@@ -253,29 +240,19 @@ fn run_loop(
     legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     let notify_enabled = notify::enabled_from_env();
-    let mut drawer_selection = MouseSelection::default();
-    let mut chat_selection = ChatSelection::default();
-    let mut chat_layout: Option<ChatLayout> = None;
     loop {
         state.poll_team_editor_catalog();
         drain_runtime_events(state, events, notify_enabled);
+        state.warm_model_catalog_once();
         if let Some(member) = state.take_attach_release_pending()
             && !handle.finish_attach(member, Vec::new())
         {
             state.mark_runtime_unavailable();
         }
 
-        let screen = terminal
-            .draw(|frame| {
-                chat_layout = chat_view::render(frame, state);
-                if let Some(layout) = chat_layout.as_ref() {
-                    chat_selection.clear_if_width_changed(layout.width);
-                    chat_selection.render(frame.buffer_mut(), layout);
-                }
-                drawer_selection.render(frame.buffer_mut());
-            })?
-            .buffer
-            .clone();
+        terminal.draw(|frame| {
+            let _ = chat_view::render(frame, state);
+        })?;
 
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
@@ -286,14 +263,6 @@ fn run_loop(
                         }
                         continue;
                     }
-                    let any_sel = drawer_selection.is_active() || chat_selection.is_active();
-                    if any_sel && key.code == KeyCode::Esc {
-                        drawer_selection.clear();
-                        chat_selection.clear();
-                        continue;
-                    }
-                    drawer_selection.clear();
-                    chat_selection.clear();
                     if handle_team_editor_key(key, state, handle) {
                         continue;
                     }
@@ -301,20 +270,11 @@ fn run_loop(
                         handle_action(action, state, handle);
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(
-                    mouse,
-                    state,
-                    &mut drawer_selection,
-                    &mut chat_selection,
-                    chat_layout.as_ref(),
-                    &screen,
-                )?,
+                Event::Mouse(_) => {}
                 Event::Paste(text) => {
                     if !state.runtime_available() {
                         continue;
                     }
-                    drawer_selection.clear();
-                    chat_selection.clear();
                     if !state.insert_team_editor_text(&text) {
                         state.insert_text(&text);
                     }
@@ -364,191 +324,11 @@ fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
             }
             true
         }
-        TeamEditorOutcome::ApplyAndClose(command) => {
-            if send_runtime(state, handle, command) {
-                state.close_drawer();
-            }
-            true
-        }
         TeamEditorOutcome::Close => {
             state.close_drawer();
             true
         }
     }
-}
-
-/// Mouse wheel scrolls the conversation (or the open drawer), a few lines per
-/// tick. Mouse capture keeps wheel events distinct from keyboard arrow keys.
-///
-/// Chat selection is content-anchored and survives wheel scroll. Drawers and
-/// the header/footer status bars use bounded screen-space selection.
-fn handle_mouse(
-    mouse: MouseEvent,
-    state: &mut AppState,
-    drawer_selection: &mut MouseSelection,
-    chat_selection: &mut ChatSelection,
-    chat_layout: Option<&ChatLayout>,
-    screen: &ratatui::buffer::Buffer,
-) -> io::Result<()> {
-    const STEP: usize = 6;
-    const EDGE_SCROLL: usize = 2;
-    match mouse.kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let up = mouse.kind == MouseEventKind::ScrollUp;
-            if state.drawer().is_some() {
-                drawer_selection.clear();
-                for _ in 0..STEP {
-                    if up {
-                        state.drawer_scroll_up();
-                    } else {
-                        state.drawer_scroll_down();
-                    }
-                }
-            } else {
-                drawer_selection.clear();
-                // Keep chat selection; endpoints stay on the same content.
-                let max_scroll = chat_layout
-                    .map(ChatLayout::max_scroll)
-                    .unwrap_or(usize::MAX);
-                for _ in 0..STEP {
-                    if up {
-                        if state.scroll() < max_scroll {
-                            state.scroll_up();
-                        }
-                    } else {
-                        state.scroll_down();
-                    }
-                }
-            }
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            if state.drawer().is_some() {
-                chat_selection.clear();
-                drawer_selection.begin_bounded(
-                    mouse.column,
-                    mouse.row,
-                    drawer_view::drawer_rect(screen.area),
-                );
-            } else {
-                drawer_selection.clear();
-                if let Some(layout) = chat_layout {
-                    if layout.contains(mouse.column, mouse.row) {
-                        if let Some(point) = layout.screen_to_content(mouse.column, mouse.row) {
-                            chat_selection.begin(point, layout.width);
-                        }
-                    } else if let Some(bounds) = layout.completion_area.filter(|bounds| {
-                        mouse.column >= bounds.x
-                            && mouse.column < bounds.x.saturating_add(bounds.width)
-                            && mouse.row >= bounds.y
-                            && mouse.row < bounds.y.saturating_add(bounds.height)
-                    }) {
-                        chat_selection.clear();
-                        drawer_selection.begin_bounded(mouse.column, mouse.row, bounds);
-                    } else if let Some(bounds) =
-                        status_bar_at(screen.area, layout, mouse.column, mouse.row)
-                    {
-                        chat_selection.clear();
-                        drawer_selection.begin_bounded(mouse.column, mouse.row, bounds);
-                    } else {
-                        chat_selection.clear();
-                    }
-                } else {
-                    chat_selection.clear();
-                }
-            }
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if state.drawer().is_some() || drawer_selection.is_active() {
-                drawer_selection.update(mouse.column, mouse.row);
-            } else if chat_selection.is_active()
-                && let Some(layout) = chat_layout
-            {
-                // Drag-to-edge auto-scroll: extend selection across pages.
-                let area = layout.area;
-                let max_scroll = layout.max_scroll();
-                let mut scrolled = 0usize;
-                if !area.is_empty() && mouse.row <= area.y {
-                    for _ in 0..EDGE_SCROLL {
-                        if state.scroll() < max_scroll {
-                            state.scroll_up();
-                            scrolled += 1;
-                        }
-                    }
-                    let first = layout
-                        .first_line
-                        .saturating_sub(scrolled)
-                        .min(layout.lines.len().saturating_sub(1));
-                    let col = layout
-                        .screen_to_content(mouse.column, area.y)
-                        .map(|(_, c)| c)
-                        .unwrap_or(0);
-                    chat_selection.update((first, col));
-                } else if !area.is_empty() && mouse.row >= area.y + area.height.saturating_sub(1) {
-                    for _ in 0..EDGE_SCROLL {
-                        if state.scroll() > 0 {
-                            state.scroll_down();
-                            scrolled += 1;
-                        }
-                    }
-                    let height = area.height as usize;
-                    let last = (layout.first_line + height.saturating_sub(1) + scrolled)
-                        .min(layout.lines.len().saturating_sub(1));
-                    let col = layout
-                        .screen_to_content(mouse.column, area.y + area.height.saturating_sub(1))
-                        .map(|(_, c)| c)
-                        .unwrap_or(0);
-                    chat_selection.update((last, col));
-                } else if let Some(point) = layout.screen_to_content(mouse.column, mouse.row) {
-                    chat_selection.update(point);
-                }
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if drawer_selection.is_active() {
-                if let Some(text) = drawer_selection.finish(mouse.column, mouse.row, screen) {
-                    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text))?;
-                }
-            } else if let Some(layout) = chat_layout {
-                // screen_to_content clamps into the chat area.
-                if let Some(point) = layout.screen_to_content(mouse.column, mouse.row)
-                    && let Some(text) = chat_selection.finish(point, layout)
-                {
-                    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text))?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Return the selectable status region under a screen point. The top status
-/// block ends where the chat begins; the bottom status bar is the last row.
-fn status_bar_at(
-    screen: ratatui::layout::Rect,
-    chat: &ChatLayout,
-    x: u16,
-    y: u16,
-) -> Option<ratatui::layout::Rect> {
-    let header = ratatui::layout::Rect::new(
-        screen.x,
-        screen.y,
-        screen.width,
-        chat.area.y.saturating_sub(screen.y),
-    );
-    let footer = ratatui::layout::Rect::new(
-        screen.x,
-        screen.y.saturating_add(screen.height.saturating_sub(1)),
-        screen.width,
-        u16::from(screen.height > 0),
-    );
-    [header, footer].into_iter().find(|area| {
-        !area.is_empty()
-            && x >= area.x
-            && x < area.x.saturating_add(area.width)
-            && y >= area.y
-            && y < area.y.saturating_add(area.height)
-    })
 }
 
 /// Hand the whole terminal to the member's real interactive CLI (resuming its
@@ -584,7 +364,7 @@ fn attach_to_member(
             &req.cwd,
         ))),
         BackendKind::Claude => Some(AttachSnapshot::Claude(claude_import::snapshot(
-            req.session.as_deref(),
+            req.transcript_session(),
             &req.cwd,
         ))),
         BackendKind::Grok | BackendKind::Agy => None,
@@ -599,7 +379,6 @@ fn attach_to_member(
     execute!(
         out,
         DisableBracketedPaste,
-        DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
@@ -623,12 +402,7 @@ fn attach_to_member(
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
-    execute!(
-        out,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     if keyboard_enhancement {
         execute!(
             out,
@@ -659,7 +433,7 @@ fn attach_to_member(
     // Import any messages exchanged in the attached session so they appear in
     // (and persist to) the Asterline transcript. The runtime records them and
     // emits the events the main loop renders.
-    let imported = if attached_cli_ran && let Some(snapshot) = snapshot {
+    let mut imported = if attached_cli_ran && let Some(snapshot) = snapshot {
         match snapshot {
             AttachSnapshot::Codex(s) => rollout_import::imported_attach_since(s),
             AttachSnapshot::Claude(s) => claude_import::imported_attach_since(s),
@@ -667,6 +441,12 @@ fn attach_to_member(
     } else {
         attach::AttachOutcome::default()
     };
+    // The fresh Claude UUID was generated by Asterline and supplied directly
+    // to the successfully launched CLI, so it is a deterministic identity
+    // even if the user exits before Claude writes an importable chat row.
+    if attached_cli_ran && req.backend == BackendKind::Claude && imported.session.is_none() {
+        imported.session = req.fresh_session.clone();
+    }
     Ok(imported)
 }
 
@@ -757,8 +537,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_previous_run_step() {
                     state.select_newer_run();
                 }
-            } else if state.drawer() == Some(drawers::Drawer::Skills) {
-                state.select_previous_skill();
             } else if state.drawer() == Some(drawers::Drawer::Resume) {
                 state.select_previous_resume();
             } else if state.drawer().is_some() {
@@ -775,8 +553,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_next_run_step() {
                     state.select_older_run();
                 }
-            } else if state.drawer() == Some(drawers::Drawer::Skills) {
-                state.select_next_skill();
             } else if state.drawer() == Some(drawers::Drawer::Resume) {
                 state.select_next_resume();
             } else if state.drawer().is_some() {
@@ -795,9 +571,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
         Action::Complete => {
-            if state.drawer() == Some(drawers::Drawer::Skills) && state.stage_selected_skill() {
-                return;
-            }
             if state.drawer() == Some(drawers::Drawer::Runs) && state.stage_selected_run_dispatch()
             {
                 return;
@@ -832,22 +605,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 }
                 return;
             }
-            if state.drawer() == Some(drawers::Drawer::Skills) && state.stage_selected_skill() {
-                return;
-            }
             if state.drawer() == Some(drawers::Drawer::Runs) && state.stage_selected_run_action() {
                 return;
             }
             // With the popup open, Enter accepts the highlighted item; if the
             // token is already complete (no change), fall through to submit.
-            if state.completion().is_some() {
-                let opens_model_picker = state.selected_completion_is_model_picker();
-                if state.accept_completion() {
-                    if opens_model_picker {
-                        submit(state, handle);
-                    }
-                    return;
-                }
+            if state.completion().is_some() && state.accept_completion() {
+                return;
             }
             if let Some(idx) = state.header_selected() {
                 // Selecting a member and pressing Enter attaches to its live
@@ -1066,13 +830,6 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             state.take_composer();
             state.quit();
         }
-        Submission::ModelPicker { member } => match state.open_model_picker(member.as_ref()) {
-            Ok(()) => {
-                state.record_submission(&text);
-                state.take_composer();
-            }
-            Err(message) => state.apply(RuntimeEvent::Notice(message)),
-        },
         Submission::Attach { member } => {
             if state.member_backend(&member).is_none() {
                 state.apply(RuntimeEvent::Notice(format!("unknown member: {member}")));
@@ -1098,7 +855,6 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Submission::Runtime(command) => {
-            let command = state.normalize_member_control(command);
             let command = state.normalize_known_skill_invocation(command);
             // `/mode` and `/new` can be rejected by the runtime (for example,
             // when persistence fails or work is still active). Apply their UI
@@ -1126,11 +882,6 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             if drawer == drawers::Drawer::Diff && state.drawer() != Some(drawers::Drawer::Diff) {
                 let diff = compute_git_diff(state.workspace());
                 state.set_diff(diff);
-            }
-            if drawer == drawers::Drawer::Skills && state.drawer() != Some(drawers::Drawer::Skills)
-            {
-                let workspace = Path::new(state.workspace());
-                state.set_skills(skills::discover(workspace));
             }
             state.toggle_drawer(drawer);
         }
@@ -1675,14 +1426,17 @@ mod tests {
 
         let mut escape = verifying_state();
         handle_action(Action::CloseOverlay, &mut escape, &handle);
-        assert!(!escape.runtime_available(), "Esc must dispatch /abort");
+        assert!(
+            !escape.runtime_available(),
+            "Esc must dispatch global cancellation"
+        );
 
         let mut interrupt = verifying_state();
         interrupt.insert_text("keep this draft");
         handle_action(Action::Interrupt, &mut interrupt, &handle);
         assert!(
             !interrupt.runtime_available(),
-            "Ctrl+C must dispatch /abort"
+            "Ctrl+C must dispatch global cancellation"
         );
         assert!(!interrupt.should_quit());
         assert_eq!(interrupt.composer().text(), "keep this draft");
@@ -1713,7 +1467,10 @@ mod tests {
 
         handle_action(Action::CloseOverlay, &mut state, &handle);
 
-        assert!(!state.runtime_available(), "Esc must dispatch /abort");
+        assert!(
+            !state.runtime_available(),
+            "Esc must dispatch global cancellation"
+        );
         assert_eq!(state.paused_routes(), 0);
     }
 
@@ -1746,162 +1503,6 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(!enable_keyboard_enhancement(&mut bytes, false).unwrap());
         assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_chat_independently_of_arrow_history() {
-        let mut state = AppState::new(Vec::new());
-        let mut drawer_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        // Layout tall enough that STEP (6) scroll-ups are not capped.
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 1, 78, 10),
-            first_line: 0,
-            width: 78,
-            lines: (0..40).map(|i| format!("line {i}")).collect(),
-            completion_area: None,
-        };
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-        let mouse = |kind| MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-
-        handle_mouse(
-            mouse(MouseEventKind::ScrollUp),
-            &mut state,
-            &mut drawer_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert_eq!(state.scroll(), 6);
-        handle_mouse(
-            mouse(MouseEventKind::ScrollDown),
-            &mut state,
-            &mut drawer_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert_eq!(state.scroll(), 0);
-    }
-
-    #[test]
-    fn mouse_wheel_does_not_clear_chat_selection() {
-        let mut state = AppState::new(Vec::new());
-        let mut drawer_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 1, 78, 10),
-            first_line: 0,
-            width: 78,
-            lines: (0..40).map(|i| format!("line {i}")).collect(),
-            completion_area: None,
-        };
-        chat_selection.begin((2, 0), layout.width);
-        chat_selection.update((5, 3));
-        assert!(chat_selection.is_active());
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-        handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                column: 0,
-                row: 0,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            },
-            &mut state,
-            &mut drawer_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert!(chat_selection.is_active());
-        assert_eq!(state.scroll(), 6);
-    }
-
-    #[test]
-    fn header_and_footer_status_bars_start_screen_selection() {
-        let mut state = AppState::new(Vec::new());
-        let mut screen_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 3, 78, 17),
-            first_line: 0,
-            width: 78,
-            lines: vec!["chat".to_string()],
-            completion_area: None,
-        };
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-        let down = |row| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 4,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-
-        handle_mouse(
-            down(1),
-            &mut state,
-            &mut screen_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert!(screen_selection.is_active());
-        assert!(!chat_selection.is_active());
-
-        screen_selection.clear();
-        handle_mouse(
-            down(23),
-            &mut state,
-            &mut screen_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert!(screen_selection.is_active());
-        assert!(!chat_selection.is_active());
-    }
-
-    #[test]
-    fn completion_popup_starts_screen_selection() {
-        let mut state = AppState::new(Vec::new());
-        let mut screen_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 3, 78, 17),
-            first_line: 0,
-            width: 78,
-            lines: vec!["chat".to_string()],
-            completion_area: Some(ratatui::layout::Rect::new(0, 22, 80, 2)),
-        };
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-
-        handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 4,
-                row: 22,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            },
-            &mut state,
-            &mut screen_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-
-        assert!(screen_selection.is_active());
-        assert!(!chat_selection.is_active());
     }
 
     #[test]
