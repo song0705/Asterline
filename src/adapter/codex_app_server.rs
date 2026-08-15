@@ -57,6 +57,7 @@ struct NativeApprovalDecision {
 struct CodexAppServerConfig {
     binary: String,
     cwd: PathBuf,
+    session_name: String,
     sandbox: SandboxPolicy,
     permission_mode: Option<PermissionMode>,
     model: Option<String>,
@@ -68,11 +69,16 @@ impl CodexAppServerConfig {
         Self {
             binary: "codex".to_string(),
             cwd: absolute_path(&member.resolved_cwd(workspace)),
+            session_name: native_session_name(&member.display_name),
             sandbox: member.sandbox,
             permission_mode: member.permission_mode,
             model: member.model.clone(),
             system_prompt: member.system_prompt.clone(),
         }
+    }
+
+    fn native_session_name(&self) -> &str {
+        &self.session_name
     }
 
     fn thread_params(&self) -> Value {
@@ -141,6 +147,7 @@ pub(crate) fn discover_models(cwd: &Path) -> Result<Vec<DiscoveredModel>, String
     let config = CodexAppServerConfig {
         binary: "codex".to_string(),
         cwd: absolute_path(cwd),
+        session_name: "Asterline · model catalog".to_string(),
         sandbox: SandboxPolicy::ReadOnly,
         permission_mode: None,
         model: None,
@@ -483,8 +490,31 @@ impl AppServerClient {
         let _ = events.send(AgentEvent::SessionDiscovered(AgentSessionId(
             thread_id.clone(),
         )));
+        self.set_native_thread_name(&thread_id, config, events, mapper);
         self.active_thread_id = Some(thread_id.clone());
         Ok(thread_id)
+    }
+
+    /// Keep App Server-created threads recognizable in Codex's own resume
+    /// list. Naming is cosmetic; an older CLI that does not expose this
+    /// optional method must not prevent the actual chat from starting.
+    fn set_native_thread_name(
+        &mut self,
+        thread_id: &str,
+        config: &CodexAppServerConfig,
+        events: &SyncSender<AgentEvent>,
+        mapper: &mut AppServerEventMapper,
+    ) {
+        if let Err(error) = self.request(
+            "thread/name/set",
+            json!({ "threadId": thread_id, "name": config.native_session_name() }),
+            events,
+            mapper,
+        ) {
+            let _ = events.send(AgentEvent::ParseWarning(format!(
+                "could not label native Codex thread {thread_id}: {error}"
+            )));
+        }
     }
 
     fn wait_for_turn(
@@ -825,6 +855,10 @@ fn codex_approval_policy(mode: Option<PermissionMode>) -> &'static str {
     }
 }
 
+fn native_session_name(display_name: &str) -> String {
+    format!("Asterline · {}", display_name.trim())
+}
+
 impl Drop for AppServerClient {
     fn drop(&mut self) {
         // A line pump can be blocked in `SyncSender::send` when its bounded
@@ -971,6 +1005,11 @@ impl AppServerEventMapper {
                         .unwrap_or("Codex turn failed");
                     let _ = events.send(AgentEvent::Fatal(message.to_string()));
                 }
+                // App Server normally emits item/completed before its turn
+                // terminal notification. Treat the accumulated deltas as the
+                // final answer if a server version ends the turn without that
+                // item event, rather than silently dropping the reply.
+                self.finish_open_agent_messages(events);
                 self.terminal = Some(ok);
             }
             "error" => {
@@ -1046,6 +1085,18 @@ impl AppServerEventMapper {
         if let Some(delta) = append_bounded_text(text, delta, MAX_MESSAGE_TEXT_BYTES) {
             let _ = events.send(AgentEvent::TextDelta(delta));
         }
+    }
+
+    fn finish_open_agent_messages(&mut self, events: &SyncSender<AgentEvent>) {
+        let ids = self.started_messages.drain().collect::<Vec<_>>();
+        for id in ids {
+            if self.agent_phases.get(&id).and_then(Option::as_deref) == Some("commentary") {
+                continue;
+            }
+            let text = self.agent_text.remove(&id).unwrap_or_default();
+            let _ = events.send(AgentEvent::MessageCompleted(text));
+        }
+        self.agent_phases.clear();
     }
 
     fn handle_item(&mut self, item: &Value, started: bool, events: &SyncSender<AgentEvent>) {
@@ -1472,6 +1523,48 @@ mod tests {
     }
 
     #[test]
+    fn app_server_finalizes_streamed_text_when_turn_ends_without_item_completed() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        mapper.handle_notification(
+            "item/started",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": { "id": "message-1", "type": "agentMessage", "phase": "final_answer" }
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/agentMessage/delta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "message-1", "delta": "final reply"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "turn/completed",
+            &json!({
+                "threadId": "thread-1", "turn": { "id": "turn-1", "status": "completed" }
+            }),
+            &tx,
+        );
+        drop(tx);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::MessageStarted,
+                AgentEvent::TextDelta("final reply".to_string()),
+                AgentEvent::MessageCompleted("final reply".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn app_server_maps_completed_command_without_a_false_start() {
         let mut mapper = AppServerEventMapper::default();
         let (tx, rx) = mpsc::sync_channel(32);
@@ -1513,6 +1606,7 @@ mod tests {
             TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
         member.sandbox = SandboxPolicy::WorkspaceWrite;
         let config = CodexAppServerConfig::from_member(&member, Path::new("/tmp"));
+        assert_eq!(config.native_session_name(), "Asterline · Builder");
         assert_eq!(config.thread_params()["sandbox"], "workspace-write");
         assert_eq!(config.thread_params()["approvalPolicy"], "never");
         let resume = config.resume_params("thread-7");
@@ -1684,13 +1778,15 @@ read_line
 read_line
 printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-1"}}}}}}'
 read_line
-printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+printf '%s\n' '{{"id":3,"result":{{}}}}'
+read_line
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"turn-1"}}}}}}'
 printf '%s\n' '{{"method":"item/started","params":{{"threadId":"thread-1","turnId":"turn-1","item":{{"id":"message-1","type":"agentMessage","phase":"final","text":""}}}}}}'
 printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"first"}}}}'
 printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"thread-1","turnId":"turn-1","item":{{"id":"message-1","type":"agentMessage","phase":"final","text":"first"}}}}}}'
 printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-1","turnId":"turn-1","turn":{{"id":"turn-1","status":"completed"}}}}}}'
 read_line
-  printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"turn-2"}}}}}}'
+  printf '%s\n' '{{"id":5,"result":{{"turn":{{"id":"turn-2"}}}}}}'
 printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-1","turnId":"turn-2","turn":{{"id":"turn-2","status":"completed"}}}}}}'
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
@@ -1762,6 +1858,10 @@ done
                 .iter()
                 .any(|message| message["method"] == "thread/start")
         );
+        assert!(input.iter().any(|message| {
+            message["method"] == "thread/name/set"
+                && message["params"]["name"] == "Asterline · Builder"
+        }));
         assert!(
             !input
                 .iter()

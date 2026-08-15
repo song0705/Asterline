@@ -10,7 +10,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::adapter::parser::{
-    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, str_field, summarize, tool_value,
+    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, str_field, summarize, tool_value,
 };
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
@@ -22,6 +22,7 @@ const TOOL_OUTPUT_MAX: usize = 32_000;
 pub struct ClaudeStreamAdapter {
     binary: String,
     cwd: std::path::PathBuf,
+    session_name: String,
     model: Option<String>,
     permission_mode: Option<PermissionMode>,
     allowed_tools: Vec<String>,
@@ -33,6 +34,7 @@ impl ClaudeStreamAdapter {
         Self {
             binary: "claude".to_string(),
             cwd: member.resolved_cwd(workspace),
+            session_name: native_session_name(&member.display_name),
             model: member.model.clone(),
             permission_mode: member.permission_mode,
             allowed_tools: member.allowed_tools.clone(),
@@ -69,6 +71,12 @@ impl StreamAdapter for ClaudeStreamAdapter {
             args.push("--resume".to_string());
             args.push(session.as_str().to_string());
         }
+        // Claude persists print-mode sessions unless explicitly disabled. A
+        // stable, human-readable name records the session as Asterline-owned
+        // instead of leaving a system-prompt fragment as its title. Passing it
+        // on resume repairs sessions that predate this label too.
+        args.push("--name".to_string());
+        args.push(self.session_name.clone());
         if let Some(model) = &self.model {
             args.push("--model".to_string());
             args.push(model.clone());
@@ -111,43 +119,48 @@ impl StreamAdapter for ClaudeStreamAdapter {
     }
 }
 
+fn native_session_name(display_name: &str) -> String {
+    format!("Asterline · {}", display_name.trim())
+}
+
 /// Streaming parser for the Claude stream-json envelope.
 #[derive(Default)]
 pub struct ClaudeLineParser {
-    message_open: bool,
     text_acc: String,
+    /// A Claude assistant message can contain an explanatory text block and
+    /// then request tools. That text is progress for the still-running turn,
+    /// not its final answer, so it must not be committed ahead of the tools.
+    message_has_tool: bool,
+    message_emitted: bool,
     tool_blocks: HashMap<u64, String>,
     tool_input_started: HashSet<u64>,
     result_seen: bool,
 }
 
 impl ClaudeLineParser {
-    fn open_message(&mut self, out: &mut Vec<AgentEvent>) {
-        if !self.message_open {
-            self.message_open = true;
+    fn flush_message(&mut self, out: &mut Vec<AgentEvent>) {
+        if self.message_has_tool {
             self.text_acc.clear();
-            out.push(AgentEvent::MessageStarted);
+            return;
         }
-    }
-
-    fn close_message(&mut self, out: &mut Vec<AgentEvent>) {
-        if self.message_open {
-            self.message_open = false;
-            out.push(AgentEvent::MessageCompleted(std::mem::take(
-                &mut self.text_acc,
-            )));
+        let text = std::mem::take(&mut self.text_acc);
+        if !text.is_empty() {
+            self.message_emitted = true;
+            out.push(AgentEvent::MessageCompleted(text));
         }
     }
 
     fn handle_stream_event(&mut self, event: &Value, out: &mut Vec<AgentEvent>) {
         match str_field(event, "type") {
             Some("message_start") => {
-                self.message_open = false;
                 self.text_acc.clear();
+                self.message_has_tool = false;
+                self.message_emitted = false;
             }
             Some("content_block_start") => {
                 let block = &event["content_block"];
                 if str_field(block, "type") == Some("tool_use") {
+                    self.message_has_tool = true;
                     let id = str_field(block, "id").unwrap_or_default().to_string();
                     let name = str_field(block, "name").unwrap_or("tool").to_string();
                     let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -174,12 +187,7 @@ impl ClaudeLineParser {
                 if str_field(delta, "type") == Some("text_delta")
                     && let Some(text) = str_field(delta, "text")
                 {
-                    self.open_message(out);
-                    if let Some(delta) =
-                        append_bounded_text(&mut self.text_acc, text, MAX_MESSAGE_TEXT_BYTES)
-                    {
-                        out.push(AgentEvent::TextDelta(delta));
-                    }
+                    let _ = append_bounded_text(&mut self.text_acc, text, MAX_MESSAGE_TEXT_BYTES);
                 } else if str_field(delta, "type") == Some("input_json_delta")
                     && let Some(partial) = str_field(delta, "partial_json")
                     && let Some(index) = event.get("index").and_then(Value::as_u64)
@@ -214,7 +222,7 @@ impl ClaudeLineParser {
                     }
                 }
             }
-            Some("message_stop") => self.close_message(out),
+            Some("message_stop") => self.flush_message(out),
             _ => {}
         }
     }
@@ -314,7 +322,20 @@ impl LineParser for ClaudeLineParser {
                         session.to_string(),
                     )));
                 }
-                self.close_message(&mut out);
+                self.flush_message(&mut out);
+                // Stream-json normally delivers the terminal text through
+                // stream_event. Keep the result-body fallback for CLI builds
+                // that omit those partials, without duplicating a flushed
+                // final assistant message.
+                if !self.message_emitted
+                    && let Some(text) = str_field(&value, "result").filter(|text| !text.is_empty())
+                {
+                    out.push(AgentEvent::MessageCompleted(bounded_text(
+                        text,
+                        MAX_MESSAGE_TEXT_BYTES,
+                    )));
+                    self.message_emitted = true;
+                }
                 if value.get("is_error").and_then(Value::as_bool) == Some(true) {
                     let message = str_field(&value, "result").unwrap_or("claude reported an error");
                     out.push(AgentEvent::Fatal(message.to_string()));
@@ -331,7 +352,7 @@ impl LineParser for ClaudeLineParser {
 
     fn finish(&mut self) -> Vec<AgentEvent> {
         let mut out = Vec::new();
-        self.close_message(&mut out);
+        self.flush_message(&mut out);
         out
     }
 
@@ -387,6 +408,12 @@ mod tests {
                 .contains(&"--forward-subagent-text".to_string())
         );
         assert!(command.args.windows(2).any(|w| w == ["--resume", "sess-1"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--name", "Asterline · Reviewer"])
+        );
         assert!(command.args.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(
             command
@@ -459,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_text_deltas_then_completes() {
+    fn buffers_final_text_until_the_assistant_message_is_complete() {
         let events = parse_all(&[
             r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}}"#,
@@ -468,13 +495,46 @@ mod tests {
         ]);
         assert_eq!(
             events,
-            vec![
-                AgentEvent::MessageStarted,
-                AgentEvent::TextDelta("Hello ".to_string()),
-                AgentEvent::TextDelta("world".to_string()),
-                AgentEvent::MessageCompleted("Hello world".to_string()),
-            ]
+            vec![AgentEvent::MessageCompleted("Hello world".to_string())]
         );
+    }
+
+    #[test]
+    fn tool_call_progress_is_not_committed_as_a_reply_before_the_final_message() {
+        let events = parse_all(&[
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I will inspect it."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents","is_error":false}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Done."}"#,
+        ]);
+
+        let tool_started = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ToolStarted { id, .. } if id == "toolu_1"),
+            )
+            .expect("tool start");
+        let tool_completed = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ToolCompleted { id, .. } if id == "toolu_1"),
+            )
+            .expect("tool result");
+        let final_message = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::MessageCompleted(text) if text == "Done."),
+            )
+            .expect("final assistant message");
+        assert!(tool_started < tool_completed && tool_completed < final_message);
+        assert!(!events.iter().any(
+            |event| matches!(event, AgentEvent::MessageCompleted(text) if text.contains("inspect"))
+        ));
     }
 
     #[test]
