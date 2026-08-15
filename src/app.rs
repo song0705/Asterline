@@ -190,11 +190,18 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             }
         }
     };
-    // A CLI workspace is an explicit launch-time override. Without one, the
-    // team file's workspace is canonical for runners, skills, and the default
-    // database location.
+    // A CLI workspace is an explicit launch-time override. A roster loaded
+    // from `<cwd>/.asterline/team.json` belongs to that directory as well: if
+    // a project was moved, its serialized `workspace` value is stale, and
+    // continuing to use it would make native Codex/Claude transcripts belong
+    // to the old project. An explicitly supplied `--team` file retains its
+    // declared workspace instead.
+    let adopt_saved_workspace = restore_saved_roster && config.workspace.is_none();
     if let Some(workspace) = &config.workspace {
         team.workspace = workspace.clone();
+    } else if adopt_saved_workspace && team.workspace != requested_workspace {
+        team.workspace = requested_workspace.clone();
+        runtime::save_team_config(&saved_team, &team)?;
     }
     let workspace = team.workspace.clone();
     ensure_team_skill(&team.workspace)?;
@@ -646,6 +653,14 @@ mod tests {
         store
             .save_conversation_snapshot(&saved, &[], crate::domain::TerminalMode::Normal)
             .unwrap();
+        let turn = store.create_turn().unwrap();
+        store
+            .record_user(
+                turn,
+                std::slice::from_ref(&launch.members[0].id),
+                "restore this chat after reopening",
+            )
+            .unwrap();
         drop(store);
 
         let config = AppConfig::parse([
@@ -657,6 +672,10 @@ mod tests {
         ])
         .unwrap();
         let prepared = prepare(&config, &dir).unwrap().expect("prepared");
+        assert!(prepared.state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::User { body } if body == "restore this chat after reopening"
+        )));
         let ready = prepared
             .events
             .recv_timeout(Duration::from_secs(2))
@@ -780,6 +799,62 @@ mod tests {
             RuntimeEvent::Ready { workspace, .. }
                 if workspace == team_workspace.display().to_string()
         ));
+
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn saved_roster_adopts_the_workspace_that_contains_it_after_a_project_move() {
+        let root = std::env::temp_dir().join(format!(
+            "asterline-app-moved-workspace-{}",
+            std::process::id()
+        ));
+        let previous_workspace = root.join("previous-location");
+        let moved_workspace = root.join("moved-location");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&previous_workspace).unwrap();
+        std::fs::create_dir_all(moved_workspace.join(".asterline")).unwrap();
+
+        let team = crate::domain::config::default_team(
+            &previous_workspace,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+        let saved_team = moved_workspace.join(".asterline/team.json");
+        runtime::save_team_config(&saved_team, &team).unwrap();
+
+        let config = AppConfig::parse(["--fake", "--no-restore"]).unwrap();
+        let prepared = prepare(&config, &moved_workspace)
+            .unwrap()
+            .expect("prepared");
+        let ready = prepared
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        assert!(matches!(
+            ready,
+            RuntimeEvent::Ready { workspace, .. }
+                if workspace == moved_workspace.display().to_string()
+        ));
+        let saved: TeamConfig = load_team_config(&saved_team).unwrap();
+        assert_eq!(saved.workspace, moved_workspace);
+        assert!(
+            moved_workspace
+                .join(".asterline/asterline.sqlite3")
+                .is_file()
+        );
+        assert!(
+            !previous_workspace
+                .join(".asterline/asterline.sqlite3")
+                .exists()
+        );
 
         prepared.handle.send(UiCommand::Shutdown);
         prepared.join.join().unwrap();

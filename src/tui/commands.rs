@@ -120,7 +120,10 @@ fn parse_slash(rest: &str) -> Submission {
                 }
             }
         }
-        "new" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
+        // Both spellings intentionally perform the same durable reset. Keep
+        // `/new` for muscle memory and accept `/clear` when it is submitted
+        // directly (rather than only after completion rewrites it).
+        "new" | "clear" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
         "resume" if arg.is_empty() => Submission::Runtime(UiCommand::RequestResume),
         "exit" if arg.is_empty() => Submission::Exit,
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
@@ -193,8 +196,8 @@ fn parse_slash(rest: &str) -> Submission {
             }
         }
         "help" if arg.is_empty() => Submission::Help,
-        "team" | "runs" | "logs" | "diff" | "new" | "resume" | "exit" | "retry" | "approve"
-        | "reject" | "help" => {
+        "team" | "runs" | "logs" | "diff" | "new" | "clear" | "resume" | "exit" | "retry"
+        | "approve" | "reject" | "help" => {
             Submission::Invalid(format!("/{cmd} does not accept arguments; draft kept"))
         }
         _ => Submission::Help,
@@ -517,6 +520,7 @@ mod tests {
             "/logs extra",
             "/diff extra",
             "/new extra",
+            "/clear extra",
             "/resume extra",
             "/exit extra",
             "/retry extra",
@@ -802,9 +806,9 @@ mod tests {
     }
 
     #[test]
-    fn new_session_command() {
+    fn new_and_clear_both_start_a_fresh_session() {
         assert_eq!(parse("/new"), Submission::Runtime(UiCommand::NewSession));
-        assert_eq!(parse("/clear"), Submission::Help);
+        assert_eq!(parse("/clear"), Submission::Runtime(UiCommand::NewSession));
     }
 
     #[test]
