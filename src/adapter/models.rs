@@ -451,7 +451,7 @@ fn discover_gateway_models(gateway: &ClaudeGateway) -> Result<Vec<DiscoveredMode
         .timeout_global(Some(GATEWAY_MODEL_DISCOVERY_TIMEOUT))
         .tls_config(
             ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
+                .provider(ureq::tls::TlsProvider::Rustls)
                 .build(),
         )
         .build()

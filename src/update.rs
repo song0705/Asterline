@@ -215,7 +215,7 @@ fn update_agent() -> ureq::Agent {
         .timeout_global(Some(Duration::from_secs(30)))
         .tls_config(
             ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
+                .provider(ureq::tls::TlsProvider::Rustls)
                 .build(),
         )
         .build()

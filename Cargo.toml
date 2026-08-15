@@ -26,7 +26,7 @@ textwrap = { version = "0.16", default-features = false, features = ["unicode-wi
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 uuid = { version = "1.23.3", features = ["v4"] }
-ureq = { version = "=3.3.0", default-features = false, features = ["native-tls"] }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
