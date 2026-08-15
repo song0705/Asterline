@@ -748,6 +748,12 @@ pub struct ConversationSummary {
 pub enum ChatItem {
     User {
         body: String,
+        /// Members this prompt was routed to. Empty on legacy replay rows.
+        targets: Vec<MemberId>,
+        /// Members already working when this prompt was sent, excluding
+        /// `targets`. Later output from these members stays under their
+        /// previous block; otherwise the transcript stays chronological.
+        interrupted: Vec<MemberId>,
     },
     Agent {
         member: MemberId,

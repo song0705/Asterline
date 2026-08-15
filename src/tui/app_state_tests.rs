@@ -207,6 +207,8 @@ fn route_queue_update_clears_resolved_or_aborted_routes() {
 fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
     let mut state = AppState::new(vec![ChatItem::User {
         body: "current".to_string(),
+        targets: Vec::new(),
+        interrupted: Vec::new(),
     }]);
     state.apply(RuntimeEvent::ResumeChoices {
         conversations: vec![
@@ -242,13 +244,17 @@ fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
         conversation: 3,
         chat: vec![ChatItem::User {
             body: "older saved question".to_string(),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         }],
     });
     assert_eq!(state.drawer(), None);
     assert_eq!(
         state.chat(),
         &[ChatItem::User {
-            body: "older saved question".to_string()
+            body: "older saved question".to_string(),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         }]
     );
 }
@@ -778,7 +784,7 @@ fn oversized_replayed_and_live_items_are_visibly_truncated() {
     });
     let live = state.chat().last().unwrap();
     assert!(chat_item_bytes(live) <= MAX_CHAT_ITEM_BYTES);
-    assert!(matches!(live, ChatItem::User { body } if body.contains("output truncated")));
+    assert!(matches!(live, ChatItem::User { body, .. } if body.contains("output truncated")));
     assert!(state.chat().iter().map(chat_item_bytes).sum::<usize>() <= MAX_CHAT_BYTES);
 }
 
@@ -1132,6 +1138,8 @@ fn prompt_history_seed_and_submissions_obey_hard_budget() {
     let replayed = (0..MAX_PROMPT_HISTORY_ITEMS + 20)
         .map(|index| ChatItem::User {
             body: format!("seed-{index}"),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         })
         .collect();
     let mut state = AppState::new(replayed);
@@ -1379,6 +1387,8 @@ fn find_matches_case_insensitively_and_navigates() {
     let mut state = AppState::new(vec![
         ChatItem::User {
             body: "Fix the Parser".to_string(),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         },
         ChatItem::Agent {
             member: MemberId::new("builder"),
@@ -1461,6 +1471,8 @@ fn find_jump_scroll_sums_items_below() {
     let mut state = AppState::new(vec![
         ChatItem::User {
             body: "alpha\nline2".to_string(),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         },
         ChatItem::Notice {
             text: "beta".to_string(),
@@ -1812,7 +1824,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
     });
     assert!(matches!(
         state.chat().last(),
-        Some(ChatItem::User { body }) if body == "go"
+        Some(ChatItem::User { body, .. }) if body == "go"
     ));
     assert_eq!(state.running_count(), 0);
 
@@ -2107,6 +2119,8 @@ fn prompt_history_seeds_from_replayed_user_messages() {
     let chat = vec![
         ChatItem::User {
             body: "first".to_string(),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         },
         ChatItem::Agent {
             member: MemberId::new("builder"),
@@ -2116,6 +2130,8 @@ fn prompt_history_seeds_from_replayed_user_messages() {
         },
         ChatItem::User {
             body: "second".to_string(),
+            targets: Vec::new(),
+            interrupted: Vec::new(),
         },
     ];
     let mut state = AppState::new(chat);
@@ -2137,6 +2153,8 @@ fn prompt_history_seeds_from_replayed_user_messages() {
 fn history_preserves_and_restores_the_live_draft() {
     let mut state = AppState::new(vec![ChatItem::User {
         body: "prior".to_string(),
+        targets: Vec::new(),
+        interrupted: Vec::new(),
     }]);
     for ch in "draft".chars() {
         state.insert_char(ch);

@@ -755,7 +755,7 @@ fn resume_picker_restores_chat_roster_and_native_member_sessions() {
             if *conversation == original
                 && chat.iter().any(|item| matches!(
                     item,
-                    ChatItem::User { body } if body == "original question"
+                    ChatItem::User { body, .. } if body == "original question"
                 ))
     )));
     assert!(resumed.events.iter().any(|event| matches!(
@@ -4772,7 +4772,7 @@ fn brainstorm_records_original_topic_as_visible_user_message() {
     )));
     assert!(rt.store.replay_chat().unwrap().iter().any(|item| matches!(
         item,
-        ChatItem::User { body } if body == topic
+        ChatItem::User { body, .. } if body == topic
     )));
     assert_eq!(step.actions.len(), 3);
     assert!(

@@ -224,7 +224,7 @@ impl AppState {
         // collapsing consecutive duplicates the way a shell history does.
         let mut prompt_history: Vec<String> = Vec::new();
         for item in &chat {
-            if let ChatItem::User { body } = item
+            if let ChatItem::User { body, .. } = item
                 && prompt_history.last() != Some(body)
             {
                 prompt_history.push(body.clone());
@@ -354,8 +354,21 @@ impl AppState {
             }
             RuntimeEvent::ModeChanged { mode } => self.active_mode = mode,
             RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {}
-            RuntimeEvent::UserMessage { body, .. } => {
-                self.push(ChatItem::User { body });
+            RuntimeEvent::UserMessage { body, targets, .. } => {
+                let interrupted = self
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member_status_is_active(member.status)
+                            && !targets.iter().any(|target| target == &member.id)
+                    })
+                    .map(|member| member.id.clone())
+                    .collect();
+                self.push(ChatItem::User {
+                    body,
+                    targets,
+                    interrupted,
+                });
             }
             RuntimeEvent::MemberStatus { member, status } => {
                 if !member_status_is_active(status) {
@@ -2569,7 +2582,7 @@ fn format_inherited_user_body(target: &MessageTarget, body: &str) -> String {
 /// Searchable text for one chat item (used by `/find`).
 fn chat_item_search_text(item: &ChatItem) -> String {
     match item {
-        ChatItem::User { body } => body.clone(),
+        ChatItem::User { body, .. } => body.clone(),
         ChatItem::Agent { text, .. } => text.clone(),
         ChatItem::Tool {
             name,
@@ -2596,7 +2609,7 @@ fn chat_item_search_text(item: &ChatItem) -> String {
 /// conservative lower bound.
 fn estimate_item_lines(item: &ChatItem) -> usize {
     match item {
-        ChatItem::User { body } => body.lines().count().max(1),
+        ChatItem::User { body, .. } => body.lines().count().max(1),
         ChatItem::Agent { text, .. } => {
             if text.is_empty() {
                 1 // header only
@@ -2639,7 +2652,15 @@ fn bounded_chat_field(text: String, fixed_bytes: usize) -> Option<String> {
 /// visible notice, ensuring every variant obeys the same hard ceiling.
 fn bound_chat_item(item: ChatItem) -> ChatItem {
     let bounded = match item {
-        ChatItem::User { body } => bounded_chat_field(body, 0).map(|body| ChatItem::User { body }),
+        ChatItem::User {
+            body,
+            targets,
+            interrupted,
+        } => bounded_chat_field(body, 0).map(|body| ChatItem::User {
+            body,
+            targets,
+            interrupted,
+        }),
         ChatItem::Agent {
             member,
             display_name,
@@ -2715,7 +2736,7 @@ fn bound_chat_item(item: ChatItem) -> ChatItem {
 
 fn chat_item_bytes(item: &ChatItem) -> usize {
     match item {
-        ChatItem::User { body } => body.len(),
+        ChatItem::User { body, .. } => body.len(),
         ChatItem::Agent {
             member,
             display_name,

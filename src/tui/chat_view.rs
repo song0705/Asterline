@@ -279,52 +279,6 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
         lines.push(Line::raw(""));
     }
 
-    // Append live activity lines for members that are currently busy.
-    let active_members: Vec<_> = state
-        .members()
-        .iter()
-        .filter(|m| member_status_is_active(m.status))
-        .collect();
-
-    let spin_char = status_indicator::spinner();
-    for member in active_members {
-        // A member that hasn't started its message yet gets a placeholder
-        // header; one that has only surfaces its live reasoning.
-        let show_placeholder = !state.has_active_message(&member.id);
-        let reasoning = state
-            .active_reasoning()
-            .get(&member.id)
-            .map(String::as_str)
-            .filter(|s| !s.is_empty());
-        if !show_placeholder && reasoning.is_none() {
-            continue;
-        }
-        if show_placeholder {
-            lines.push(agent_header_line(&member.display_name, member.backend));
-        }
-        let line_text = status_indicator::member_activity_text(
-            member.status,
-            reasoning,
-            // Claude exposes a verbose thought stream. Keep it private from
-            // the default live view while retaining an intentional Ctrl+T
-            // reveal; the other backends retain their existing live output.
-            member.backend != crate::domain::team::BackendKind::Claude || state.tools_expanded(),
-            state.member_elapsed_secs(&member.id),
-            spin_char,
-            Some(&state.member_runtime_profile(member)),
-        );
-        for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
-            lines.push(Line::from(vec![
-                chat_rail(theme::backend_color(member.backend)),
-                Span::raw(" "),
-                Span::styled(wrapped, theme::muted_italic()),
-            ]));
-        }
-        if show_placeholder {
-            lines.push(Line::raw(""));
-        }
-    }
-
     let height = inner.height as usize;
     let total = lines.len();
     let max_start = total.saturating_sub(height);
@@ -417,6 +371,57 @@ fn restyle_column_range(line: &Line<'_>, start_col: usize, end_col: usize) -> Li
     Line::from(out)
 }
 
+/// Display order that keeps one member's work together only when a later
+/// prompt was sent while that member was already working. Sequential turns
+/// stay chronological.
+fn grouped_chat_indices(items: &[ChatItem], start: usize, end: usize) -> Vec<usize> {
+    let start = start.min(items.len());
+    let end = end.min(items.len()).max(start);
+    let mut used = vec![false; end];
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        out.push(i);
+        let Some(member) = item_member(&items[i]).cloned() else {
+            continue;
+        };
+        for j in (i + 1)..end {
+            if used[j] {
+                continue;
+            }
+            if user_breaks_member_region(&items[j], &member) {
+                break;
+            }
+            if item_member(&items[j]) == Some(&member) {
+                used[j] = true;
+                out.push(j);
+            }
+        }
+    }
+    out
+}
+
+fn user_breaks_member_region(item: &ChatItem, member: &MemberId) -> bool {
+    match item {
+        ChatItem::User {
+            targets,
+            interrupted,
+            ..
+        } => {
+            if targets.iter().any(|target| target == member) {
+                return true;
+            }
+            // A prompt sent while this member was already working should not
+            // split their later output into the other member's region.
+            !interrupted.iter().any(|busy| busy == member)
+        }
+        _ => false,
+    }
+}
+
 fn render_chat_history_range(
     state: &AppState,
     width: usize,
@@ -427,8 +432,11 @@ fn render_chat_history_range(
     let items = state.chat();
     let start = start.min(items.len());
     let end = end.min(items.len()).max(start);
+    let order = grouped_chat_indices(items, start, end);
     let mut saw_work_activity = start > 0 && items[..start].iter().any(is_work_activity);
-    for (i, item) in items.iter().enumerate().take(end).skip(start) {
+    let mut rendered_live = std::collections::HashSet::new();
+    for (pos, &i) in order.iter().enumerate() {
+        let item = &items[i];
         if matches!(item, ChatItem::User { .. }) && saw_work_activity {
             render_turn_separator(width, out);
             saw_work_activity = false;
@@ -437,12 +445,13 @@ fn render_chat_history_range(
             saw_work_activity = true;
         }
         let before = out.len();
-        let previous_sender = if i == 0 {
-            None
-        } else {
-            items.get(i - 1).and_then(item_sender)
-        };
-        let show_sender_header = item_sender(item) != previous_sender;
+        let previous = pos.checked_sub(1).map(|p| &items[order[p]]);
+        let previous_sender = previous.and_then(item_sender);
+        // User and agent bubbles keep their own title so a member's later
+        // reply still reads as "member1: second message" in that member's
+        // region. Tools stay attached to the preceding speaker.
+        let show_sender_header = matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
+            || item_sender(item) != previous_sender;
         let is_find_current = state.find_current_chat_index() == Some(i);
         render_item(item, width, state, out, show_sender_header);
         if is_find_current && let Some(line) = out.get_mut(before) {
@@ -451,10 +460,18 @@ fn render_chat_history_range(
             spans.append(&mut line.spans);
             line.spans = spans;
         }
+        let next = order.get(pos + 1).map(|&j| &items[j]);
+        let member_block_ends = item_member(item)
+            .is_some_and(|member| next.and_then(item_member).is_none_or(|next| next != member));
+        if member_block_ends
+            && let Some(member) = item_member(item)
+            && render_live_member_activity(state, width, member, false, out)
+        {
+            rendered_live.insert(member.clone());
+        }
         // Keep one member's answer, tools, routes, diffs, and errors on the
         // same uninterrupted visual rail. Separate unrelated blocks.
         if out.len() > before {
-            let next = items.get(i + 1);
             let grouped = (is_compact(item) && next.is_some_and(is_compact))
                 || item_sender(item)
                     .is_some_and(|sender| next.and_then(item_sender).as_ref() == Some(&sender))
@@ -467,6 +484,59 @@ fn render_chat_history_range(
     if end == items.len() && saw_work_activity && state.running_count() == 0 {
         render_turn_separator(width, out);
     }
+    if end == items.len() {
+        for member in state.members() {
+            if member_status_is_active(member.status)
+                && !rendered_live.contains(&member.id)
+                && render_live_member_activity(state, width, &member.id, true, out)
+            {
+                out.push(Line::raw(""));
+            }
+        }
+    }
+}
+
+fn render_live_member_activity(
+    state: &AppState,
+    width: usize,
+    member_id: &MemberId,
+    show_placeholder_header: bool,
+    out: &mut Vec<Line<'static>>,
+) -> bool {
+    let Some(member) = state.members().iter().find(|m| &m.id == member_id) else {
+        return false;
+    };
+    if !member_status_is_active(member.status) {
+        return false;
+    }
+    let show_placeholder = show_placeholder_header && !state.has_active_message(&member.id);
+    let reasoning = state
+        .active_reasoning()
+        .get(&member.id)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    if !show_placeholder && reasoning.is_none() {
+        return false;
+    }
+    if show_placeholder {
+        out.push(agent_header_line(&member.display_name, member.backend));
+    }
+    let line_text = status_indicator::member_activity_text(
+        member.status,
+        reasoning,
+        member.backend != crate::domain::team::BackendKind::Claude || state.tools_expanded(),
+        state.member_elapsed_secs(&member.id),
+        status_indicator::spinner(),
+        Some(&state.member_runtime_profile(member)),
+    );
+    for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
+        out.push(Line::from(vec![
+            chat_rail(theme::backend_color(member.backend)),
+            Span::raw(" "),
+            Span::styled(wrapped, theme::muted_italic()),
+        ]));
+    }
+    true
 }
 
 fn is_work_activity(item: &ChatItem) -> bool {
@@ -589,11 +659,33 @@ fn agent_header_line(
     ])
 }
 
-fn user_header_line() -> Line<'static> {
-    Line::from(vec![
+fn user_header_line(state: &AppState, targets: &[MemberId]) -> Line<'static> {
+    let mut spans = vec![
         Span::styled("◆ ", theme::bold(theme::user_color())),
         Span::styled("You", theme::bold(theme::user_color())),
-    ])
+    ];
+    if targets.is_empty() {
+        return Line::from(spans);
+    }
+    spans.push(Span::styled(" → ", theme::muted()));
+    let roster = state.members();
+    if roster.len() > 1
+        && targets.len() == roster.len()
+        && roster
+            .iter()
+            .all(|member| targets.iter().any(|target| target == &member.id))
+    {
+        spans.push(Span::styled("all", theme::emphasis()));
+        return Line::from(spans);
+    }
+    for (index, target) in targets.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", theme::muted()));
+        }
+        let (name, backend) = state.member_meta(target);
+        spans.push(Span::styled(name, theme::backend_bold(backend)));
+    }
+    Line::from(spans)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -628,9 +720,9 @@ fn render_item(
         out.push(agent_header_line(&display_name, backend));
     }
     match item {
-        ChatItem::User { body } => {
+        ChatItem::User { body, targets, .. } => {
             if show_sender_header {
-                out.push(user_header_line());
+                out.push(user_header_line(state, targets));
             }
             for line in markdown::wrap(body, width.saturating_sub(2).max(1)) {
                 out.push(Line::from(vec![
@@ -1250,6 +1342,8 @@ mod tests {
         let state = AppState::new(vec![
             ChatItem::User {
                 body: "explain this function".to_string(),
+                targets: vec![MemberId::new("builder")],
+                interrupted: Vec::new(),
             },
             ChatItem::Agent {
                 member: MemberId::new("builder"),
@@ -1264,7 +1358,7 @@ mod tests {
 
         let text = plain_text(&lines);
         assert!(!text.iter().any(|line| is_separator_text(line)));
-        assert!(text.iter().any(|line| line == "◆ You"));
+        assert!(text.iter().any(|line| line.contains("◆ You")));
         assert!(
             text.iter()
                 .any(|line| line.contains("explain this function"))
@@ -1272,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_agent_messages_suppress_repeated_header() {
+    fn consecutive_agent_messages_keep_a_title_on_each_reply() {
         let state = AppState::new(vec![
             ChatItem::Agent {
                 member: MemberId::new("builder"),
@@ -1306,7 +1400,7 @@ mod tests {
             .iter()
             .filter(|line| line.contains("Reviewer") && line.contains("claude"))
             .count();
-        assert_eq!(builder_headers, 1);
+        assert_eq!(builder_headers, 2);
         assert_eq!(reviewer_headers, 1);
         assert!(text.iter().any(|line| line.contains("first reply")));
         assert!(text.iter().any(|line| line.contains("second reply")));
@@ -1314,7 +1408,201 @@ mod tests {
             .iter()
             .position(|line| line.contains("first reply"))
             .unwrap();
-        assert!(text[first + 1].contains("second reply"));
+        let second = text
+            .iter()
+            .position(|line| line.contains("second reply"))
+            .unwrap();
+        assert!(first < second);
+    }
+
+    #[test]
+    fn concurrent_members_keep_each_members_work_together() {
+        use crate::domain::event::{MessageId, TurnId};
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "impl",
+                    MemberStatus::Idle,
+                ),
+                member_summary(
+                    "planer",
+                    "Planer",
+                    BackendKind::Claude,
+                    "plan",
+                    MemberStatus::Idle,
+                ),
+            ],
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "fix the parser".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(1),
+            turn: TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageDelta {
+            msg: MessageId(1),
+            text: "builder started".to_string(),
+        });
+        state.apply(RuntimeEvent::MemberStatus {
+            member: MemberId::new("builder"),
+            status: MemberStatus::Running,
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(2),
+            targets: vec![MemberId::new("planer")],
+            body: "draft the plan".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(2),
+            turn: TurnId(2),
+            member: MemberId::new("planer"),
+        });
+        state.apply(RuntimeEvent::MessageDelta {
+            msg: MessageId(2),
+            text: "planer started".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("builder"),
+            tool_id: "b1".to_string(),
+            name: "shell".to_string(),
+            summary: "cargo test".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolCompleted {
+            member: MemberId::new("builder"),
+            tool_id: "b1".to_string(),
+            ok: true,
+            output: "ok".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(1),
+            text: "builder started\nbuilder done".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("planer"),
+            tool_id: "p1".to_string(),
+            name: "read_file".to_string(),
+            summary: "docs".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(2),
+            text: "planer started\nplaner done".to_string(),
+        });
+
+        let mut lines = Vec::new();
+        render_chat_history(&state, 80, 0, &mut lines);
+        let text = plain_text(&lines);
+        let joined = text.join("\n");
+        let builder_start = joined.find("builder started").expect(&joined);
+        let builder_tool = joined.find("cargo test").expect(&joined);
+        let plan_prompt = joined.find("draft the plan").expect(&joined);
+        let planer_start = joined.find("planer started").expect(&joined);
+        let planer_tool = joined.find("read_file").expect(&joined);
+        assert!(
+            joined.contains("You → Builder") && joined.contains("You → Planer"),
+            "{joined}"
+        );
+        assert!(
+            builder_start < builder_tool
+                && builder_tool < plan_prompt
+                && plan_prompt < planer_start
+                && planer_start < planer_tool,
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn sequential_turns_stay_chronological_when_nobody_else_is_working() {
+        use crate::domain::event::{MessageId, TurnId};
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "impl",
+                    MemberStatus::Idle,
+                ),
+                member_summary(
+                    "planer",
+                    "Planer",
+                    BackendKind::Claude,
+                    "plan",
+                    MemberStatus::Idle,
+                ),
+            ],
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "first job".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(1),
+            turn: TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(1),
+            text: "builder finished first".to_string(),
+        });
+        state.apply(RuntimeEvent::MemberStatus {
+            member: MemberId::new("builder"),
+            status: MemberStatus::Idle,
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(2),
+            targets: vec![MemberId::new("planer")],
+            body: "second job".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(2),
+            turn: TurnId(2),
+            member: MemberId::new("planer"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(2),
+            text: "planer reply".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(3),
+            turn: TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(3),
+            text: "late builder note".to_string(),
+        });
+
+        let mut lines = Vec::new();
+        render_chat_history(&state, 80, 0, &mut lines);
+        let joined = plain_text(&lines).join("\n");
+        let first = joined.find("builder finished first").expect(&joined);
+        let second_prompt = joined.find("second job").expect(&joined);
+        let planer = joined.find("planer reply").expect(&joined);
+        let late = joined.find("late builder note").expect(&joined);
+        assert!(
+            first < second_prompt && second_prompt < planer && planer < late,
+            "{joined}"
+        );
     }
 
     #[test]
@@ -1371,11 +1659,11 @@ mod tests {
             .position(|line| line.contains("final reply"))
             .expect("final reply");
         assert!(header < tool && tool < reply, "{text:?}");
-        assert_eq!(
+        assert!(
             text.iter()
                 .filter(|line| line.contains("Builder") && line.contains("grok"))
-                .count(),
-            1
+                .count()
+                >= 1
         );
     }
 

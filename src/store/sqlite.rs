@@ -1781,7 +1781,7 @@ fn split_targets(value: Option<String>) -> Vec<String> {
 
 fn chat_item_replay_bytes(item: &ChatItem) -> usize {
     let payload = match item {
-        ChatItem::User { body } => body.len(),
+        ChatItem::User { body, .. } => body.len(),
         ChatItem::Agent {
             member,
             display_name,
@@ -1839,6 +1839,11 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
     let item = match kind.as_str() {
         "user" => ChatItem::User {
             body: text.unwrap_or_default(),
+            targets: split_targets(targets)
+                .into_iter()
+                .map(MemberId::new)
+                .collect(),
+            interrupted: Vec::new(),
         },
         "agent" => ChatItem::Agent {
             member: MemberId::new(member_id.unwrap_or_default()),

@@ -674,7 +674,7 @@ mod tests {
         let prepared = prepare(&config, &dir).unwrap().expect("prepared");
         assert!(prepared.state.chat().iter().any(|item| matches!(
             item,
-            ChatItem::User { body } if body == "restore this chat after reopening"
+            ChatItem::User { body, .. } if body == "restore this chat after reopening"
         )));
         let ready = prepared
             .events

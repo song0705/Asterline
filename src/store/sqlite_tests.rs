@@ -236,7 +236,9 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
     assert_eq!(
         store.replay_chat_for(first).unwrap(),
         vec![ChatItem::User {
-            body: "restore this exact chat".to_string()
+            body: "restore this exact chat".to_string(),
+            targets: vec![MemberId::new("builder")],
+            interrupted: Vec::new(),
         }]
     );
     store.set_conversation(first).unwrap();
@@ -517,7 +519,9 @@ fn replays_chat_in_insertion_order() {
     assert_eq!(
         items[0],
         ChatItem::User {
-            body: "build the parser".to_string()
+            body: "build the parser".to_string(),
+            targets: vec![MemberId::new("builder")],
+            interrupted: Vec::new(),
         }
     );
     assert!(matches!(
