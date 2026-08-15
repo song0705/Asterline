@@ -36,34 +36,63 @@ fn ready_populates_header() {
 }
 
 #[test]
-fn model_catalog_is_warmed_once_per_ast_process() {
+fn active_member_profile_uses_the_discovered_cli_default() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    // Seed the expected first-roster key so this unit test verifies lifecycle
-    // semantics without launching a real CLI model discovery subprocess.
     state.model_catalog.seed(
         BackendKind::Codex,
         Path::new("/tmp/ws"),
-        vec!["gpt-test".to_string()],
+        vec!["gpt-5.6-sol".to_string()],
     );
 
+    assert_eq!(
+        state.member_runtime_profile(&state.members[0]),
+        "model: gpt-5.6-sol"
+    );
+}
+
+#[test]
+fn model_catalog_warms_every_detected_backend_once_per_ast_process() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    // Seed every startup key so this lifecycle test exercises the detected
+    // backend fan-out without launching real CLI subprocesses.
+    for backend in [
+        BackendKind::Codex,
+        BackendKind::Claude,
+        BackendKind::Grok,
+        BackendKind::Agy,
+    ] {
+        state.model_catalog.seed(
+            backend,
+            Path::new("/tmp/ws"),
+            vec![backend.as_str().to_string()],
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.model_catalog_detection = Some(rx);
+    tx.send(crate::domain::config::DetectedBackends {
+        codex: true,
+        claude: true,
+        grok: true,
+        agy: true,
+    })
+    .unwrap();
     state.warm_model_catalog_once();
     assert!(state.model_catalog_warmed);
-    assert!(
-        state
-            .model_catalog
-            .contains(BackendKind::Codex, Path::new("/tmp/ws"))
-    );
+    for backend in [
+        BackendKind::Codex,
+        BackendKind::Claude,
+        BackendKind::Grok,
+        BackendKind::Agy,
+    ] {
+        assert!(state.model_catalog.contains(backend, Path::new("/tmp/ws")));
+    }
 
     // A later roster refresh in the same process must not launch a second
-    // catalog lookup, even if it now contains another backend.
-    state.members[0].backend = BackendKind::Claude;
+    // startup sweep.
     state.warm_model_catalog_once();
-    assert!(
-        !state
-            .model_catalog
-            .contains(BackendKind::Claude, Path::new("/tmp/ws"))
-    );
+    assert!(state.model_catalog_warmed);
 }
 
 #[test]
@@ -2171,4 +2200,15 @@ fn reverse_history_search_cancel_keeps_composer() {
     state.cancel_history_search();
     assert!(!state.in_history_search());
     assert_eq!(state.composer().text(), "draft");
+}
+
+#[test]
+fn wheel_scroll_moves_several_lines_at_once() {
+    let mut state = AppState::new(Vec::new());
+    state.scroll_by(10);
+    assert_eq!(state.scroll(), 10);
+    state.scroll_by(-3);
+    assert_eq!(state.scroll(), 7);
+    state.scroll_by(-20);
+    assert_eq!(state.scroll(), 0);
 }

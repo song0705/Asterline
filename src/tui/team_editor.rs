@@ -152,6 +152,22 @@ impl TeamEditor {
         &self.model_catalog
     }
 
+    /// Complete the process-startup warm-up even if the user opened `/team`
+    /// before the asynchronous backend detection finished.
+    pub(crate) fn preload_installed_model_catalogs(&mut self, detected: DetectedBackends) {
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            if detected.contains(backend) {
+                self.model_catalog.preload(backend, &self.workspace);
+            }
+        }
+        self.model_catalog.freeze();
+    }
+
     pub(crate) fn selected_cwd(&self) -> PathBuf {
         self.selected_member()
             .map(|member| member.resolved_cwd(&self.workspace))
@@ -353,7 +369,7 @@ impl TeamEditor {
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Char('t') if self.field_mode && self.selected_field() == Field::Model => {
-                self.refresh_failed_model_catalog();
+                self.refresh_model_catalog();
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Char('e')
@@ -685,18 +701,18 @@ impl TeamEditor {
             }
             ModelChoices::Failed(err) => {
                 self.model_picker_pending = false;
-                self.notice = Some(format!("{err} · focus Model and press t to retry"));
+                self.notice = Some(format!("{err} · focus Model and press t to reload"));
             }
         }
     }
 
-    fn refresh_failed_model_catalog(&mut self) {
+    fn refresh_model_catalog(&mut self) {
         let Some(member) = self.selected_member() else {
             return;
         };
         let backend = member.backend;
         let cwd = member.resolved_cwd(&self.workspace);
-        match self.model_catalog.refresh_failed(backend, &cwd) {
+        match self.model_catalog.refresh(backend, &cwd) {
             Ok(()) => {
                 self.model_picker_pending = true;
                 self.notice = Some(format!(
@@ -935,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn model_field_t_does_not_refetch_a_successful_catalog() {
+    fn model_field_t_reports_an_inflight_catalog_without_spawning_a_duplicate() {
         let mut editor = editor();
         editor.field_mode = true;
         editor.field = editor
@@ -943,11 +959,9 @@ mod tests {
             .iter()
             .position(|field| *field == Field::Model)
             .unwrap();
-        editor.model_catalog.seed(
-            BackendKind::Codex,
-            Path::new("/tmp/ws"),
-            vec!["gpt-5.6-sol".to_string()],
-        );
+        editor
+            .model_catalog
+            .seed_loading(BackendKind::Codex, Path::new("/tmp/ws"));
 
         assert_eq!(
             editor.handle_key(KeyCode::Char('t'), KeyModifiers::NONE),
@@ -957,7 +971,7 @@ mod tests {
         assert!(
             editor
                 .notice()
-                .is_some_and(|notice| notice.contains("already loaded"))
+                .is_some_and(|notice| notice.contains("still loading"))
         );
     }
 
@@ -1300,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_does_not_apply_an_incompatible_effort_while_browsing() {
+    fn model_picker_switches_to_the_browsed_models_native_effort_default() {
         let mut editor = editor();
         let mut spark = DiscoveredModel::simple("gpt-5.3-codex-spark");
         spark.supported_efforts = vec![Effort::High];
@@ -1318,16 +1332,8 @@ mod tests {
 
         editor.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        assert!(editor.model_picker.is_some());
-        assert_eq!(
-            editor.members[0].model.as_deref(),
-            Some("gpt-5.3-codex-spark")
-        );
-        assert_eq!(editor.members[0].effort, Some(Effort::High));
-        assert!(
-            editor
-                .notice()
-                .is_some_and(|notice| notice.contains("does not advertise high"))
-        );
+        assert!(editor.model_picker.is_none());
+        assert_eq!(editor.members[0].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(editor.members[0].effort, None);
     }
 }

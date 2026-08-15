@@ -17,7 +17,6 @@ use crate::tui::theme::{clip_width, display_width, truncate_width};
 /// thin rule that separates the header block from the conversation.
 pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let width = area.width as usize;
-
     // Line 1: title on the left, workspace path on the right.
     // `custom` is only the bootstrap builder's placeholder team name. It is
     // not a model, profile, or execution mode, so it should not consume the

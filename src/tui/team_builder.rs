@@ -59,43 +59,33 @@ impl ModelCatalog {
         }
     }
 
-    /// Prevent follow-up UI actions from spawning more model-list commands.
-    /// The normal Team UI freezes its initial roster catalog after startup;
-    /// the interactive first-run builder intentionally leaves its own catalog
-    /// open while the user is still composing a roster.
+    /// Stop automatic background warm-up after the initial roster. An explicit
+    /// Model selection may still load a newly added backend on demand; that
+    /// result is cached and shared for the rest of this `ast` process.
     pub(crate) fn freeze(&mut self) {
         self.frozen = true;
     }
 
-    /// Retry exactly one catalog that failed during this `ast` session. A
-    /// successful or still-loading catalog is retained, so every member with
-    /// the same backend and working directory continues to share it.
-    pub(crate) fn refresh_failed(
-        &mut self,
-        backend: BackendKind,
-        cwd: &Path,
-    ) -> Result<(), String> {
+    /// Re-fetch exactly one catalog on explicit user request. A load that is
+    /// already in flight remains in place; every other cached result is
+    /// replaced so matching backend/working-directory members share the fresh
+    /// result.
+    pub(crate) fn refresh(&mut self, backend: BackendKind, cwd: &Path) -> Result<(), String> {
         let key = (backend, cwd.to_path_buf());
         match self.loads.get(&key) {
-            Some(ModelLoad::Ready(Err(_))) => {
-                self.loads.remove(&key);
-                // This is the sole post-startup escape hatch: an explicit
-                // retry of a failure selected by the user in the Team editor.
-                self.request(backend, cwd);
-                Ok(())
-            }
             Some(ModelLoad::Loading(_)) => Err(format!(
                 "{} model catalog is still loading",
                 backend.as_str()
             )),
-            Some(ModelLoad::Ready(Ok(_))) => Err(format!(
-                "{} model catalog is already loaded for this ast session",
-                backend.as_str()
-            )),
-            None => Err(format!(
-                "{} was not in the startup roster; restart ast to load its models",
-                backend.as_str()
-            )),
+            Some(ModelLoad::Ready(_)) => {
+                self.loads.remove(&key);
+                self.request(backend, cwd);
+                Ok(())
+            }
+            None => {
+                self.request(backend, cwd);
+                Ok(())
+            }
         }
     }
 
@@ -138,11 +128,10 @@ impl ModelCatalog {
 
     pub(crate) fn models(&mut self, backend: BackendKind, cwd: &Path) -> ModelChoices {
         let key = (backend, cwd.to_path_buf());
-        if self.frozen && !self.loads.contains_key(&key) {
-            return ModelChoices::Failed(
-                "not loaded for this ast session; restart to refresh models".to_string(),
-            );
-        }
+        // `models` is reached only from an explicit Model-field activation.
+        // Unlike background preload, that user action may add one new catalog
+        // after startup (for example after adding a Codex member). The key
+        // makes it one request shared by every member with this backend/cwd.
         self.request(backend, cwd);
         let Some(load) = self.loads.get_mut(&key) else {
             return ModelChoices::Loading;
@@ -179,6 +168,13 @@ impl ModelCatalog {
                 native_permission: None,
             })),
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_loading(&mut self, backend: BackendKind, cwd: &Path) {
+        let (_tx, rx) = mpsc::channel();
+        self.loads
+            .insert((backend, cwd.to_path_buf()), ModelLoad::Loading(rx));
     }
 
     #[cfg(test)]
@@ -274,7 +270,7 @@ impl ModelCatalog {
             (None, None) if self.has_ready_catalog(member.backend, &cwd) => {
                 "CLI default".to_string()
             }
-            (None, None) if self.frozen => "not preloaded at startup".to_string(),
+            (None, None) if self.frozen => "not loaded · press Enter".to_string(),
             (None, None) => "CLI default".to_string(),
             (Some(id), Some(model)) if model.name != *id => format!("{} · {id}", model.name),
             (Some(id), _) => id.clone(),
@@ -299,7 +295,7 @@ impl ModelCatalog {
 
     pub(crate) fn backend_summary(&self, backend: BackendKind, cwd: &Path) -> String {
         match self.loads.get(&(backend, cwd.to_path_buf())) {
-            None if self.frozen => "installed · models not loaded this session".to_string(),
+            None if self.frozen => "installed · select Model to load".to_string(),
             None => "installed · models load when selected".to_string(),
             Some(ModelLoad::Loading(_)) => "installed · loading models…".to_string(),
             Some(ModelLoad::Ready(Err(err))) => {
@@ -451,7 +447,10 @@ pub(crate) struct ModelPicker {
     backend: BackendKind,
     options: Vec<ModelChoice>,
     selected: usize,
-    effort: Option<Effort>,
+    /// Draft effort overrides keyed by model row. An override belongs to the
+    /// model it was chosen on: browsing a different model must show that
+    /// model's native default, not carry an unrelated `max`/`high` setting.
+    effort_overrides: HashMap<usize, Effort>,
     query: String,
 }
 
@@ -496,11 +495,15 @@ impl ModelPicker {
                     .position(|choice| choice.model.as_ref().is_some_and(|model| model.is_default))
             })
             .unwrap_or(0);
+        let mut effort_overrides = HashMap::new();
+        if let Some(effort) = current_effort {
+            effort_overrides.insert(selected, effort);
+        }
         let mut picker = Self {
             backend,
             options,
             selected,
-            effort: current_effort,
+            effort_overrides,
             query: String::new(),
         };
         picker.normalize_effort();
@@ -599,8 +602,8 @@ impl ModelPicker {
         if choices.is_empty() {
             return;
         }
-        self.effort = match self
-            .effort
+        let effort = match self
+            .effort()
             .and_then(|effort| choices.iter().position(|choice| *choice == effort))
         {
             None => self
@@ -611,6 +614,7 @@ impl ModelPicker {
             Some(0) => None,
             Some(index) => Some(choices[index - 1]),
         };
+        self.set_selected_effort(effort);
     }
 
     pub(crate) fn next_effort(&mut self) {
@@ -618,8 +622,8 @@ impl ModelPicker {
         if choices.is_empty() {
             return;
         }
-        self.effort = match self
-            .effort
+        let effort = match self
+            .effort()
             .and_then(|effort| choices.iter().position(|choice| *choice == effort))
         {
             None => match self.selected_default_effort() {
@@ -634,6 +638,7 @@ impl ModelPicker {
                 .copied()
                 .or_else(|| choices.get(index).copied()),
         };
+        self.set_selected_effort(effort);
     }
 
     pub(crate) fn push_query(&mut self, ch: char) {
@@ -689,19 +694,24 @@ impl ModelPicker {
             .selected_choice()
             .is_some_and(|choice| choice.value.is_none())
         {
-            // Selecting the CLI-default row resets both overrides. Otherwise
-            // a stale model-specific effort would remain hidden behind a
-            // seemingly-default selection.
-            self.effort = None;
+            // Selecting the CLI-default row cannot retain an effort override.
+            self.effort_overrides.remove(&self.selected);
         }
-        // Do not alter an existing override merely because the cursor visits a
-        // different model. In particular, `↑`/`↓` must not turn a configured
-        // `high` into that other model's `low`/`medium` default. Only ←/→ or
-        // selecting the CLI-default row changes the stored override.
     }
 
     pub(crate) fn effort(&self) -> Option<Effort> {
-        self.effort
+        self.effort_overrides.get(&self.selected).copied()
+    }
+
+    fn set_selected_effort(&mut self, effort: Option<Effort>) {
+        match effort {
+            Some(effort) => {
+                self.effort_overrides.insert(self.selected, effort);
+            }
+            None => {
+                self.effort_overrides.remove(&self.selected);
+            }
+        }
     }
 
     /// An advertised capability list is authoritative when it is present.
@@ -710,11 +720,14 @@ impl ModelPicker {
     /// than guessed away.
     pub(crate) fn has_unsupported_effort_override(&self) -> bool {
         let choices = self.selected_efforts();
-        !choices.is_empty() && self.effort.is_some_and(|effort| !choices.contains(&effort))
+        !choices.is_empty()
+            && self
+                .effort()
+                .is_some_and(|effort| !choices.contains(&effort))
     }
 
     pub(crate) fn unsupported_effort_notice(&self) -> Option<String> {
-        let effort = self.effort?;
+        let effort = self.effort()?;
         if !self.has_unsupported_effort_override() {
             return None;
         }
@@ -729,7 +742,7 @@ impl ModelPicker {
     }
 
     pub(crate) fn effort_label(&self) -> String {
-        match self.effort {
+        match self.effort() {
             Some(effort) if self.has_unsupported_effort_override() => {
                 format!("{} (unsupported)", effort.as_str())
             }
@@ -818,7 +831,7 @@ pub(crate) fn backend_picker_lines(
     let mut lines = vec![
         Line::styled(" Agent CLI catalog", theme::accent_bold()),
         Line::styled(
-            " Availability is checked first; model catalogs load when selected.",
+            " Availability is checked first; installed model catalogs load at startup.",
             theme::muted(),
         ),
     ];
@@ -1447,7 +1460,11 @@ impl BuilderState {
     }
 
     fn preload_agent_catalog(&mut self) {
-        self.notice = Some("Agent CLIs ready · open a Model field to load its catalog".to_string());
+        for backend in &self.available {
+            self.model_catalog.preload(*backend, &self.workspace);
+        }
+        self.model_catalog.freeze();
+        self.notice = Some("Agent CLIs ready · loading installed model catalogs…".to_string());
     }
 
     fn poll_agent_catalog(&mut self) {
@@ -1518,7 +1535,7 @@ impl BuilderState {
             KeyCode::Char('d') if !self.field_mode => self.delete_member(),
             KeyCode::Char('s') => return true,
             KeyCode::Char('t') if self.field_mode && self.selected_field() == Field::Model => {
-                self.refresh_failed_model_catalog()
+                self.refresh_model_catalog()
             }
             KeyCode::Char('e') if self.field_mode && self.selected_field() == Field::Model => {
                 self.edit_selected_field()
@@ -1752,15 +1769,15 @@ impl BuilderState {
             }
             ModelChoices::Failed(err) => {
                 self.model_picker_pending = false;
-                self.notice = Some(format!("{err} · focus Model and press t to retry"));
+                self.notice = Some(format!("{err} · focus Model and press t to reload"));
             }
         }
     }
 
-    fn refresh_failed_model_catalog(&mut self) {
+    fn refresh_model_catalog(&mut self) {
         let backend = self.selected_member().backend;
         let cwd = self.selected_member().resolved_cwd(&self.workspace);
-        match self.model_catalog.refresh_failed(backend, &cwd) {
+        match self.model_catalog.refresh(backend, &cwd) {
             Ok(()) => {
                 self.model_picker_pending = true;
                 self.notice = Some(format!(
@@ -2619,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn browsing_a_different_model_never_discards_the_original_effort_override() {
+    fn browsing_models_uses_each_models_own_effort_default() {
         let mut spark = DiscoveredModel::simple("gpt-5.3-codex-spark");
         spark.default_effort = Some(Effort::High);
         spark.supported_efforts = vec![Effort::Medium, Effort::High];
@@ -2638,14 +2655,9 @@ mod tests {
         assert_eq!(picker.effort_label(), "high (override)");
 
         picker.down();
-        assert_eq!(picker.effort(), Some(Effort::High));
-        assert!(picker.has_unsupported_effort_override());
-        assert_eq!(picker.effort_label(), "high (unsupported)");
-        assert!(
-            picker
-                .unsupported_effort_notice()
-                .is_some_and(|notice| notice.contains("gpt-5.6-sol"))
-        );
+        assert_eq!(picker.effort(), None);
+        assert!(!picker.has_unsupported_effort_override());
+        assert_eq!(picker.effort_label(), "default low");
 
         picker.up();
         assert_eq!(picker.effort(), Some(Effort::High));
@@ -2654,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_requires_an_explicit_effort_choice_before_applying_an_incompatible_model() {
+    fn model_picker_applies_a_new_models_native_effort_default() {
         let mut spark = DiscoveredModel::simple("gpt-5.3-codex-spark");
         spark.supported_efforts = vec![Effort::High];
         let mut sol = DiscoveredModel::simple("gpt-5.6-sol");
@@ -2670,15 +2682,9 @@ mod tests {
 
         state.handle_model_picker_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        assert!(state.model_picker.is_some());
-        assert_eq!(state.members[0].model, None);
+        assert!(state.model_picker.is_none());
+        assert_eq!(state.members[0].model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(state.members[0].effort, None);
-        assert!(
-            state
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("does not advertise high"))
-        );
     }
 
     #[test]
@@ -2885,21 +2891,18 @@ mod tests {
     }
 
     #[test]
-    fn frozen_catalog_never_starts_a_late_lookup() {
+    fn frozen_catalog_labels_a_new_member_as_explicitly_loadable() {
         let mut catalog = ModelCatalog::default();
         let cwd = Path::new("/tmp/new-member-workspace");
         catalog.freeze();
-
-        let ModelChoices::Failed(message) = catalog.models(BackendKind::Agy, cwd) else {
-            panic!("a frozen catalog must not start a new lookup");
-        };
-        assert!(message.contains("restart"));
-        assert!(!catalog.contains(BackendKind::Agy, cwd));
-
         let member = TeamMember::new("planner", "Planner", BackendKind::Agy, "plan");
         assert_eq!(
             catalog.model_label(&member, cwd),
-            "not preloaded at startup"
+            "not loaded · press Enter"
+        );
+        assert_eq!(
+            catalog.backend_summary(BackendKind::Agy, cwd),
+            "installed · select Model to load"
         );
     }
 

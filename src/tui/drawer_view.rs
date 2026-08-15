@@ -378,7 +378,7 @@ fn drawer_team_editor(
     ]));
     lines.push(Line::styled(
         if editor.field_mode() {
-            " ↑/↓ field · Enter edit/choose · t retry failed model · e manual model/session · s apply · Esc members"
+            " ↑/↓ field · Enter edit/choose · t reload model · e manual model/session · s apply · Esc members"
         } else {
             " ↑/↓ member · Enter fields · a add · d delete · t target · * all · s apply · Esc close"
         },

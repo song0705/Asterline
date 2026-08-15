@@ -32,6 +32,8 @@ struct Palette {
     emphasis: Color,
     user: Color,
     selection_text: Color,
+    chat_selection_bg: Color,
+    chat_selection_fg: Color,
 }
 
 fn palette() -> Palette {
@@ -50,6 +52,8 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             emphasis: Color::Rgb(250, 250, 250),
             user: Color::Rgb(134, 239, 172),
             selection_text: Color::Black,
+            chat_selection_bg: Color::Rgb(63, 63, 70),
+            chat_selection_fg: Color::Rgb(244, 244, 245),
         },
         ThemeVariant::Light => Palette {
             accent: Color::Rgb(14, 116, 144),
@@ -61,6 +65,8 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             emphasis: Color::Rgb(24, 24, 27),
             user: Color::Rgb(22, 101, 52),
             selection_text: Color::White,
+            chat_selection_bg: Color::Rgb(212, 212, 216),
+            chat_selection_fg: Color::Rgb(24, 24, 27),
         },
     }
 }
@@ -160,6 +166,15 @@ pub fn selection() -> Style {
         .fg(palette().selection_text)
         .bg(accent_color())
         .add_modifier(Modifier::BOLD)
+}
+
+/// Drag-select highlight in the chat column. Neutral zinc, not the accent
+/// cyan used by interactive chrome.
+pub fn chat_selection() -> Style {
+    let palette = palette();
+    Style::default()
+        .fg(palette.chat_selection_fg)
+        .bg(palette.chat_selection_bg)
 }
 
 /// Secondary selection for a focused cell inside an already-selected row.
@@ -275,6 +290,24 @@ pub fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// Extract the substring covering display columns `[start, end)`.
+pub fn slice_display_cols(text: &str, start: usize, end: usize) -> String {
+    let end = end.max(start);
+    let mut out = String::new();
+    let mut col = 0;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col >= end {
+            break;
+        }
+        if col + width > start {
+            out.push(ch);
+        }
+        col += width;
+    }
+    out
+}
+
 /// Collapse internal whitespace and truncate to at most `max` display
 /// columns, appending `…` when the text was cut.
 pub fn truncate_width(text: &str, max: usize) -> String {
@@ -314,6 +347,24 @@ pub fn pad_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_selection_uses_neutral_zinc_not_accent_cyan() {
+        let dark = palette_for(ThemeVariant::Dark);
+        let light = palette_for(ThemeVariant::Light);
+        assert_eq!(dark.chat_selection_bg, Color::Rgb(63, 63, 70));
+        assert_eq!(light.chat_selection_bg, Color::Rgb(212, 212, 216));
+        assert_ne!(dark.chat_selection_bg, dark.accent);
+        assert_ne!(light.chat_selection_bg, light.accent);
+        assert_eq!(chat_selection().bg, Some(dark.chat_selection_bg));
+        assert_eq!(chat_selection().fg, Some(dark.chat_selection_fg));
+    }
+
+    #[test]
+    fn slice_display_cols_extracts_a_column_range() {
+        assert_eq!(slice_display_cols("hello world", 0, 5), "hello");
+        assert_eq!(slice_display_cols("hello world", 6, 11), "world");
+    }
 
     #[test]
     fn clip_width_counts_display_columns_not_chars() {

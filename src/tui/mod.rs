@@ -33,9 +33,11 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent, KeyEventKind,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEvent, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -58,6 +60,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_RUNTIME_EVENTS_PER_DRAIN: usize = 1_024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const RESET_KEYBOARD_TO_LEGACY: &[u8] = b"\x1b[=0u";
+const WHEEL_SCROLL_LINES: i32 = 5;
 
 /// Asterline uses color for backend identity, status, and selection—not only
 /// decoration. Full-screen interactive sessions therefore keep color enabled
@@ -75,6 +78,7 @@ struct TerminalRestore {
     keyboard_enhancement: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
     legacy_keyboard_reset: bool,
 }
 
@@ -90,6 +94,10 @@ impl TerminalRestore {
         if self.bracketed_paste {
             record_cleanup(&mut first_error, execute!(out, DisableBracketedPaste));
             self.bracketed_paste = false;
+        }
+        if self.mouse_capture {
+            record_cleanup(&mut first_error, execute!(out, DisableMouseCapture));
+            self.mouse_capture = false;
         }
         if self.alternate_screen {
             record_cleanup(&mut first_error, execute!(out, LeaveAlternateScreen));
@@ -151,12 +159,18 @@ pub fn run(
     restore.raw_mode = true;
     restore.alternate_screen = true;
     restore.bracketed_paste = true;
-    // Do not enable mouse reporting. It would intercept the terminal's native
-    // I-beam cursor and text selection, including the terminal's own copy UI.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    // Kitty keeps separate keyboard-mode stacks for the main and alternate
-    // screens. Push only after entering the alternate screen so cleanup pops
-    // the same stack before leaving it.
+    restore.mouse_capture = true;
+    // Full-screen alternate buffer so the header stays pinned at the top and
+    // the shell's `cargo run` / `ls` output is not mixed into the chat. Mouse
+    // capture is required so the wheel can scroll the chat pane; drag-select
+    // copy is handled in-process via OSC 52 (native selection is unavailable
+    // once the application owns mouse events).
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let keyboard_enhancement =
         enable_keyboard_enhancement(&mut stdout, keyboard_enhancement_allowed)?;
     restore.keyboard_enhancement = keyboard_enhancement;
@@ -240,6 +254,7 @@ fn run_loop(
     legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     let notify_enabled = notify::enabled_from_env();
+    let mut last_layout = None;
     loop {
         state.poll_team_editor_catalog();
         drain_runtime_events(state, events, notify_enabled);
@@ -251,7 +266,7 @@ fn run_loop(
         }
 
         terminal.draw(|frame| {
-            let _ = chat_view::render(frame, state);
+            last_layout = chat_view::render(frame, state);
         })?;
 
         if event::poll(POLL_INTERVAL)? {
@@ -270,7 +285,9 @@ fn run_loop(
                         handle_action(action, state, handle);
                     }
                 }
-                Event::Mouse(_) => {}
+                Event::Mouse(mouse) => {
+                    handle_mouse(mouse, state, last_layout.as_ref());
+                }
                 Event::Paste(text) => {
                     if !state.runtime_available() {
                         continue;
@@ -313,6 +330,71 @@ fn run_loop(
             return Ok(());
         }
     }
+}
+
+fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_view::ChatLayout>) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if state.drawer().is_some() {
+                state.drawer_scroll_by(-WHEEL_SCROLL_LINES);
+            } else if state.completion().is_some() {
+                for _ in 0..WHEEL_SCROLL_LINES {
+                    state.popup_up();
+                }
+            } else {
+                state.scroll_by(WHEEL_SCROLL_LINES);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if state.drawer().is_some() {
+                state.drawer_scroll_by(WHEEL_SCROLL_LINES);
+            } else if state.completion().is_some() {
+                for _ in 0..WHEEL_SCROLL_LINES {
+                    state.popup_down();
+                }
+            } else {
+                state.scroll_by(-WHEEL_SCROLL_LINES);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if state.drawer().is_some() {
+                return;
+            }
+            match layout.and_then(|layout| {
+                layout
+                    .contains(mouse.column, mouse.row)
+                    .then(|| layout.screen_to_content(mouse.column, mouse.row))
+                    .flatten()
+            }) {
+                Some(pos) => state.begin_chat_selection(pos),
+                None => state.clear_chat_selection(),
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(pos) =
+                layout.and_then(|layout| layout.screen_to_content(mouse.column, mouse.row))
+            {
+                state.update_chat_selection(pos);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let (Some(layout), Some(selection)) = (layout, state.chat_selection()) {
+                let text = layout.selected_text(selection);
+                if text.trim().is_empty() {
+                    state.clear_chat_selection();
+                } else {
+                    copy_to_clipboard(&text);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    let mut out = io::stdout();
+    let _ = execute!(out, CopyToClipboard::to_clipboard_from(text));
+    let _ = execute!(out, CopyToClipboard::to_primary_from(text));
 }
 
 fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeHandle) -> bool {
@@ -371,13 +453,12 @@ fn attach_to_member(
     };
 
     // --- Suspend Asterline: hand the real terminal to the child CLI. ---
-    // Restore the cooked terminal, leave our alternate screen, and show the
-    // cursor, flushing so the child starts from a clean, owned main screen.
     let mut out = io::stdout();
     disable_keyboard_enhancement(&mut out, keyboard_enhancement)?;
     disable_raw_mode()?;
     execute!(
         out,
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
@@ -402,7 +483,12 @@ fn attach_to_member(
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     if keyboard_enhancement {
         execute!(
             out,
@@ -416,8 +502,6 @@ fn attach_to_member(
     while event::poll(Duration::from_secs(0))? {
         let _ = event::read()?;
     }
-    // Discard ratatui's cached screen contents so the next draw is a full
-    // repaint over whatever the child CLI left behind.
     terminal.clear()?;
 
     match result {

@@ -52,8 +52,8 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::Right => Some(Action::CursorRight),
         KeyCode::Home => Some(Action::Home),
         KeyCode::End => Some(Action::End),
-        // Arrows recall prompt history (or move the popup selection); page
-        // keys scroll the conversation. Mirrors shell / codex conventions.
+        // Actual mouse wheel events are handled separately by the TUI. Arrows
+        // retain shell-style prompt history (or move a popup selection).
         KeyCode::Up => Some(Action::HistoryPrev),
         KeyCode::Down => Some(Action::HistoryNext),
         KeyCode::PageUp => Some(Action::ScrollUp),

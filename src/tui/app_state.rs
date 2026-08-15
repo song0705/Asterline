@@ -4,12 +4,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use sha2::{Digest, Sha256};
 
 use crate::adapter::parser::{append_bounded_text, bounded_text};
+use crate::domain::config::{DetectedBackends, detect_backends};
 use crate::domain::event::{
     AgentSessionId, ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId,
     MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
@@ -110,6 +113,27 @@ struct HistorySearch {
     match_idx: Option<usize>,
 }
 
+/// Inclusive start/end anchors for a mouse drag selection in the chat column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatSelection {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
+impl ChatSelection {
+    pub fn normalized(self) -> ((usize, usize), (usize, usize)) {
+        if self.start <= self.end {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+}
+
 /// Transcript search (`/find`): query, matching chat indices, and current match.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FindState {
@@ -178,12 +202,18 @@ pub struct AppState {
     /// transient editor borrows it by ownership while open, then returns it on
     /// close so reopening `/team` does not rerun CLI discovery every time.
     model_catalog: ModelCatalog,
-    /// The active `ast` process probes its roster once at startup. Keeping
-    /// this fixed avoids model-list subprocess churn while the Team changes.
+    /// Backend availability is checked asynchronously at startup so every
+    /// installed CLI's workspace catalog can warm without blocking the TUI.
+    model_catalog_detection: Option<Receiver<DetectedBackends>>,
+    /// The active `ast` process warms all installed backends once at startup.
+    /// Keeping that fixed avoids model-list subprocess churn while the Team
+    /// changes.
     model_catalog_warmed: bool,
     skills: Vec<SkillInfo>,
     resume_choices: Vec<ConversationSummary>,
     selected_resume: usize,
+    /// Drag-select range in flattened chat-line coordinates, if any.
+    chat_selection: Option<ChatSelection>,
 }
 
 impl AppState {
@@ -243,10 +273,12 @@ impl AppState {
             diff_text: None,
             team_editor: None,
             model_catalog: ModelCatalog::default(),
+            model_catalog_detection: None,
             model_catalog_warmed: false,
             skills: Vec::new(),
             resume_choices: Vec::new(),
             selected_resume: 0,
+            chat_selection: None,
         }
     }
 
@@ -691,6 +723,7 @@ impl AppState {
                 self.scroll = 0;
                 self.drawer = None;
                 self.drawer_scroll = 0;
+                self.chat_selection = None;
                 self.stash_team_editor_catalog();
             }
             RuntimeEvent::ResumeChoices { conversations } => {
@@ -716,6 +749,7 @@ impl AppState {
                 self.scroll = 0;
                 self.drawer = None;
                 self.drawer_scroll = 0;
+                self.chat_selection = None;
                 self.stash_team_editor_catalog();
             }
         }
@@ -968,6 +1002,7 @@ impl AppState {
                 .collect();
             find.current = find.current.min(find.matches.len().saturating_sub(1));
         }
+        self.chat_selection = None;
     }
 
     fn set_status(&mut self, member: &MemberId, status: MemberStatus) {
@@ -1004,7 +1039,7 @@ impl AppState {
         }
     }
 
-    fn member_meta(&self, member: &MemberId) -> (String, BackendKind) {
+    pub(crate) fn member_meta(&self, member: &MemberId) -> (String, BackendKind) {
         self.members
             .iter()
             .find(|m| &m.id == member)
@@ -1171,9 +1206,26 @@ impl AppState {
     pub fn members(&self) -> &[MemberView] {
         &self.members
     }
+
+    /// A live member's effective model label. Model discovery is deliberately
+    /// display-only: it must not pin a CLI default into team.json, but the
+    /// activity line should still show the model and effort the CLI reported
+    /// instead of two misleading `default` placeholders.
+    pub(crate) fn member_runtime_profile(&self, view: &MemberView) -> String {
+        let member = self.view_to_member(view);
+        let workspace = PathBuf::from(&self.workspace);
+        let model = self
+            .team_editor
+            .as_ref()
+            .map(|editor| editor.model_catalog().model_label(&member, &workspace))
+            .unwrap_or_else(|| self.model_catalog.model_label(&member, &workspace));
+        format!("model: {model}")
+    }
+
     pub fn chat(&self) -> &[ChatItem] {
         &self.chat
     }
+
     pub fn logs(&self) -> &[LogEntry] {
         &self.logs
     }
@@ -1229,6 +1281,28 @@ impl AppState {
     }
     pub fn scroll(&self) -> usize {
         self.scroll
+    }
+
+    pub fn chat_selection(&self) -> Option<ChatSelection> {
+        self.chat_selection
+    }
+
+    pub fn begin_chat_selection(&mut self, pos: (usize, usize)) {
+        self.disarm_quit();
+        self.chat_selection = Some(ChatSelection {
+            start: pos,
+            end: pos,
+        });
+    }
+
+    pub fn update_chat_selection(&mut self, pos: (usize, usize)) {
+        if let Some(selection) = self.chat_selection.as_mut() {
+            selection.end = pos;
+        }
+    }
+
+    pub fn clear_chat_selection(&mut self) {
+        self.chat_selection = None;
     }
     pub fn composer(&self) -> &Composer {
         &self.composer
@@ -2136,12 +2210,20 @@ impl AppState {
         self.drawer_scroll
     }
     pub fn drawer_scroll_up(&mut self) {
-        self.disarm_quit();
-        self.drawer_scroll = self.drawer_scroll.saturating_sub(1);
+        self.drawer_scroll_by(-1);
     }
     pub fn drawer_scroll_down(&mut self) {
+        self.drawer_scroll_by(1);
+    }
+    pub fn drawer_scroll_by(&mut self, delta: i32) {
         self.disarm_quit();
-        self.drawer_scroll = self.drawer_scroll.saturating_add(1);
+        if delta >= 0 {
+            self.drawer_scroll = self.drawer_scroll.saturating_add(delta as usize);
+        } else {
+            self.drawer_scroll = self
+                .drawer_scroll
+                .saturating_sub(delta.unsigned_abs() as usize);
+        }
     }
 
     /// The captured working-tree diff shown in the diff drawer.
@@ -2189,30 +2271,52 @@ impl AppState {
         }
     }
 
-    /// Warm only the catalogs used by the initial roster. The TUI invokes this
-    /// after it has received `Ready`, so construction and unit tests stay free
-    /// of subprocess side effects.
+    /// Warm every installed backend for the startup workspace. Detection and
+    /// model discovery both stay asynchronous: opening Asterline never waits
+    /// for a slow CLI, while a later `/team` reuses the same keyed cache.
     pub(crate) fn warm_model_catalog_once(&mut self) {
-        if self.model_catalog_warmed || self.members.is_empty() {
+        if self.model_catalog_warmed || self.workspace.trim().is_empty() {
             return;
         }
-        let workspace = PathBuf::from(&self.workspace);
-        let requests = self
-            .members
-            .iter()
-            .map(|member| {
-                let cwd = if member.cwd.is_empty() {
-                    workspace.clone()
-                } else {
-                    PathBuf::from(&member.cwd)
-                };
-                (member.backend, cwd)
-            })
-            .collect::<Vec<_>>();
-        for (backend, cwd) in requests {
-            self.model_catalog.preload(backend, &cwd);
+        if self.model_catalog_detection.is_none() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(detect_backends());
+            });
+            self.model_catalog_detection = Some(rx);
+            return;
         }
-        self.model_catalog.freeze();
+        let detected = match self
+            .model_catalog_detection
+            .as_ref()
+            .map(Receiver::try_recv)
+        {
+            Some(Ok(detected)) => detected,
+            Some(Err(TryRecvError::Empty)) | None => return,
+            Some(Err(TryRecvError::Disconnected)) => DetectedBackends {
+                codex: false,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        };
+        self.model_catalog_detection = None;
+        let workspace = PathBuf::from(&self.workspace);
+        if let Some(editor) = self.team_editor.as_mut() {
+            editor.preload_installed_model_catalogs(detected);
+        } else {
+            for backend in [
+                BackendKind::Codex,
+                BackendKind::Claude,
+                BackendKind::Grok,
+                BackendKind::Agy,
+            ] {
+                if detected.contains(backend) {
+                    self.model_catalog.preload(backend, &workspace);
+                }
+            }
+            self.model_catalog.freeze();
+        }
         self.model_catalog_warmed = true;
     }
 
@@ -2295,13 +2399,20 @@ impl AppState {
     }
 
     pub fn scroll_up(&mut self) {
-        self.disarm_quit();
-        self.scroll = self.scroll.saturating_add(1);
+        self.scroll_by(1);
     }
 
     pub fn scroll_down(&mut self) {
+        self.scroll_by(-1);
+    }
+
+    pub fn scroll_by(&mut self, delta: i32) {
         self.disarm_quit();
-        self.scroll = self.scroll.saturating_sub(1);
+        if delta >= 0 {
+            self.scroll = self.scroll.saturating_add(delta as usize);
+        } else {
+            self.scroll = self.scroll.saturating_sub(delta.unsigned_abs() as usize);
+        }
     }
 
     pub fn reset_scroll(&mut self) {

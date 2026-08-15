@@ -40,6 +40,7 @@ pub(crate) fn fmt_elapsed_compact(secs: u64) -> String {
 pub(crate) fn member_activity_text(
     status: MemberStatus,
     reasoning: Option<&str>,
+    show_reasoning: bool,
     elapsed_secs: Option<u64>,
     spin: &str,
     runtime_profile: Option<&str>,
@@ -47,6 +48,9 @@ pub(crate) fn member_activity_text(
     let runtime_profile = runtime_profile.filter(|text| !text.is_empty());
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
         let context = activity_context(elapsed_secs, runtime_profile);
+        if !show_reasoning {
+            return format!("{spin} Thinking{context} · Ctrl+T expand");
+        }
         return format!("{spin} Thinking{context}: {reasoning}");
     }
 
@@ -140,13 +144,14 @@ mod tests {
     #[test]
     fn activity_text_keeps_interrupt_hint_stable() {
         assert_eq!(
-            member_activity_text(MemberStatus::Running, None, Some(64), "⠋", None),
+            member_activity_text(MemberStatus::Running, None, true, Some(64), "⠋", None),
             "⠋ Working (1m 04s • Esc/Ctrl+C to interrupt)"
         );
         assert_eq!(
             member_activity_text(
                 MemberStatus::Running,
                 Some("reading files"),
+                true,
                 Some(64),
                 "⠋",
                 None
@@ -156,7 +161,19 @@ mod tests {
         assert_eq!(
             member_activity_text(
                 MemberStatus::Running,
+                Some("reading files"),
+                false,
+                Some(64),
+                "⠋",
+                None
+            ),
+            "⠋ Thinking (1m 04s) · Ctrl+T expand"
+        );
+        assert_eq!(
+            member_activity_text(
+                MemberStatus::Running,
                 None,
+                true,
                 Some(64),
                 "⠋",
                 Some("model: gpt-5-codex • effort: high")
