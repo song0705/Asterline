@@ -16,9 +16,14 @@ At startup, Asterline chooses a roster in this order:
 4. If no saved team and no supported executable exists, startup stops with a
    setup message.
 
-Use `/team` to modify the live roster. Opening it refreshes installed Agent
-CLIs and preloads their model and reasoning-effort catalogs. Press `s` to
-apply the changes, replace member runners, and save the updated team.
+Use `/team` to modify the live roster. Asterline loads installed Agent CLIs
+and their model catalogs once when it starts; opening `/team` reuses that
+cache. The same lookup reads non-Codex CLIs' local permission defaults for
+display, without copying them into `team.json`. Codex instead receives
+Asterline's explicit default `approvalPolicy: "never"` at thread start/resume.
+When a model lookup fails, select that member's **model** field and press `t`
+to retry. Press `s` to apply the changes, replace member runners, and save the
+updated team.
 
 ### Platform paths and backend history
 
@@ -34,7 +39,7 @@ platform `PATH`; on Windows it also honors `PATHEXT` and launches the resolved
 `.exe`, `.cmd`, or `.bat` path. When leaving an attached CLI, use `Ctrl+D` on
 Unix or `Ctrl+Z` followed by `Enter` on Windows (or type `/exit`).
 
-### Windows installer updates
+### Installation-aware updates
 
 Only copies installed by the Windows Setup executable update automatically.
 Portable ZIP copies and source builds never rewrite themselves. An installed
@@ -43,10 +48,17 @@ new version exists, Asterline downloads its Setup executable, verifies it
 against the same Release's `SHA256SUMS`, and starts Setup in silent mode after
 the current Asterline process exits.
 
-Run `ast --update` to force a check now. Use `ast --no-auto-update` to skip the
-automatic check for one launch. Network failures are ignored during background
-checks and never prevent Asterline from starting; a forced check reports the
-error to the terminal.
+Run `ast update` to force a check now. On macOS and Linux, it updates only an
+installation that it proves belongs to the official Homebrew Formula, using
+`brew update` followed by a targeted Formula upgrade. It never overwrites a
+portable archive, source build, direct macOS package, or direct `.deb`/`.rpm`
+install; those use their own explicit replacement path. `ast --update` remains
+an alias.
+
+Use `ast --no-auto-update` to skip the Windows automatic check for one launch.
+Network failures are ignored during background checks and never prevent
+Asterline from starting; a forced Windows check reports the error to the
+terminal.
 
 ## Team file
 
@@ -193,15 +205,26 @@ to backend-native sandbox and permission enforcement.
 | `backend`         | Yes                         | `codex`, `claude`, `grok`, or `agy`                     |
 | `role`            | Yes                         | Free-form team responsibility                           |
 | `id`              | No                          | Stable handle used by `@member` and routing             |
-| `cwd`             | No                          | Member-specific working directory                       |
+| `cwd`             | No                          | Advanced per-member working-directory override          |
 | `model`           | No                          | Omitted delegates to the backend CLI                    |
-| `effort`          | No                          | Chosen with the model; `default` delegates to the CLI   |
+| `effort`          | No                          | Chosen inside the selected model picker when supported. |
 | `system_prompt`   | No                          | Additional member instructions                          |
-| `sandbox`         | No                          | `read-only`, `workspace-write`, or `danger-full-access` |
-| `permission_mode` | No                          | Backend-native permission mode                          |
+| `sandbox`         | No                          | Codex; mapped to Grok/Agy and ignored by Claude         |
+| `permission_mode` | No                          | Backend control native in `/team`                       |
 | `allowed_tools`   | No                          | Backend-specific tool allowlist                         |
 | `session_policy`  | No                          | `resume` (default) or `fresh`                           |
 | `session_id`      | No                          | Native CLI session/conversation ID to resume            |
+
+In `/team`, a `resume` member displays its bound native session ID directly.
+Without one, it says `select a session` to make the required picker/manual-ID
+choice explicit; a `fresh` member says `not set (fresh)`. The UI never calls an
+unbound session ID `default`.
+
+`cwd` is deliberately not editable in `/team`: members created there use the
+team workspace. Keep the optional `team.json` field only for an advanced
+multi-repository or monorepo setup where a member must run in a different
+working directory. It also determines the backend session project and the
+model-catalog cache key for that member.
 
 Both policies pin and reuse the backend session ID after the first call.
 `resume` keeps an existing persisted ID when available. Switching a member to
@@ -210,9 +233,10 @@ conversation; that newly discovered ID is then reused for subsequent calls.
 `fresh` does not create a separate conversation for every turn.
 
 Set `session_id` to bind a team member to a specific conversation from its
-native CLI history. Asterline passes it through the backend's native resume
-mechanism (`codex exec resume`, `claude --resume`, `grok --resume`, or Agy
-`--conversation`). In the Team editor, use `default` to clear the explicit ID.
+native CLI history. For Codex it is the App Server `thread.id`, resumed through
+`thread/resume`. Claude, Grok, and Agy use `claude --resume`, ACP
+`session/load`, and `agy --conversation` respectively. In the Team editor,
+use `default` to clear the explicit ID.
 
 Permission modes, sandbox mappings, and allowed-tool behavior depend on the
 backend. Do not assume a field has the same effect across all four CLIs.
@@ -225,19 +249,25 @@ Team editor.
 
 | Setting                | Codex                                                              | Claude                                      | Grok ACP                                                        | Agy                                                                          |
 | ---------------------- | ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `cwd`                  | Process cwd and exec-level `-C`, including resumed sessions        | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
-| `model`                | `-m`                                                               | `--model`                                   | Agent `--model`                                                 | `--model`                                                                    |
-| `effort`               | `model_reasoning_effort`; picker follows model metadata            | `--effort` (through `max`)                  | Agent `--reasoning-effort`                                      | `--effort` (`low`, `medium`, or `high`)                                      |
-| `sandbox`              | Exec-level `-s`, including resumed sessions                        | Not passed                                  | Top-level `--sandbox` with an Asterline profile mapping         | `--sandbox` unless configured as `danger-full-access`                        |
-| `permission_mode`      | Not passed                                                         | `--permission-mode` (omitted for `default`) | Top-level mode plus ACP permission responses                    | `acceptEdits` → `--mode accept-edits`; `plan` → `--mode plan`; bypass → flag |
+| `cwd`                  | App Server `thread/start`/`thread/resume`                          | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
+| `model`                | App Server `model`                                                 | `--model`                                   | Agent `--model`                                                 | `--model`                                                                    |
+| `effort`               | App Server `effort`; picker follows model metadata                 | `--effort` (through `max`)                  | Cache-defined levels pass as Agent `--reasoning-effort`         | Model-specific effort; defined only by its listed model (not a generic menu) |
+| `sandbox`              | `read-only` / `workspace-write` / `danger-full-access`             | Not passed (not shown in `/team`)           | `read-only` / `workspace` / `off` profile mapping               | Terminal sandbox on/off; read-only intent also forces `--mode plan`          |
+| `permission_mode`      | App Server `approvalPolicy` (`never` by default)                   | `--permission-mode` (default omitted)       | Mode plus ACP responses                                         | `--mode`; bypass requires terminal sandbox off                               |
 | `allowed_tools`        | Not passed                                                         | `--tools` (hard built-in-tool allowlist)    | Added to ACP session rules; not a hard protocol-level allowlist | Not passed                                                                   |
-| custom `system_prompt` | `-c developer_instructions=…`                                      | `--append-system-prompt`                    | ACP session `rules`                                             | Prepended to the print prompt                                                |
+| `system_prompt`        | App Server `developerInstructions`                                 | `--append-system-prompt`                    | ACP session `rules`                                             | Prepended to the print prompt                                                |
 | `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                             | Resume or fresh conversation                                                 |
-| `session_id`           | `codex exec [options] resume <id>`                                 | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
+| `session_id`           | App Server `thread/resume <thread.id>`                             | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
 
-For Claude and Grok, choose only permission modes accepted by the installed CLI
-version. Asterline serializes the configured value but does not negotiate
-vendor-version compatibility before launch. Agy 1.1.12 or newer is required;
+For compatibility with existing `team.json` files, Codex's displayed policies
+are stored through the shared adapter field: omitted/default,
+`dontAsk`/`bypassPermissions` map to `never`; `plan`/`acceptEdits` map to
+`untrusted`; and `auto` maps to `on-request`. Codex command, file-change, and permission-escalation callbacks are
+shown as Asterline pending approvals and return your one-time decision to the
+live App Server thread; the selected sandbox remains an independent boundary.
+For Claude and Grok, choose only permission modes accepted by the installed CLI version. Asterline serializes
+the configured value but does not negotiate vendor-version compatibility before
+launch. Agy 1.1.12 or newer is required;
 older versions are excluded from backend detection and rejected before a run
 because earlier releases either lack structured streaming or ignore headless
 `--mode` enforcement. Recent Claude CLIs no longer list
@@ -248,28 +278,77 @@ configured mode is `default` so the CLI default applies.
 
 Model choices are resolved in each member's effective working directory:
 
+Asterline starts these lookups asynchronously for the configured roster once
+at launch. Until a lookup completes the Team editor shows `loading…`; once the
+CLI reports a concrete default, it shows that model name rather than the
+placeholder `default`. The result is held for the lifetime of that `ast`
+process: opening and closing `/team` never re-runs it. Restart `ast` to refresh
+the catalog. A backend or working directory added after startup is shown as
+`not preloaded at startup` rather than silently launching another model lookup.
+If a catalog loaded successfully but its CLI did not identify a default, the
+field correctly shows `CLI default`; its picker still contains the discovered
+models.
+
+If the initial lookup failed, enter the member's fields, select `model`, and
+press `t` to retry that failed backend/workspace catalog once. The refreshed
+result is shared by all matching members; `t` never re-fetches an already
+successful catalog.
+
 | Backend | Source                                                          |
 | ------- | --------------------------------------------------------------- |
-| Codex   | `codex debug models`                                            |
-| Claude  | documented aliases plus project/user `availableModels` settings |
+| Codex   | App Server `model/list`; `codex debug models` only as fallback  |
+| Claude  | Local settings/env; opt-in gateway `/v1/models`; Claude cache   |
 | Grok    | `grok --no-auto-update models`                                  |
 | Agy     | `agy models`                                                    |
 
-The Team builder and `/team` editor start background discovery as soon as they
-open. The Agent field lists all four supported CLIs, includes installation
-status and discovered model/effort summaries, and disables missing CLIs. Open
-the member's `model` field to browse the already-loading catalog. Type to
-filter by display name, model ID, or description, use `↑`/`↓` for the model,
-and use `←`/`→` for that model's effort. `Enter` applies both values. The
-picker selects the CLI-marked default when discovery returns models or,
-if none is marked, the first discovered model. It shows only actual model
-entries in that case. `default` is available only when discovery returns no
-models. Press `e` on the field to enter a model ID manually.
+Claude's catalog is local-configuration first. Asterline reads `model`,
+`availableModels`, `modelOverrides`, and the corresponding `ANTHROPIC_*`
+variables from the same user/project/local settings hierarchy as Claude Code.
+For a `modelOverrides` entry it displays the provider ID while preserving the
+Claude-side key passed to `claude --model`.
 
-Reasoning effort is model-aware when discovery returns capability metadata.
-Unsupported levels are omitted and the model's reported default effort is
-shown directly when available. Agy exposes the three levels its CLI accepts:
-`low`, `medium`, and `high`.
+When that local configuration opts into Claude's gateway discovery with
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` and a non-Anthropic
+`ANTHROPIC_BASE_URL`, Asterline uses the same endpoint, authentication, and
+custom headers to read `/v1/models`; a failed refresh uses Claude's local
+`gateway-models.json` cache. Without a configured model or enabled gateway
+discovery, it deliberately shows no invented Claude model list: use the native
+CLI default or enter an explicit local/provider model ID.
+
+Agy's local `~/.gemini/antigravity-cli/settings.json` `model` value is often
+the human-readable label rather than the CLI ID. Asterline matches it against
+the ID/label pairs returned by `agy models`, then displays that configured
+model as the startup default.
+
+The first-run Team builder discovers a catalog when its `model` field is
+opened; `/team` reuses the catalog loaded once at `ast` startup. The Agent
+field lists all four supported CLIs, includes installation status and
+discovered model/effort summaries, and disables missing CLIs. Open the
+member's `model` field to browse the already-loading catalog. Type to filter
+by display name, model ID, or description, and use `↑`/`↓` to choose a model.
+Only a picker whose selected model explicitly reports effort settings shows
+`←`/`→`; `←` lowers and `→` raises the selected setting. Those settings are
+applied with that model. Browsing with `↑`/`↓` never changes a saved effort
+override. If the highlighted model does not advertise the existing override,
+`Enter` keeps the current configuration and asks for an explicit `←`/`→`
+choice instead of silently substituting a guessed default. Grok reads each listed
+model's menu from its own CLI cache, and Agy reads model-qualified settings.
+Neither gets a fabricated generic effort menu. Claude has no machine-readable
+effort capability catalog, so Asterline does not guess from a model name. A
+configured Claude alias remains exactly as configured, while a gateway model
+uses the gateway's `display_name`. The picker selects the CLI-marked default
+when discovery returns models or, if none is marked, the first discovered
+model. It shows only actual model entries in that case. `default` is available
+only when discovery returns no models. If a `/team` lookup failed, focus
+`model` and press `t` to retry it; that refresh is shared by matching
+backend/workspace members. Press `e` on the field to enter a model ID
+manually.
+
+Reasoning effort is model-aware only when discovery returns capability
+metadata. Unsupported levels are omitted and the model's reported default is
+shown directly as a native default when available; it is not an override.
+Agy exposes only the effort encoded by a
+discovered model; Grok has no independent Team effort control.
 
 ## Streaming and resource limits
 
@@ -315,7 +394,7 @@ should ignore it:
 
 `/new` creates a clean conversation in normal mode and new backend sessions
 while retaining older database records. It is rejected while members, runs, or
-verification are active; use `/abort` and wait for cancellation first.
+verification are active; press `Esc` and wait for cancellation first.
 `--no-restore` skips startup replay without deleting data. `--db <PATH>` moves
 the database outside the workspace.
 
@@ -439,12 +518,12 @@ asterline --fake --no-restore
 Confirm that at least one of `codex`, `claude`, `grok`, or `agy` is installed,
 authenticated, and on `PATH`. Alternatively, pass a valid file with `--team`.
 
-### The model picker only shows `default`
+### The model picker has no detected models
 
-Wait for the automatic catalog-loading notice in the Team editor to finish,
-then reopen the `model` field. If discovery failed, verify the selected CLI is
-authenticated and can list models in the member's working directory. Press
-`e` to enter a model name manually.
+Wait for the startup catalog-loading notice to finish, then reopen the
+`model` field. If discovery failed, verify the selected CLI is authenticated
+and can list models in the member's working directory, then focus `model` and
+press `t` to retry. Press `e` to enter a model name manually.
 
 ### The wrong roster opens
 

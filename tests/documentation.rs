@@ -3,6 +3,7 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthStr;
 
 const CONFIGURATION_DOC: &str = include_str!("../docs/configuration.md");
+const APPROVALS_DOC: &str = include_str!("../docs/approvals.md");
 const CARGO_MANIFEST: &str = include_str!("../Cargo.toml");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const REAL_SMOKE_WORKFLOW: &str = include_str!("../.github/workflows/real-smoke.yml");
@@ -155,6 +156,20 @@ fn markdown_table_pipes_are_display_aligned() {
 }
 
 #[test]
+fn codex_app_server_permission_mapping_is_documented() {
+    assert!(
+        CONFIGURATION_DOC.contains("App Server `approvalPolicy` (`never` by default)"),
+        "configuration must document Codex's native approval-policy transport"
+    );
+    assert!(
+        APPROVALS_DOC.contains(
+            "Use `/approve` or `/reject` to send a one-time decision back to the same live\nCodex thread"
+        ),
+        "approvals must document that Codex callbacks reach the user rather than being auto-resolved"
+    );
+}
+
+#[test]
 fn readmes_use_real_product_images_without_a_handwritten_ui_mockup() {
     for (path, document) in &DOCUMENTS[..2] {
         for image in [
@@ -299,6 +314,10 @@ fn installers_are_tested_checksummed_and_attested() {
                 "{path} must document startup option {option}"
             );
         }
+        assert!(
+            document.contains("ast update"),
+            "{path} must document the installation-aware update command"
+        );
     }
 }
 

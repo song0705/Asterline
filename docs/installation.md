@@ -26,6 +26,18 @@ ast --help
 
 The package installs `ast` and `asterline` into `/usr/local/bin`.
 
+## Homebrew (macOS and Linux)
+
+Install the official Formula, then use the same command for later updates:
+
+```bash
+brew install song0705/asterline/asterline
+ast update
+```
+
+`ast update` verifies that the running binary belongs to the installed Formula,
+then runs `brew update` and `brew upgrade song0705/asterline/asterline`.
+
 ### Portable macOS archive
 
 Use a portable archive when a system-wide installation is not appropriate:
@@ -101,8 +113,10 @@ before replacing the binaries.
 Run an update check immediately:
 
 ```powershell
-ast --update
+ast update
 ```
+
+`ast --update` remains a compatible alias.
 
 Skip the background check for one launch:
 
@@ -110,7 +124,9 @@ Skip the background check for one launch:
 ast --no-auto-update
 ```
 
-Portable ZIP copies and source builds do not update themselves.
+Portable ZIP copies and source builds do not update themselves. `ast update`
+also leaves direct macOS packages and direct `.deb`/`.rpm` Release installs
+untouched; install their next matching Release package explicitly.
 
 ### Portable Windows ZIP
 
@@ -197,6 +213,8 @@ cargo install --path . --locked --force
 
 Cargo installs both commands into `$HOME/.cargo/bin` on macOS and Linux, or
 `%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on `PATH`.
+Run the same Cargo command again after pulling the source changes; `ast update`
+does not modify source builds.
 
 ## Verify a release
 

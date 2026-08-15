@@ -22,6 +22,18 @@ ast --help
 
 安装包会把 `ast` 和 `asterline` 安装到 `/usr/local/bin`。
 
+## Homebrew（macOS 和 Linux）
+
+安装官方 Formula，之后使用同一个命令更新：
+
+```bash
+brew install song0705/asterline/asterline
+ast update
+```
+
+`ast update` 会先确认当前二进制属于已安装的 Formula，再运行 `brew update` 和
+`brew upgrade song0705/asterline/asterline`。
+
 ### macOS 便携包
 
 不适合进行系统级安装时，可以改用便携包：
@@ -86,8 +98,10 @@ ast --help
 立即检查更新：
 
 ```powershell
-ast --update
+ast update
 ```
+
+`ast --update` 仍可作为兼容别名使用。
 
 单次启动跳过后台检查：
 
@@ -95,7 +109,8 @@ ast --update
 ast --no-auto-update
 ```
 
-便携 ZIP 和源码构建版本不会自动更新。
+便携 ZIP 和源码构建版本不会自动更新。`ast update` 也不会改写直接安装的 macOS
+安装包或 `.deb`/`.rpm` Release 包；请明确安装下一个匹配的 Release 包。
 
 ### Windows 便携 ZIP
 
@@ -173,7 +188,7 @@ ast --help
 cargo install --path . --locked --force
 ```
 
-Cargo 会把两个命令安装到 macOS/Linux 的 `$HOME/.cargo/bin`，或 Windows 的 `%USERPROFILE%\.cargo\bin`。请确认对应目录已经加入 `PATH`。
+Cargo 会把两个命令安装到 macOS/Linux 的 `$HOME/.cargo/bin`，或 Windows 的 `%USERPROFILE%\.cargo\bin`。请确认对应目录已经加入 `PATH`。拉取源码变更后再次运行同一条 Cargo 命令；`ast update` 不会改写源码构建版本。
 
 ## 校验发布包
 

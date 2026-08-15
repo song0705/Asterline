@@ -114,16 +114,27 @@ Print a compact startup banner before entering the TUI.
 asterline --banner
 ```
 
-### `--update`
+### `update`
 
-On a Windows Setup-managed installation, force a stable-release check, verify a
-new Setup executable against that Release's `SHA256SUMS`, schedule it to run
-after Asterline exits, print the result, and exit. Portable copies, source
-builds, macOS, and Linux report that installer updates are unavailable and exit.
+Run an explicit update for the installation method that owns the currently
+running binary:
 
-```powershell
-ast --update
+- A Windows Setup-managed installation keeps the verified installer flow: it
+  checks the latest stable Release, verifies Setup against that Release's
+  `SHA256SUMS`, schedules it after Asterline exits, then exits.
+- A Homebrew installation on macOS or Linux runs `brew update` followed by
+  `brew upgrade song0705/asterline/asterline`. Asterline first verifies that
+  its own executable is inside that Formula's installed prefix.
+
+Portable archives, direct `.deb`/`.rpm` installs, macOS packages, and source
+builds are intentionally not overwritten. They print the appropriate manual
+path instead of guessing where to replace files.
+
+```bash
+ast update
 ```
+
+`ast --update` remains a backward-compatible alias.
 
 ### `--no-auto-update`
 
@@ -175,17 +186,17 @@ after the member prefix to open skill completion.
 @builder /asterline-team inspect the active run
 ```
 
-Completion and the skill picker insert the native invocation that was
-discovered for that member. Codex uses `$skill`; Claude plugin skills keep
-their `/plugin-name:skill` namespace. For convenience, a manually typed
+Targeted completion inserts the native invocation discovered for that member.
+Codex uses `$skill`; Claude plugin skills keep their `/plugin-name:skill`
+namespace. For convenience, a manually typed
 `@<codex-member> /skill` is converted only when it exactly matches a
-discovered Codex skill. `@member /` offers the local `/model` action, the
-real `/attach` action, and only that member's discovered skills. `/attach`
-opens the [native session](#native-session-attach), where the backend's own
-interactive slash-command menu is available. Unknown targeted slash commands
-are kept out of noninteractive runners unless they exactly match a discovered
-skill. Slash controls always need one member; Asterline rejects `@all /…`
-rather than broadcasting it.
+discovered Codex skill. `@member /` offers the real `/attach` action and only
+that member's discovered skills. `/attach` opens the [native
+session](#native-session-attach), where the backend's own interactive
+slash-command menu is available. Unknown targeted slash commands are kept out
+of noninteractive runners unless they exactly match a discovered skill. Slash
+controls always need one member; Asterline rejects `@all /…` rather than
+broadcasting it.
 
 ## Message and conversation commands
 
@@ -224,7 +235,7 @@ Broadcast the message to every enabled member.
 Persist the current conversation, create a new conversation, clear the visible
 transcript and current run list, create fresh backend session IDs, and reset
 the terminal mode to `normal`. If a member, collaboration run, or verification
-is active, `/new` is rejected; use `/abort` and wait for cancellation first.
+is active, `/new` is rejected; press `Esc` and wait for cancellation first.
 
 `/clear` is intentionally not a separate command. Typing `/cl` or `/clear`
 offers `/new` in completion, so accepting it performs the full new-conversation
@@ -242,7 +253,7 @@ backend session IDs, active mode, and conversation-scoped runs. Press `Esc` to
 cancel.
 
 `/resume` accepts no ID or other argument. Asterline refuses to switch while
-members or verification are active; use `/abort` first.
+members or verification are active; press `Esc` first.
 
 ### `/retry`
 
@@ -255,16 +266,6 @@ does not resume a blocked run or a paused approval route; use `/continue` or
 `/approve` for those cases. If the conversation has no previous user request,
 nothing is sent.
 
-### `/abort`
-
-```text
-/abort
-```
-
-Cancel all running members, queued dispatches, active verification, and paused
-routes. Active collaboration or team runs are marked blocked with an
-user-aborted reason. Use this before `/resume` when work is still active.
-
 ### `/attach`
 
 ```text
@@ -275,12 +276,12 @@ user-aborted reason. Use this before `/resume` when work is still active.
 Suspend Asterline and open that member's real interactive CLI, resuming its
 existing backend session when one is available. Exit using the method supported
 by that native CLI (usually its own `/exit`) to return automatically to
-Asterline. Messages made while attached to Codex or Claude are imported only
-when Asterline can safely identify an already-bound native session, or a
-Claude fork uniquely proven by that session's prior transcript. A fresh or
-ambiguous session is not guessed; Asterline leaves its transcript untouched
-and tells you to choose the session ID in `/team` before a later attach. Grok
-and Agy can resume their sessions but do not yet import attached messages.
+Asterline. A fresh Claude attach receives an Asterline-generated UUID through
+`claude --session-id`, so its transcript is automatically imported and bound
+to that member when you return. Codex imports only an already-bound session it
+can identify safely; a Claude fork is imported only when its prior transcript
+proves the lineage. Ambiguous native sessions are never guessed. Grok and Agy
+can resume their sessions but do not yet import attached messages.
 
 ### `/exit`
 
@@ -310,7 +311,7 @@ pending, Asterline reports that there is nothing to approve.
 Reject the oldest pending Asterline approval request. If no request is
 pending, Asterline reports that there is nothing to reject.
 
-## Team, model, and diagnostics commands
+## Team and diagnostics commands
 
 ### `/team`
 
@@ -319,80 +320,15 @@ pending, Asterline reports that there is nothing to reject.
 ```
 
 Open the live Team editor. Opening it refreshes installed Codex, Claude, Grok,
-and Agy executables. Opening a member's Model field then loads that backend's
-model and reasoning-effort catalog asynchronously, so the editor stays
-responsive. Missing CLIs remain visible for diagnosis but cannot be selected.
+and Agy executables. Model catalogs are loaded asynchronously once at `ast`
+startup, so the editor stays responsive and reports the actual detected model.
+If that initial lookup failed, focus the member's `model` field and press `t`
+to retry it; the result is shared by matching backend/workspace members.
+Missing CLIs remain visible for diagnosis but cannot be selected.
 
-The editor changes the roster, backend, role, model, effort, working directory,
-native session ID, approval behavior, and default target. Changes stay in a
+The editor changes the roster, backend, role, model, effort, native session ID,
+approval behavior, and default target. Changes stay in a
 draft until `s` applies and saves them. See [Team editor keys](#team-editor).
-
-### `/effort`
-
-```text
-/effort <member> <level>
-```
-
-Set one member's reasoning effort and persist it with the conversation.
-Supported levels are model-dependent:
-
-- General choices: `low`, `medium`, `high`, `xhigh`, `max`.
-- Agy accepts `low`, `medium`, or `high`.
-- Codex additionally accepts `ultra` when the selected model advertises it.
-
-```text
-/effort builder high
-```
-
-Use the model picker in `/team` when possible: it applies the model and one of
-that model's discovered effort levels together. An unsupported level or an
-unknown member is rejected.
-
-### `/model`
-
-```text
-/model
-/model <member>
-@member /model
-/model <member> <model>
-@member /model <model>
-```
-
-With no model value, open the asynchronous discovered model catalog and choose
-both model and reasoning effort. Bare `/model` uses the configured default
-member (or the only member); when the default target is `all`, name one member
-explicitly. The picker saves its selection immediately and applies it to that
-member's next run.
-
-With a model value, set the model Asterline passes to one member's subsequent
-runs. The targeted form is convenient from the member menu; both forms persist
-the choice in the active conversation. This inline form accepts exactly one
-model ID; use the picker to choose reasoning effort. Use `default` as the model
-value to return to that CLI's default model and reasoning effort.
-
-```text
-@builder /model gpt-5.6-sol
-/model reviewer sonnet
-```
-
-This is an Asterline control backed by the same discovered catalog used in the
-Team editor, not a simulated Codex TUI picker: the targeted `@member /model`
-forms are intercepted locally too. To use a backend's native interactive
-controls, enter its session with `/attach <member>` or `@member /attach`;
-Asterline does not pretend those controls work through a noninteractive prompt.
-
-### `/skills`
-
-```text
-/skills
-```
-
-Rescan workspace and user skill directories plus enabled Claude plugin skills
-and legacy command files in their standard locations, then open the skill
-picker.
-`Enter` or `Tab` stages the selected skill invocation in the composer for the
-default target (or first member); it does not execute the skill until the
-message is submitted.
 
 ### `/focus`
 
@@ -699,15 +635,18 @@ The Team editor has member-selection and field-selection levels.
 | `Enter`   | Open member fields                          | Edit or open Agent/model/session picker  |
 | `Esc`     | Close Team                                  | Return to member selection               |
 | `a` / `d` | Add/delete a member                         | —                                        |
-| `t`       | Make member the default target              | —                                        |
+| `t`       | Make member the default target              | Retry failed Model catalog               |
 | `*`       | Make all members the default target         | —                                        |
 | `s`       | Apply and save                              | Apply and save                           |
 | `e`       | —                                           | Manually enter model or session ID       |
 
 Text fields open in a focused input box. Press `Enter` to commit or `Esc` to
 cancel. Model pickers use `↑`/`↓` for model, `←`/`→` for that model's effort,
-and `Enter` to apply both. The first choice always restores the CLI default
-model and effort; discovered models follow it.
+and `Enter` to apply both. When discovery returns models, its actual default
+is selected directly; the generic `default` entry appears only for an empty
+catalog. Browsing never alters an existing effort override. If a different
+model does not advertise that override, `Enter` leaves the current setting in
+place until you explicitly choose an advertised effort with `←`/`→`.
 
 On `session id`, `Enter` opens Asterline's native-session table. It reads local
 Codex, Claude, or Grok history, shows title/project/update time/native ID, and
@@ -729,7 +668,8 @@ entry because Asterline has no verified local Agy history format.
 | `Esc`                 | Close drawer                                                 |
 
 `Enter` and `Tab` stage text in the composer; they do not execute it
-immediately. Changing runs clears the selected step.
+immediately. Changing runs clears the selected step. To cancel active work,
+close the drawer with `Esc`, then press `Esc` again.
 
 ## Other drawers
 
@@ -745,9 +685,9 @@ suspends its TUI and opens that member's native interactive CLI. Use that CLI's
 supported exit method—normally `/exit`; EOF works only when the backend accepts
 it—to return to Asterline.
 
-Messages created while attached to Codex or Claude are imported only for an
-already-bound session that Asterline can identify safely, or a Claude fork
-uniquely proven by that session's prior transcript. Fresh or ambiguous native
-sessions are not guessed or imported; choose their session ID in `/team` before
-a later attach. Grok and Agy resume their native sessions but attached messages
-are not currently imported.
+Fresh Claude attach sessions are created with an Asterline-generated UUID, then
+automatically imported and bound on return. Codex messages are imported only
+for an already-bound session that Asterline can identify safely; a Claude fork
+is imported only when its prior transcript proves the lineage. Ambiguous native
+sessions are never guessed. Grok and Agy resume their native sessions but
+attached messages are not currently imported.

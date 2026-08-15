@@ -65,16 +65,16 @@ ast
 
 ### 基于原生 CLI 的实时团队
 
-同一团队可以混用多个提供商，也可以多次使用同一后端。每个成员都可以独立设置职责、模型、推理强度、工作目录、系统提示、沙箱、权限模式、工具白名单与会话策略。
+同一团队可以混用多个提供商，也可以多次使用同一后端。每个成员都可以独立设置职责、模型、受后端支持的推理设置、工作目录、系统提示、沙箱、权限模式、工具白名单与会话策略。
 
 ![Asterline Team 编辑器](docs/assets/asterline-team.webp)
 
-| 后端   | 接入方式               | 会话恢复 | 模型发现                       |
-| ------ | ---------------------- | -------- | ------------------------------ |
-| Codex  | `codex exec --json`    | 支持     | `codex debug models`           |
-| Claude | 流式 JSON              | 支持     | CLI 设置与模型别名             |
-| Grok   | `grok agent stdio` ACP | 支持     | `grok --no-auto-update models` |
-| Agy    | `stream-json` 事件     | 支持     | `agy models`                   |
+| 后端   | 接入方式                                | 会话恢复 | 模型发现                                  |
+| ------ | --------------------------------------- | -------- | ----------------------------------------- |
+| Codex  | 持久 App Server（默认）；可选旧版 exec  | 支持     | App Server `model/list`（旧命令作回退）   |
+| Claude | 流式 JSON                               | 支持     | CLI 设置与模型别名                        |
+| Grok   | `grok agent stdio` ACP                  | 支持     | `grok --no-auto-update models`            |
+| Agy    | `stream-json` 事件                      | 支持     | `agy models`                              |
 
 Asterline 不代替各提供商的认证、计费、模型授权或用量限制。
 
@@ -128,10 +128,9 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 | `/team`                | 编辑当前团队             |
 | `/resume`              | 恢复已保存的对话         |
 | `/approve` / `/reject` | 处理待审批请求           |
-| `/abort`               | 取消正在运行的工作与验证 |
 | `/help`                | 打开命令面板             |
 
-[完整命令与键盘参考](docs/commands.zh-CN.md)还包含原生会话接入、导航、Run 步骤、Skills、日志、搜索和 diff。
+[完整命令与键盘参考](docs/commands.zh-CN.md)还包含原生会话接入、导航、Run 步骤、定向 Skill 调用、日志、搜索和 diff。
 
 ## 文档
 
@@ -139,7 +138,7 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 - [命令与键盘参考](docs/commands.zh-CN.md)
 - [配置与本地数据](docs/configuration.md)
 - [审批与工具控制](docs/approvals.md)
-- [版本发布说明](docs/releases/v0.2.7.md)
+- [版本发布说明](docs/releases/v0.2.8.md)
 - [维护者发布流程](docs/releasing.md)
 
 程序内可通过 `/help` 和 `asterline --help` 查看帮助。

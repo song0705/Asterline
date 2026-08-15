@@ -82,17 +82,17 @@ work.
 ### Live teams over native CLIs
 
 A team can mix providers or use the same backend more than once. Each member can
-have its own role, model, reasoning effort, working directory, system prompt,
+have its own role, model, supported reasoning setting, working directory, system prompt,
 sandbox, permission mode, tool allowlist, and session policy.
 
 ![Asterline Team editor](docs/assets/asterline-team.webp)
 
-| Backend | Integration                 | Session resume | Model discovery                |
-| ------- | --------------------------- | -------------- | ------------------------------ |
-| Codex   | `codex exec --json`         | Yes            | `codex debug models`           |
-| Claude  | Streaming JSON              | Yes            | CLI settings and aliases       |
-| Grok    | ACP over `grok agent stdio` | Yes            | `grok --no-auto-update models` |
-| Agy     | `stream-json` events        | Yes            | `agy models`                   |
+| Backend | Integration                                         | Session resume    | Model discovery                               |
+| ------- | --------------------------------------------------- | ----------------- | --------------------------------------------- |
+| Codex   | Persistent App Server                               | Yes               | App Server `model/list`                       |
+| Claude  | Streaming JSON                                      | Yes               | CLI settings and aliases                      |
+| Grok    | ACP over `grok agent stdio`                         | Yes               | `grok --no-auto-update models`                |
+| Agy     | `stream-json` events                                | Yes               | `agy models`                                  |
 
 Asterline does not replace provider authentication, billing, model access, or
 usage limits.
@@ -157,11 +157,10 @@ second process sandbox beyond the selected backend. Read
 | `/team`                | Edit the live roster                        |
 | `/resume`              | Restore a saved conversation                |
 | `/approve` / `/reject` | Resolve a pending approval                  |
-| `/abort`               | Cancel active work and verification         |
 | `/help`                | Open the command palette                    |
 
 See the [complete command and keyboard reference](docs/commands.md) for session
-attach, navigation, Run steps, Skills, logs, search, and diffs.
+attach, navigation, Run steps, targeted skills, logs, search, and diffs.
 
 ## Documentation
 
@@ -169,7 +168,7 @@ attach, navigation, Run steps, Skills, logs, search, and diffs.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration and local data](docs/configuration.md)
 - [Approvals and tool control](docs/approvals.md)
-- [Release notes](docs/releases/v0.2.7.md)
+- [Release notes](docs/releases/v0.2.8.md)
 - [Maintainer release process](docs/releasing.md)
 
 Built-in help is available through `/help` and `asterline --help`.
