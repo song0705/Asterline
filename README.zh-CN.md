@@ -30,10 +30,11 @@ Asterline 支持 macOS、Linux 和 Windows 10/11。使用前，至少需要安�
 - **Windows：**下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。
 - **Linux：**按 CPU 架构选择 `asterline-v<version>-Linux-x86_64` 或
   `asterline-v<version>-Linux-arm64` 的 `.tar.gz`、`.deb` 或 `.rpm`。
+- **Homebrew（macOS 和 Linux）：**`brew install song0705/asterline/asterline`。
 
 Linux 发布包要求 GNU/glibc 2.28 或更高版本，并内置 SQLite；目前不提供 Alpine/musl 发布目标。
 
-安装器会同时提供完整命令 `asterline` 和短命令 `ast`。便携安装、源码构建、版本校验、自动更新、卸载与故障排查请参阅[安装指南](docs/installation.zh-CN.md)。
+安装器会同时提供完整命令 `asterline` 和短命令 `ast`。Homebrew、便携安装、源码构建、版本校验、自动更新、卸载与故障排查请参阅[安装指南](docs/installation.zh-CN.md)。
 
 ## 开始使用
 

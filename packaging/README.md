@@ -11,7 +11,7 @@ different versions.
 
 ## Homebrew (macOS and Linux)
 
-`homebrew/Formula/asterline.rb` pins v0.2.7 macOS and GNU/Linux archives for
+`homebrew/Formula/asterline.rb` pins v0.2.8 macOS and GNU/Linux archives for
 Apple silicon / Intel macOS and ARM64 / x86_64 Linux by SHA-256. The Linux
 archives are the verified glibc 2.28-baseline Release assets.
 

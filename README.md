@@ -40,12 +40,13 @@ must already be installed and authenticated.
 - **Windows:** Download and run `asterline-<version>-x86_64-windows-setup.exe`.
 - **Linux:** Choose `asterline-v<version>-Linux-x86_64` or
   `asterline-v<version>-Linux-arm64` as a `.tar.gz`, `.deb`, or `.rpm`.
+- **Homebrew (macOS and Linux):** `brew install song0705/asterline/asterline`.
 
 Linux archives target GNU/glibc 2.28 or newer and embed SQLite; Alpine/musl is
 not a supported release target.
 
 The installers provide both `asterline` and the shorter `ast` command. See the
-[installation guide](docs/installation.md) for portable packages, source builds,
+[installation guide](docs/installation.md) for Homebrew, portable packages, source builds,
 release verification, updates, uninstallation, and troubleshooting.
 
 ## Get started
