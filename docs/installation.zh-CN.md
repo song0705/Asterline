@@ -1,5 +1,7 @@
 # 安装 Asterline
 
+[English](installation.md)
+
 Asterline 为 macOS、Linux 和 Windows 提供原生发布包。每个发布包都同时包含完整命令 `asterline` 和短命令 `ast`。
 
 ## 安装前准备

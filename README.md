@@ -169,8 +169,10 @@ attach, navigation, Run steps, targeted skills, logs, search, and diffs.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration and local data](docs/configuration.md)
 - [Approvals and tool control](docs/approvals.md)
+- [Real-backend smoke tests](docs/real-smoke.md)
 - [Release notes](docs/releases/v0.2.8.md)
 - [Maintainer release process](docs/releasing.md)
+- [Third-party package definitions](packaging/README.md)
 
 Built-in help is available through `/help` and `asterline --help`.
 

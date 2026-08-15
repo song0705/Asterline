@@ -1,5 +1,7 @@
 # Asterline configuration and operations
 
+[简体中文](configuration.zh-CN.md)
+
 This page covers team files, runtime data, permissions, CLI options, agent
 coordination, and troubleshooting. For the product overview, return to the
 [main README](../README.md). For interactive controls, see the

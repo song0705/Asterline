@@ -1,5 +1,7 @@
 # Releasing Asterline
 
+[简体中文](releasing.zh-CN.md)
+
 Asterline releases are built and published by GitHub Actions. A release tag
 must exactly match the package version in `Cargo.toml`. The normal and release
 workflows use Rust 1.93.1; the explicit MSRV job enforces the package's declared

@@ -1,5 +1,7 @@
 # Installing Asterline
 
+[简体中文](installation.zh-CN.md)
+
 Asterline publishes native packages for macOS, Linux, and Windows. Every release
 contains both the full `asterline` command and the shorter `ast` alias.
 

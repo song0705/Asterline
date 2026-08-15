@@ -75,6 +75,8 @@ pkgbuild "${pkg_args[@]}" "$dmg_root/Install Asterline.pkg"
 cp "$repo_root/LICENSE" "$dmg_root/LICENSE.txt"
 sed "s/@VERSION@/$version/g" \
   "$repo_root/packaging/macos/README.txt" > "$dmg_root/README.txt"
+sed "s/@VERSION@/$version/g" \
+  "$repo_root/packaging/macos/README.zh-CN.txt" > "$dmg_root/README.zh-CN.txt"
 
 hdiutil create \
   -volname "Asterline $version" \

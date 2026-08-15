@@ -137,10 +137,12 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 
 - [安装与更新](docs/installation.zh-CN.md)
 - [命令与键盘参考](docs/commands.zh-CN.md)
-- [配置与本地数据](docs/configuration.md)
-- [审批与工具控制](docs/approvals.md)
+- [配置与本地数据](docs/configuration.zh-CN.md)
+- [审批与工具控制](docs/approvals.zh-CN.md)
+- [真实后端冒烟测试](docs/real-smoke.zh-CN.md)
 - [版本发布说明](docs/releases/v0.2.8.md)
-- [维护者发布流程](docs/releasing.md)
+- [维护者发布流程](docs/releasing.zh-CN.md)
+- [第三方包定义](packaging/README.zh-CN.md)
 
 程序内可通过 `/help` 和 `asterline --help` 查看帮助。
 

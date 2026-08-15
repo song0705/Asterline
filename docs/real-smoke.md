@@ -1,5 +1,7 @@
 # Real-backend smoke tests
 
+[简体中文](real-smoke.zh-CN.md)
+
 `tests/real_smoke.rs` exercises Asterline's real provider processes and event
 parsers. The tests are ignored by the normal test suite because they make live
 model calls and may consume paid usage. Maintainers can run one provider at a

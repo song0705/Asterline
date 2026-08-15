@@ -1,5 +1,7 @@
 # Approvals and tool-level control
 
+[简体中文](approvals.zh-CN.md)
+
 Asterline gates work at two layers. This page explains what each layer covers,
 how to configure the Asterline layer, and why per-tool interactive approval is
 delegated to the backends in this release.

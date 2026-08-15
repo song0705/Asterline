@@ -3,13 +3,17 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthStr;
 
 const CONFIGURATION_DOC: &str = include_str!("../docs/configuration.md");
+const CONFIGURATION_DOC_ZH: &str = include_str!("../docs/configuration.zh-CN.md");
 const APPROVALS_DOC: &str = include_str!("../docs/approvals.md");
+const APPROVALS_DOC_ZH: &str = include_str!("../docs/approvals.zh-CN.md");
 const CARGO_MANIFEST: &str = include_str!("../Cargo.toml");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const REAL_SMOKE_WORKFLOW: &str = include_str!("../.github/workflows/real-smoke.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const RELEASING_DOC: &str = include_str!("../docs/releasing.md");
+const RELEASING_DOC_ZH: &str = include_str!("../docs/releasing.zh-CN.md");
 const REAL_SMOKE_DOC: &str = include_str!("../docs/real-smoke.md");
+const REAL_SMOKE_DOC_ZH: &str = include_str!("../docs/real-smoke.zh-CN.md");
 const JUSTFILE: &str = include_str!("../justfile");
 const WINDOWS_INSTALLER_SMOKE: &str = include_str!("../scripts/smoke-windows-installer.ps1");
 const HOMEBREW_FORMULA: &str = include_str!("../packaging/homebrew/Formula/asterline.rb");
@@ -17,7 +21,10 @@ const AUR_PKGBUILD: &str = include_str!("../packaging/aur/asterline/PKGBUILD");
 const AUR_SRCINFO: &str = include_str!("../packaging/aur/asterline/.SRCINFO");
 const DEB_CONTROL: &str = include_str!("../packaging/deb/control.in");
 const PACKAGING_README: &str = include_str!("../packaging/README.md");
+const PACKAGING_README_ZH: &str = include_str!("../packaging/README.zh-CN.md");
 const MACOS_PACKAGE_README: &str = include_str!("../packaging/macos/README.txt");
+const MACOS_PACKAGE_README_ZH: &str = include_str!("../packaging/macos/README.zh-CN.txt");
+const BUILD_MACOS_DMG: &str = include_str!("../scripts/build-macos-dmg.sh");
 const PACKAGE_DEB: &str = include_str!("../scripts/package-deb.sh");
 const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
 const RPM_SPEC: &str = include_str!("../packaging/rpm/asterline.spec.in");
@@ -40,6 +47,62 @@ const COMMAND_DOCS: &[(&str, &str)] = &[
     (
         "docs/commands.zh-CN.md",
         include_str!("../docs/commands.zh-CN.md"),
+    ),
+];
+const BILINGUAL_DOCUMENTS: &[(&str, &str, &str, &str)] = &[
+    (
+        "README.md",
+        include_str!("../README.md"),
+        "README.zh-CN.md",
+        include_str!("../README.zh-CN.md"),
+    ),
+    (
+        "docs/installation.md",
+        INSTALLATION_DOCS[0].1,
+        "docs/installation.zh-CN.md",
+        INSTALLATION_DOCS[1].1,
+    ),
+    (
+        "docs/commands.md",
+        COMMAND_DOCS[0].1,
+        "docs/commands.zh-CN.md",
+        COMMAND_DOCS[1].1,
+    ),
+    (
+        "docs/configuration.md",
+        CONFIGURATION_DOC,
+        "docs/configuration.zh-CN.md",
+        CONFIGURATION_DOC_ZH,
+    ),
+    (
+        "docs/approvals.md",
+        APPROVALS_DOC,
+        "docs/approvals.zh-CN.md",
+        APPROVALS_DOC_ZH,
+    ),
+    (
+        "docs/real-smoke.md",
+        REAL_SMOKE_DOC,
+        "docs/real-smoke.zh-CN.md",
+        REAL_SMOKE_DOC_ZH,
+    ),
+    (
+        "docs/releasing.md",
+        RELEASING_DOC,
+        "docs/releasing.zh-CN.md",
+        RELEASING_DOC_ZH,
+    ),
+    (
+        "docs/releases/v0.2.8.en.md",
+        include_str!("../docs/releases/v0.2.8.en.md"),
+        "docs/releases/v0.2.8.md",
+        include_str!("../docs/releases/v0.2.8.md"),
+    ),
+    (
+        "packaging/README.md",
+        PACKAGING_README,
+        "packaging/README.zh-CN.md",
+        PACKAGING_README_ZH,
     ),
 ];
 const DOCUMENTS: &[(&str, &str)] = &[
@@ -120,6 +183,26 @@ fn documented_team_json_accepts_crlf_checkout() {
         .replace("\r\n", "\n")
         .replace('\n', "\r\n");
     assert!(first_json_fence(&crlf).is_some());
+}
+
+#[test]
+fn maintained_documents_have_cross_linked_english_and_chinese_versions() {
+    for (english_path, english, chinese_path, chinese) in BILINGUAL_DOCUMENTS {
+        let english_name = english_path.rsplit('/').next().unwrap_or(english_path);
+        let chinese_name = chinese_path.rsplit('/').next().unwrap_or(chinese_path);
+        assert!(
+            english.contains(chinese_name),
+            "{english_path} must link to {chinese_path}"
+        );
+        assert!(
+            chinese.contains(english_name),
+            "{chinese_path} must link to {english_path}"
+        );
+    }
+
+    assert!(MACOS_PACKAGE_README.contains("README.zh-CN.txt"));
+    assert!(MACOS_PACKAGE_README_ZH.contains("README.txt"));
+    assert!(BUILD_MACOS_DMG.contains("README.zh-CN.txt"));
 }
 
 #[test]

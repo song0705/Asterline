@@ -1,5 +1,7 @@
 # Third-party package definitions
 
+[简体中文](README.zh-CN.md)
+
 This directory keeps version-pinned definitions for package-manager maintainers.
 They install both `asterline` and its short `ast` alias. The Homebrew Formula
 mirrors the published Homebrew tap; the AUR definition remains ready to submit

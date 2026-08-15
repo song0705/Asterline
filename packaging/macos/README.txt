@@ -1,6 +1,8 @@
 Asterline @VERSION@
 ==================
 
+[简体中文：README.zh-CN.txt]
+
 1. Double-click “Install Asterline.pkg”.
 2. Follow the standard macOS Installer steps.
 3. Open a new Terminal window and run:
