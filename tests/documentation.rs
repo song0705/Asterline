@@ -157,12 +157,13 @@ fn markdown_table_pipes_are_display_aligned() {
 
 #[test]
 fn codex_app_server_permission_mapping_is_documented() {
+    let approvals_doc = APPROVALS_DOC.replace("\r\n", "\n");
     assert!(
         CONFIGURATION_DOC.contains("App Server `approvalPolicy` (`never` by default)"),
         "configuration must document Codex's native approval-policy transport"
     );
     assert!(
-        APPROVALS_DOC.contains(
+        approvals_doc.contains(
             "Use `/approve` or `/reject` to send a one-time decision back to the same live\nCodex thread"
         ),
         "approvals must document that Codex callbacks reach the user rather than being auto-resolved"
