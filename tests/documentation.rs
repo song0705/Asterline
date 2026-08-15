@@ -30,7 +30,7 @@ const SMOKE_DEB_PACKAGE: &str = include_str!("../scripts/smoke-deb-package.sh");
 const RPM_SPEC: &str = include_str!("../packaging/rpm/asterline.spec.in");
 const PACKAGE_RPM: &str = include_str!("../scripts/package-rpm.sh");
 const SMOKE_RPM_PACKAGE: &str = include_str!("../scripts/smoke-rpm-package.sh");
-const HOMEBREW_RELEASE_VERSION: &str = "0.2.8";
+const HOMEBREW_RELEASE_VERSION: &str = "0.2.9";
 const AUR_RELEASE_VERSION: &str = "0.2.3";
 const INSTALLATION_DOCS: &[(&str, &str)] = &[
     (
@@ -461,19 +461,19 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     for (target, checksum) in [
         (
             "aarch64-apple-darwin.tar.gz",
-            "fe93fedc7fa561e6cfa9399cab9a09fa7fecd30df60773a25d0c2dad02cb024c",
+            "322604253de110254c119300d562c2646992465026ba85173acca82b08bcb6a4",
         ),
         (
             "x86_64-apple-darwin.tar.gz",
-            "be17f0575a98a8814ccdba9730b1067613d62b2fc68c27bea3b34b7ee0adc0e4",
+            "ed33fbc31705663e5a00cc03a53ebb522e0e3d0db6bb5286a3bc5e3b62162842",
         ),
         (
-            "asterline-v0.2.8-Linux-arm64.tar.gz",
-            "18cf85bcb1000040aa6231891cc169f47f19da913e033bb28a8f564f26bc33ae",
+            "asterline-v0.2.9-Linux-arm64.tar.gz",
+            "fb2afd79405f25ed697c596860a169599d6bb258e232f34fc5df6069a71de766",
         ),
         (
-            "asterline-v0.2.8-Linux-x86_64.tar.gz",
-            "f8a35ede4a74b3e8158708369f06ee1c44708204652e23399acd76b319c2e164",
+            "asterline-v0.2.9-Linux-x86_64.tar.gz",
+            "eedde381531acfbad4a451cbdd8c5de008b4f54d6f0f42567742ae90451b802d",
         ),
     ] {
         assert!(

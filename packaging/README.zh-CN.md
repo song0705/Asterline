@@ -11,7 +11,7 @@
 
 ## Homebrew（macOS 和 Linux）
 
-`homebrew/Formula/asterline.rb` 通过 SHA-256 固定 v0.2.8 的 macOS 与 GNU/Linux 归档：
+`homebrew/Formula/asterline.rb` 通过 SHA-256 固定 v0.2.9 的 macOS 与 GNU/Linux 归档：
 Apple silicon / Intel macOS，以及 ARM64 / x86_64 Linux。Linux 归档是已验证的 glibc 2.28
 基线 Release 资产。
 
