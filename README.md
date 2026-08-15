@@ -122,8 +122,10 @@ Runs remain actionable when work pauses:
 
 ### Local, resumable history
 
-`/new` starts a clean conversation. `/resume` restores a saved transcript,
-roster, backend sessions, mode, and Runs. Project state is stored by default in:
+Reopening Asterline resumes the last conversation by default. `/new` and
+`/clear` are equivalent: each starts a clean conversation. `/resume` restores a
+saved transcript, roster, backend sessions, mode, and Runs. Project state is
+stored by default in:
 
 ```text
 <workspace>/.asterline/

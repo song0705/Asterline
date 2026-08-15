@@ -237,9 +237,9 @@ transcript and current run list, create fresh backend session IDs, and reset
 the terminal mode to `normal`. If a member, collaboration run, or verification
 is active, `/new` is rejected; press `Esc` and wait for cancellation first.
 
-`/clear` is intentionally not a separate command. Typing `/cl` or `/clear`
-offers `/new` in completion, so accepting it performs the full new-conversation
-operation instead of merely hiding history.
+`/clear` is a direct alias for `/new`; both perform the same full
+new-conversation operation rather than merely hiding history. A normal restart
+reopens the currently selected conversation instead of clearing it.
 
 ### `/resume`
 
@@ -322,8 +322,8 @@ pending, Asterline reports that there is nothing to reject.
 Open the live Team editor. Opening it refreshes installed Codex, Claude, Grok,
 and Agy executables. Model catalogs are loaded asynchronously once at `ast`
 startup, so the editor stays responsive and reports the actual detected model.
-If that initial lookup failed, focus the member's `model` field and press `t`
-to retry it; the result is shared by matching backend/workspace members.
+Focus the member's `model` field and press `t` to re-fetch it at any time; the
+result is shared by matching backend/workspace members.
 Missing CLIs remain visible for diagnosis but cannot be selected.
 
 The editor changes the roster, backend, role, model, effort, native session ID,
@@ -611,7 +611,7 @@ Set or clear the owner. `member` may be written with or without `@`.
 | Mouse drag                     | Select and copy chat, status-bar, or drawer text              |
 | Mouse wheel                    | Scroll chat or the open drawer                                |
 | `Esc`                          | Close an overlay, clear find, or cancel running work          |
-| `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | Expand or collapse successful tool output                     |
+| `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | Expand or collapse detailed output (tools + Claude thinking)  |
 | `Ctrl+L`                       | Open logs                                                     |
 | `Ctrl+P`                       | Open command palette                                          |
 | `Ctrl+N` / `Ctrl+B`            | Focus next/previous member                                    |

@@ -23,8 +23,8 @@ and their model catalogs once when it starts; opening `/team` reuses that
 cache. The same lookup reads non-Codex CLIs' local permission defaults for
 display, without copying them into `team.json`. Codex instead receives
 Asterline's explicit default `approvalPolicy: "never"` at thread start/resume.
-When a model lookup fails, select that member's **model** field and press `t`
-to retry. Press `s` to apply the changes, replace member runners, and save the
+Focus a member's **model** field and press `t` to re-fetch its catalog at any
+time. Press `s` to apply the changes, replace member runners, and save the
 updated team.
 
 ### Platform paths and backend history
@@ -240,6 +240,16 @@ native CLI history. For Codex it is the App Server `thread.id`, resumed through
 `session/load`, and `agy --conversation` respectively. In the Team editor,
 use `default` to clear the explicit ID.
 
+Asterline names its Codex threads and Claude sessions `Asterline · <member>`
+so they are recognizable in native history that exposes a title. A saved roster
+at `<workspace>/.asterline/team.json` is also bound to that containing
+workspace: on a project move, Asterline corrects a stale serialized workspace
+before launching members, so new native transcripts remain associated with the
+project you opened. Native session pickers filter by working directory. Claude
+print-mode sessions are resumable with `claude --resume <id>`, but some Claude
+Code versions intentionally omit print-mode sessions from their interactive
+picker.
+
 Permission modes, sandbox mappings, and allowed-tool behavior depend on the
 backend. Do not assume a field has the same effect across all four CLIs.
 
@@ -280,21 +290,25 @@ configured mode is `default` so the CLI default applies.
 
 Model choices are resolved in each member's effective working directory:
 
-Asterline starts these lookups asynchronously for the configured roster once
-at launch. Until a lookup completes the Team editor shows `loading…`; once the
-CLI reports a concrete default, it shows that model name rather than the
-placeholder `default`. The result is held for the lifetime of that `ast`
-process: opening and closing `/team` never re-runs it. Restart `ast` to refresh
-the catalog. A backend or working directory added after startup is shown as
-`not preloaded at startup` rather than silently launching another model lookup.
+Asterline detects all four supported CLIs at launch, then starts one
+workspace-scoped lookup asynchronously for every installed backend. The
+queries do not depend on the configured roster, so a Codex, Claude, Grok, or
+Agy member added later can use the already-loading result. Until a lookup
+completes the Team editor shows `loading…`; once the CLI reports a concrete
+default, it shows that model name rather than the placeholder `default`. The
+result is held for the lifetime of that `ast` process: opening and closing
+`/team` never re-runs it. A new working directory is shown as `not loaded ·
+press Enter` rather than silently launching another background lookup; opening
+that member's **Model** field explicitly loads one shared catalog for that
+backend and working directory.
 If a catalog loaded successfully but its CLI did not identify a default, the
 field correctly shows `CLI default`; its picker still contains the discovered
 models.
 
-If the initial lookup failed, enter the member's fields, select `model`, and
-press `t` to retry that failed backend/workspace catalog once. The refreshed
-result is shared by all matching members; `t` never re-fetches an already
-successful catalog.
+Focus `model` and press `t` to re-fetch that backend/workspace catalog whether
+it previously succeeded or failed. The refreshed result is shared by all
+matching members. If a load is already in progress, `t` leaves that shared
+request in place rather than creating a duplicate.
 
 | Backend | Source                                                          |
 | ------- | --------------------------------------------------------------- |
@@ -322,9 +336,9 @@ the human-readable label rather than the CLI ID. Asterline matches it against
 the ID/label pairs returned by `agy models`, then displays that configured
 model as the startup default.
 
-The first-run Team builder discovers a catalog when its `model` field is
-opened; `/team` reuses the catalog loaded once at `ast` startup. The Agent
-field lists all four supported CLIs, includes installation status and
+The first-run Team builder also starts every installed catalog immediately;
+`/team` reuses the catalog loaded once at `ast` startup. The Agent field lists
+all four supported CLIs, includes installation status and
 discovered model/effort summaries, and disables missing CLIs. Open the
 member's `model` field to browse the already-loading catalog. Type to filter
 by display name, model ID, or description, and use `↑`/`↓` to choose a model.
@@ -341,9 +355,9 @@ configured Claude alias remains exactly as configured, while a gateway model
 uses the gateway's `display_name`. The picker selects the CLI-marked default
 when discovery returns models or, if none is marked, the first discovered
 model. It shows only actual model entries in that case. `default` is available
-only when discovery returns no models. If a `/team` lookup failed, focus
-`model` and press `t` to retry it; that refresh is shared by matching
-backend/workspace members. Press `e` on the field to enter a model ID
+only when discovery returns no models. Focus `model` and press `t` to re-fetch
+that catalog; the refresh is shared by matching backend/workspace members.
+Press `e` on the field to enter a model ID
 manually.
 
 Reasoning effort is model-aware only when discovery returns capability
@@ -394,9 +408,11 @@ should ignore it:
 .asterline/
 ```
 
-`/new` creates a clean conversation in normal mode and new backend sessions
-while retaining older database records. It is rejected while members, runs, or
-verification are active; press `Esc` and wait for cancellation first.
+Reopening Asterline restores the selected conversation by default. `/new` and
+`/clear` both create a clean conversation in normal mode and new backend
+sessions while retaining older database records. They are rejected while
+members, runs, or verification are active; press `Esc` and wait for
+cancellation first.
 `--no-restore` skips startup replay without deleting data. `--db <PATH>` moves
 the database outside the workspace.
 
@@ -523,9 +539,9 @@ authenticated, and on `PATH`. Alternatively, pass a valid file with `--team`.
 ### The model picker has no detected models
 
 Wait for the startup catalog-loading notice to finish, then reopen the
-`model` field. If discovery failed, verify the selected CLI is authenticated
-and can list models in the member's working directory, then focus `model` and
-press `t` to retry. Press `e` to enter a model name manually.
+`model` field. Verify the selected CLI is authenticated and can list models in
+the member's working directory, then focus `model` and press `t` to re-fetch.
+Press `e` to enter a model name manually.
 
 ### The wrong roster opens
 
@@ -535,7 +551,7 @@ press `s` to apply changes.
 ### Start without the previous transcript
 
 Use `asterline --no-restore`. This skips replay but does not delete SQLite data.
-Use `/new` for a clean conversation with new backend sessions.
+Use `/new` or `/clear` for a clean conversation with new backend sessions.
 
 ### Test without invoking backend CLIs
 

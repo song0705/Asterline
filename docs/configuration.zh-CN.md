@@ -17,8 +17,8 @@
 用 `/team` 修改正在运行的 roster。Asterline 在启动时一次性加载已安装 Agent CLI 与它们的
 模型目录；之后打开 `/team` 会复用缓存。同一次查询也会读取非 Codex CLI 的本地权限默认值
 用于显示，但不会将它们复制进 `team.json`。Codex 则会在 thread start/resume 时接收
-Asterline 显式设置的默认 `approvalPolicy: "never"`。模型查询失败时，选择该成员的
-**model** 字段并按 `t` 重试。按 `s` 应用更改、替换成员 runner 并保存更新后的团队。
+Asterline 显式设置的默认 `approvalPolicy: "never"`。聚焦成员的 **model** 字段并按
+`t` 可随时重新拉取该目录。按 `s` 应用更改、替换成员 runner 并保存更新后的团队。
 
 ### 平台路径与后端历史
 
@@ -202,6 +202,13 @@ Server 的 `thread.id`，通过 `thread/resume` 恢复；Claude、Grok、Agy 分
 `claude --resume`、ACP `session/load` 和 `agy --conversation`。Team editor 中使用 `default`
 可清除显式 ID。
 
+Asterline 会把自己的 Codex thread 和 Claude session 命名为 `Asterline · <成员名>`，以便在
+会显示标题的原生历史中辨认。`<workspace>/.asterline/team.json` 保存的 roster 也绑定到其
+所在 workspace：项目移动后，Asterline 会在启动成员前修正过期的已序列化 workspace，使新的
+原生 transcript 仍归属你实际打开的项目。原生 session picker 会按工作目录过滤。Claude 的
+print-mode session 可通过 `claude --resume <id>` 恢复，但部分 Claude Code 版本会有意不在
+交互式 picker 中列出 print-mode session。
+
 权限模式、sandbox 映射和 allowed-tool 行为取决于后端。不要假定同一个字段在四个 CLI 上
 有相同效果。
 
@@ -236,15 +243,18 @@ Asterline 待审批，并把你的一次性决定返回给 live App Server threa
 
 模型选项在每位成员的有效工作目录中解析。
 
-Asterline 在启动时为已配置 roster 异步启动这些查询一次。查询完成前 Team editor 显示
-`loading…`；CLI 报告具体默认模型后显示该模型名，而非占位值 `default`。结果在该 `ast`
-进程生命周期中保存；打开和关闭 `/team` 都不会重新运行。重启 `ast` 可刷新目录。启动后
-新增的 backend 或工作目录会显示 `not preloaded at startup`，不会静默启动另一项模型查询。
+Asterline 在启动时检测全部四个受支持 CLI，并为每个已安装 backend 异步启动一份 workspace
+目录查询。查询不依赖已配置 roster，因此后来新增的 Codex、Claude、Grok 或 Agy 成员也会
+直接使用已在加载的结果。查询完成前 Team editor 显示 `loading…`；CLI 报告具体默认模型后
+显示该模型名，而非占位值 `default`。结果在该 `ast` 进程生命周期中保存；打开和关闭
+`/team` 都不会重新运行。新工作目录显示 `not loaded · press Enter`，不会静默启动另一项
+后台查询；明确打开该成员的 **Model** 字段时，才会为该 backend 与工作目录加载一份可共享
+的 catalog。
 目录成功加载但 CLI 未识别默认值时，字段正确显示 `CLI default`，其 picker 仍包含发现的
 模型。
 
-初始查询失败时，进入成员字段，选择 `model` 后按 `t`，即可重试该 backend/workspace 的目录。
-刷新结果会在所有匹配成员间共享；`t` 不会重新获取已成功的目录。
+聚焦 `model` 后按 `t`，无论之前查询成功或失败，都会重新拉取该 backend/workspace 的目录。
+刷新结果会在所有匹配成员间共享；若已经在加载，`t` 会保留这份共享请求，不会重复创建。
 
 | 后端 | 来源 |
 | --- | --- |
@@ -266,8 +276,8 @@ cache。没有配置模型或启用 gateway discovery 时，它有意不虚构 C
 Agy 本地 `~/.gemini/antigravity-cli/settings.json` 的 `model` 值常是人类可读标签而非 CLI ID。
 Asterline 将它与 `agy models` 返回的 ID/label 对匹配，再将该配置模型显示为启动默认值。
 
-首次运行的 Team builder 会在打开 `model` 字段时发现目录；`/team` 复用 `ast` 启动时加载一次
-的目录。Agent 字段列出四个支持的 CLI，包含安装状态和发现的 model/effort 摘要，并禁用缺失
+首次运行的 Team builder 也会立即加载每个已安装 CLI 的目录；`/team` 复用 `ast` 启动时加载
+一次的目录。Agent 字段列出四个支持的 CLI，包含安装状态和发现的 model/effort 摘要，并禁用缺失
 CLI。打开成员的 `model` 字段即可浏览已在加载的目录。输入可按显示名、model ID 或 description
 过滤，使用 `↑` / `↓` 选择模型。只有所选模型明确报告 effort 设置时才显示 `←` / `→`；
 `←` 降低、`→` 提高所选设置。这些设置随该模型应用。使用 `↑` / `↓` 浏览不会更改已保存的
@@ -277,8 +287,8 @@ Agy 读取模型限定的设置；两者都不会得到虚构的通用 effort �
 effort capability catalog，因此 Asterline 不会从模型名猜测。已配置 Claude alias 保持原样，
 gateway model 使用 gateway 的 `display_name`。发现模型时 picker 选择 CLI 标记的默认模型；
 若没有标记则选第一个发现的模型。此时它只显示真实模型条目。只有发现不到模型时才可用
-`default`。若 `/team` 查询失败，聚焦 `model` 并按 `t` 重试；刷新会由相同 backend/workspace
-成员共享。按 `e` 可手动输入 model ID。
+`default`。聚焦 `model` 并按 `t` 可重新拉取目录；刷新会由相同 backend/workspace 成员共享。
+按 `e` 可手动输入 model ID。
 
 只有发现能力 metadata 时 reasoning effort 才按模型生效。不支持的级别会省略；若可用，模型
 报告的默认值直接显示为原生默认值，不是 override。Agy 只公开已发现模型中编码的 effort；
@@ -318,9 +328,10 @@ checklist、timeline 和验证结果。
 .asterline/
 ```
 
-`/new` 会在普通模式创建干净会话和新的后端 session，同时保留旧数据库记录。成员、Runs 或
-验证处于活动状态时它会被拒绝；先按 `Esc` 并等待取消。`--no-restore` 跳过启动 replay，
-不删除数据。`--db <PATH>` 将数据库移出 workspace。
+重新打开 Asterline 默认恢复当前选中的对话。`/new` 与 `/clear` 都会在普通模式创建干净会话和
+新的后端 session，同时保留旧数据库记录。成员、Runs 或验证处于活动状态时它们会被拒绝；先按
+`Esc` 并等待取消。`--no-restore` 跳过启动 replay，不删除数据。`--db <PATH>` 将数据库移出
+workspace。
 
 `/resume` 打开已保存聊天的 picker。恢复聊天也会恢复该聊天所属的 roster、完整成员配置和
 每位成员的原生后端 session ID。
@@ -439,8 +450,8 @@ asterline --fake --no-restore
 
 ### 不加载之前的 transcript 启动
 
-使用 `asterline --no-restore`。它只跳过 replay，不会删除 SQLite 数据。使用 `/new` 可创建
-具有新后端 session 的干净 conversation。
+使用 `asterline --no-restore`。它只跳过 replay，不会删除 SQLite 数据。使用 `/new` 或 `/clear`
+可创建具有新后端 session 的干净 conversation。
 
 ### 测试但不调用后端 CLI
 
