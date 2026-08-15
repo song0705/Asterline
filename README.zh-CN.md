@@ -141,7 +141,7 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 - [配置与本地数据](docs/configuration.zh-CN.md)
 - [审批与工具控制](docs/approvals.zh-CN.md)
 - [真实后端冒烟测试](docs/real-smoke.zh-CN.md)
-- [版本发布说明](docs/releases/v0.2.8.md)
+- [版本发布说明](docs/releases/v0.2.9.md)
 - [维护者发布流程](docs/releasing.zh-CN.md)
 - [第三方包定义](packaging/README.zh-CN.md)
 

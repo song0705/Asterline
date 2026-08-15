@@ -172,7 +172,7 @@ attach, navigation, Run steps, targeted skills, logs, search, and diffs.
 - [Configuration and local data](docs/configuration.md)
 - [Approvals and tool control](docs/approvals.md)
 - [Real-backend smoke tests](docs/real-smoke.md)
-- [Release notes](docs/releases/v0.2.8.md)
+- [Release notes](docs/releases/v0.2.9.md)
 - [Maintainer release process](docs/releasing.md)
 - [Third-party package definitions](packaging/README.md)
 
