@@ -158,6 +158,23 @@ pub fn step_dispatch_prompt(run_id: RunId, leader: &MemberId, steps: &[(u32, Str
     )
 }
 
+/// One-time reminder for an owner that ended a work turn without completing
+/// the checklist protocol.  The next incomplete completion is re-planned.
+pub fn plan_step_nudge_prompt(run_id: RunId, steps: &[(u32, String)]) -> String {
+    let list = steps
+        .iter()
+        .map(|(number, title)| format!("  - step #{number}: {title}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your previous turn for {run_id} ended while these assigned checklist steps were still doing:\n\
+         {list}\n\n\
+         If you completed a step, report it now with exactly one \
+         @@run_step {{\"action\":\"done\",\"step\":N}} line per completed step. \
+         If it is blocked, report the blocker clearly."
+    )
+}
+
 /// Leader prompt after an execution round left unfinished steps.
 pub fn plan_progress_prompt(
     task: &str,

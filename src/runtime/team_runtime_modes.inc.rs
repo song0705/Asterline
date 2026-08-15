@@ -34,13 +34,6 @@ impl TeamRuntime {
             }
         };
 
-        if mode == CollabMode::Brainstorm && roles.participants.len() < 2 {
-            step.events.push(RuntimeEvent::Notice(
-                "brainstorm needs at least two participants".to_string(),
-            ));
-            return;
-        }
-
         let (phase, iteration, round) = match mode {
             CollabMode::Review => (ModePhase::Building, 1, 0),
             CollabMode::Plan => (ModePhase::Planning, 1, 0),
@@ -66,6 +59,7 @@ impl TeamRuntime {
             verify_command: limits.verify_command.clone(),
             builder_output: String::new(),
             reviewer_nudged: false,
+            owner_nudged: false,
             last_feedback: None,
             pending_verdict: None,
             reviewer_last_text: String::new(),
@@ -561,6 +555,7 @@ impl TeamRuntime {
             s.iteration = next_iteration;
             s.phase = ModePhase::Planning;
             s.reviewer_nudged = false;
+            s.owner_nudged = false;
             s.pending_verdict = None;
         }
         // mark_run_turn already wrote Failed; restore Running before UI events.
@@ -679,19 +674,9 @@ impl TeamRuntime {
             step.events.push(RuntimeEvent::RunUpdated { run });
         }
 
-        // Group steps by owner.
-        let mut by_owner: HashMap<MemberId, Vec<(u32, String)>> = HashMap::new();
-        for s in &owned_todos {
-            if let Some(owner) = &s.owner {
-                by_owner
-                    .entry(owner.clone())
-                    .or_default()
-                    .push((s.number, s.title.clone()));
-            }
-        }
-
         if let Some(s) = self.mode_sessions.get_mut(&run_id) {
             s.phase = ModePhase::Executing;
+            s.owner_nudged = false;
         }
         if !self.persist_mode_state(run_id, step) {
             return;
@@ -702,13 +687,7 @@ impl TeamRuntime {
             (s.max_iterations, s.iteration, s.mode)
         };
         let leader = session.leader.clone();
-        let dispatches: Vec<(MemberId, String)> = by_owner
-            .into_iter()
-            .map(|(owner, owned_steps)| {
-                let prompt = step_dispatch_prompt(run_id, &leader, &owned_steps);
-                (owner, prompt)
-            })
-            .collect();
+        let dispatches = plan_owner_dispatches(run_id, &leader, owned_todos.iter().copied());
         let owners: Vec<String> = dispatches.iter().map(|(m, _)| m.to_string()).collect();
         self.mode_dispatch_multi(
             run_id,
@@ -744,6 +723,7 @@ impl TeamRuntime {
         if unfinished.is_empty() {
             if let Some(s) = self.mode_sessions.get_mut(&run_id) {
                 s.reviewer_nudged = false;
+                s.owner_nudged = false;
                 s.phase = ModePhase::Reviewing;
                 s.pending_verdict = None;
                 s.reviewer_last_text.clear();
@@ -777,6 +757,52 @@ impl TeamRuntime {
             return;
         }
 
+        let owned_unfinished: HashMap<MemberId, Vec<(u32, String)>> = unfinished
+            .iter()
+            .filter(|step| step.status == RunStepStatus::Doing)
+            .filter_map(|step| {
+                step.owner
+                    .as_ref()
+                    .map(|owner| (owner.clone(), (step.number, step.title.clone())))
+            })
+            .fold(HashMap::new(), |mut grouped, (owner, item)| {
+                grouped.entry(owner).or_default().push(item);
+                grouped
+            });
+        if !session.owner_nudged && !owned_unfinished.is_empty() {
+            if let Some(s) = self.mode_sessions.get_mut(&run_id) {
+                s.owner_nudged = true;
+            }
+            if !self.persist_mode_state(run_id, step) {
+                return;
+            }
+            let (max_iterations, iteration, mode) = {
+                let s = &self.mode_sessions[&run_id];
+                (s.max_iterations, s.iteration, s.mode)
+            };
+            let owners = owned_unfinished
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let dispatches = owned_unfinished
+                .into_iter()
+                .map(|(owner, steps)| {
+                    let prompt = plan_step_nudge_prompt(run_id, &steps);
+                    (owner, prompt)
+                })
+                .collect();
+            self.mode_dispatch_multi(
+                run_id,
+                dispatches,
+                format!(
+                    "[{mode} {run_id} · iter {iteration}/{max_iterations}] → {}: checklist nudge",
+                    owners.join(", ")
+                ),
+                step,
+            );
+            return;
+        }
+
         let next_iteration = session.iteration.saturating_add(1);
         if next_iteration > session.max_iterations {
             self.block_mode_run(
@@ -793,6 +819,7 @@ impl TeamRuntime {
             s.iteration = next_iteration;
             s.phase = ModePhase::Planning;
             s.reviewer_nudged = false;
+            s.owner_nudged = false;
         }
         if !self.persist_mode_state(run_id, step) {
             return;
@@ -1040,6 +1067,7 @@ impl TeamRuntime {
             session.last_feedback = Some(feedback.clone());
             session.pending_verdict = None;
             session.reviewer_nudged = false;
+            session.owner_nudged = false;
             match mode {
                 CollabMode::Plan => {
                     session.phase = ModePhase::Planning;
@@ -1349,7 +1377,9 @@ impl TeamRuntime {
                     let unknown = vote
                         .ranked
                         .iter()
-                        .filter(|candidate| !candidates.contains(candidate.as_str()))
+                        .filter(|candidate| {
+                            !candidates.contains(&normalize_brainstorm_candidate_id(candidate))
+                        })
                         .cloned()
                         .collect::<Vec<_>>();
                     if !unknown.is_empty() {
@@ -1495,7 +1525,7 @@ impl TeamRuntime {
         }
         self.failed_runs.remove(&run.id);
         session.cancelled = false;
-        session.idea_count = session.idea_batches.len() as u32;
+        session.idea_count = brainstorm_card_count(&session);
 
         let phase = session.phase;
         let task = session.task.clone();
@@ -1562,24 +1592,7 @@ impl TeamRuntime {
                 if owned.is_empty() {
                     self.mode_resume_planning(run.id, step);
                 } else {
-                    let mut by_owner: HashMap<MemberId, Vec<(u32, String)>> = HashMap::new();
-                    for s in owned {
-                        if let Some(owner) = &s.owner {
-                            by_owner
-                                .entry(owner.clone())
-                                .or_default()
-                                .push((s.number, s.title.clone()));
-                        }
-                    }
-                    let dispatches: Vec<(MemberId, String)> = by_owner
-                        .into_iter()
-                        .map(|(owner, owned_steps)| {
-                            (
-                                owner,
-                                step_dispatch_prompt(run.id, &leader, &owned_steps),
-                            )
-                        })
-                        .collect();
+                    let dispatches = plan_owner_dispatches(run.id, &leader, owned);
                     let owners: Vec<String> =
                         dispatches.iter().map(|(m, _)| m.to_string()).collect();
                     self.mode_dispatch_multi(
@@ -1652,6 +1665,7 @@ impl TeamRuntime {
                 if let Some(s) = self.mode_sessions.get_mut(&run.id) {
                     s.phase = ModePhase::Reviewing;
                     s.reviewer_nudged = false;
+                    s.owner_nudged = false;
                 }
                 if !self.persist_mode_state(run.id, step) {
                     return;
@@ -1792,6 +1806,32 @@ fn format_lead_steps_summary(steps: &[RunStepSummary]) -> String {
         .join("\n")
 }
 
+/// Group actionable plan steps by owner and build their shared dispatch
+/// prompts. New execution and resumed execution must follow the same routing
+/// and checklist wording.
+fn plan_owner_dispatches<'a>(
+    run_id: RunId,
+    leader: &MemberId,
+    steps: impl IntoIterator<Item = &'a RunStepSummary>,
+) -> Vec<(MemberId, String)> {
+    let mut by_owner: HashMap<MemberId, Vec<(u32, String)>> = HashMap::new();
+    for step in steps {
+        if let Some(owner) = &step.owner {
+            by_owner
+                .entry(owner.clone())
+                .or_default()
+                .push((step.number, step.title.clone()));
+        }
+    }
+    by_owner
+        .into_iter()
+        .map(|(owner, owned_steps)| {
+            let prompt = step_dispatch_prompt(run_id, leader, &owned_steps);
+            (owner, prompt)
+        })
+        .collect()
+}
+
 /// Unfinished checklist lines for the leader: `#{n} [owner] status title — note`.
 fn format_unfinished_step_lines(steps: &[&RunStepSummary]) -> Vec<String> {
     steps
@@ -1909,6 +1949,8 @@ struct ModeSession {
     builder_output: String,
     #[serde(default)]
     reviewer_nudged: bool,
+    #[serde(default)]
+    owner_nudged: bool,
     #[serde(default)]
     last_feedback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2029,9 +2071,14 @@ fn brainstorm_candidate_ids(session: &ModeSession) -> HashSet<String> {
     brainstorm_labeled_batches(session)
         .into_iter()
         .flat_map(|(batch, label)| {
-            (1..=batch.cards.len().max(1)).map(move |item| format!("{label}#{item}"))
+            (1..=batch.cards.len().max(1))
+                .map(move |item| normalize_brainstorm_candidate_id(&format!("{label}#{item}")))
         })
         .collect()
+}
+
+fn normalize_brainstorm_candidate_id(candidate: &str) -> String {
+    candidate.trim().to_ascii_uppercase()
 }
 
 fn format_brainstorm_idea_set(session: &ModeSession) -> String {
@@ -2083,7 +2130,7 @@ fn brainstorm_vote_tally(session: &ModeSession) -> Vec<(String, u32, u32)> {
     for ballot in &session.votes {
         let mut seen = HashSet::new();
         for (index, candidate) in ballot.ranked.iter().take(BRAINSTORM_VOTE_TOP_K).enumerate() {
-            let candidate = candidate.trim().to_ascii_uppercase();
+            let candidate = normalize_brainstorm_candidate_id(candidate);
             if candidate.is_empty() || !seen.insert(candidate.clone()) {
                 continue;
             }

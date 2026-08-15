@@ -860,6 +860,7 @@ impl TeamRuntime {
                 s.last_feedback = Some(feedback.clone());
                 s.pending_verdict = None;
                 s.reviewer_nudged = false;
+                s.owner_nudged = false;
                 s.builder_output.clear();
                 match mode {
                     CollabMode::Plan => s.phase = ModePhase::Planning,

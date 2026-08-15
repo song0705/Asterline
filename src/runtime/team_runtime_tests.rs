@@ -581,6 +581,27 @@ fn new_chat_is_rejected_while_a_member_is_active() {
 }
 
 #[test]
+fn new_chat_leaves_the_new_transcript_empty() {
+    let mut rt = runtime();
+
+    let reset = rt.on_ui_command(UiCommand::NewSession);
+
+    assert!(
+        reset
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset))
+    );
+    assert!(
+        !reset
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Notice(_))),
+        "a post-reset notice would become the first item in the fresh chat"
+    );
+}
+
+#[test]
 fn new_chat_keeps_current_state_when_atomic_reset_fails() {
     let path = std::env::temp_dir().join(format!(
         "asterline-new-chat-reset-failure-{}.sqlite3",
@@ -1421,6 +1442,25 @@ fn streaming_text_deltas_build_a_message() {
     assert!(step.events.iter().any(|e| matches!(
         e,
         RuntimeEvent::MessageCompleted { text, .. } if text == "Hello"
+    )));
+}
+
+#[test]
+fn empty_terminal_message_keeps_the_streamed_answer() {
+    let mut rt = runtime();
+    rt.on_ui_command(user("hi"));
+    let builder = MemberId::new("builder");
+
+    rt.on_agent_event(&builder, AgentEvent::MessageStarted);
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::TextDelta("streamed answer".to_string()),
+    );
+    let step = rt.on_agent_event(&builder, AgentEvent::MessageCompleted(String::new()));
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::MessageCompleted { text, .. } if text == "streamed answer"
     )));
 }
 
@@ -4336,6 +4376,26 @@ fn second_run_mode_while_active_is_refused() {
 }
 
 #[test]
+fn explicit_member_message_stays_routable_during_an_active_mode_run() {
+    let mut rt = runtime();
+    let reviewer = MemberId::new("reviewer");
+    rt.on_ui_command(run_mode("review this change"));
+
+    let step = rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(reviewer.clone()),
+        body: "@reviewer focus on the error path".to_string(),
+    });
+
+    assert!(step.actions.iter().any(|action| {
+        action.member == reviewer && action.prompt.contains("focus on the error path")
+    }));
+    assert!(!step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("already active")
+    )));
+}
+
+#[test]
 fn verdict_outside_review_is_ignored() {
     let mut rt = runtime();
     let builder = MemberId::new("builder");
@@ -4578,7 +4638,7 @@ fn plan_empty_checklist_nudges_then_blocks() {
 }
 
 #[test]
-fn plan_unfinished_steps_return_to_leader() {
+fn plan_unfinished_steps_get_one_owner_nudge_before_replanning() {
     let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
@@ -4593,11 +4653,21 @@ fn plan_unfinished_steps_return_to_leader() {
     let step = complete_ok(&mut rt, &builder, "I worked but forgot to mark done");
     assert!(
         step.actions.iter().any(|a| {
-            a.member == planner && (a.prompt.contains("Do the thing") || a.prompt.contains("#1"))
+            a.member == builder
+                && a.prompt.contains("Do the thing")
+                && a.prompt.contains("@@run_step")
         }),
-        "leader should see unfinished step: {:?}",
+        "owner should receive one checklist nudge: {:?}",
         step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
     );
+    let run = latest_run(&rt);
+    assert_eq!(run.mode.as_ref().unwrap().state.iteration, 1);
+    assert_eq!(run.mode.as_ref().unwrap().state.phase, "executing");
+
+    let step = complete_ok(&mut rt, &builder, "I still forgot to mark it done");
+    assert!(step.actions.iter().any(|a| {
+        a.member == planner && (a.prompt.contains("Do the thing") || a.prompt.contains("#1"))
+    }));
     let run = latest_run(&rt);
     assert_eq!(run.mode.as_ref().unwrap().state.iteration, 2);
     assert_eq!(run.mode.as_ref().unwrap().state.phase, "planning");
@@ -5022,6 +5092,27 @@ fn brainstorm_rejects_well_formed_but_unknown_candidate_ids() {
 }
 
 #[test]
+fn brainstorm_accepts_case_insensitive_candidate_ids() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let run_id = enter_fallback_voting(&mut rt);
+
+    let accepted = rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted(
+            "@@brainstorm_vote {\"ranked\":[\"r1-a#1\",\"r1-b#1\"]}".to_string(),
+        ),
+    );
+
+    assert!(!accepted.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("unknown brainstorm candidate")
+    )));
+    assert_eq!(rt.mode_sessions[&run_id].vote_count, 1);
+    assert_eq!(rt.mode_sessions[&run_id].votes[0].ranked[0], "R1-A#1");
+}
+
+#[test]
 fn brainstorm_vote_updates_memory_only_after_atomic_persistence() {
     let path = std::env::temp_dir().join(format!(
         "asterline-vote-atomic-failure-{}.sqlite3",
@@ -5168,7 +5259,11 @@ fn brainstorm_resume_mid_generation_preserves_prior_ideas() {
     complete_all(
         &mut rt,
         &[
-            (planner.clone(), "p seed"),
+            (
+                planner.clone(),
+                "@@brainstorm_card {\"title\":\"one\",\"operation\":\"seed\",\"proposal\":\"p1\",\"mechanism\":\"m\",\"sources\":[]}\n\
+                 @@brainstorm_card {\"title\":\"two\",\"operation\":\"seed\",\"proposal\":\"p2\",\"mechanism\":\"m\",\"sources\":[]}",
+            ),
             (builder.clone(), "b seed"),
             (reviewer.clone(), "r seed"),
         ],
@@ -5194,6 +5289,9 @@ fn brainstorm_resume_mid_generation_preserves_prior_ideas() {
     assert!(resumed.actions.iter().all(|action| {
         action.prompt.contains(BRAINSTORM_BUILD_HINT) && action.prompt.contains("seed")
     }));
+    // Two structured cards plus two free-text batches.  Resume must retain
+    // the same card-count semantics as live generation.
+    assert_eq!(rt.mode_sessions[&run_id].idea_count, 4);
 }
 
 #[test]

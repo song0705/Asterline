@@ -207,18 +207,18 @@ impl Default for TeamLimits {
 
 /// Resolve team-mode limits from `modes.team` (defaults: max_iterations=3, auto_verify=true).
 pub fn resolve_team_limits(config: &TeamConfig) -> Result<TeamLimits, String> {
-    let mut limits = TeamLimits::default();
-    if let Some(settings) = &config.modes.team {
-        limits.max_iterations = positive_or_default("max_iterations", settings.max_iterations, 3)?;
-        limits.auto_verify = settings.auto_verify.unwrap_or(true);
-        limits.verify_command = settings
-            .verify_command
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string);
-    }
-    Ok(limits)
+    config
+        .modes
+        .team
+        .as_ref()
+        .map(|settings| {
+            resolve_iteration_settings(
+                settings.max_iterations,
+                settings.auto_verify,
+                settings.verify_command.as_deref(),
+            )
+        })
+        .unwrap_or_else(|| Ok(TeamLimits::default()))
 }
 
 /// Fully resolved role bindings (every id verified against the roster).
@@ -343,15 +343,14 @@ pub fn resolve_mode_roles(
                     resolve_or_derived(config, settings.builder.as_ref(), &roles.builder)?;
                 roles.reviewer =
                     resolve_or_derived(config, settings.reviewer.as_ref(), &roles.reviewer)?;
-                limits.max_iterations =
-                    positive_or_default("max_iterations", settings.max_iterations, 3)?;
-                limits.auto_verify = settings.auto_verify.unwrap_or(true);
-                limits.verify_command = settings
-                    .verify_command
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string);
+                let iterations = resolve_iteration_settings(
+                    settings.max_iterations,
+                    settings.auto_verify,
+                    settings.verify_command.as_deref(),
+                )?;
+                limits.max_iterations = iterations.max_iterations;
+                limits.auto_verify = iterations.auto_verify;
+                limits.verify_command = iterations.verify_command;
             }
         }
         CollabMode::Plan => {
@@ -359,15 +358,14 @@ pub fn resolve_mode_roles(
                 roles.leader = resolve_or_derived(config, settings.leader.as_ref(), &roles.leader)?;
                 roles.reviewer =
                     resolve_or_derived(config, settings.reviewer.as_ref(), &roles.reviewer)?;
-                limits.max_iterations =
-                    positive_or_default("max_iterations", settings.max_iterations, 3)?;
-                limits.auto_verify = settings.auto_verify.unwrap_or(true);
-                limits.verify_command = settings
-                    .verify_command
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string);
+                let iterations = resolve_iteration_settings(
+                    settings.max_iterations,
+                    settings.auto_verify,
+                    settings.verify_command.as_deref(),
+                )?;
+                limits.max_iterations = iterations.max_iterations;
+                limits.auto_verify = iterations.auto_verify;
+                limits.verify_command = iterations.verify_command;
             }
         }
         CollabMode::Brainstorm => {
@@ -377,8 +375,7 @@ pub fn resolve_mode_roles(
                     settings.participants.as_ref(),
                     &roles.participants,
                 )?;
-                limits.rounds =
-                    positive_or_default("generation_rounds", settings.generation_rounds, 3)?;
+                limits.rounds = settings.generation_rounds.unwrap_or(3);
                 limits.ideas_per_round =
                     positive_or_default("ideas_per_round", settings.ideas_per_round, 4)?;
                 if limits.rounds < 2 {
@@ -451,6 +448,21 @@ fn positive_or_default(field: &str, value: Option<u32>, default: u32) -> Result<
         return Err(format!("{field} must be > 0"));
     }
     Ok(value)
+}
+
+/// Resolve the three iteration settings shared by team, review, and plan
+/// modes. Keeping this one path prevents a mode from silently drifting in how
+/// it trims `verify_command` or applies the documented defaults.
+fn resolve_iteration_settings(
+    max_iterations: Option<u32>,
+    auto_verify: Option<bool>,
+    verify_command: Option<&str>,
+) -> Result<TeamLimits, String> {
+    Ok(TeamLimits {
+        max_iterations: positive_or_default("max_iterations", max_iterations, 3)?,
+        auto_verify: auto_verify.unwrap_or(true),
+        verify_command: resolve_verify_command(verify_command, None),
+    })
 }
 
 pub fn resolve_team_coordinator(config: &TeamConfig) -> Result<MemberId, String> {
@@ -708,7 +720,7 @@ mod tests {
             ..BrainstormModeConfig::default()
         });
         let err = resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap_err();
-        assert_eq!(err, "generation_rounds must be > 0");
+        assert_eq!(err, "generation_rounds must be >= 2");
     }
 
     #[test]

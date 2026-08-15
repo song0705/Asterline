@@ -39,9 +39,9 @@ use crate::runtime::approval::ApprovalMatcher;
 use crate::runtime::mode_prompts::{
     brainstorm_build_prompt, brainstorm_propose_prompt, brainstorm_stretch_prompt,
     brainstorm_synthesis_prompt, brainstorm_vote_prompt, plan_iteration_prompt, plan_nudge_prompt,
-    plan_plan_prompt, plan_progress_prompt, plan_review_prompt, plan_verify_failure_prompt,
-    review_iteration_prompt, review_prompt, review_task_prompt, step_dispatch_prompt,
-    verdict_nudge_prompt, verify_failure_prompt,
+    plan_plan_prompt, plan_progress_prompt, plan_review_prompt, plan_step_nudge_prompt,
+    plan_verify_failure_prompt, review_iteration_prompt, review_prompt, review_task_prompt,
+    step_dispatch_prompt, verdict_nudge_prompt, verify_failure_prompt,
 };
 use crate::runtime::session_registry::SessionRegistry;
 use crate::store::sqlite::{SqliteStore, StoredConversationSession};
@@ -513,6 +513,16 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) {
         self.last_user = Some((target.clone(), body.clone()));
+        // A collaboration run owns its orchestration task, but an explicit
+        // member route is still a normal, one-to-one instruction.  Do not
+        // reinterpret it as a second mode task while the run is active.
+        if !matches!(self.active_mode, TerminalMode::Normal)
+            && matches!(target, MessageTarget::Member(_))
+            && !self.mode_sessions.is_empty()
+        {
+            self.handle_user_message(target, body, step);
+            return;
+        }
         let task = strip_routing_prefix(&body);
         match self.active_mode {
             TerminalMode::Normal => {
@@ -777,9 +787,6 @@ impl TeamRuntime {
             });
         }
         step.events.push(RuntimeEvent::SessionReset);
-        step.events.push(RuntimeEvent::Notice(
-            "started a new chat in normal mode — fresh session for all members".to_string(),
-        ));
     }
 
     fn handle_request_resume(&self, step: &mut RuntimeStep) {
@@ -1800,7 +1807,20 @@ impl TeamRuntime {
             return;
         };
 
-        let text = bounded_text(&text, MAX_MESSAGE_TEXT_BYTES);
+        let supplied_text = bounded_text(&text, MAX_MESSAGE_TEXT_BYTES);
+        // Deltas are the only final text supplied by some otherwise-valid
+        // streaming transports. Never replace a visible streamed answer with
+        // an empty terminal event just because that transport omits its
+        // canonical text field.
+        let text = if supplied_text.is_empty() {
+            self.members
+                .get(member)
+                .and_then(|state| state.running.as_ref())
+                .map(|running| running.text.clone())
+                .unwrap_or(supplied_text)
+        } else {
+            supplied_text
+        };
         let parsed = parse_agent_output(&text);
         for warning in &parsed.warnings {
             self.log(
