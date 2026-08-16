@@ -1,0 +1,116 @@
+name: Sync Homebrew Formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published release version without the v prefix"
+        required: true
+        type: string
+
+run-name: Sync Homebrew Formula v${{ inputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  update-homebrew:
+    name: Open Homebrew Formula update
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify the published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+      - name: Require the Homebrew tap credential
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: test -n "$HOMEBREW_TAP_TOKEN"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: song0705/homebrew-asterline
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-asterline
+      - name: Download published Homebrew checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/homebrew-release"
+          mkdir -p "$directory"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir "$directory"
+      - name: Update the Formula archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          checksums="$RUNNER_TEMP/homebrew-release/SHA256SUMS"
+          checksum_for() {
+            awk -v asset="$1" '
+              $2 == asset { value = $1; count += 1 }
+              END {
+                if (count != 1 || length(value) != 64 || value !~ /^[0-9a-f]+$/) exit 1
+                print value
+              }
+            ' "$checksums"
+          }
+          ruby scripts/update-homebrew-formula.rb \
+            homebrew-asterline/Formula/asterline.rb \
+            "$version" \
+            "$(checksum_for "asterline-$version-aarch64-apple-darwin.tar.gz)" \
+            "$(checksum_for "asterline-$version-x86_64-apple-darwin.tar.gz)" \
+            "$(checksum_for "asterline-v$version-Linux-arm64.tar.gz)" \
+            "$(checksum_for "asterline-v$version-Linux-x86_64.tar.gz)"
+      - name: Validate the Formula on macOS
+        working-directory: homebrew-asterline
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew style Formula/asterline.rb
+          brew tap song0705/asterline "$PWD"
+          brew install --formula song0705/asterline/asterline
+          brew test song0705/asterline/asterline
+      - name: Commit and open Formula pull request
+        working-directory: homebrew-asterline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          branch="automation/asterline-v$version"
+          git checkout -B "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/asterline.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "asterline $version"
+          git push --force origin "$branch"
+          existing_pr=$(gh pr list \
+            --repo song0705/homebrew-asterline \
+            --base main \
+            --head "$branch" \
+            --state open \
+            --json url \
+            --jq '.[0].url')
+          if test -z "$existing_pr"; then
+            gh pr create \
+              --repo song0705/homebrew-asterline \
+              --base main \
+              --head "$branch" \
+              --title "asterline $version" \
+              --body "Automated Formula update for Asterline v$version."
+          fi

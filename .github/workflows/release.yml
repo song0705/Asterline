@@ -812,8 +812,9 @@ jobs:
         run: |
           set -euo pipefail
           brew style Formula/asterline.rb
-          brew install --formula ./Formula/asterline.rb
-          brew test asterline
+          brew tap song0705/asterline "$PWD"
+          brew install --formula song0705/asterline/asterline
+          brew test song0705/asterline/asterline
       - name: Commit and open Formula pull request
         working-directory: homebrew-asterline
         shell: bash
