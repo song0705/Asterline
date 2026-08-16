@@ -1024,6 +1024,9 @@ mod tests {
         let active_mode = run.mode.as_ref().map(|mode| terminal_mode(mode.mode));
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "t".to_string(),
             workspace: String::new(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),

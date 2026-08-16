@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,22 +18,27 @@ use crate::adapter::parser::{
     MAX_MESSAGE_TEXT_BYTES, MAX_TOOL_DETAIL_BYTES, append_bounded_text, bounded_text,
 };
 use crate::domain::config::{
-    ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_TEAM_SKILL_NAME, brainstorm_skill_text,
+    ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_ROSTER_PATH, brainstorm_skill_text,
     inject_team_protocol, strip_team_protocol, strip_team_protocols, team_skill_hint,
 };
 use crate::domain::event::{
-    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ImportedMessage, LogEntry,
+    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ImportedMessage, LogEntry,
     MemberStatus, MemberSummary, MessageId, MessageTarget, RunId, RunStatus, RunStepRequest,
     RunStepStatus, RunStepSummary, RunSummary, RuntimeEvent, TurnId, UiCommand,
 };
 use crate::domain::mode::{
-    BrainstormCard, CollabMode, ModeStatusSummary, ReviewVerdict, ReviewVerdictKind, TerminalMode,
-    resolve_mode_roles, resolve_team_coordinator, resolve_team_limits, resolve_verify_command,
+    BrainstormCard, CollabMode, ModeStatusSummary, ModesConfig, ReviewVerdict, ReviewVerdictKind,
+    TerminalMode, apply_mode_overrides, clear_mode_overrides, format_mode_binding,
+    format_verify_label, merge_modes, mode_overrides_for, prune_empty_mode_overrides,
+    resolve_mode_roles, resolve_plan_auto_execute, resolve_plan_builder, resolve_plan_reviewer,
+    resolve_team_coordinator, resolve_team_limits, resolve_verify_command, validate_mode_overrides,
+    validate_terminal_mode,
 };
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
     TeamMember,
 };
+use crate::fs_safety;
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
 use crate::run_support::suggested_verify_command;
 use crate::runtime::approval::ApprovalMatcher;
@@ -49,7 +55,6 @@ use crate::store::sqlite::{SqliteStore, StoredConversationSession};
 pub(super) const MAX_IMPORTED_ITEMS: usize = 1_000;
 pub(super) const MAX_IMPORTED_ITEM_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_IMPORTED_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ACTIVE_REASONING_BYTES: usize = 8 * 1024;
 
 /// What the core wants the transport layer to do after handling an input.
 #[derive(Default)]
@@ -116,6 +121,7 @@ struct RunningState {
     message: Option<MessageId>,
     text: String,
     reasoning: String,
+    reasoning_started: Option<Instant>,
     failed: bool,
     raw_persistence_failed: bool,
 }
@@ -195,11 +201,14 @@ pub struct TeamRuntime {
     /// Selection for subsequent messages in the current chat. `/new` resets it
     /// to normal; another `/mode` selection replaces it within the chat.
     active_mode: TerminalMode,
+    /// Field-level conversation overlay on `config.modes`.
+    session_mode_overrides: ModesConfig,
     last_user: Option<(MessageTarget, String)>,
     next_message_id: u64,
     approvals_enabled: bool,
     matcher: ApprovalMatcher,
     startup_notices: Vec<String>,
+    startup_events: Vec<RuntimeEvent>,
     startup_reconciled: bool,
 }
 
@@ -229,14 +238,15 @@ impl TeamRuntime {
                 "could not reject approval requests interrupted by restart: {err}"
             )),
         }
-        let active_mode = match store.conversation_snapshot(store.active_conversation()) {
-            Ok(Some(snapshot)) => snapshot.mode,
-            Ok(None) => TerminalMode::Normal,
-            Err(err) => {
-                startup_notices.push(format!("could not restore the current chat mode: {err}"));
-                TerminalMode::Normal
-            }
-        };
+        let (active_mode, session_mode_overrides) =
+            match store.conversation_snapshot(store.active_conversation()) {
+                Ok(Some(snapshot)) => (snapshot.mode, snapshot.mode_overrides),
+                Ok(None) => (TerminalMode::Normal, ModesConfig::default()),
+                Err(err) => {
+                    startup_notices.push(format!("could not restore the current chat mode: {err}"));
+                    (TerminalMode::Normal, ModesConfig::default())
+                }
+            };
         // In-flight mode runs cannot be resumed losslessly across process restarts.
         let mut startup_reconciled = true;
         match store.running_mode_runs() {
@@ -288,11 +298,13 @@ impl TeamRuntime {
             failed_runs: HashSet::new(),
             mode_sessions: HashMap::new(),
             active_mode,
+            session_mode_overrides,
             last_user: None,
             next_message_id: 0,
             approvals_enabled: true,
             matcher,
             startup_notices,
+            startup_events: Vec::new(),
             startup_reconciled,
         };
         let mut runtime = runtime;
@@ -301,6 +313,12 @@ impl TeamRuntime {
                 .startup_notices
                 .push(format!("could not save the initial chat snapshot: {err}"));
         }
+        if let Err(err) = runtime.write_roster_snapshot() {
+            runtime
+                .startup_notices
+                .push(format!("could not write {ASTERLINE_ROSTER_PATH}: {err}"));
+        }
+        runtime.sync_resume_sessions();
         runtime
     }
 
@@ -314,11 +332,102 @@ impl TeamRuntime {
         self.active_mode
     }
 
+    fn effective_config(&self) -> TeamConfig {
+        apply_mode_overrides(&self.config, &self.session_mode_overrides)
+    }
+
+    fn emit_modes_updated(&self) -> RuntimeEvent {
+        RuntimeEvent::ModesUpdated {
+            defaults: self.config.modes.clone(),
+            overrides: self.session_mode_overrides.clone(),
+        }
+    }
+
+    fn sync_resume_sessions(&mut self) {
+        let existing = match self.store.replay_chat() {
+            Ok(chat) => chat
+                .iter()
+                .filter_map(chat_item_fingerprint)
+                .collect::<HashSet<_>>(),
+            Err(err) => {
+                self.startup_notices.push(format!(
+                    "could not compare native sessions with chat: {err}"
+                ));
+                return;
+            }
+        };
+        let members = self.config.members.clone();
+        for member in members {
+            if member.session_policy != SessionPolicy::Resume {
+                continue;
+            }
+            let Some(session) = self.sessions.get(&member.id) else {
+                continue;
+            };
+            let native = native_session_messages(
+                member.backend,
+                session.as_str(),
+                &member.resolved_cwd(&self.config.workspace),
+            );
+            let cursor = match self.store.native_import_cursor(&member.id, &session) {
+                Ok(cursor) => cursor.min(native.len()),
+                Err(err) => {
+                    self.startup_notices.push(format!(
+                        "could not read the native import cursor for {}: {err}",
+                        member.id
+                    ));
+                    continue;
+                }
+            };
+            let incoming = native
+                .iter()
+                .skip(cursor)
+                .filter(|item| !existing.contains(&import_fingerprint(&item.text)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !incoming.is_empty() {
+                let mut step = RuntimeStep::default();
+                self.handle_import_transcript(member.id.clone(), incoming, &mut step);
+                self.startup_events.extend(step.events);
+            }
+            if let Err(err) =
+                self.store
+                    .set_native_import_cursor(&member.id, &session, native.len())
+            {
+                self.startup_notices.push(format!(
+                    "could not save the native import cursor for {}: {err}",
+                    member.id
+                ));
+            }
+        }
+    }
+
+    fn refresh_native_import_cursor(&self, member: &MemberId) {
+        let Some(cfg) = self.config.member(member) else {
+            return;
+        };
+        if cfg.session_policy != SessionPolicy::Resume {
+            return;
+        }
+        let Some(session) = self.sessions.get(member) else {
+            return;
+        };
+        let count = native_session_messages(
+            cfg.backend,
+            session.as_str(),
+            &cfg.resolved_cwd(&self.config.workspace),
+        )
+        .len();
+        let _ = self.store.set_native_import_cursor(member, &session, count);
+    }
+
     pub fn take_startup_events(&mut self) -> Vec<RuntimeEvent> {
-        std::mem::take(&mut self.startup_notices)
+        let mut events = std::mem::take(&mut self.startup_notices)
             .into_iter()
             .map(RuntimeEvent::Notice)
-            .collect()
+            .collect::<Vec<_>>();
+        events.extend(std::mem::take(&mut self.startup_events));
+        events
     }
 
     /// Snapshot for the TUI's initial `Ready` event.
@@ -347,6 +456,10 @@ impl TeamRuntime {
             })
             .collect();
         RuntimeEvent::Ready {
+            modes: self.config.modes.clone(),
+            mode_overrides: self.session_mode_overrides.clone(),
+            suggested_verify: suggested_verify_command(&self.config.workspace)
+                .map(ToString::to_string),
             team: self.config.name.clone(),
             workspace: self.config.workspace.display().to_string(),
             default_target: self.config.default_target.clone(),
@@ -401,14 +514,22 @@ impl TeamRuntime {
                     return step;
                 }
                 step.events.push(RuntimeEvent::ModeChanged { mode });
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "terminal mode → {mode} (applies until changed)"
-                )));
+                step.events
+                    .push(RuntimeEvent::Notice(self.mode_switch_notice(mode)));
+            }
+            UiCommand::SetModeOverrides { overrides } => {
+                self.handle_set_mode_overrides(overrides, &mut step);
+            }
+            UiCommand::SaveModeDefaults { mode } => {
+                self.handle_save_mode_defaults(mode, &mut step);
             }
             UiCommand::UserMessage { target, body } => {
                 self.handle_active_user_message(target, body, &mut step);
             }
             UiCommand::Cancel { member } => self.handle_cancel(member, &mut step),
+            UiCommand::EditQueuedPrompt { member } => {
+                self.handle_edit_queued_prompt(member, &mut step);
+            }
             UiCommand::Retry => {
                 if let Some((target, body)) = self.last_user.clone() {
                     self.handle_active_user_message(target, body, &mut step);
@@ -504,6 +625,86 @@ impl TeamRuntime {
         }
         self.handle_import_transcript(member, items, &mut step);
         step
+    }
+
+    fn mode_switch_notice(&self, mode: TerminalMode) -> String {
+        match mode {
+            TerminalMode::Normal => {
+                "mode → normal — next plain text uses the last @target".to_string()
+            }
+            _ => {
+                let binding = format_mode_binding(
+                    &self.effective_config(),
+                    mode,
+                    suggested_verify_command(&self.config.workspace),
+                );
+                format!(
+                    "mode → {mode} — next plain text starts this run ({binding}); @member still sends directly"
+                )
+            }
+        }
+    }
+
+    fn handle_set_mode_overrides(&mut self, overrides: ModesConfig, step: &mut RuntimeStep) {
+        let mut overrides = overrides;
+        prune_empty_mode_overrides(&mut overrides);
+        if let Err(err) = validate_mode_overrides(&self.config, &overrides) {
+            step.events.push(RuntimeEvent::Notice(err));
+            return;
+        }
+        let previous = self.session_mode_overrides.clone();
+        self.session_mode_overrides = overrides;
+        if let Err(err) = self.persist_conversation_snapshot() {
+            self.session_mode_overrides = previous;
+            step.events.push(RuntimeEvent::Notice(format!(
+                "could not save mode settings: {err}"
+            )));
+            return;
+        }
+        step.events.push(self.emit_modes_updated());
+    }
+
+    fn handle_save_mode_defaults(&mut self, mode: TerminalMode, step: &mut RuntimeStep) {
+        if matches!(mode, TerminalMode::Normal) {
+            step.events.push(RuntimeEvent::Notice(
+                "normal has no team.json defaults to save".to_string(),
+            ));
+            return;
+        }
+        let extracted = mode_overrides_for(&self.session_mode_overrides, mode);
+        if extracted.is_default() {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "no this-chat overrides to save for {mode}"
+            )));
+            return;
+        }
+        let mut next_modes = merge_modes(&self.config.modes, &extracted);
+        prune_empty_mode_overrides(&mut next_modes);
+        let mut check = self.config.clone();
+        check.modes = next_modes.clone();
+        if let Err(err) = validate_terminal_mode(&check, mode) {
+            step.events.push(RuntimeEvent::Notice(err));
+            return;
+        }
+
+        let previous_modes = self.config.modes.clone();
+        let previous_overrides = self.session_mode_overrides.clone();
+        self.config.modes = next_modes;
+        clear_mode_overrides(&mut self.session_mode_overrides, mode);
+        prune_empty_mode_overrides(&mut self.session_mode_overrides);
+        if let Err(err) = self.persist_conversation_snapshot() {
+            self.config.modes = previous_modes;
+            self.session_mode_overrides = previous_overrides;
+            step.events.push(RuntimeEvent::Notice(format!(
+                "could not save mode defaults: {err}"
+            )));
+            return;
+        }
+        step.persist_team = Some(strip_team_protocols(self.config.clone()));
+        step.events.push(self.emit_modes_updated());
+        step.events.push(RuntimeEvent::Notice(format!(
+            "saved {mode} defaults to team.json"
+        )));
     }
 
     fn handle_active_user_message(
@@ -705,27 +906,43 @@ impl TeamRuntime {
                 self.members.keys().cloned().collect()
             }
         };
+        let mut roster_changed = false;
         for member in targets {
-            let mut finished_turns = Vec::new();
-            if let Some(state) = self.members.get_mut(&member) {
-                for queued in state.queue.drain(..) {
-                    finished_turns.push(queued.turn);
-                }
+            let start_queued = if let Some(state) = self.members.get_mut(&member) {
+                // Keep queued prompts. Esc interrupts the live run so the
+                // next queued message can start as soon as the child exits.
                 if let Some(running) = &state.running {
                     running.cancel.store(true, Ordering::Relaxed);
-                    step.events
-                        .push(RuntimeEvent::Notice(format!("cancelling {member}")));
+                    let queued = state.queue.len();
+                    step.events.push(RuntimeEvent::Notice(if queued == 0 {
+                        format!("cancelling {member}")
+                    } else {
+                        format!("cancelling {member} · {queued} queued message(s) will send next")
+                    }));
+                    None
+                } else if !state.queue.is_empty() {
+                    state.queue.pop_front()
                 } else if state.status != MemberStatus::Idle {
                     state.status = MemberStatus::Idle;
                     step.events.push(RuntimeEvent::MemberStatus {
                         member: member.clone(),
                         status: MemberStatus::Idle,
                     });
+                    roster_changed = true;
+                    None
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if let Some(queued) = start_queued {
+                self.emit_queue_updated(&member, step);
+                self.start_run(&member, queued.turn, queued.prompt, step);
             }
-            for turn in finished_turns {
-                self.check_turn_complete(turn, step);
-            }
+        }
+        if roster_changed {
+            self.note_roster_write(step);
         }
         for turn in cancelled_approval_turns {
             cancelled_route_turns.insert(turn);
@@ -773,6 +990,7 @@ impl TeamRuntime {
         }
         let previous_mode = self.active_mode;
         self.active_mode = TerminalMode::Normal;
+        self.session_mode_overrides = ModesConfig::default();
         self.sessions = SessionRegistry::new();
         for member in &mut self.config.members {
             member.session_id = None;
@@ -832,6 +1050,7 @@ impl TeamRuntime {
             }
         };
         let mode = snapshot.mode;
+        let mode_overrides = snapshot.mode_overrides;
         let raw_config = strip_team_protocols(snapshot.team);
         if let Err(err) = raw_config.validate() {
             step.events.push(RuntimeEvent::Notice(format!(
@@ -865,6 +1084,7 @@ impl TeamRuntime {
             &raw_config,
             &restored_sessions,
             mode,
+            &mode_overrides,
         ) {
             Ok(rejected) => rejected,
             Err(err) => {
@@ -903,6 +1123,7 @@ impl TeamRuntime {
         self.failed_runs.clear();
         self.mode_sessions.clear();
         self.active_mode = mode;
+        self.session_mode_overrides = mode_overrides;
         self.last_user = None;
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
@@ -918,6 +1139,7 @@ impl TeamRuntime {
         step.events.push(RuntimeEvent::Notice(format!(
             "resumed saved chat {conversation}"
         )));
+        self.note_roster_write(step);
     }
 
     fn persist_conversation_snapshot(&self) -> crate::store::sqlite::Result<()> {
@@ -945,8 +1167,12 @@ impl TeamRuntime {
                     })
             })
             .collect::<Vec<_>>();
-        self.store
-            .save_conversation_snapshot(&team, &sessions, self.active_mode)
+        self.store.save_conversation_snapshot(
+            &team,
+            &sessions,
+            self.active_mode,
+            &self.session_mode_overrides,
+        )
     }
 
     fn persist_snapshot_or_notice(&self, context: &str, step: &mut RuntimeStep) {
@@ -1108,6 +1334,7 @@ impl TeamRuntime {
             &raw_config,
             &next_sessions,
             self.active_mode,
+            &self.session_mode_overrides,
             &approval_ids,
         ) {
             self.report_store_error("save the updated team atomically", err, step);
@@ -1184,6 +1411,7 @@ impl TeamRuntime {
             "team updated: {} member(s)",
             self.config.members.len()
         )));
+        self.note_roster_write(step);
     }
 
     fn merge_member_config(&self, members: Vec<TeamMember>) -> Vec<TeamMember> {
@@ -1228,6 +1456,7 @@ impl TeamRuntime {
                 .push(RuntimeEvent::Notice(format!("unknown member: {member}")));
             return;
         };
+        let items = coalesce_imported_assistant_messages(items);
         let original_count = items.len();
         let mut retained_bytes = 0_usize;
         let mut truncated = false;
@@ -1310,7 +1539,7 @@ impl TeamRuntime {
             }
         }
         step.events.push(RuntimeEvent::Notice(format!(
-            "imported {count} message(s) from {id}'s attached session"
+            "imported {count} message(s) from {id}'s session"
         )));
         if truncated || count < original_count {
             step.events.push(RuntimeEvent::Notice(format!(
@@ -1429,6 +1658,16 @@ impl TeamRuntime {
         }
         match decision {
             ApprovalDecision::Approve => {
+                if let Some(run_id) = held.mode_run
+                    && self
+                        .mode_sessions
+                        .get(&run_id)
+                        .is_some_and(|session| session.phase == ModePhase::AwaitingExecution)
+                    && !self.mode_plan_confirm_execution(run_id, step)
+                {
+                    self.check_turn_complete(held.turn, step);
+                    return;
+                }
                 for member in held.targets {
                     self.enqueue_prompt(&member, held.turn, held.prompt.clone(), step);
                 }
@@ -1531,6 +1770,15 @@ impl TeamRuntime {
                 }
             }
             AgentEvent::Reasoning(text) => {
+                if self.message_id(member).is_some() {
+                    let pending = self
+                        .members
+                        .get(member)
+                        .and_then(|state| state.running.as_ref())
+                        .map(|running| running.text.clone())
+                        .unwrap_or_default();
+                    self.complete_message(member, pending, &mut step);
+                }
                 if let Some(text) = self.append_reasoning(member, &text) {
                     step.events.push(RuntimeEvent::Reasoning {
                         member: member.clone(),
@@ -1538,8 +1786,13 @@ impl TeamRuntime {
                     });
                 }
             }
+            AgentEvent::ReasoningSectionBreak | AgentEvent::ReasoningCompleted => {
+                self.commit_open_thinking(member, &mut step);
+            }
             AgentEvent::MessageCompleted(text) => self.complete_message(member, text, &mut step),
             AgentEvent::ToolStarted { id, name, summary } => {
+                self.commit_open_thinking(member, &mut step);
+                self.commit_open_message_before_tools(member, &mut step);
                 if let Some(state) = self.members.get_mut(member) {
                     state.tools.insert(
                         id.clone(),
@@ -1777,6 +2030,7 @@ impl TeamRuntime {
     }
 
     fn start_message(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        self.commit_open_thinking(member, step);
         let msg = self.next_msg();
         if let Some(turn) = self.running_turn(member)
             && let Some(state) = self.members.get_mut(member)
@@ -1796,6 +2050,47 @@ impl TeamRuntime {
         if self.message_id(member).is_none() {
             self.start_message(member, step);
         }
+    }
+
+    /// Clear the current thinking progress before the next tool or answer.
+    /// Thinking is transient status, not transcript content.
+    fn commit_open_thinking(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        if self.running_turn(member).is_none() {
+            return;
+        }
+        let had_reasoning = self
+            .members
+            .get(member)
+            .and_then(|state| state.running.as_ref())
+            .is_some_and(|running| !running.reasoning.trim().is_empty());
+        if let Some(state) = self.members.get_mut(member)
+            && let Some(running) = &mut state.running
+        {
+            running.reasoning.clear();
+            running.reasoning_started = None;
+        }
+        if !had_reasoning {
+            return;
+        }
+        step.events.push(RuntimeEvent::ReasoningCompleted {
+            member: member.clone(),
+        });
+    }
+
+    /// Close any in-progress assistant cell before tools land after it.
+    /// Otherwise MessageCompleted writes the final reply into the earlier
+    /// cell and the UI shows the essay above the tools that produced it.
+    fn commit_open_message_before_tools(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        if self.message_id(member).is_none() {
+            return;
+        }
+        let text = self
+            .members
+            .get(member)
+            .and_then(|state| state.running.as_ref())
+            .map(|running| running.text.clone())
+            .unwrap_or_default();
+        self.complete_message(member, text, step);
     }
 
     fn complete_message(&mut self, member: &MemberId, text: String, step: &mut RuntimeStep) {
@@ -2252,6 +2547,7 @@ impl TeamRuntime {
         ok: bool,
         step: &mut RuntimeStep,
     ) {
+        self.commit_open_thinking(member, step);
         // Flush an unterminated streaming message.
         let pending_text = self.members.get(member).and_then(|s| {
             s.running
@@ -2311,6 +2607,8 @@ impl TeamRuntime {
             member: member.clone(),
             status: MemberStatus::Idle,
         });
+        self.refresh_native_import_cursor(member);
+        self.note_roster_write(step);
 
         if !terminal_state_saved {
             return;
@@ -2331,8 +2629,83 @@ impl TeamRuntime {
             .get_mut(member)
             .and_then(|s| s.queue.pop_front());
         if let Some(queued) = next {
+            self.emit_queue_updated(member, step);
             self.start_run(member, queued.turn, queued.prompt, step);
         }
+    }
+
+    fn emit_queue_updated(&self, member: &MemberId, step: &mut RuntimeStep) {
+        let prompts = self
+            .members
+            .get(member)
+            .map(|state| {
+                state
+                    .queue
+                    .iter()
+                    .map(|queued| queued.prompt.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        step.events.push(RuntimeEvent::QueueUpdated {
+            member: member.clone(),
+            prompts,
+        });
+    }
+
+    fn handle_edit_queued_prompt(&mut self, member: Option<MemberId>, step: &mut RuntimeStep) {
+        let member = member
+            .or_else(|| {
+                self.last_user.as_ref().and_then(|(target, _)| {
+                    self.resolve_message_target(target)
+                        .0
+                        .into_iter()
+                        .rev()
+                        .find(|id| {
+                            self.members
+                                .get(id)
+                                .is_some_and(|state| !state.queue.is_empty())
+                        })
+                })
+            })
+            .or_else(|| {
+                self.members
+                    .iter()
+                    .find_map(|(id, state)| (!state.queue.is_empty()).then_some(id.clone()))
+            });
+        let Some(member) = member else {
+            step.events.push(RuntimeEvent::Notice(
+                "no queued message to edit".to_string(),
+            ));
+            return;
+        };
+        let Some(queued) = self
+            .members
+            .get_mut(&member)
+            .and_then(|state| state.queue.pop_back())
+        else {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "{member} has no queued message"
+            )));
+            return;
+        };
+        self.check_turn_complete(queued.turn, step);
+        if let Some(state) = self.members.get_mut(&member)
+            && state.running.is_none()
+            && state.queue.is_empty()
+            && state.status == MemberStatus::Queued
+        {
+            state.status = MemberStatus::Idle;
+            step.events.push(RuntimeEvent::MemberStatus {
+                member: member.clone(),
+                status: MemberStatus::Idle,
+            });
+            self.note_roster_write(step);
+        }
+        self.emit_queue_updated(&member, step);
+        step.events.push(RuntimeEvent::QueuedPromptReturned {
+            member,
+            body: queued.prompt,
+        });
     }
 
     // === queueing / dispatch ============================================
@@ -2362,6 +2735,8 @@ impl TeamRuntime {
                 member: member.clone(),
                 status: MemberStatus::Queued,
             });
+            self.emit_queue_updated(member, step);
+            self.note_roster_write(step);
         } else {
             self.start_run(member, turn, stripped_prompt, step);
         }
@@ -2402,6 +2777,7 @@ impl TeamRuntime {
                 message: None,
                 text: String::new(),
                 reasoning: String::new(),
+                reasoning_started: None,
                 failed: false,
                 raw_persistence_failed: false,
             });
@@ -2412,8 +2788,8 @@ impl TeamRuntime {
             member: member.clone(),
             status: MemberStatus::Running,
         });
+        self.note_roster_write(step);
         let prompt = normalize_backend_command(self.member_backend(member), prompt);
-        let prompt = self.prompt_for_member(member, prompt);
         step.actions.push(RunAction {
             member: member.clone(),
             prompt,
@@ -2423,34 +2799,37 @@ impl TeamRuntime {
         });
     }
 
-    fn prompt_for_member(&self, member: &MemberId, prompt: String) -> String {
-        let Some(member) = self.config.member(member) else {
-            return prompt;
-        };
-        if member.backend != BackendKind::Codex {
-            return prompt;
-        }
-        let marker = format!("${ASTERLINE_TEAM_SKILL_NAME}");
-        let team_context = self.team_context_for(member);
-        if prompt.contains(&marker) {
-            format!("{team_context}\n\n{prompt}")
-        } else {
-            format!("{team_context}\n\n{}\n\n{prompt}", team_skill_hint())
-        }
-    }
-
-    fn team_context_for(&self, current: &TeamMember) -> String {
+    fn roster_snapshot(&self) -> String {
         let mut lines = vec![
-            "Current Asterline team roster. This lists available members only; do not message them unless collaboration is necessary or explicitly requested. If routing is needed, use member ids."
-                .to_string(),
-            format!("You are: {}", self.team_member_card(current)),
+            "# Asterline roster".to_string(),
+            String::new(),
             format!("Default target: {}", self.default_target_label()),
-            "Members:".to_string(),
+            String::new(),
+            "## Members".to_string(),
         ];
         for member in &self.config.members {
             lines.push(format!("- {}", self.team_member_card(member)));
         }
+        lines.push(String::new());
         lines.join("\n")
+    }
+
+    fn write_roster_snapshot(&self) -> std::io::Result<()> {
+        let directory =
+            fs_safety::ensure_workspace_directory(&self.config.workspace, &[".asterline"], true)?;
+        fs_safety::write_regular_file(
+            &directory.join("roster.md"),
+            "team roster",
+            &self.roster_snapshot(),
+        )
+    }
+
+    fn note_roster_write(&self, step: &mut RuntimeStep) {
+        if let Err(err) = self.write_roster_snapshot() {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "could not update {ASTERLINE_ROSTER_PATH}: {err}"
+            )));
+        }
     }
 
     fn team_member_card(&self, member: &TeamMember) -> String {
@@ -2570,7 +2949,7 @@ impl TeamRuntime {
     }
 
     fn append_reasoning(&mut self, member: &MemberId, text: &str) -> Option<String> {
-        let text = bounded_text(text, MAX_ACTIVE_REASONING_BYTES);
+        let text = bounded_text(text, MAX_MESSAGE_TEXT_BYTES);
         if text.is_empty() {
             return None;
         }
@@ -2578,6 +2957,9 @@ impl TeamRuntime {
             .get_mut(member)
             .and_then(|state| state.running.as_mut())
             .and_then(|running| {
+                if running.reasoning_started.is_none() {
+                    running.reasoning_started = Some(Instant::now());
+                }
                 if text.starts_with(running.reasoning.as_str()) {
                     if text == running.reasoning {
                         return None;
@@ -2588,7 +2970,7 @@ impl TeamRuntime {
                 if running.reasoning.ends_with(&text) {
                     return None;
                 }
-                append_bounded_text(&mut running.reasoning, &text, MAX_ACTIVE_REASONING_BYTES)
+                append_bounded_text(&mut running.reasoning, &text, MAX_MESSAGE_TEXT_BYTES)
                     .map(|_| running.reasoning.clone())
             })
     }
@@ -2645,7 +3027,10 @@ fn relay_prompt(from: &MemberId, from_display: &str, kind: Option<&str>, body: &
              Visible response text and run-step updates do not replace this reply."
         )
     };
-    format!("[relay from {from_display} ({from})]\n{reply_instruction}\n\n{body}")
+    format!(
+        "[relay from {from_display} ({from})]\n{}\n{reply_instruction}\n\n{body}",
+        team_skill_hint()
+    )
 }
 
 fn session_policy_label(policy: SessionPolicy) -> &'static str {
@@ -2653,6 +3038,82 @@ fn session_policy_label(policy: SessionPolicy) -> &'static str {
         SessionPolicy::Resume => "resume",
         SessionPolicy::Fresh => "fresh",
     }
+}
+
+fn native_session_messages(
+    backend: BackendKind,
+    session_id: &str,
+    cwd: &std::path::Path,
+) -> Vec<ImportedMessage> {
+    match backend {
+        BackendKind::Grok => crate::tui::grok_import::messages_for_session(session_id),
+        BackendKind::Codex => crate::tui::rollout_import::messages_for_session(session_id),
+        BackendKind::Claude => {
+            crate::tui::claude_import::messages_for_session(session_id, &cwd.display().to_string())
+        }
+        BackendKind::Agy => Vec::new(),
+    }
+}
+
+/// Native transcripts omit tool calls from the Asterline chat. Their assistant
+/// text therefore arrives in multiple adjacent records for one user turn.
+fn coalesce_imported_assistant_messages(items: Vec<ImportedMessage>) -> Vec<ImportedMessage> {
+    let mut merged: Vec<ImportedMessage> = Vec::with_capacity(items.len());
+    for item in items {
+        let can_merge = merged.last().is_some_and(|previous| {
+            !previous.from_user
+                && !item.from_user
+                && previous
+                    .text
+                    .len()
+                    .saturating_add(item.text.len())
+                    .saturating_add(2)
+                    <= MAX_IMPORTED_ITEM_BYTES
+        });
+        if !can_merge {
+            merged.push(item);
+            continue;
+        }
+        let previous = merged.last_mut().expect("checked above");
+        previous.text.push_str("\n\n");
+        previous.text.push_str(&item.text);
+    }
+    merged
+}
+
+fn chat_item_fingerprint(item: &ChatItem) -> Option<String> {
+    let text = match item {
+        ChatItem::User { body, .. } | ChatItem::Agent { text: body, .. } => body.as_str(),
+        _ => return None,
+    };
+    Some(import_fingerprint(text))
+}
+
+fn import_fingerprint(text: &str) -> String {
+    let extracted = extract_tagged(text, "user_query").unwrap_or(text);
+    let trimmed = extracted.trim();
+    let body = if let Some(rest) = trimmed.strip_prefix('@') {
+        rest.split_once(char::is_whitespace)
+            .map(|(_, rest)| rest)
+            .unwrap_or(rest)
+    } else {
+        trimmed
+    };
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn extract_tagged<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    let inner = text[start..end].trim();
+    (!inner.is_empty()).then_some(inner)
 }
 
 fn strip_routing_prefix(prompt: &str) -> String {
@@ -2698,5 +3159,5 @@ fn summarize_verify_output(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[path = "team_runtime_tests.rs"]
+#[path = "team_runtime_tests/mod.rs"]
 mod tests;

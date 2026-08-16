@@ -1083,21 +1083,26 @@ fn select_loop(
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if state.handle_key(key.code, key.modifiers) {
-                    return Ok(state.finish());
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if state.handle_key(key.code, key.modifiers) {
+                        return Ok(state.finish());
+                    }
+                    if state.cancelled {
+                        return Ok(None);
+                    }
                 }
-                if state.cancelled {
-                    return Ok(None);
+                Event::Paste(text) => {
+                    if let Some(edit) = state.editing.as_mut() {
+                        edit.insert_text(&text);
+                    }
                 }
+                _ => {}
             }
-            Event::Paste(text) => {
-                if let Some(edit) = state.editing.as_mut() {
-                    edit.insert_text(&text);
-                }
+            if !event::poll(Duration::ZERO)? {
+                break;
             }
-            _ => {}
         }
     }
 }
@@ -1207,6 +1212,7 @@ pub(crate) struct EditState {
     pub(crate) buffer: String,
     /// Unicode scalar index kept on a user-visible grapheme boundary.
     pub(crate) cursor: usize,
+    pub(crate) title_override: Option<String>,
 }
 
 impl EditState {
@@ -1216,7 +1222,20 @@ impl EditState {
             field,
             buffer,
             cursor,
+            title_override: None,
         }
+    }
+
+    pub(crate) fn named(title: impl Into<String>, buffer: String) -> Self {
+        let mut edit = Self::new(Field::Name, buffer);
+        edit.title_override = Some(title.into());
+        edit
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        self.title_override
+            .as_deref()
+            .unwrap_or_else(|| self.field.label())
     }
 
     pub(crate) fn insert_text(&mut self, text: &str) {
@@ -2074,7 +2093,7 @@ pub(crate) fn render_edit_box(frame: &mut ratatui::Frame<'_>, area: Rect, edit: 
     );
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(format!(" Edit {} ", edit.field.label()))
+        .title(format!(" Edit {} ", edit.title()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::accent_bold());

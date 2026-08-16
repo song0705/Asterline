@@ -16,6 +16,7 @@ pub mod grok_stream;
 pub mod models;
 pub mod parser;
 pub mod process;
+pub mod prompt_images;
 
 use std::path::Path;
 use std::sync::Arc;

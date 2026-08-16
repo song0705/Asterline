@@ -16,11 +16,11 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::event::{
-    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary, LogEntry,
-    LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId, RunStatus, RunStepStatus,
+    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary, FileChangeItem,
+    LogEntry, LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId, RunStatus, RunStepStatus,
     RunStepSummary, RunSummary, RunVerification, TurnId,
 };
-use crate::domain::mode::{CollabMode, ModeStatusSummary, TerminalMode};
+use crate::domain::mode::{CollabMode, ModeStatusSummary, ModesConfig, TerminalMode};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
@@ -55,6 +55,7 @@ pub struct ConversationSnapshot {
     pub team: TeamConfig,
     pub sessions: Vec<StoredConversationSession>,
     pub mode: TerminalMode,
+    pub mode_overrides: ModesConfig,
 }
 
 #[derive(Debug)]
@@ -130,6 +131,13 @@ impl SqliteStore {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS native_import_cursors (
+                member_id    TEXT NOT NULL,
+                session_id   TEXT NOT NULL,
+                native_count INTEGER NOT NULL,
+                PRIMARY KEY (member_id, session_id)
+            );
+
             CREATE TABLE IF NOT EXISTS turns (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -150,6 +158,7 @@ impl SqliteStore {
                 team_json       TEXT NOT NULL,
                 sessions_json   TEXT NOT NULL,
                 mode            TEXT NOT NULL DEFAULT 'normal',
+                mode_overrides_json TEXT NOT NULL DEFAULT '{}',
                 updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id)
             );
@@ -305,6 +314,13 @@ impl SqliteStore {
                 [],
             )?;
         }
+        if !self.has_column("conversation_snapshots", "mode_overrides_json")? {
+            self.conn.execute(
+                "ALTER TABLE conversation_snapshots
+                 ADD COLUMN mode_overrides_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS runs_conversation_idx
              ON runs (conversation_id, id)",
@@ -412,6 +428,28 @@ impl SqliteStore {
         })
     }
 
+    pub fn record_thinking(
+        &self,
+        turn: TurnId,
+        member: &MemberId,
+        display_name: &str,
+        backend: BackendKind,
+        text: &str,
+        elapsed_secs: Option<u64>,
+    ) -> Result<MessageId> {
+        let elapsed = elapsed_secs.map(|secs| secs.to_string());
+        self.insert_message(MessageRow {
+            turn: Some(turn),
+            kind: "thinking",
+            member: Some(member),
+            display_name: Some(display_name),
+            backend: Some(backend.as_str()),
+            text: Some(text),
+            summary: elapsed.as_deref(),
+            ..MessageRow::default()
+        })
+    }
+
     pub fn record_tool(
         &self,
         turn: TurnId,
@@ -454,14 +492,10 @@ impl SqliteStore {
         &self,
         turn: TurnId,
         member: &MemberId,
-        files: &[(String, String)],
+        files: &[FileChangeItem],
         ok: bool,
     ) -> Result<MessageId> {
-        let encoded = files
-            .iter()
-            .map(|(path, kind)| format!("{kind}\t{path}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let encoded = encode_diff_files(files);
         self.insert_message(MessageRow {
             turn: Some(turn),
             kind: "diff",
@@ -542,12 +576,52 @@ impl SqliteStore {
     }
 
     /// Rebuild one saved conversation's transcript in insertion order.
+    ///
+    /// Conversations that fit the replay budget are loaded from the first
+    /// message so the TUI can scroll to the start. Oversized transcripts still
+    /// take the newest tail so a restart shows recent work.
     pub fn replay_chat_for(&self, conversation: i64) -> Result<Vec<ChatItem>> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE conversation_id = ?1
+               AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')",
+            params![conversation],
+            |row| row.get(0),
+        )?;
+        if (count as usize) <= REPLAY_MAX_ITEMS {
+            let items = self.load_replay_items(conversation, false)?;
+            let bytes: usize = items.iter().map(chat_item_replay_bytes).sum();
+            if bytes <= REPLAY_MAX_BYTES {
+                return Ok(items);
+            }
+        }
+        self.load_replay_items(conversation, true)
+    }
+
+    fn load_replay_items(&self, conversation: i64, tail: bool) -> Result<Vec<ChatItem>> {
+        if !tail {
+            let mut stmt = self.conn.prepare(
+                "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
+                 FROM messages
+                 WHERE conversation_id = ?1
+                   AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![conversation], map_chat_item)?;
+            let mut items = Vec::new();
+            for item in rows {
+                if let Some(item) = item? {
+                    items.push(item);
+                }
+            }
+            return Ok(items);
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
              FROM messages
              WHERE conversation_id = ?1
-               AND kind IN ('user', 'agent', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')
+               AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')
              ORDER BY id DESC
              LIMIT ?2",
         )?;
@@ -662,7 +736,13 @@ impl SqliteStore {
             let id = self.conn.last_insert_rowid();
             self.write_active_conversation(id)?;
             self.replace_session_rows(&[])?;
-            self.write_conversation_snapshot(id, &team_json, &sessions_json, mode)?;
+            self.write_conversation_snapshot(
+                id,
+                &team_json,
+                &sessions_json,
+                mode,
+                &ModesConfig::default(),
+            )?;
             Ok(id)
         })?;
         self.conversation.set(id);
@@ -721,6 +801,7 @@ impl SqliteStore {
         team: &TeamConfig,
         sessions: &[StoredConversationSession],
         mode: TerminalMode,
+        mode_overrides: &ModesConfig,
     ) -> Result<()> {
         let (team_json, sessions_json) = serialize_conversation_snapshot(team, sessions)?;
         self.write_conversation_snapshot(
@@ -728,6 +809,7 @@ impl SqliteStore {
             &team_json,
             &sessions_json,
             mode,
+            mode_overrides,
         )
     }
 
@@ -737,17 +819,27 @@ impl SqliteStore {
         team_json: &str,
         sessions_json: &str,
         mode: TerminalMode,
+        mode_overrides: &ModesConfig,
     ) -> Result<()> {
+        let mode_overrides_json = serde_json::to_string(mode_overrides)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         self.conn.execute(
             "INSERT INTO conversation_snapshots
-                (conversation_id, team_json, sessions_json, mode, updated_at)
-             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+                (conversation_id, team_json, sessions_json, mode, mode_overrides_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
              ON CONFLICT(conversation_id) DO UPDATE SET
                 team_json = excluded.team_json,
                 sessions_json = excluded.sessions_json,
                 mode = excluded.mode,
+                mode_overrides_json = excluded.mode_overrides_json,
                 updated_at = CURRENT_TIMESTAMP",
-            params![conversation, team_json, sessions_json, mode.as_str()],
+            params![
+                conversation,
+                team_json,
+                sessions_json,
+                mode.as_str(),
+                mode_overrides_json
+            ],
         )?;
         Ok(())
     }
@@ -759,6 +851,7 @@ impl SqliteStore {
         snapshot_team: &TeamConfig,
         sessions: &[StoredConversationSession],
         mode: TerminalMode,
+        mode_overrides: &ModesConfig,
         approvals_to_reject: &[ApprovalId],
     ) -> Result<()> {
         let (team_json, sessions_json) = serialize_conversation_snapshot(snapshot_team, sessions)?;
@@ -771,6 +864,7 @@ impl SqliteStore {
                 &team_json,
                 &sessions_json,
                 mode,
+                mode_overrides,
             )
         })
     }
@@ -783,6 +877,7 @@ impl SqliteStore {
         snapshot_team: &TeamConfig,
         sessions: &[StoredConversationSession],
         mode: TerminalMode,
+        mode_overrides: &ModesConfig,
     ) -> Result<usize> {
         let (team_json, sessions_json) = serialize_conversation_snapshot(snapshot_team, sessions)?;
         let rejected = self.transactional(|| {
@@ -795,7 +890,13 @@ impl SqliteStore {
             )?;
             self.replace_team_rows(roster)?;
             self.replace_session_rows(sessions)?;
-            self.write_conversation_snapshot(conversation, &team_json, &sessions_json, mode)?;
+            self.write_conversation_snapshot(
+                conversation,
+                &team_json,
+                &sessions_json,
+                mode,
+                mode_overrides,
+            )?;
             Ok(rejected)
         })?;
         self.conversation.set(conversation);
@@ -804,16 +905,16 @@ impl SqliteStore {
 
     /// Load the roster and native backend sessions saved with one chat.
     pub fn conversation_snapshot(&self, conversation: i64) -> Result<Option<ConversationSnapshot>> {
-        let row: Option<(String, String, String)> = self
+        let row: Option<(String, String, String, String)> = self
             .conn
             .query_row(
-                "SELECT team_json, sessions_json, mode
+                "SELECT team_json, sessions_json, mode, mode_overrides_json
                  FROM conversation_snapshots WHERE conversation_id = ?1",
                 params![conversation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        row.map(|(team_json, sessions_json, mode)| {
+        row.map(|(team_json, sessions_json, mode, mode_overrides_json)| {
             let team = serde_json::from_str(&team_json).map_err(|err| {
                 rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(err))
             })?;
@@ -821,10 +922,12 @@ impl SqliteStore {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(err))
             })?;
             let mode = TerminalMode::parse(&mode).unwrap_or_default();
+            let mode_overrides = serde_json::from_str(&mode_overrides_json).unwrap_or_default();
             Ok(ConversationSnapshot {
                 team,
                 sessions,
                 mode,
+                mode_overrides,
             })
         })
         .transpose()
@@ -984,6 +1087,40 @@ impl SqliteStore {
             )
             .optional()
             .map(|opt| opt.map(AgentSessionId))
+    }
+
+    pub fn native_import_cursor(
+        &self,
+        member: &MemberId,
+        session: &AgentSessionId,
+    ) -> Result<usize> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT native_count FROM native_import_cursors
+                 WHERE member_id = ?1 AND session_id = ?2",
+                params![member.as_str(), session.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|count| count.max(0) as usize)
+            .unwrap_or(0))
+    }
+
+    pub fn set_native_import_cursor(
+        &self,
+        member: &MemberId,
+        session: &AgentSessionId,
+        native_count: usize,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO native_import_cursors (member_id, session_id, native_count)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(member_id, session_id) DO UPDATE SET
+                native_count = excluded.native_count",
+            params![member.as_str(), session.as_str(), native_count as i64],
+        )?;
+        Ok(())
     }
 
     /// Forget a member's resumable session so the next run starts fresh.
@@ -1761,6 +1898,45 @@ fn member_csv(ids: &[MemberId]) -> String {
         .join(",")
 }
 
+fn encode_diff_files(files: &[FileChangeItem]) -> String {
+    if files
+        .iter()
+        .all(|file| file.old_text.is_none() && file.new_text.is_none() && file.patch.is_none())
+    {
+        return files
+            .iter()
+            .map(|file| format!("{}\t{}", file.kind, file.path))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    serde_json::to_string(files).unwrap_or_else(|_| {
+        files
+            .iter()
+            .map(|file| format!("{}\t{}", file.kind, file.path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn decode_diff_files(text: &str) -> Vec<FileChangeItem> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(files) = serde_json::from_str::<Vec<FileChangeItem>>(trimmed) {
+        return files;
+    }
+    trimmed
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let kind = parts.next()?.to_string();
+            let path = parts.next()?.to_string();
+            Some(FileChangeItem::new(path, kind))
+        })
+        .collect()
+}
+
 fn serialize_conversation_snapshot(
     team: &TeamConfig,
     sessions: &[StoredConversationSession],
@@ -1787,6 +1963,12 @@ fn chat_item_replay_bytes(item: &ChatItem) -> usize {
             display_name,
             text,
             ..
+        }
+        | ChatItem::Thinking {
+            member,
+            display_name,
+            text,
+            ..
         } => member.as_str().len() + display_name.len() + text.len(),
         ChatItem::Tool {
             member,
@@ -1799,7 +1981,13 @@ fn chat_item_replay_bytes(item: &ChatItem) -> usize {
             member.as_str().len()
                 + files
                     .iter()
-                    .map(|(path, kind)| path.len() + kind.len())
+                    .map(|file| {
+                        file.path.len()
+                            + file.kind.len()
+                            + file.old_text.as_ref().map(String::len).unwrap_or(0)
+                            + file.new_text.as_ref().map(String::len).unwrap_or(0)
+                            + file.patch.as_ref().map(String::len).unwrap_or(0)
+                    })
                     .sum::<usize>()
         }
         ChatItem::Route { from, to, body } => {
@@ -1851,6 +2039,13 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
             backend: read_backend(backend.as_deref())?,
             text: text.unwrap_or_default(),
         },
+        "thinking" => ChatItem::Thinking {
+            member: MemberId::new(member_id.unwrap_or_default()),
+            display_name: display_name.unwrap_or_default(),
+            backend: read_backend(backend.as_deref())?,
+            text: text.unwrap_or_default(),
+            elapsed_secs: summary.and_then(|value| value.parse().ok()),
+        },
         "tool" => ChatItem::Tool {
             member: MemberId::new(member_id.unwrap_or_default()),
             name: name.unwrap_or_default(),
@@ -1865,16 +2060,7 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
         },
         "diff" => ChatItem::Diff {
             member: MemberId::new(member_id.unwrap_or_default()),
-            files: text
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(2, '\t');
-                    let kind = parts.next()?.to_string();
-                    let path = parts.next()?.to_string();
-                    Some((path, kind))
-                })
-                .collect(),
+            files: decode_diff_files(&text.unwrap_or_default()),
             ok: ok.map(|value| value != 0).unwrap_or(true),
         },
         "notice" => ChatItem::Notice {

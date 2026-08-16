@@ -23,12 +23,11 @@ use crate::adapter::parser::{
     MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, summarize, tool_detail, tool_value,
 };
 use crate::adapter::process::{
-    ChildProcessTree, MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_LINE_BYTES, bounded_lines,
-    configure_process_tree,
+    ChildProcessTree, MAX_STDERR_LINE_BYTES, bounded_lines, configure_process_tree,
 };
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::config::resolve_binary_on_path;
-use crate::domain::event::{AgentEvent, AgentSessionId, ApprovalDecision};
+use crate::domain::event::{AgentEvent, AgentSessionId, ApprovalDecision, FileChangeItem};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
 
 const RPC_QUEUE_CAPACITY: usize = 256;
@@ -37,6 +36,13 @@ const RPC_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 const TOOL_SUMMARY_MAX: usize = 160;
 const TOOL_OUTPUT_MAX: usize = 32_000;
+/// Codex App Server can put a complete command result into one JSON-RPC
+/// notification. Keep a finite transport bound, but allow such a response to
+/// reach the semantic output limits below instead of failing at 8 MiB.
+const MAX_APP_SERVER_PROTOCOL_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Raw protocol records are diagnostic-only. Large frames already have their
+/// meaningful tool/message data recorded through bounded semantic events.
+const MAX_PERSISTED_RAW_PROTOCOL_BYTES: usize = 512 * 1024;
 const MODEL_LIST_PAGE_SIZE: u64 = 100;
 const MAX_MODEL_LIST_PAGES: usize = 8;
 const NATIVE_APPROVAL_DETAIL_MAX: usize = 4 * 1024;
@@ -105,7 +111,7 @@ impl CodexAppServerConfig {
     fn turn_params(&self, thread_id: &str, prompt: &str, effort: Option<Effort>) -> Value {
         json!({
             "threadId": thread_id,
-            "input": [{ "type": "text", "text": prompt }],
+            "input": crate::adapter::prompt_images::codex_user_input(prompt),
             "cwd": self.cwd,
             "model": self.model,
             "effort": effort.map(Effort::codex_value),
@@ -389,7 +395,11 @@ impl AppServerClient {
             stdin,
             stdout_rx,
             stderr_rx,
-            stdout_worker: Some(spawn_line_pump(stdout, MAX_PROTOCOL_LINE_BYTES, stdout_tx)),
+            stdout_worker: Some(spawn_line_pump(
+                stdout,
+                MAX_APP_SERVER_PROTOCOL_LINE_BYTES,
+                stdout_tx,
+            )),
             stderr_worker: Some(spawn_line_pump(stderr, MAX_STDERR_LINE_BYTES, stderr_tx)),
             next_id: 1,
             active_thread_id: None,
@@ -641,13 +651,16 @@ impl AppServerClient {
                         // are persisted through normal chat/tool state, so
                         // retain protocol raw records for boundaries and
                         // unknown messages rather than every streamed chunk.
-                        if should_persist_raw_message(&message) {
+                        if should_persist_raw_message(&line, &message) {
                             let _ = events.send(AgentEvent::Raw(line));
                         }
                         Ok(Some(message))
                     }
                     Err(error) => {
-                        let _ = events.send(AgentEvent::Raw(line));
+                        let _ = events.send(AgentEvent::Raw(bounded_text(
+                            &line,
+                            MAX_PERSISTED_RAW_PROTOCOL_BYTES,
+                        )));
                         Err(format!("invalid JSON from Codex App Server: {error}"))
                     }
                 }
@@ -764,19 +777,21 @@ impl AppServerClient {
     }
 }
 
-fn should_persist_raw_message(message: &Value) -> bool {
-    !matches!(
-        message.get("method").and_then(Value::as_str),
-        Some(
-            "item/agentMessage/delta"
-                | "item/reasoning/summaryTextDelta"
-                | "item/reasoning/textDelta"
-                | "item/commandExecution/outputDelta"
-                | "item/mcpToolCall/progress"
-                | "item/plan/delta"
-                | "item/fileChange/patchUpdated"
+fn should_persist_raw_message(line: &str, message: &Value) -> bool {
+    line.len() <= MAX_PERSISTED_RAW_PROTOCOL_BYTES
+        && !matches!(
+            message.get("method").and_then(Value::as_str),
+            Some(
+                "item/agentMessage/delta"
+                    | "item/reasoning/summaryTextDelta"
+                    | "item/reasoning/summaryPartAdded"
+                    | "item/reasoning/textDelta"
+                    | "item/commandExecution/outputDelta"
+                    | "item/mcpToolCall/progress"
+                    | "item/plan/delta"
+                    | "item/fileChange/patchUpdated"
+            )
         )
-    )
 }
 
 /// Details that a user must see before granting a Codex App Server request.
@@ -900,9 +915,10 @@ fn spawn_line_pump<R: Read + Send + 'static>(
 struct AppServerEventMapper {
     thread_id: Option<String>,
     turn_id: Option<String>,
-    agent_phases: HashMap<String, Option<String>>,
     agent_text: HashMap<String, String>,
     started_messages: HashSet<String>,
+    streamed_reasoning: HashSet<String>,
+    reasoning_summary_indices: HashMap<String, u64>,
     command_output: HashMap<String, String>,
     terminal: Option<bool>,
 }
@@ -939,14 +955,19 @@ impl AppServerEventMapper {
                 self.handle_item(params.get("item").unwrap_or(&Value::Null), false, events)
             }
             "item/agentMessage/delta" => self.handle_agent_delta(params, events),
-            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+            "item/reasoning/summaryTextDelta" => {
+                self.begin_reasoning_section(params, events);
                 if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                    let _ = events.send(AgentEvent::Reasoning(bounded_text(
-                        delta,
-                        MAX_MESSAGE_TEXT_BYTES,
-                    )));
+                    let delta = bounded_text(delta, MAX_MESSAGE_TEXT_BYTES);
+                    if let Some(id) = params.get("itemId").and_then(Value::as_str)
+                        && !id.is_empty()
+                    {
+                        self.streamed_reasoning.insert(id.to_string());
+                    }
+                    let _ = events.send(AgentEvent::Reasoning(delta));
                 }
             }
+            "item/reasoning/summaryPartAdded" => self.begin_reasoning_section(params, events),
             "item/commandExecution/outputDelta" => {
                 let id = params
                     .get("itemId")
@@ -982,16 +1003,6 @@ impl AppServerEventMapper {
                     });
                 }
             }
-            "item/plan/delta" => {
-                if let Some(delta) = params.get("delta").and_then(Value::as_str)
-                    && !delta.is_empty()
-                {
-                    let _ = events.send(AgentEvent::Reasoning(bounded_text(
-                        delta,
-                        MAX_MESSAGE_TEXT_BYTES,
-                    )));
-                }
-            }
             "turn/completed" => {
                 let status = params
                     .pointer("/turn/status")
@@ -1010,6 +1021,8 @@ impl AppServerEventMapper {
                 // final answer if a server version ends the turn without that
                 // item event, rather than silently dropping the reply.
                 self.finish_open_agent_messages(events);
+                self.streamed_reasoning.clear();
+                self.reasoning_summary_indices.clear();
                 self.terminal = Some(ok);
             }
             "error" => {
@@ -1073,13 +1086,6 @@ impl AppServerEventMapper {
         if id.is_empty() || delta.is_empty() {
             return;
         }
-        if self.agent_phases.get(id).and_then(Option::as_deref) == Some("commentary") {
-            let _ = events.send(AgentEvent::Reasoning(bounded_text(
-                delta,
-                MAX_MESSAGE_TEXT_BYTES,
-            )));
-            return;
-        }
         self.start_message(id, events);
         let text = self.agent_text.entry(id.to_string()).or_default();
         if let Some(delta) = append_bounded_text(text, delta, MAX_MESSAGE_TEXT_BYTES) {
@@ -1087,16 +1093,32 @@ impl AppServerEventMapper {
         }
     }
 
+    fn begin_reasoning_section(&mut self, params: &Value, events: &SyncSender<AgentEvent>) {
+        let Some(id) = params
+            .get("itemId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let Some(index) = params.get("summaryIndex").and_then(Value::as_u64) else {
+            return;
+        };
+        if self
+            .reasoning_summary_indices
+            .insert(id.to_string(), index)
+            .is_some_and(|previous| previous != index)
+        {
+            let _ = events.send(AgentEvent::ReasoningSectionBreak);
+        }
+    }
+
     fn finish_open_agent_messages(&mut self, events: &SyncSender<AgentEvent>) {
         let ids = self.started_messages.drain().collect::<Vec<_>>();
         for id in ids {
-            if self.agent_phases.get(&id).and_then(Option::as_deref) == Some("commentary") {
-                continue;
-            }
             let text = self.agent_text.remove(&id).unwrap_or_default();
             let _ = events.send(AgentEvent::MessageCompleted(text));
         }
-        self.agent_phases.clear();
     }
 
     fn handle_item(&mut self, item: &Value, started: bool, events: &SyncSender<AgentEvent>) {
@@ -1104,46 +1126,33 @@ impl AppServerEventMapper {
         let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
         match item_type {
             "agentMessage" => {
-                let phase = item
-                    .get("phase")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
                 if started {
-                    self.agent_phases.insert(id.to_string(), phase);
-                    if self.agent_phases.get(id).and_then(Option::as_deref) != Some("commentary") {
-                        self.start_message(id, events);
-                    }
+                    self.start_message(id, events);
                     return;
                 }
                 let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
-                if self.agent_phases.get(id).and_then(Option::as_deref) == Some("commentary") {
-                    if !text.is_empty() {
-                        let _ = events.send(AgentEvent::Reasoning(bounded_text(
-                            text,
-                            MAX_MESSAGE_TEXT_BYTES,
-                        )));
-                    }
+                self.start_message(id, events);
+                let canonical = if text.is_empty() {
+                    self.agent_text.remove(id).unwrap_or_default()
                 } else {
-                    self.start_message(id, events);
-                    let canonical = if text.is_empty() {
-                        self.agent_text.remove(id).unwrap_or_default()
-                    } else {
-                        bounded_text(text, MAX_MESSAGE_TEXT_BYTES)
-                    };
-                    let _ = events.send(AgentEvent::MessageCompleted(canonical));
-                }
+                    bounded_text(text, MAX_MESSAGE_TEXT_BYTES)
+                };
+                let _ = events.send(AgentEvent::MessageCompleted(canonical));
                 self.agent_text.remove(id);
                 self.started_messages.remove(id);
             }
             "reasoning" if !started => {
-                let text = item
-                    .get("summary")
-                    .or_else(|| item.get("content"))
-                    .map(|value| tool_value(value, MAX_MESSAGE_TEXT_BYTES))
-                    .unwrap_or_default();
-                if !text.is_empty() {
-                    let _ = events.send(AgentEvent::Reasoning(text));
+                if !self.streamed_reasoning.remove(id) {
+                    let text = item
+                        .get("summary")
+                        .map(|value| tool_value(value, MAX_MESSAGE_TEXT_BYTES))
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        let _ = events.send(AgentEvent::Reasoning(text));
+                    }
                 }
+                self.reasoning_summary_indices.remove(id);
+                let _ = events.send(AgentEvent::ReasoningCompleted);
             }
             "commandExecution" => {
                 let summary = summarize(
@@ -1194,20 +1203,36 @@ impl AppServerEventMapper {
                         changes
                             .iter()
                             .map(|change| {
-                                (
-                                    change
-                                        .get("path")
-                                        .or_else(|| change.get("movePath"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    change
-                                        .get("type")
-                                        .or_else(|| change.get("kind"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("update")
-                                        .to_string(),
-                                )
+                                let path = change
+                                    .get("path")
+                                    .or_else(|| change.get("movePath"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                let kind = change
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| {
+                                        change.pointer("/kind/type").and_then(Value::as_str)
+                                    })
+                                    .or_else(|| change.get("kind").and_then(Value::as_str))
+                                    .unwrap_or("update");
+                                FileChangeItem::new(path, kind)
+                                    .with_texts(
+                                        change
+                                            .get("oldText")
+                                            .or_else(|| change.get("before"))
+                                            .and_then(Value::as_str),
+                                        change
+                                            .get("newText")
+                                            .or_else(|| change.get("after"))
+                                            .and_then(Value::as_str),
+                                    )
+                                    .with_patch(
+                                        change
+                                            .get("diff")
+                                            .or_else(|| change.get("patch"))
+                                            .and_then(Value::as_str),
+                                    )
                             })
                             .collect()
                     })
@@ -1352,7 +1377,10 @@ impl AppServerEventMapper {
             let summary = item
                 .get("arguments")
                 .map(|arguments| {
-                    summarize(&tool_value(arguments, TOOL_SUMMARY_MAX), TOOL_SUMMARY_MAX)
+                    summarize(
+                        &crate::adapter::parser::tool_brief(arguments),
+                        TOOL_SUMMARY_MAX,
+                    )
                 })
                 .filter(|summary| !summary.is_empty())
                 .unwrap_or_else(|| name.clone());
@@ -1385,7 +1413,9 @@ impl AppServerEventMapper {
         if started {
             let summary = item
                 .get("arguments")
-                .map(|value| summarize(&tool_value(value, TOOL_SUMMARY_MAX), TOOL_SUMMARY_MAX))
+                .map(|value| {
+                    summarize(&crate::adapter::parser::tool_brief(value), TOOL_SUMMARY_MAX)
+                })
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| name.clone());
             let _ = events.send(AgentEvent::ToolStarted { id, name, summary });
@@ -1523,6 +1553,272 @@ mod tests {
     }
 
     #[test]
+    fn app_server_streams_commentary_as_an_agent_message() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        mapper.handle_notification(
+            "item/started",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": { "id": "commentary-1", "type": "agentMessage", "phase": "commentary" }
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/agentMessage/delta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "commentary-1", "delta": "**Planning the next tool call**"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": {
+                    "id": "commentary-1", "type": "agentMessage", "phase": "commentary",
+                    "text": "**Planning the next tool call**"
+                }
+            }),
+            &tx,
+        );
+        drop(tx);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::MessageStarted,
+                AgentEvent::TextDelta("**Planning the next tool call**".to_string()),
+                AgentEvent::MessageCompleted("**Planning the next tool call**".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_keeps_commentary_and_final_as_separate_messages() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        for (id, phase, text) in [
+            ("commentary-1", "commentary", "I will inspect the renderer."),
+            ("final-1", "final_answer", "The renderer is fixed."),
+        ] {
+            mapper.handle_notification(
+                "item/started",
+                &json!({
+                    "threadId": "thread-1", "turnId": "turn-1",
+                    "item": { "id": id, "type": "agentMessage", "phase": phase }
+                }),
+                &tx,
+            );
+            mapper.handle_notification(
+                "item/agentMessage/delta",
+                &json!({
+                    "threadId": "thread-1", "turnId": "turn-1", "itemId": id, "delta": text
+                }),
+                &tx,
+            );
+            mapper.handle_notification(
+                "item/completed",
+                &json!({
+                    "threadId": "thread-1", "turnId": "turn-1",
+                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                }),
+                &tx,
+            );
+        }
+        drop(tx);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::MessageStarted,
+                AgentEvent::TextDelta("I will inspect the renderer.".to_string()),
+                AgentEvent::MessageCompleted("I will inspect the renderer.".to_string()),
+                AgentEvent::MessageStarted,
+                AgentEvent::TextDelta("The renderer is fixed.".to_string()),
+                AgentEvent::MessageCompleted("The renderer is fixed.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_keeps_streamed_reasoning_summary_without_completed_duplicate() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        mapper.handle_notification(
+            "item/reasoning/summaryTextDelta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "delta": "Inspecting "
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/reasoning/summaryTextDelta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "delta": "the adapter"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": {
+                    "id": "reasoning-1", "type": "reasoning",
+                    "summary": "Inspecting the adapter"
+                }
+            }),
+            &tx,
+        );
+        drop(tx);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::Reasoning("Inspecting ".to_string()),
+                AgentEvent::Reasoning("the adapter".to_string()),
+                AgentEvent::ReasoningCompleted,
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_forwards_bold_reasoning_summaries_without_guessing_their_meaning() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        mapper.handle_notification(
+            "item/reasoning/summaryTextDelta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "delta": "**Planning comprehensive Codex documentation search**"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": {
+                    "id": "reasoning-1", "type": "reasoning",
+                    "summary": "**Planning comprehensive Codex documentation search**"
+                }
+            }),
+            &tx,
+        );
+        drop(tx);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::Reasoning(
+                    "**Planning comprehensive Codex documentation search**".to_string()
+                ),
+                AgentEvent::ReasoningCompleted,
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_uses_summary_section_boundaries_without_text_heuristics() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        mapper.handle_notification(
+            "item/reasoning/summaryTextDelta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "summaryIndex": 0, "delta": "**First**\nbody one"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/reasoning/summaryPartAdded",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "summaryIndex": 1
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/reasoning/summaryTextDelta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "summaryIndex": 1, "delta": "**Second**\nbody two"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": { "id": "reasoning-1", "type": "reasoning", "summary": [] }
+            }),
+            &tx,
+        );
+        drop(tx);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::Reasoning("**First**\nbody one".to_string()),
+                AgentEvent::ReasoningSectionBreak,
+                AgentEvent::Reasoning("**Second**\nbody two".to_string()),
+                AgentEvent::ReasoningCompleted,
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_ignores_raw_reasoning_and_plan_deltas() {
+        let mut mapper = AppServerEventMapper {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        mapper.handle_notification(
+            "item/reasoning/textDelta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "reasoning-1", "delta": "raw reasoning"
+            }),
+            &tx,
+        );
+        mapper.handle_notification(
+            "item/plan/delta",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1", "delta": "plan progress"
+            }),
+            &tx,
+        );
+        drop(tx);
+
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
     fn app_server_finalizes_streamed_text_when_turn_ends_without_item_completed() {
         let mut mapper = AppServerEventMapper {
             thread_id: Some("thread-1".to_string()),
@@ -1601,6 +1897,33 @@ mod tests {
     }
 
     #[test]
+    fn app_server_preserves_native_file_change_patch() {
+        let events = mapper_events(
+            "item/completed",
+            json!({
+                "item": {
+                    "id": "file-1", "type": "fileChange", "status": "completed",
+                    "changes": [{
+                        "path": "/workspace/src/lib.rs",
+                        "kind": { "type": "update" },
+                        "diff": "@@ -4 +4 @@\n-old\n+new\n"
+                    }]
+                }
+            }),
+        );
+        assert_eq!(
+            events,
+            vec![AgentEvent::FileChange {
+                files: vec![
+                    FileChangeItem::new("/workspace/src/lib.rs", "update")
+                        .with_patch(Some("@@ -4 +4 @@\n-old\n+new\n"),)
+                ],
+                ok: true,
+            }]
+        );
+    }
+
+    #[test]
     fn app_server_forwards_member_sandbox_and_default_policy_to_start_and_resume() {
         let mut member =
             TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
@@ -1619,6 +1942,24 @@ mod tests {
         assert!(
             config.turn_params("thread", "hello", Some(Effort::High))["sandboxPolicy"].is_null()
         );
+        let img_dir =
+            std::env::temp_dir().join(format!("asterline-codex-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&img_dir);
+        let img = img_dir.join("shot.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let input = config.turn_params(
+            "thread",
+            &format!("look\n[asterline-image]: {}", img.display()),
+            None,
+        )["input"]
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "look");
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[1]["path"], img.to_string_lossy().as_ref());
+        let _ = std::fs::remove_dir_all(&img_dir);
     }
 
     #[test]
@@ -1754,6 +2095,49 @@ mod tests {
         let worker = spawn_line_pump(Cursor::new(b"one\n"), 64, tx);
         drop(rx);
         assert!(worker.join().is_ok());
+    }
+
+    #[test]
+    fn app_server_accepts_large_tool_frames_without_persisting_raw_payloads() {
+        let output = "x".repeat(8 * 1024 * 1024);
+        let message = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "cargo test",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "aggregatedOutput": output,
+                }
+            }
+        });
+        let mut encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.len() > 8 * 1024 * 1024);
+        assert!(encoded.len() < MAX_APP_SERVER_PROTOCOL_LINE_BYTES);
+        encoded.push('\n');
+
+        let line = bounded_lines(
+            BufReader::new(Cursor::new(encoded)),
+            MAX_APP_SERVER_PROTOCOL_LINE_BYTES,
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert!(!should_persist_raw_message(&line, &parsed));
+
+        let events = mapper_events("item/completed", parsed["params"].clone());
+        let [AgentEvent::ToolCompleted { ok, summary, .. }] = events.as_slice() else {
+            panic!("expected one bounded tool completion, got {events:?}");
+        };
+        assert!(*ok);
+        assert!(
+            summary.chars().count() <= TOOL_OUTPUT_MAX,
+            "{}",
+            summary.chars().count()
+        );
     }
 
     #[cfg(unix)]

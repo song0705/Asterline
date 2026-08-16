@@ -16,8 +16,10 @@ const TEAM_PROTOCOL_BEGIN: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_BEGIN -->";
 const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
 pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL.md";
+/// Live roster and member status. Rewritten whenever the team or a status changes.
+pub const ASTERLINE_ROSTER_PATH: &str = ".asterline/roster.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 12;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 16;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
@@ -108,7 +110,7 @@ fn is_managed_skill(text: &str) -> bool {
 
 pub fn team_skill_hint() -> String {
     format!(
-        "${ASTERLINE_TEAM_SKILL_NAME} documents optional Asterline team controls. The roster only lists available members; do not message them unless collaboration is necessary or explicitly requested. If skills are unavailable, read {ASTERLINE_TEAM_SKILL_PATH}."
+        "${ASTERLINE_TEAM_SKILL_NAME} documents optional Asterline team controls. If skills are unavailable, read {ASTERLINE_TEAM_SKILL_PATH}."
     )
 }
 
@@ -580,15 +582,9 @@ fn build_protocol(me: &str, teammates: &[String]) -> String {
         team_skill_hint()
     );
     if teammates.is_empty() {
-        protocol.push_str("You are the only member; there are no teammates to message.\n");
+        protocol.push_str("You are the only member.\n");
     } else {
-        protocol.push_str(&format!(
-            "Available teammates (optional; their presence does not require messaging): {}.\n",
-            teammates.join(", ")
-        ));
-        protocol.push_str(
-            "Work independently unless the user or active run explicitly requires collaboration.\n",
-        );
+        protocol.push_str(&format!("Teammates: {}.\n", teammates.join(", ")));
     }
     protocol.push_str("All other text you write is shown to the user.");
     protocol
@@ -876,11 +872,11 @@ mod tests {
         let prompt = config.members[0].system_prompt.as_ref().unwrap();
         assert!(prompt.contains("$asterline-team"));
         assert!(prompt.contains(ASTERLINE_TEAM_SKILL_PATH));
+        assert!(!prompt.contains(ASTERLINE_ROSTER_PATH));
         assert!(!prompt.contains("@@team_message"));
         assert!(!prompt.contains("@@team_member"));
         assert!(prompt.contains("reviewer"));
-        assert!(prompt.contains("their presence does not require messaging"));
-        assert!(prompt.contains("Work independently"));
+        assert!(!prompt.contains("do not message"));
         assert!(prompt.contains("custom prompt"));
 
         let stripped = strip_team_protocols(config);
@@ -947,9 +943,9 @@ mod tests {
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 12"));
+        assert!(text.contains("version: 16"));
         assert!(text.contains("@@review"));
-        assert!(text.contains("Work independently by default"));
+        assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1020,12 +1016,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v12() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 12);
+    fn embedded_team_skill_is_protocol_v16() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 16);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 12")
+                .any(|line| line.trim() == "version: 16")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1033,7 +1029,10 @@ mod tests {
         assert!(ASTERLINE_TEAM_SKILL.contains("$asterline-brainstorm"));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@brainstorm_card"));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@brainstorm_vote"));
-        assert!(ASTERLINE_TEAM_SKILL.contains("Work independently by default"));
+        assert!(
+            ASTERLINE_TEAM_SKILL
+                .contains("Do not send `@@team_message` merely because teammates are listed")
+        );
         assert!(
             ASTERLINE_TEAM_SKILL.contains("task involves search, research, review, or planning")
         );
@@ -1042,7 +1041,12 @@ mod tests {
         assert!(ASTERLINE_TEAM_SKILL.contains("@@run_step"));
         assert!(ASTERLINE_TEAM_SKILL.contains("Every Received Message Must Be Answered"));
         assert!(ASTERLINE_TEAM_SKILL.contains(r#""kind":"reply""#));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 12);
+        assert!(
+            ASTERLINE_TEAM_SKILL
+                .contains("Writing the plan, review, or patch \"for the user\" is not delivery")
+        );
+        assert!(ASTERLINE_TEAM_SKILL.contains(ASTERLINE_ROSTER_PATH));
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 16);
     }
 
     #[test]

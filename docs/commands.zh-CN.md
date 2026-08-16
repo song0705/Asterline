@@ -357,12 +357,24 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 ### `/mode`
 
 ```text
+/mode
 /mode <normal|review|plan|brainstorm|team>
 ```
 
-选择后续纯文本提示的派发方式。`/mode` 只选择模式，任务应在下一条消息输入。
-模式在当前对话中持续有效，直到再次用 `/mode` 修改。`/new` 会把新对话重置为
-`normal`，`/resume` 则恢复所选历史对话原来的模式。
+无参数的 `/mode` 打开覆盖在聊天上的小浮层（和 `/team` 一样是单个 drawer）。
+第一层列出每种模式及其当前绑定摘要，打开时落在本对话当前模式上。Enter
+是进入高亮模式字段层的唯一按键；Esc 或 q 关闭且不应用未保存的改动。
+
+每个字段显示当前生效值以及来源：`default` / `team.json` / `this chat`
+（本对话）。改动先作为 pending：`s` 选择当前模式并应用到本对话，`w` 把当前
+模式被覆盖的字段写入 `team.json` 作为这支队伍的默认，`r` 清除该字段的本对话
+覆盖并回落。不按 `s` / `w` 直接关闭会丢弃 pending。
+
+`/mode <name>` 仍是键盘快路径：立刻切模式、不打开面板，Notice 只有一行。选择
+`review`、`plan`、`brainstorm` 或 `team` 后，下一条直接输入任务即可，**不要**加
+`@member` 前缀；该消息会按所选模式交给配置的参与成员。`@member <消息>` 有意
+始终是一对一指令，会绕开当前协作 Run。`/new` 把新对话重置为 `normal` 并清空
+本对话覆盖；`/resume` 恢复所选历史对话的模式和覆盖。
 
 #### `/mode normal`
 
@@ -373,7 +385,11 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 
 启动 builder/reviewer 循环。Builder 执行工作，Reviewer 输出结构化
 `@@review` 结论；未批准时继续修改，直到批准或用尽 `max_iterations`。用尽后
-运行会进入 blocked。
+运行会进入 blocked。Reviewer 被要求亲自检查 working tree 并运行项目检查；
+批准后 auto-verify（若开启）会再次运行验证命令，这是刻意设计的第二道独立
+关卡，而不是可以关掉的冗余步骤。Reviewer 回复中没有结构化结论时会被提醒
+一次，之后整段回复按 `request_changes` 处理（会有 Notice 说明）并消耗一次
+迭代。
 
 ```text
 /mode review
@@ -382,8 +398,11 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 
 #### `/mode plan`
 
-启动由 Leader 驱动的规划运行。Leader 创建清单、派发工作、维护步骤状态，并在
-完成前执行 Reviewer 循环。
+启动由 Leader 驱动的规划运行。Plan 必须配置 Builder；Leader 创建 checklist（步骤不需要
+owner）后，最终 checklist 会派给 Builder。Reviewer 是可选的：若配置，它只审计划本身——
+完整性、顺序、风险、验收标准与可测性——从不审代码或 diff；要求修改时回到 Leader 修订
+checklist。`modes.plan.auto_execute` 默认 `true`；设为 `false` 时，最终计划会停在显式
+`/approve`，确认后才派给 Builder。Builder 完成后再按配置验证。
 
 ```text
 /mode plan
@@ -442,6 +461,11 @@ Coordinator 修复，直到达到配置的迭代上限。
 恢复 blocked 或 failed 的模式/团队运行，并可向 Coordinator 或模式引擎附带
 备注。省略运行 ID 时选择本对话最近的运行。活动中的运行不能再次 continue；
 没有持久化模式状态的旧版运行也无法重建。
+
+恢复会重入运行被阻塞时所处的阶段：review 运行重新派发 Builder（若审阅未出
+结论则派发 Reviewer）；plan 运行回到 Leader 或重新派发未完成的已分配步骤；
+brainstorm 运行重跑当前生成波次（或投票/综合阶段）；处于验证中的运行会重新
+执行验证。运行记录中的所有成员必须仍在 roster 中。
 
 ```text
 /continue run-4 使用刚安装的依赖重试
@@ -552,6 +576,10 @@ Coordinator 修复，直到达到配置的迭代上限。
 
 ## 全局键盘操作
 
+成员还在工作时，`Enter` 会把下一条消息排进队列，而不是立刻再开一轮。
+`Esc` 打断当前成员，然后把队列里的消息发出去。如果这条队列消息还没开始、
+你想改，用 `Shift+←` 拉回输入框。当前对话可以一直往上滑到第一条消息。
+
 | 按键                           | 功能                                                        |
 | ------------------------------ | ----------------------------------------------------------- |
 | `Enter`                        | 发送，或接受当前选项                                        |
@@ -561,18 +589,30 @@ Coordinator 修复，直到达到配置的迭代上限。
 | `Tab`                          | 接受补全                                                    |
 | `Ctrl+R`                       | 反向搜索提示历史                                            |
 | `n` / `p`                      | 输入框为空时跳到下一/上一条 `/find` 结果                    |
-| `PageUp` / `PageDown`          | 滚动聊天或当前抽屉                                          |
-| 鼠标拖动                       | 选择并复制聊天、状态栏或抽屉文字                            |
+| `PageUp` / `PageDown`          | 按页滚动聊天或当前抽屉                                      |
+| `Shift+←`                      | 把尚未发给成员的最后一条排队消息拉回输入框修改              |
+| 鼠标拖动                       | 选择并复制聊天、输入框、状态栏或抽屉文字                    |
 | 鼠标滚轮                       | 滚动聊天或当前抽屉                                          |
-| `Esc`                          | 关闭浮层、清除搜索或取消运行中的工作                        |
-| `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | 展开或折叠详细输出（工具输出和 Claude 思考）                |
+| `Esc`                          | 关闭浮层、清除搜索，或打断当前成员并把下一条排队消息发出    |
+| `Ctrl+T`                       | 展开或折叠思考过程                                          |
+| `Ctrl+G`                       | 展开或折叠文件改动                                          |
+| `Ctrl+O`                       | 展开或折叠工具输出                                          |
 | `Ctrl+L`                       | 打开日志                                                    |
 | `Ctrl+P`                       | 打开命令面板                                                |
 | `Ctrl+N` / `Ctrl+B`            | 聚焦下一/上一个成员                                         |
 | `Ctrl+A` / `Ctrl+E`            | 移到行首/行尾                                               |
-| `Ctrl+U`                       | 清空当前行                                                  |
+| `Ctrl+U` / `Cmd+Backspace`     | 清空输入框当前行（其它行保留）                              |
 | `Ctrl+W`                       | 删除前一个词                                                |
 | `Ctrl+C`                       | 取消、清空输入框；空闲时第一次按键进入退出待确认状态        |
+| `Ctrl+V` / `Cmd+V`             | 把剪贴板图片附到下一条消息（不是 Ctrl+C）                   |
+
+截图或复制的图片写在进程临时目录
+`std::env::temp_dir()/asterline-pasted/<pid>/`：Windows 是 `%TEMP%`，macOS 是
+`$TMPDIR`，Linux 是 `/tmp`。不依赖系统自动回收。输入框 Backspace / 清空会立刻
+删未发送的拷贝；退出时清掉本进程目录；下次启动会清掉已经退出的进程留下的目录。
+再按各后端原生格式发出：Codex `localImage`、Grok ACP image 块、Claude/Agy
+可读的附件路径。每条消息最多四张。粘贴 PNG/JPEG/GIF/WebP 文件路径会拷进临时
+目录，而不是插入路径文本。
 
 提示历史的行为与 Shell 类似：浏览旧记录时，`↑`、`↓` 会保留当前草稿。在
 `Ctrl+R` 搜索中，继续输入可缩小范围，再按 `Ctrl+R` 找更早的匹配，按 `Enter`

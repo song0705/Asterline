@@ -104,6 +104,22 @@ fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> At
     }
 }
 
+/// Load every importable message from the bound Codex session's rollout.
+pub(crate) fn messages_for_session(session_id: &str) -> Vec<ImportedMessage> {
+    let Some(path) = newest_rollout_for_session(&all_rollouts(), session_id) else {
+        return Vec::new();
+    };
+    let mut imported = Vec::new();
+    let mut retained_bytes = 0_usize;
+    import_io::for_each_json_value(&path, |value| {
+        let Some(message) = parse_rollout_message(&value).and_then(to_imported) else {
+            return true;
+        };
+        import_io::push_imported_bounded(&mut imported, &mut retained_bytes, message)
+    });
+    imported
+}
+
 /// `$CODEX_HOME/sessions`, or the platform user profile's `.codex/sessions`.
 fn sessions_dir() -> Option<PathBuf> {
     sessions_dir_from_codex_home(config::codex_home_dir())

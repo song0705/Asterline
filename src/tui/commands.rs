@@ -67,6 +67,36 @@ pub fn parse(input: &str) -> Submission {
     Submission::NeedsTarget
 }
 
+/// `@member` / `@all` / `/ask member` / `/all` typed with no message body.
+/// Lets an image-only send keep an explicit target.
+pub fn parse_target_only(input: &str) -> Option<MessageTarget> {
+    let trimmed = input.trim();
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        let (member, body) = split_first_word(rest);
+        if !member.is_empty() && body.is_empty() {
+            return Some(target_from_member_token(member));
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("/ask") {
+        let (member, body) = split_first_word(rest);
+        if !member.is_empty() && body.is_empty() {
+            return Some(target_from_member_token(member));
+        }
+    }
+    if trimmed == "/all" {
+        return Some(MessageTarget::All);
+    }
+    None
+}
+
+fn target_from_member_token(member: &str) -> MessageTarget {
+    if member == "all" {
+        MessageTarget::All
+    } else {
+        MessageTarget::Member(MemberId::new(member))
+    }
+}
+
 fn parse_slash(rest: &str) -> Submission {
     let (cmd, arg) = split_first_word(rest);
     match cmd {
@@ -129,6 +159,7 @@ fn parse_slash(rest: &str) -> Submission {
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
         "reject" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Reject),
+        "mode" if arg.is_empty() => Submission::Drawer(Drawer::Mode),
         "mode" => parse_mode_selector(arg),
         "find" => Submission::FindInChat(arg.to_string()),
         "continue" => {
@@ -451,6 +482,22 @@ mod tests {
     #[test]
     fn plain_text_requires_an_explicit_target_prefix() {
         assert_eq!(parse("build the parser"), Submission::NeedsTarget);
+    }
+
+    #[test]
+    fn target_only_accepts_member_or_all_without_a_body() {
+        assert_eq!(
+            parse_target_only("@builder"),
+            Some(MessageTarget::Member(MemberId::new("builder")))
+        );
+        assert_eq!(parse_target_only("@all"), Some(MessageTarget::All));
+        assert_eq!(
+            parse_target_only("/ask reviewer"),
+            Some(MessageTarget::Member(MemberId::new("reviewer")))
+        );
+        assert_eq!(parse_target_only("/all"), Some(MessageTarget::All));
+        assert_eq!(parse_target_only("@builder look"), None);
+        assert_eq!(parse_target_only(""), None);
     }
 
     #[test]
@@ -834,7 +881,7 @@ mod tests {
                 Submission::Runtime(UiCommand::SetMode { mode })
             );
         }
-        assert_eq!(parse("/mode"), Submission::Help);
+        assert_eq!(parse("/mode"), Submission::Drawer(Drawer::Mode));
         assert_eq!(parse("/mode review fix parser"), Submission::Help);
     }
 

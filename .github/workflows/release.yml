@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Candidate version without the v prefix (must match Cargo.toml)"
+        required: true
+        type: string
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release preflight v{0}', inputs.version) || format('Release {0}', github.ref_name) }}
 
 permissions:
   contents: read
@@ -22,6 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag_object: ${{ steps.provenance.outputs.tag_object }}
+      release_tag: ${{ steps.provenance.outputs.release_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,29 +45,48 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PREFLIGHT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          test "$GITHUB_REF_NAME" = "v$version"
-          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
-          tagged_commit=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
-          test "$tagged_commit" = "$GITHUB_SHA"
-          git merge-base --is-ancestor "$tagged_commit" origin/main
-          tag_object=$(git rev-parse "refs/tags/$GITHUB_REF_NAME")
-          remote_tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
-          test "$remote_tag_object" = "$tag_object"
-          printf 'tag_object=%s\n' "$tag_object" >> "$GITHUB_OUTPUT"
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            test "$PREFLIGHT_VERSION" = "$version"
+            release_tag="v$version"
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+            test -z "$(git tag --list "$release_tag")"
+            ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1
+            printf 'tag_object=\n' >> "$GITHUB_OUTPUT"
+          else
+            release_tag="$GITHUB_REF_NAME"
+            test "$release_tag" = "v$version"
+            test "$(git cat-file -t "refs/tags/$release_tag")" = tag
+            tagged_commit=$(git rev-parse "refs/tags/$release_tag^{commit}")
+            test "$tagged_commit" = "$GITHUB_SHA"
+            git merge-base --is-ancestor "$tagged_commit" origin/main
+            tag_object=$(git rev-parse "refs/tags/$release_tag")
+            remote_tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" --jq .object.sha)
+            test "$remote_tag_object" = "$tag_object"
+            printf 'tag_object=%s\n' "$tag_object" >> "$GITHUB_OUTPUT"
+            preflight_count=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs?event=workflow_dispatch&head_sha=$GITHUB_SHA&status=completed&per_page=100" \
+              | jq --slurp '[.[] | .workflow_runs[] | select(.name == "Release" and .conclusion == "success")] | length')
+            if test "$preflight_count" -lt 1; then
+              echo "A successful Release preflight for $GITHUB_SHA is required before pushing $release_tag." >&2
+              exit 1
+            fi
+          fi
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
           releases="$RUNNER_TEMP/asterline-releases.json"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            | jq --slurp --arg tag "$GITHUB_REF_NAME" \
+            | jq --slurp --arg tag "$release_tag" \
               '[.[][] | select(.tag_name == $tag)]' > "$releases"
           test "$(jq length "$releases")" -le 1
           if test "$(jq length "$releases")" -eq 1; then
             if test "$(jq -r '.[0].draft' "$releases")" = false; then
-              echo "A published release already exists for $GITHUB_REF_NAME; published version tags are never reused." >&2
+              echo "A published release already exists for $release_tag; published version tags are never reused." >&2
               exit 1
             fi
-            echo "An incomplete draft exists for $GITHUB_REF_NAME; publish will replace it after every gate passes."
+            echo "An incomplete draft exists for $release_tag; publish will replace it after every gate passes."
           fi
       - name: Format
         run: cargo fmt --check
@@ -70,6 +98,11 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit dependencies
         run: cargo audit
+      - name: Require the Homebrew tap credential
+        if: github.event_name == 'push'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: test -n "$HOMEBREW_TAP_TOKEN"
 
   quality-platforms:
     name: Test ${{ matrix.name }}
@@ -105,6 +138,8 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-09
@@ -120,7 +155,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           package="asterline-${version}-${{ matrix.target }}"
           mkdir -p "dist/$package"
           cp "target/${{ matrix.target }}/release/asterline" "dist/$package/"
@@ -133,7 +168,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $version = $env:RELEASE_TAG -replace '^v', ''
           $package = "asterline-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/asterline.exe" "dist/$package/"
@@ -145,7 +180,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $version = $env:RELEASE_TAG -replace '^v', ''
           ./scripts/build-windows-installer.ps1 -Version $version
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -174,6 +209,8 @@ jobs:
             release_arch: arm64
             image: quay.io/pypa/manylinux_2_28_aarch64@sha256:b9dd5b2d6885fae144119ac934978003bcc413087ea08f602a960257205ec246
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     container:
       image: ${{ matrix.image }}
     steps:
@@ -204,7 +241,7 @@ jobs:
       - name: Package release archive
         shell: bash
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           archive_root="asterline-${version}-${{ matrix.target }}"
           mkdir -p "dist/$archive_root"
           cp "target/${{ matrix.target }}/release/asterline" "dist/$archive_root/"
@@ -223,7 +260,7 @@ jobs:
 
   package-debian:
     name: Package Debian / Ubuntu Linux ${{ matrix.release_arch }}
-    needs: build-linux
+    needs: [quality, build-linux]
     strategy:
       fail-fast: false
       matrix:
@@ -239,6 +276,8 @@ jobs:
             release_arch: arm64
             image: debian@sha256:4466bf7af8c14212301aa7b61cb9504f97041992e541eaad4af4ded52308037c
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     container:
       image: ${{ matrix.image }}
     steps:
@@ -260,7 +299,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           archive="dist/input/asterline-v$version-Linux-${{ matrix.release_arch }}.tar.gz"
           ./scripts/package-deb.sh \
             "$version" \
@@ -272,7 +311,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package="dist/asterline-v${GITHUB_REF_NAME#v}-Linux-${{ matrix.release_arch }}.deb"
+          package="dist/asterline-v${RELEASE_TAG#v}-Linux-${{ matrix.release_arch }}.deb"
           ./scripts/smoke-deb-package.sh "$package" "${{ matrix.deb_arch }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -284,7 +323,7 @@ jobs:
 
   smoke-deb-ubuntu:
     name: Smoke test Ubuntu Linux package ${{ matrix.release_arch }}
-    needs: package-debian
+    needs: [quality, package-debian]
     strategy:
       fail-fast: false
       matrix:
@@ -296,6 +335,8 @@ jobs:
             deb_arch: arm64
             release_arch: arm64
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -306,12 +347,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package="dist/asterline-v${GITHUB_REF_NAME#v}-Linux-${{ matrix.release_arch }}.deb"
+          package="dist/asterline-v${RELEASE_TAG#v}-Linux-${{ matrix.release_arch }}.deb"
           ./scripts/smoke-deb-package.sh "$package" "${{ matrix.deb_arch }}"
 
   package-rpm:
     name: Package RPM Linux ${{ matrix.release_arch }}
-    needs: build-linux
+    needs: [quality, build-linux]
     strategy:
       fail-fast: false
       matrix:
@@ -327,6 +368,8 @@ jobs:
             release_arch: arm64
             image: rockylinux/rockylinux:8@sha256:f514765516176a9aa4729ee83964e5a1900df95fd4bc7182cca64c7199b7eec7
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     container:
       image: ${{ matrix.image }}
     steps:
@@ -348,7 +391,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           archive="dist/input/asterline-v$version-Linux-${{ matrix.release_arch }}.tar.gz"
           ./scripts/package-rpm.sh \
             "$version" \
@@ -360,7 +403,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package="dist/asterline-v${GITHUB_REF_NAME#v}-Linux-${{ matrix.release_arch }}.rpm"
+          package="dist/asterline-v${RELEASE_TAG#v}-Linux-${{ matrix.release_arch }}.rpm"
           ./scripts/smoke-rpm-package.sh "$package" "${{ matrix.rpm_arch }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -372,7 +415,7 @@ jobs:
 
   smoke-rpm-fedora:
     name: Smoke test Fedora RPM ${{ matrix.release_arch }}
-    needs: package-rpm
+    needs: [quality, package-rpm]
     strategy:
       fail-fast: false
       matrix:
@@ -386,6 +429,8 @@ jobs:
             release_arch: arm64
             image: fedora:44@sha256:a471bd8bf8e7e99812fd2f29fc950685d860b3d528b9f090443dbc1a0d2bad62
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     container:
       image: ${{ matrix.image }}
     steps:
@@ -406,13 +451,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package="dist/asterline-v${GITHUB_REF_NAME#v}-Linux-${{ matrix.release_arch }}.rpm"
+          package="dist/asterline-v${RELEASE_TAG#v}-Linux-${{ matrix.release_arch }}.rpm"
           ./scripts/smoke-rpm-package.sh "$package" "${{ matrix.rpm_arch }}"
 
   package-macos:
     name: Package universal macOS DMG
-    needs: build
+    needs: [quality, build]
     runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ needs.quality.outputs.release_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -469,7 +516,7 @@ jobs:
       - name: Build universal installer DMG
         shell: bash
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           x86_dir="$RUNNER_TEMP/asterline-x86_64"
           arm_dir="$RUNNER_TEMP/asterline-arm64"
           mkdir -p "$x86_dir" "$arm_dir"
@@ -497,7 +544,7 @@ jobs:
           notary_key="$RUNNER_TEMP/AuthKey_$NOTARY_KEY_ID.p8"
           printf '%s' "$NOTARY_KEY_P8_BASE64" > "$encoded"
           base64 --decode -i "$encoded" -o "$notary_key"
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           dmg="dist/asterline-$version-macos-universal.dmg"
           xcrun notarytool submit "$dmg" \
             --key "$notary_key" \
@@ -509,7 +556,7 @@ jobs:
       - name: Smoke test DMG and package payload
         shell: bash
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           dmg="dist/asterline-$version-macos-universal.dmg"
           mount_point="$RUNNER_TEMP/asterline-dmg"
           expanded="$RUNNER_TEMP/asterline-expanded-pkg"
@@ -544,7 +591,7 @@ jobs:
 
   smoke-windows-installer:
     name: Smoke test Windows Setup
-    needs: build
+    needs: [quality, build]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -561,6 +608,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [quality, build, build-linux, package-debian, smoke-deb-ubuntu, package-rpm, smoke-rpm-fedora, package-macos, smoke-windows-installer]
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -708,3 +756,92 @@ jobs:
           test "$(jq -r .object.sha <<< "$tag_json")" = "$GITHUB_SHA"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           test "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+
+  update-homebrew:
+    name: Open Homebrew Formula update
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: song0705/homebrew-asterline
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-asterline
+      - name: Download published Homebrew checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/homebrew-release"
+          mkdir -p "$directory"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir "$directory"
+      - name: Update the Formula archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          checksums="$RUNNER_TEMP/homebrew-release/SHA256SUMS"
+          checksum_for() {
+            awk -v asset="$1" '
+              $2 == asset { value = $1; count += 1 }
+              END {
+                if (count != 1 || length(value) != 64 || value !~ /^[0-9a-f]+$/) exit 1
+                print value
+              }
+            ' "$checksums"
+          }
+          ruby scripts/update-homebrew-formula.rb \
+            homebrew-asterline/Formula/asterline.rb \
+            "$version" \
+            "$(checksum_for "asterline-$version-aarch64-apple-darwin.tar.gz")" \
+            "$(checksum_for "asterline-$version-x86_64-apple-darwin.tar.gz")" \
+            "$(checksum_for "asterline-v$version-Linux-arm64.tar.gz")" \
+            "$(checksum_for "asterline-v$version-Linux-x86_64.tar.gz")"
+      - name: Validate the Formula on macOS
+        working-directory: homebrew-asterline
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew style Formula/asterline.rb
+          brew install --formula ./Formula/asterline.rb
+          brew test asterline
+      - name: Commit and open Formula pull request
+        working-directory: homebrew-asterline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          branch="automation/asterline-v$version"
+          git checkout -B "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/asterline.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "asterline $version"
+          git push --force origin "$branch"
+          existing_pr=$(gh pr list \
+            --repo song0705/homebrew-asterline \
+            --base main \
+            --head "$branch" \
+            --state open \
+            --json url \
+            --jq '.[0].url')
+          if test -z "$existing_pr"; then
+            gh pr create \
+              --repo song0705/homebrew-asterline \
+              --base main \
+              --head "$branch" \
+              --title "asterline $version" \
+              --body "Automated Formula update for Asterline v$version."
+          fi

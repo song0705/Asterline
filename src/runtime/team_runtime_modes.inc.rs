@@ -26,12 +26,32 @@ impl TeamRuntime {
             return;
         }
 
-        let (roles, limits) = match resolve_mode_roles(&self.config, mode) {
+        let (roles, limits) = match resolve_mode_roles(&self.effective_config(), mode) {
             Ok(resolved) => resolved,
             Err(err) => {
                 step.events.push(RuntimeEvent::Notice(err));
                 return;
             }
+        };
+        let (plan_builder, plan_reviewer, auto_execute) = if mode == CollabMode::Plan {
+            let config = self.effective_config();
+            let builder = match resolve_plan_builder(&config) {
+                Ok(builder) => builder,
+                Err(err) => {
+                    step.events.push(RuntimeEvent::Notice(err));
+                    return;
+                }
+            };
+            let reviewer = match resolve_plan_reviewer(&config) {
+                Ok(reviewer) => reviewer,
+                Err(err) => {
+                    step.events.push(RuntimeEvent::Notice(err));
+                    return;
+                }
+            };
+            (Some(builder), reviewer, resolve_plan_auto_execute(&config))
+        } else {
+            (None, None, true)
         };
 
         let (phase, iteration, round) = match mode {
@@ -46,8 +66,10 @@ impl TeamRuntime {
             phase,
             task: task.clone(),
             builder: roles.builder.clone(),
-            reviewer: roles.reviewer.clone(),
+            reviewer: plan_reviewer.clone().unwrap_or_else(|| roles.reviewer.clone()),
             leader: roles.leader.clone(),
+            plan_builder,
+            plan_reviewer,
             participants: roles.participants.clone(),
             iteration,
             max_iterations: limits.max_iterations,
@@ -56,6 +78,7 @@ impl TeamRuntime {
             ideas_per_round: limits.ideas_per_round,
             idea_count: 0,
             auto_verify: limits.auto_verify,
+            auto_execute,
             verify_command: limits.verify_command.clone(),
             builder_output: String::new(),
             reviewer_nudged: false,
@@ -116,8 +139,13 @@ impl TeamRuntime {
 
         match mode {
             CollabMode::Review => {
+                let verify = format_verify_label(
+                    limits.auto_verify,
+                    limits.verify_command.as_deref(),
+                    suggested_verify_command(&self.config.workspace),
+                );
                 step.events.push(RuntimeEvent::Notice(format!(
-                    "review {run_id} started → {} (reviewer: {})",
+                    "review {run_id} started → {} (reviewer: {}) · {verify}",
                     session.builder, session.reviewer
                 )));
                 let builder = session.builder.clone();
@@ -136,9 +164,28 @@ impl TeamRuntime {
                 );
             }
             CollabMode::Plan => {
+                let builder = session
+                    .plan_builder
+                    .as_ref()
+                    .expect("plan start validates its required builder");
+                let reviewer = session
+                    .plan_reviewer
+                    .as_ref()
+                    .map(|reviewer| reviewer.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let execution = if session.auto_execute {
+                    "auto execute"
+                } else {
+                    "manual execution confirmation"
+                };
+                let verify = format_verify_label(
+                    limits.auto_verify,
+                    limits.verify_command.as_deref(),
+                    suggested_verify_command(&self.config.workspace),
+                );
                 step.events.push(RuntimeEvent::Notice(format!(
-                    "plan {run_id} started → {} (reviewer: {})",
-                    session.leader, session.reviewer
+                    "plan {run_id} started → {} (builder: {builder}; reviewer: {reviewer}; {execution}) · {verify}",
+                    session.leader
                 )));
                 let leader = session.leader.clone();
                 self.mode_sessions.insert(run_id, session);
@@ -398,45 +445,15 @@ impl TeamRuntime {
                 if !self.persist_mode_state(run_id, step) {
                     return;
                 }
-                let (auto_verify, configured) = self
-                    .mode_sessions
-                    .get(&run_id)
-                    .map(|s| (s.auto_verify, s.verify_command.clone()))
-                    .unwrap_or((false, None));
-                if auto_verify
-                    && let Some(cmd) = crate::domain::mode::resolve_verify_command(
-                        configured.as_deref(),
-                        suggested_verify_command(&self.config.workspace),
-                    )
-                {
-                    if let Some(session) = self.mode_sessions.get_mut(&run_id) {
-                        session.phase = ModePhase::Verifying;
-                    }
-                    if !self.persist_mode_state(run_id, step) {
+                if session.mode == CollabMode::Plan {
+                    let Some(builder) = session.plan_builder.clone() else {
+                        self.block_mode_run(run_id, "plan mode needs a builder", step);
                         return;
-                    }
-                    match self
-                        .store
-                        .update_run_status(run_id, RunStatus::Verifying)
-                    {
-                        Ok(run) => step.events.push(RuntimeEvent::RunUpdated { run }),
-                        Err(err) => {
-                            self.report_store_error("start mode verification", err, step);
-                            return;
-                        }
-                    }
-                    step.events.push(RuntimeEvent::Notice(format!(
-                        "verifying {run_id}: {cmd}"
-                    )));
-                    step.verify_actions.push(VerifyAction {
-                        run_id,
-                        command: cmd,
-                        workspace: self.config.workspace.clone(),
-                        cancel: Arc::new(AtomicBool::new(false)),
-                    });
+                    };
+                    self.mode_plan_dispatch_builder(run_id, &builder, step);
                     return;
                 }
-                self.finish_mode_run_approved(run_id, step);
+                self.mode_start_verification_or_finish(run_id, step);
             }
             Some(PersistedReviewVerdict {
                 verdict: PersistedReviewVerdictKind::RequestChanges,
@@ -483,9 +500,203 @@ impl TeamRuntime {
                         }
                     })
                     .unwrap_or_else(|| "(reviewer gave no verdict)".to_string());
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "{} {run_id}: {} gave no structured @@review verdict — treating the reply as request_changes",
+                    session.mode, session.reviewer
+                )));
                 self.mode_request_changes(run_id, feedback, step);
             }
         }
+    }
+
+    fn mode_start_verification_or_finish(&mut self, run_id: RunId, step: &mut RuntimeStep) {
+        let (auto_verify, configured) = self
+            .mode_sessions
+            .get(&run_id)
+            .map(|s| (s.auto_verify, s.verify_command.clone()))
+            .unwrap_or((false, None));
+        if auto_verify
+            && let Some(cmd) = crate::domain::mode::resolve_verify_command(
+                configured.as_deref(),
+                suggested_verify_command(&self.config.workspace),
+            )
+        {
+            if let Some(session) = self.mode_sessions.get_mut(&run_id) {
+                session.phase = ModePhase::Verifying;
+            }
+            if !self.persist_mode_state(run_id, step) {
+                return;
+            }
+            match self.store.update_run_status(run_id, RunStatus::Verifying) {
+                Ok(run) => step.events.push(RuntimeEvent::RunUpdated { run }),
+                Err(err) => {
+                    self.report_store_error("start mode verification", err, step);
+                    return;
+                }
+            }
+            step.events
+                .push(RuntimeEvent::Notice(format!("verifying {run_id}: {cmd}")));
+            step.verify_actions.push(VerifyAction {
+                run_id,
+                command: cmd,
+                workspace: self.config.workspace.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+            return;
+        }
+        self.finish_mode_run_approved(run_id, step);
+    }
+
+    fn mode_plan_dispatch_builder(
+        &mut self,
+        run_id: RunId,
+        builder: &MemberId,
+        step: &mut RuntimeStep,
+    ) {
+        let steps = match self.store.run_steps_all(run_id) {
+            Ok(steps) => steps,
+            Err(err) => {
+                self.report_store_error("load the approved plan checklist", err, step);
+                self.block_mode_run(run_id, "approved plan checklist is unavailable", step);
+                return;
+            }
+        };
+        let executable = steps
+            .iter()
+            .filter(|item| item.status != RunStepStatus::Done)
+            .map(|item| (item.number, item.title.clone()))
+            .collect::<Vec<_>>();
+        if executable.is_empty() {
+            self.block_mode_run(run_id, "approved plan has no executable steps", step);
+            return;
+        }
+
+        let mut last_run = None;
+        for (number, _) in &executable {
+            match self.store.assign_run_step(run_id, *number, Some(builder)) {
+                Ok(_) => {}
+                Err(err) => {
+                    self.report_store_error("assign an approved plan step to the builder", err, step);
+                    self.block_mode_run(run_id, "could not dispatch the approved plan", step);
+                    return;
+                }
+            }
+            match self
+                .store
+                .update_run_step(run_id, *number, RunStepStatus::Doing, None)
+            {
+                Ok(run) => last_run = Some(run),
+                Err(err) => {
+                    self.report_store_error("start an approved plan step", err, step);
+                    self.block_mode_run(run_id, "could not dispatch the approved plan", step);
+                    return;
+                }
+            }
+        }
+        if let Some(run) = last_run {
+            step.events.push(RuntimeEvent::RunUpdated { run });
+        }
+        let (leader, mode, iteration, max_iterations, auto_execute) = {
+            let session = &self.mode_sessions[&run_id];
+            (
+                session.leader.clone(),
+                session.mode,
+                session.iteration,
+                session.max_iterations,
+                session.auto_execute,
+            )
+        };
+        if let Some(session) = self.mode_sessions.get_mut(&run_id) {
+            session.phase = if auto_execute {
+                ModePhase::Executing
+            } else {
+                ModePhase::AwaitingExecution
+            };
+            session.owner_nudged = false;
+        }
+        if !self.persist_mode_state(run_id, step) {
+            return;
+        }
+        let prompt = step_dispatch_prompt(run_id, &leader, &executable);
+        let display = format!(
+            "[{mode} {run_id} · iter {iteration}/{max_iterations}] → {builder}: execute approved plan"
+        );
+        if auto_execute {
+            self.mode_dispatch(run_id, std::slice::from_ref(builder), prompt, display, step);
+        } else {
+            self.mode_request_plan_execution_approval(run_id, builder, prompt, display, step);
+        }
+    }
+
+    fn mode_request_plan_execution_approval(
+        &mut self,
+        run_id: RunId,
+        builder: &MemberId,
+        prompt: String,
+        display: String,
+        step: &mut RuntimeStep,
+    ) {
+        let turn = match self.store.create_turn() {
+            Ok(turn) => turn,
+            Err(err) => {
+                self.report_store_error("create a plan execution confirmation", err, step);
+                self.block_mode_run(run_id, "could not request plan execution confirmation", step);
+                return;
+            }
+        };
+        if let Err(err) = self.store.record_user(turn, std::slice::from_ref(builder), &display) {
+            self.report_store_error("save a plan execution confirmation", err, step);
+            self.block_mode_run(run_id, "could not request plan execution confirmation", step);
+            return;
+        }
+        step.events.push(RuntimeEvent::TurnStarted { turn });
+        step.events.push(RuntimeEvent::UserMessage {
+            turn,
+            targets: vec![builder.clone()],
+            body: display.clone(),
+        });
+        self.run_turns.insert(turn, run_id);
+        let body = format!("{display}\n\nApprove to send the approved plan to {builder}.");
+        match self
+            .store
+            .insert_approval(Some(turn), None, "plan_execution", &body)
+        {
+            Ok(id) => {
+                self.held_approvals.insert(
+                    id,
+                    HeldApproval {
+                        turn,
+                        targets: vec![builder.clone()],
+                        prompt,
+                        mode_run: Some(run_id),
+                        member_request: None,
+                    },
+                );
+                step.events.push(RuntimeEvent::ApprovalRequested {
+                    id,
+                    member: None,
+                    action: "plan_execution".to_string(),
+                    body,
+                });
+            }
+            Err(err) => {
+                self.report_store_error("save a plan execution confirmation", err, step);
+                self.block_mode_run(run_id, "could not request plan execution confirmation", step);
+                self.check_turn_complete(turn, step);
+            }
+        }
+    }
+
+    fn mode_plan_confirm_execution(&mut self, run_id: RunId, step: &mut RuntimeStep) -> bool {
+        let Some(session) = self.mode_sessions.get_mut(&run_id) else {
+            return false;
+        };
+        if session.mode != CollabMode::Plan || session.phase != ModePhase::AwaitingExecution {
+            return true;
+        }
+        session.phase = ModePhase::Executing;
+        session.owner_nudged = false;
+        self.persist_mode_state(run_id, step)
     }
 
     fn mode_plan_on_turn_complete(&mut self, run_id: RunId, step: &mut RuntimeStep) {
@@ -611,24 +822,7 @@ impl TeamRuntime {
             }
         };
 
-        if let Some(owner) = steps
-            .iter()
-            .filter_map(|step| step.owner.as_ref())
-            .find(|owner| self.config.member(owner).is_none())
-        {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "plan checklist contains unknown owner {owner}"
-            )));
-            self.block_mode_run(run_id, "plan checklist has an unknown owner", step);
-            return;
-        }
-
-        let owned_todos: Vec<&RunStepSummary> = steps
-            .iter()
-            .filter(|s| s.owner.is_some() && s.status == RunStepStatus::Todo)
-            .collect();
-
-        if owned_todos.is_empty() {
+        if steps.is_empty() {
             if !session.reviewer_nudged {
                 if let Some(s) = self.mode_sessions.get_mut(&run_id) {
                     s.reviewer_nudged = true;
@@ -655,46 +849,41 @@ impl TeamRuntime {
             return;
         }
 
-        // Mark owned todos as Doing; emit only the last RunUpdated.
-        let mut last_run = None;
-        for s in &owned_todos {
-            match self
-                .store
-                .update_run_step(run_id, s.number, RunStepStatus::Doing, None)
-            {
-                Ok(run) => last_run = Some(run),
-                Err(err) => {
-                    self.report_store_error("start a plan checklist step", err, step);
-                    self.block_mode_run(run_id, "could not persist checklist progress", step);
-                    return;
-                }
-            }
-        }
-        if let Some(run) = last_run {
-            step.events.push(RuntimeEvent::RunUpdated { run });
-        }
-
+        let Some(reviewer) = session.plan_reviewer.clone() else {
+            let Some(builder) = session.plan_builder.clone() else {
+                self.block_mode_run(run_id, "plan mode needs a builder", step);
+                return;
+            };
+            self.mode_plan_dispatch_builder(run_id, &builder, step);
+            return;
+        };
         if let Some(s) = self.mode_sessions.get_mut(&run_id) {
-            s.phase = ModePhase::Executing;
-            s.owner_nudged = false;
+            s.phase = ModePhase::Reviewing;
+            s.reviewer_nudged = false;
+            s.pending_verdict = None;
+            s.reviewer_last_text.clear();
         }
         if !self.persist_mode_state(run_id, step) {
             return;
         }
 
-        let (max_iterations, iteration, mode) = {
+        let (max_iterations, iteration, mode, verify_command) = {
             let s = &self.mode_sessions[&run_id];
-            (s.max_iterations, s.iteration, s.mode)
+            (
+                s.max_iterations,
+                s.iteration,
+                s.mode,
+                s.verify_command.clone(),
+            )
         };
-        let leader = session.leader.clone();
-        let dispatches = plan_owner_dispatches(run_id, &leader, owned_todos.iter().copied());
-        let owners: Vec<String> = dispatches.iter().map(|(m, _)| m.to_string()).collect();
-        self.mode_dispatch_multi(
+        let summary = format_lead_steps_summary(&steps);
+        let prompt = plan_review_prompt(&session.task, &summary, verify_command.as_deref());
+        self.mode_dispatch(
             run_id,
-            dispatches,
+            std::slice::from_ref(&reviewer),
+            prompt,
             format!(
-                "[{mode} {run_id} · iter {iteration}/{max_iterations}] → {}: execute",
-                owners.join(", ")
+                "[{mode} {run_id} · iter {iteration}/{max_iterations}] → {reviewer}: review plan"
             ),
             step,
         );
@@ -721,39 +910,7 @@ impl TeamRuntime {
             .collect();
 
         if unfinished.is_empty() {
-            if let Some(s) = self.mode_sessions.get_mut(&run_id) {
-                s.reviewer_nudged = false;
-                s.owner_nudged = false;
-                s.phase = ModePhase::Reviewing;
-                s.pending_verdict = None;
-                s.reviewer_last_text.clear();
-            }
-            if !self.persist_mode_state(run_id, step) {
-                return;
-            }
-
-            let steps_summary = format_lead_steps_summary(&steps);
-            let task = session.task.clone();
-            let (reviewer, max_iterations, iteration, mode, verify_cmd) = {
-                let s = &self.mode_sessions[&run_id];
-                (
-                    s.reviewer.clone(),
-                    s.max_iterations,
-                    s.iteration,
-                    s.mode,
-                    s.verify_command.clone(),
-                )
-            };
-            let prompt = plan_review_prompt(&task, &steps_summary, verify_cmd.as_deref());
-            self.mode_dispatch(
-                run_id,
-                std::slice::from_ref(&reviewer),
-                prompt,
-                format!(
-                    "[{mode} {run_id} · iter {iteration}/{max_iterations}] → {reviewer}: review"
-                ),
-                step,
-            );
+            self.mode_start_verification_or_finish(run_id, step);
             return;
         }
 
@@ -1532,6 +1689,7 @@ impl TeamRuntime {
         let builder = session.builder.clone();
         let reviewer = session.reviewer.clone();
         let leader = session.leader.clone();
+        let plan_builder = session.plan_builder.clone();
         let iteration = session.iteration;
         let max_iterations = session.max_iterations;
         let mode = session.mode;
@@ -1572,6 +1730,13 @@ impl TeamRuntime {
             }
             ModePhase::Planning => {
                 self.mode_resume_planning(run.id, step);
+            }
+            ModePhase::AwaitingExecution => {
+                let Some(builder) = plan_builder else {
+                    self.block_mode_run(run.id, "plan mode needs a builder", step);
+                    return;
+                };
+                self.mode_plan_dispatch_builder(run.id, &builder, step);
             }
             ModePhase::Executing => {
                 let steps = match self.store.run_steps_all(run.id) {
@@ -1694,13 +1859,18 @@ impl TeamRuntime {
                         verify_cmd.as_deref(),
                     )
                 };
+                let label = if mode == CollabMode::Plan {
+                    "review plan"
+                } else {
+                    "review"
+                };
                 self.mode_dispatch(
                     run.id,
                     std::slice::from_ref(&reviewer),
                     prompt,
                     format!(
-                        "[{mode} {} · iter {iteration}/{max_iterations}] → {reviewer}: review",
-                        run.id
+                        "[{mode} {} · iter {iteration}/{max_iterations}] → {reviewer}: {label}",
+                        run.id,
                     ),
                     step,
                 );
@@ -1773,7 +1943,16 @@ impl TeamRuntime {
 fn mode_resume_missing_members(session: &ModeSession, config: &TeamConfig) -> Vec<String> {
     let mut needed: Vec<&MemberId> = match session.mode {
         CollabMode::Review => vec![&session.builder, &session.reviewer],
-        CollabMode::Plan => vec![&session.leader, &session.reviewer],
+        CollabMode::Plan => {
+            let mut members = vec![&session.leader];
+            if let Some(reviewer) = &session.plan_reviewer {
+                members.push(reviewer);
+            }
+            if let Some(builder) = &session.plan_builder {
+                members.push(builder);
+            }
+            members
+        }
         CollabMode::Brainstorm => session.participants.iter().collect(),
         CollabMode::Team => Vec::new(),
     };
@@ -1863,6 +2042,7 @@ fn format_unfinished_step_lines(steps: &[&RunStepSummary]) -> Vec<String> {
 enum ModePhase {
     Building,
     Planning,
+    AwaitingExecution,
     Executing,
     Diverging,
     Voting,
@@ -1930,6 +2110,14 @@ struct ModeSession {
     builder: MemberId,
     reviewer: MemberId,
     leader: MemberId,
+    /// Optional execution handoff for Plan mode. Older persisted sessions
+    /// retain `None`, which is blocked rather than silently inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_builder: Option<MemberId>,
+    /// Optional Plan-only reviewer. Omission deliberately skips the review
+    /// phase; `reviewer` retains a harmless derived value for shared fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_reviewer: Option<MemberId>,
     participants: Vec<MemberId>,
     iteration: u32,
     max_iterations: u32,
@@ -1942,6 +2130,8 @@ struct ModeSession {
     #[serde(default)]
     idea_count: u32,
     auto_verify: bool,
+    #[serde(default = "default_auto_execute")]
+    auto_execute: bool,
     /// Explicit auto-verify command from mode config (review/plan).
     #[serde(default)]
     verify_command: Option<String>,
@@ -1974,6 +2164,10 @@ struct ModeSession {
 
 fn default_ideas_per_round() -> u32 {
     4
+}
+
+fn default_auto_execute() -> bool {
+    true
 }
 
 const MODE_TEXT_LIMIT: usize = 4000;

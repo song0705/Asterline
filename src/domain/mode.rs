@@ -27,6 +27,14 @@ pub enum TerminalMode {
 }
 
 impl TerminalMode {
+    pub const ALL: [Self; 5] = [
+        Self::Normal,
+        Self::Review,
+        Self::Plan,
+        Self::Brainstorm,
+        Self::Team,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
@@ -124,6 +132,385 @@ impl ModesConfig {
     }
 }
 
+/// Where a single mode knob currently comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModeValueSource {
+    Default,
+    TeamJson,
+    Conversation,
+}
+
+impl ModeValueSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::TeamJson => "team.json",
+            Self::Conversation => "this chat",
+        }
+    }
+}
+
+/// Field-level merge: each `Some` in `overrides` replaces that field only.
+pub fn merge_modes(defaults: &ModesConfig, overrides: &ModesConfig) -> ModesConfig {
+    ModesConfig {
+        review: merge_review(&defaults.review, &overrides.review),
+        plan: merge_plan(&defaults.plan, &overrides.plan),
+        brainstorm: merge_brainstorm(&defaults.brainstorm, &overrides.brainstorm),
+        team: merge_team(&defaults.team, &overrides.team),
+    }
+}
+
+/// Copy `config` with `modes` replaced by the field-level merge of defaults and overrides.
+pub fn apply_mode_overrides(config: &TeamConfig, overrides: &ModesConfig) -> TeamConfig {
+    let mut merged = config.clone();
+    merged.modes = merge_modes(&config.modes, overrides);
+    merged
+}
+
+pub fn mode_field_source(overridden: bool, in_team_json: bool) -> ModeValueSource {
+    if overridden {
+        ModeValueSource::Conversation
+    } else if in_team_json {
+        ModeValueSource::TeamJson
+    } else {
+        ModeValueSource::Default
+    }
+}
+
+/// Keep only the selected mode's override block.
+pub fn mode_overrides_for(overrides: &ModesConfig, mode: TerminalMode) -> ModesConfig {
+    match mode {
+        TerminalMode::Normal => ModesConfig::default(),
+        TerminalMode::Review => ModesConfig {
+            review: overrides.review.clone(),
+            ..ModesConfig::default()
+        },
+        TerminalMode::Plan => ModesConfig {
+            plan: overrides.plan.clone(),
+            ..ModesConfig::default()
+        },
+        TerminalMode::Brainstorm => ModesConfig {
+            brainstorm: overrides.brainstorm.clone(),
+            ..ModesConfig::default()
+        },
+        TerminalMode::Team => ModesConfig {
+            team: overrides.team.clone(),
+            ..ModesConfig::default()
+        },
+    }
+}
+
+pub fn clear_mode_overrides(overrides: &mut ModesConfig, mode: TerminalMode) {
+    match mode {
+        TerminalMode::Normal => {}
+        TerminalMode::Review => overrides.review = None,
+        TerminalMode::Plan => overrides.plan = None,
+        TerminalMode::Brainstorm => overrides.brainstorm = None,
+        TerminalMode::Team => overrides.team = None,
+    }
+}
+
+pub fn prune_empty_mode_overrides(overrides: &mut ModesConfig) {
+    if overrides
+        .review
+        .as_ref()
+        .is_some_and(review_config_is_empty)
+    {
+        overrides.review = None;
+    }
+    if overrides.plan.as_ref().is_some_and(plan_config_is_empty) {
+        overrides.plan = None;
+    }
+    if overrides
+        .brainstorm
+        .as_ref()
+        .is_some_and(brainstorm_config_is_empty)
+    {
+        overrides.brainstorm = None;
+    }
+    if overrides.team.as_ref().is_some_and(team_config_is_empty) {
+        overrides.team = None;
+    }
+}
+
+fn review_config_is_empty(config: &ReviewModeConfig) -> bool {
+    config.builder.is_none()
+        && config.reviewer.is_none()
+        && config.max_iterations.is_none()
+        && config.auto_verify.is_none()
+        && config.verify_command.is_none()
+}
+
+fn plan_config_is_empty(config: &PlanModeConfig) -> bool {
+    config.leader.is_none()
+        && config.builder.is_none()
+        && config.reviewer.is_none()
+        && config.max_iterations.is_none()
+        && config.auto_execute.is_none()
+        && config.auto_verify.is_none()
+        && config.verify_command.is_none()
+}
+
+fn brainstorm_config_is_empty(config: &BrainstormModeConfig) -> bool {
+    config.participants.is_none()
+        && config.generation_rounds.is_none()
+        && config.ideas_per_round.is_none()
+}
+
+fn team_config_is_empty(config: &TeamModeConfig) -> bool {
+    config.coordinator.is_none()
+        && config.max_iterations.is_none()
+        && config.auto_verify.is_none()
+        && config.verify_command.is_none()
+}
+
+/// Validate merged knobs for modes that have any override fields set.
+pub fn validate_mode_overrides(config: &TeamConfig, overrides: &ModesConfig) -> Result<(), String> {
+    let merged = apply_mode_overrides(config, overrides);
+    if overrides.review.is_some() {
+        resolve_mode_roles(&merged, CollabMode::Review)?;
+    }
+    if overrides.plan.is_some() {
+        resolve_mode_roles(&merged, CollabMode::Plan)?;
+        resolve_plan_builder(&merged)?;
+        resolve_plan_reviewer(&merged)?;
+    }
+    if overrides.brainstorm.is_some() {
+        resolve_mode_roles(&merged, CollabMode::Brainstorm)?;
+    }
+    if overrides.team.is_some() {
+        resolve_team_coordinator(&merged)?;
+        resolve_team_limits(&merged)?;
+    }
+    Ok(())
+}
+
+pub fn validate_terminal_mode(config: &TeamConfig, mode: TerminalMode) -> Result<(), String> {
+    match mode {
+        TerminalMode::Normal => Ok(()),
+        TerminalMode::Review => resolve_mode_roles(config, CollabMode::Review).map(|_| ()),
+        TerminalMode::Plan => {
+            resolve_mode_roles(config, CollabMode::Plan)?;
+            resolve_plan_builder(config)?;
+            resolve_plan_reviewer(config)?;
+            Ok(())
+        }
+        TerminalMode::Brainstorm => resolve_mode_roles(config, CollabMode::Brainstorm).map(|_| ()),
+        TerminalMode::Team => {
+            resolve_team_coordinator(config)?;
+            resolve_team_limits(config)?;
+            Ok(())
+        }
+    }
+}
+
+fn merge_review(
+    base: &Option<ReviewModeConfig>,
+    over: &Option<ReviewModeConfig>,
+) -> Option<ReviewModeConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(over)) => Some(over.clone()),
+        (Some(base), Some(over)) => Some(ReviewModeConfig {
+            builder: over.builder.clone().or_else(|| base.builder.clone()),
+            reviewer: over.reviewer.clone().or_else(|| base.reviewer.clone()),
+            max_iterations: over.max_iterations.or(base.max_iterations),
+            auto_verify: over.auto_verify.or(base.auto_verify),
+            verify_command: over
+                .verify_command
+                .clone()
+                .or_else(|| base.verify_command.clone()),
+        }),
+    }
+}
+
+fn merge_plan(
+    base: &Option<PlanModeConfig>,
+    over: &Option<PlanModeConfig>,
+) -> Option<PlanModeConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(over)) => Some(over.clone()),
+        (Some(base), Some(over)) => Some(PlanModeConfig {
+            leader: over.leader.clone().or_else(|| base.leader.clone()),
+            builder: over.builder.clone().or_else(|| base.builder.clone()),
+            reviewer: over.reviewer.clone().or_else(|| base.reviewer.clone()),
+            max_iterations: over.max_iterations.or(base.max_iterations),
+            auto_execute: over.auto_execute.or(base.auto_execute),
+            auto_verify: over.auto_verify.or(base.auto_verify),
+            verify_command: over
+                .verify_command
+                .clone()
+                .or_else(|| base.verify_command.clone()),
+        }),
+    }
+}
+
+fn merge_brainstorm(
+    base: &Option<BrainstormModeConfig>,
+    over: &Option<BrainstormModeConfig>,
+) -> Option<BrainstormModeConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(over)) => Some(over.clone()),
+        (Some(base), Some(over)) => Some(BrainstormModeConfig {
+            participants: over
+                .participants
+                .clone()
+                .or_else(|| base.participants.clone()),
+            generation_rounds: over.generation_rounds.or(base.generation_rounds),
+            ideas_per_round: over.ideas_per_round.or(base.ideas_per_round),
+        }),
+    }
+}
+
+fn merge_team(
+    base: &Option<TeamModeConfig>,
+    over: &Option<TeamModeConfig>,
+) -> Option<TeamModeConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(over)) => Some(over.clone()),
+        (Some(base), Some(over)) => Some(TeamModeConfig {
+            coordinator: over
+                .coordinator
+                .clone()
+                .or_else(|| base.coordinator.clone()),
+            max_iterations: over.max_iterations.or(base.max_iterations),
+            auto_verify: over.auto_verify.or(base.auto_verify),
+            verify_command: over
+                .verify_command
+                .clone()
+                .or_else(|| base.verify_command.clone()),
+        }),
+    }
+}
+
+pub fn format_verify_label(
+    auto_verify: bool,
+    configured: Option<&str>,
+    suggested: Option<&str>,
+) -> String {
+    if !auto_verify {
+        return "verify off".to_string();
+    }
+    match resolve_verify_command(configured, suggested) {
+        Some(command) => format!("verify `{command}`"),
+        None => "verify on (no command detected)".to_string(),
+    }
+}
+
+/// Human binding line for a mode using merged config. Errors stay as the line
+/// text so the panel can paint them in yellow.
+pub fn format_mode_binding(
+    config: &TeamConfig,
+    mode: TerminalMode,
+    suggested: Option<&str>,
+) -> String {
+    match mode {
+        TerminalMode::Normal => "plain text goes to the last @target".to_string(),
+        TerminalMode::Review => match resolve_mode_roles(config, CollabMode::Review) {
+            Ok((roles, limits)) => format!(
+                "builder {} · reviewer {} · {} iterations · {}",
+                member_label(config, &roles.builder),
+                member_label(config, &roles.reviewer),
+                limits.max_iterations,
+                format_verify_label(
+                    limits.auto_verify,
+                    limits.verify_command.as_deref(),
+                    suggested
+                )
+            ),
+            Err(err) => err,
+        },
+        TerminalMode::Plan => match (
+            resolve_mode_roles(config, CollabMode::Plan),
+            resolve_plan_builder(config),
+            resolve_plan_reviewer(config),
+        ) {
+            (Ok((roles, limits)), Ok(builder), Ok(reviewer)) => format!(
+                "leader {} · builder {} · reviewer {} · {} · {} iterations · {}",
+                member_label(config, &roles.leader),
+                member_label(config, &builder),
+                reviewer
+                    .as_ref()
+                    .map(|id| member_label(config, id))
+                    .unwrap_or_else(|| "none".to_string()),
+                if resolve_plan_auto_execute(config) {
+                    "auto execute"
+                } else {
+                    "manual execute confirmation"
+                },
+                limits.max_iterations,
+                format_verify_label(
+                    limits.auto_verify,
+                    limits.verify_command.as_deref(),
+                    suggested
+                )
+            ),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => err,
+        },
+        TerminalMode::Brainstorm => match resolve_mode_roles(config, CollabMode::Brainstorm) {
+            Ok((roles, limits)) => {
+                let people = roles
+                    .participants
+                    .iter()
+                    .map(|id| member_label(config, id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{people} · {} waves × {} cards",
+                    limits.rounds, limits.ideas_per_round
+                )
+            }
+            Err(err) => err,
+        },
+        TerminalMode::Team => match (
+            resolve_team_coordinator(config),
+            resolve_team_limits(config),
+        ) {
+            (Ok(coordinator), Ok(limits)) => format!(
+                "coordinator {} · {} iterations · {}",
+                member_label(config, &coordinator),
+                limits.max_iterations,
+                format_verify_label(
+                    limits.auto_verify,
+                    limits.verify_command.as_deref(),
+                    suggested
+                )
+            ),
+            (Err(err), _) | (_, Err(err)) => err,
+        },
+    }
+}
+
+pub fn mode_binding_is_error(config: &TeamConfig, mode: TerminalMode) -> bool {
+    match mode {
+        TerminalMode::Normal => false,
+        TerminalMode::Review => resolve_mode_roles(config, CollabMode::Review).is_err(),
+        TerminalMode::Plan => {
+            resolve_mode_roles(config, CollabMode::Plan).is_err()
+                || resolve_plan_builder(config).is_err()
+                || resolve_plan_reviewer(config).is_err()
+        }
+        TerminalMode::Brainstorm => resolve_mode_roles(config, CollabMode::Brainstorm).is_err(),
+        TerminalMode::Team => {
+            resolve_team_coordinator(config).is_err() || resolve_team_limits(config).is_err()
+        }
+    }
+}
+
+fn member_label(config: &TeamConfig, id: &MemberId) -> String {
+    config
+        .member(id)
+        .map(|member| member.display_name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
 /// Review-only role and iteration settings stored in `team.json`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,16 +528,25 @@ pub struct ReviewModeConfig {
     pub verify_command: Option<String>,
 }
 
-/// Plan-only leader, reviewer, and iteration settings stored in `team.json`.
+/// Plan leader, required execution builder, optional reviewer, and execution settings stored in `team.json`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanModeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leader: Option<MemberId>,
+    /// Required member that executes the finalized plan checklist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<MemberId>,
+    /// Optional plan-only reviewer. When omitted, a completed checklist goes
+    /// straight to the execution setting below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
+    /// Dispatch the final checklist immediately (default), or require an
+    /// explicit `/approve` before the Builder receives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_execute: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_verify: Option<bool>,
     /// Shell command used for auto-verify after approve (e.g. `just check`).
@@ -356,8 +752,6 @@ pub fn resolve_mode_roles(
         CollabMode::Plan => {
             if let Some(settings) = &config.modes.plan {
                 roles.leader = resolve_or_derived(config, settings.leader.as_ref(), &roles.leader)?;
-                roles.reviewer =
-                    resolve_or_derived(config, settings.reviewer.as_ref(), &roles.reviewer)?;
                 let iterations = resolve_iteration_settings(
                     settings.max_iterations,
                     settings.auto_verify,
@@ -399,6 +793,41 @@ pub fn resolve_mode_roles(
         );
     }
     Ok((roles, limits))
+}
+
+/// Resolve the required Plan-mode execution builder. Plan has no derived
+/// fallback so a configuration cannot silently dispatch implementation work.
+pub fn resolve_plan_builder(config: &TeamConfig) -> Result<MemberId, String> {
+    config
+        .modes
+        .plan
+        .as_ref()
+        .and_then(|settings| settings.builder.as_ref())
+        .map(|id| resolve_bound_member(config, id))
+        .ok_or_else(|| "plan mode needs a builder".to_string())?
+}
+
+/// Resolve the optional Plan reviewer. Unlike Review mode, an omitted Plan
+/// reviewer deliberately skips the review phase.
+pub fn resolve_plan_reviewer(config: &TeamConfig) -> Result<Option<MemberId>, String> {
+    config
+        .modes
+        .plan
+        .as_ref()
+        .and_then(|settings| settings.reviewer.as_ref())
+        .map(|id| resolve_bound_member(config, id))
+        .transpose()
+}
+
+/// Whether Plan dispatches a final checklist immediately. The default keeps
+/// existing configurations non-interactive after a checklist is ready.
+pub fn resolve_plan_auto_execute(config: &TeamConfig) -> bool {
+    config
+        .modes
+        .plan
+        .as_ref()
+        .and_then(|settings| settings.auto_execute)
+        .unwrap_or(true)
 }
 
 fn resolve_bound_member(config: &TeamConfig, id: &MemberId) -> Result<MemberId, String> {
@@ -703,6 +1132,37 @@ mod tests {
     }
 
     #[test]
+    fn plan_builder_is_required_and_reviewer_is_optional() {
+        let config = mixed_roster();
+        assert_eq!(
+            resolve_plan_builder(&config).unwrap_err(),
+            "plan mode needs a builder"
+        );
+        assert_eq!(resolve_plan_reviewer(&config).unwrap(), None);
+
+        let mut configured = mixed_roster();
+        configured.modes.plan = Some(PlanModeConfig {
+            builder: Some(MemberId::new("builder")),
+            reviewer: Some(MemberId::new("reviewer")),
+            ..PlanModeConfig::default()
+        });
+        assert_eq!(
+            resolve_plan_builder(&configured).unwrap(),
+            MemberId::new("builder")
+        );
+        assert_eq!(
+            resolve_plan_reviewer(&configured).unwrap(),
+            Some(MemberId::new("reviewer"))
+        );
+
+        configured.modes.plan.as_mut().unwrap().builder = Some(MemberId::new("ghost"));
+        assert_eq!(
+            resolve_plan_builder(&configured).unwrap_err(),
+            "unknown member: ghost"
+        );
+    }
+
+    #[test]
     fn review_with_single_member_errors() {
         let config = TeamConfig::new("solo", "/tmp/ws").with_member(member("only", "review"));
         let err = resolve_mode_roles(&config, CollabMode::Review).unwrap_err();
@@ -810,6 +1270,53 @@ mod tests {
 
         let empty: ModeStatusSummary = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, ModeStatusSummary::default());
+    }
+
+    #[test]
+    fn merge_modes_overrides_single_fields() {
+        let defaults = ModesConfig {
+            review: Some(ReviewModeConfig {
+                builder: Some(MemberId::new("builder")),
+                reviewer: Some(MemberId::new("reviewer")),
+                max_iterations: Some(3),
+                ..ReviewModeConfig::default()
+            }),
+            plan: Some(PlanModeConfig {
+                leader: Some(MemberId::new("planner")),
+                builder: Some(MemberId::new("builder")),
+                max_iterations: Some(4),
+                ..PlanModeConfig::default()
+            }),
+            ..ModesConfig::default()
+        };
+        let overrides = ModesConfig {
+            review: Some(ReviewModeConfig {
+                max_iterations: Some(5),
+                ..ReviewModeConfig::default()
+            }),
+            ..ModesConfig::default()
+        };
+        let merged = merge_modes(&defaults, &overrides);
+        let review = merged.review.unwrap();
+        assert_eq!(review.builder, Some(MemberId::new("builder")));
+        assert_eq!(review.reviewer, Some(MemberId::new("reviewer")));
+        assert_eq!(review.max_iterations, Some(5));
+        let plan = merged.plan.unwrap();
+        assert_eq!(plan.leader, Some(MemberId::new("planner")));
+        assert_eq!(plan.builder, Some(MemberId::new("builder")));
+        assert_eq!(
+            mode_overrides_for(&overrides, TerminalMode::Review).review,
+            overrides.review
+        );
+        assert!(
+            mode_overrides_for(&overrides, TerminalMode::Plan)
+                .plan
+                .is_none()
+        );
+        assert_eq!(mode_field_source(true, true), ModeValueSource::Conversation);
+        assert_eq!(mode_field_source(false, true), ModeValueSource::TeamJson);
+        assert_eq!(mode_field_source(false, false), ModeValueSource::Default);
+        assert_eq!(ModeValueSource::Conversation.label(), "this chat");
     }
 
     #[test]

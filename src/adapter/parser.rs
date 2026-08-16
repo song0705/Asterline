@@ -75,6 +75,161 @@ pub fn tool_detail(text: &str, max: usize) -> String {
     }
 }
 
+/// One-line, chat-friendly label for a tool argument object.
+///
+/// Prefers paths, commands, and queries over pretty-printed JSON so the TUI
+/// title row stays readable.
+pub fn tool_brief(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => shorten_tool_path(text),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Array(items) => {
+            let parts = items
+                .iter()
+                .map(tool_brief)
+                .filter(|text| !text.is_empty())
+                .take(3)
+                .collect::<Vec<_>>();
+            let extra = items.len().saturating_sub(parts.len());
+            if extra == 0 {
+                parts.join(", ")
+            } else {
+                format!("{} +{extra}", parts.join(", "))
+            }
+        }
+        Value::Object(map) => brief_object(map),
+    }
+}
+
+fn brief_object(map: &serde_json::Map<String, Value>) -> String {
+    for key in [
+        "command",
+        "cmd",
+        "query",
+        "pattern",
+        "url",
+        "uri",
+        "target_file",
+        "file_path",
+        "path",
+        "file",
+        "filename",
+        "title",
+        "name",
+    ] {
+        let Some(primary) = map.get(key).and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if primary.is_empty() {
+            continue;
+        }
+        let mut out = if matches!(key, "command" | "cmd" | "query" | "pattern" | "url" | "uri") {
+            primary.split_whitespace().collect::<Vec<_>>().join(" ")
+        } else {
+            shorten_tool_path(primary)
+        };
+        if let Some(offset) = int_field(map, "offset").or_else(|| int_field(map, "start_line")) {
+            out.push(':');
+            out.push_str(&offset.to_string());
+            if let Some(limit) = int_field(map, "limit") {
+                out.push('+');
+                out.push_str(&limit.to_string());
+            }
+        }
+        if !matches!(
+            key,
+            "path" | "target_file" | "file_path" | "file" | "filename"
+        ) && let Some(path) = map
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            out.push_str(" in ");
+            out.push_str(&shorten_tool_path(path));
+        }
+        if let Some(glob) = map
+            .get("glob")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|glob| !glob.is_empty())
+        {
+            out.push_str(" (");
+            out.push_str(glob);
+            out.push(')');
+        }
+        return out;
+    }
+
+    let mut parts = Vec::new();
+    for (key, value) in map {
+        if SKIP_BRIEF_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let piece = match value {
+            Value::String(text) if text.chars().count() <= 80 => {
+                format!("{key} {}", shorten_tool_path(text))
+            }
+            Value::String(text) => format!("{key} · {} chars", text.chars().count()),
+            Value::Number(number) => format!("{key} {number}"),
+            Value::Bool(flag) => format!("{key} {flag}"),
+            _ => continue,
+        };
+        parts.push(piece);
+        if parts.len() == 3 {
+            break;
+        }
+    }
+    parts.join(" · ")
+}
+
+const SKIP_BRIEF_KEYS: &[&str] = &[
+    "type",
+    "old_string",
+    "new_string",
+    "contents",
+    "content",
+    "prompt",
+    "body",
+    "diff",
+    "patch",
+    "text",
+    "stdout",
+    "stderr",
+];
+
+fn int_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
+    map.get(key).and_then(Value::as_u64)
+}
+
+fn shorten_tool_path(text: &str) -> String {
+    let text = text.trim();
+    if text.starts_with("http://") || text.starts_with("https://") {
+        return text.to_string();
+    }
+    let slash = if text.contains('/') {
+        '/'
+    } else if text.contains('\\') {
+        '\\'
+    } else {
+        return text.split_whitespace().collect::<Vec<_>>().join(" ");
+    };
+    if text.contains(' ') && !text.starts_with('/') && !text.starts_with('~') {
+        return text.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    let parts = text
+        .split(slash)
+        .filter(|part| !part.is_empty() && *part != "~")
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => text.to_string(),
+        [name] => (*name).to_string(),
+        [.., parent, name] => format!("{parent}/{name}"),
+    }
+}
+
 /// Render a structured tool input/result without losing nested fields.
 pub fn tool_value(value: &Value, max: usize) -> String {
     let text = match value {
@@ -123,6 +278,28 @@ mod tests {
     fn tool_detail_preserves_lines_and_indentation() {
         assert_eq!(tool_detail("one\n  two\n", 100), "one\n  two");
         assert_eq!(tool_detail("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn tool_brief_prefers_paths_and_commands() {
+        assert_eq!(
+            tool_brief(
+                &json!({"target_file": "/Users/me/src/tui/chat_view.rs", "offset": 800, "limit": 80})
+            ),
+            "tui/chat_view.rs:800+80"
+        );
+        assert_eq!(
+            tool_brief(&json!({"command": "cargo test", "timeout": 120})),
+            "cargo test"
+        );
+        assert_eq!(
+            tool_brief(&json!({"pattern": "tool_brief", "path": "src/tui", "glob": "*.rs"})),
+            "tool_brief in src/tui (*.rs)"
+        );
+        assert_eq!(
+            tool_brief(&json!({"file_path": "src/a.rs", "old_string": "aaa", "new_string": "bbb"})),
+            "src/a.rs"
+        );
     }
 
     #[test]

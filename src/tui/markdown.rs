@@ -7,6 +7,8 @@
 //! markdown into styled `ratatui` lines wrapped to a width, and [`wrap`] is a
 //! plain width-aware word wrapper shared by the non-markdown chat cells.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -29,9 +31,37 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
         .expect("syntect ships default themes")
 });
 
+const MD_CACHE_CAP: usize = 128;
+
+thread_local! {
+    static RENDER_CACHE: RefCell<(usize, HashMap<u64, Vec<Line<'static>>>)> =
+        RefCell::new((0, HashMap::new()));
+}
+
 /// Render Markdown `text` to styled lines wrapped to `width`.
 pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut renderer = Renderer::new(width.max(1));
+    let width = width.max(1);
+    let key = fnv1a64(text.as_bytes());
+    RENDER_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 != width {
+            cache.0 = width;
+            cache.1.clear();
+        }
+        if let Some(hit) = cache.1.get(&key) {
+            return hit.clone();
+        }
+        let lines = render_uncached(text, width);
+        if cache.1.len() >= MD_CACHE_CAP {
+            cache.1.clear();
+        }
+        cache.1.insert(key, lines.clone());
+        lines
+    })
+}
+
+fn render_uncached(text: &str, width: usize) -> Vec<Line<'static>> {
+    let mut renderer = Renderer::new(width);
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -39,6 +69,15 @@ pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         renderer.handle(event);
     }
     renderer.finish()
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// A single styled character, the unit the span-aware wrapper works in.
@@ -143,7 +182,6 @@ impl Renderer {
 
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph => self.block_separator(),
             Tag::Heading { level, .. } => {
                 self.block_separator();
                 self.heading = Some(level);
@@ -475,7 +513,10 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let rule_style = Style::default().fg(Color::DarkGray);
-    let mut out = Vec::new();
+    let mut out = vec![Line::from(Span::styled(
+        table_rule(&col_w, '┌', '┬', '┐'),
+        rule_style,
+    ))];
     for (r, row) in table.rows.iter().enumerate() {
         let mut spans = vec![Span::styled("│ ", rule_style)];
         for (c, w) in col_w.iter().enumerate() {
@@ -492,15 +533,31 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
         out.push(Line::from(spans));
         // Header separator rule after the last head row.
         if r + 1 == table.head_rows {
-            let mut sep = String::from("├─");
-            for (c, w) in col_w.iter().enumerate() {
-                sep.push_str(&"─".repeat(*w));
-                sep.push_str(if c + 1 == cols { "─┤" } else { "─┼─" });
-            }
-            out.push(Line::from(Span::styled(sep, rule_style)));
+            out.push(Line::from(Span::styled(
+                table_rule(&col_w, '├', '┼', '┤'),
+                rule_style,
+            )));
         }
     }
+    out.push(Line::from(Span::styled(
+        table_rule(&col_w, '└', '┴', '┘'),
+        rule_style,
+    )));
     out
+}
+
+fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> String {
+    let mut rule = String::new();
+    rule.push(left);
+    for (index, width) in widths.iter().enumerate() {
+        rule.push_str(&"─".repeat(width.saturating_add(2)));
+        rule.push(if index + 1 == widths.len() {
+            right
+        } else {
+            middle
+        });
+    }
+    rule
 }
 
 /// Pad (and, if needed, truncate) `text` to display width `w` with alignment.
@@ -756,12 +813,21 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_paragraphs_do_not_add_a_blank_chat_row() {
+        let lines = render("first paragraph\n\nsecond paragraph", 80);
+        let text: Vec<_> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(text, ["first paragraph", "second paragraph"]);
+    }
+
+    #[test]
     fn table_renders_with_separators() {
         let lines = render("| a | b |\n|---|---|\n| 1 | 2 |", 40);
         let t = texts(&lines);
+        assert!(t.first().is_some_and(|line| line.starts_with('┌')));
         assert!(t.iter().any(|l| l.contains('a') && l.contains('b')));
         assert!(t.iter().any(|l| l.contains('│')));
         assert!(t.iter().any(|l| l.contains('┼')));
+        assert!(t.last().is_some_and(|line| line.ends_with('┘')));
     }
 
     #[test]
@@ -774,7 +840,7 @@ mod tests {
 
         assert_eq!(
             t.len(),
-            4,
+            6,
             "table code must not leak into a trailing paragraph"
         );
         assert!(t.iter().any(|line| {

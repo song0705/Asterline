@@ -26,9 +26,17 @@ pub enum Action {
     CloseOverlay,
     Complete,
     Interrupt,
-    ToggleExpand,
+    ToggleThinking,
+    ToggleDiffs,
+    ToggleTools,
     NextMember,
     PrevMember,
+    /// Pull the last queued (not-yet-started) prompt back into the composer.
+    EditQueued,
+    /// Read a bitmap from the OS clipboard and attach it to the next send.
+    /// Text paste still arrives as `Event::Paste`; this action never inserts
+    /// clipboard text, so Cmd/Ctrl+V does not double-paste.
+    PasteClipboard,
 }
 
 /// Map a key press to an action, or `None` if unbound. Function keys are
@@ -36,6 +44,8 @@ pub enum Action {
 pub fn resolve(key: KeyEvent) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let super_key = key.modifiers.contains(KeyModifiers::SUPER);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
         KeyCode::F(_) => None,
@@ -47,7 +57,11 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Some(Action::Submit),
         KeyCode::Tab => Some(Action::Complete),
         KeyCode::Esc => Some(Action::CloseOverlay),
+        // macOS Cmd+Backspace: some terminals report SUPER; others remap it to
+        // Ctrl+U. Both must clear the current composer line only.
+        KeyCode::Backspace if super_key || ctrl => Some(Action::ClearLine),
         KeyCode::Backspace => Some(Action::Backspace),
+        KeyCode::Left if shift => Some(Action::EditQueued),
         KeyCode::Left => Some(Action::CursorLeft),
         KeyCode::Right => Some(Action::CursorRight),
         KeyCode::Home => Some(Action::Home),
@@ -59,10 +73,13 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::PageUp => Some(Action::ScrollUp),
         KeyCode::PageDown => Some(Action::ScrollDown),
         KeyCode::Char('c') if ctrl => Some(Action::Interrupt),
-        KeyCode::Char('g') if ctrl => Some(Action::ToggleExpand),
+        // Ctrl+V / Cmd+V / Ctrl+Shift+V attach a clipboard image. Do not bind
+        // Ctrl+C — that remains interrupt.
+        KeyCode::Char('v' | 'V') if ctrl || super_key => Some(Action::PasteClipboard),
+        KeyCode::Char('g') if ctrl => Some(Action::ToggleDiffs),
         KeyCode::Char('l') if ctrl => Some(Action::ToggleLogs),
-        KeyCode::Char('o') if ctrl => Some(Action::ToggleExpand),
-        KeyCode::Char('t') if ctrl => Some(Action::ToggleExpand),
+        KeyCode::Char('o') if ctrl => Some(Action::ToggleTools),
+        KeyCode::Char('t') if ctrl => Some(Action::ToggleThinking),
         KeyCode::Char('r') if ctrl => Some(Action::HistorySearch),
         KeyCode::Char('p') if ctrl => Some(Action::TogglePalette),
         KeyCode::Char('u') if ctrl => Some(Action::ClearLine),
@@ -152,11 +169,86 @@ mod tests {
     }
 
     #[test]
+    fn command_or_ctrl_backspace_clears_the_current_line() {
+        assert_eq!(
+            resolve(key(KeyCode::Backspace, KeyModifiers::SUPER)),
+            Some(Action::ClearLine)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Backspace, KeyModifiers::CONTROL)),
+            Some(Action::ClearLine)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(Action::ClearLine)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(Action::Backspace)
+        );
+    }
+
+    #[test]
+    fn expand_shortcuts_are_separate() {
+        assert_eq!(
+            resolve(key(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            Some(Action::ToggleThinking)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Some(Action::ToggleDiffs)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(Action::ToggleTools)
+        );
+    }
+
+    #[test]
     fn control_letters_are_not_inserted_as_text() {
         // Ctrl+x is unbound, but must not be typed into the composer.
         assert_eq!(
             resolve(key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
             None
+        );
+    }
+
+    #[test]
+    fn paste_image_is_ctrl_or_cmd_v_not_ctrl_c() {
+        assert_eq!(
+            resolve(key(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Some(Action::PasteClipboard)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('v'), KeyModifiers::SUPER)),
+            Some(Action::PasteClipboard)
+        );
+        assert_eq!(
+            resolve(key(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Action::PasteClipboard)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Interrupt)
+        );
+    }
+
+    #[test]
+    fn shift_left_edits_queued_prompt_and_shift_right_is_not_selection() {
+        assert_eq!(
+            resolve(key(KeyCode::Left, KeyModifiers::SHIFT)),
+            Some(Action::EditQueued)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Right, KeyModifiers::SHIFT)),
+            Some(Action::CursorRight)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::CursorLeft)
         );
     }
 }

@@ -15,8 +15,9 @@ pub const REVIEW_PROTOCOL_HINT: &str = "End your reply with exactly one control 
 
 /// Marker for the leader planning prompt; the fake team runner keys on it.
 pub const PLAN_MODE_HINT: &str = "Plan the work as a checklist now: emit one \
-`@@run_step {\"action\":\"add\",\"owner\":\"<member-id>\",\"title\":\"...\"}` line per step. \
-Assign every step an owner from the teammate list. Do not do the work yourself.";
+`@@run_step {\"action\":\"add\",\"title\":\"...\"}` line per step. \
+Do not do the work yourself. After the reviewer approves, a configured Builder receives the \
+whole checklist automatically; with no Builder, this is a reviewed plan only.";
 
 /// Markers for brainstorm generation waves; the fake runner keys on them.
 pub const BRAINSTORM_PROPOSE_HINT: &str = "BRAINSTORM_WAVE: SEED";
@@ -135,8 +136,8 @@ pub fn plan_plan_prompt(task: &str, teammates: &[(String, String)]) -> String {
 /// Re-ask the leader for an owned checklist after an empty plan turn.
 pub fn plan_nudge_prompt() -> String {
     format!(
-        "Your previous reply did not produce an actionable owned checklist. \
-         Emit owned @@run_step add lines now — every step needs an owner.\n\n\
+        "Your previous reply did not produce an actionable checklist. \
+         Emit @@run_step add lines now — every step needs a concrete title.\n\n\
          {PLAN_MODE_HINT}"
     )
 }
@@ -194,9 +195,8 @@ pub fn plan_progress_prompt(
          Task:\n{task}\n\n\
          Unfinished checklist steps:\n{list}\n\n\
          {extra}\
-         Re-assess the plan: add, reassign, or clarify steps as needed, then \
-         the engine will re-dispatch owners. Do not do the work yourself.\n\
-         Steps without an owner are never dispatched — assign an owner to every actionable step.\n\n\
+         Re-assess the plan: add, remove, reorder, or clarify steps as needed. Do not do the work \
+         yourself. After review approval, the configured Builder receives the whole checklist.\n\n\
          {PLAN_MODE_HINT}"
     )
 }
@@ -215,7 +215,7 @@ pub fn plan_verify_failure_prompt(
          Automatic verification failed.\n\
          Command: {command}\n\
          Output:\n{summary}\n\n\
-         Re-plan the owned checklist so owners can fix the failures. Do not do the work yourself.\n\n\
+         Re-plan the checklist so the Builder can fix the failures. Do not do the work yourself.\n\n\
          {PLAN_MODE_HINT}"
     )
 }
@@ -232,13 +232,14 @@ pub fn plan_iteration_prompt(
         "You are the planning lead (iteration {iteration}/{max}).\n\n\
          Task:\n{task}\n\n\
          {reviewer_display} requested changes:\n{feedback}\n\n\
-         Update the checklist and plan so owners can address the feedback. \
+         Update the checklist and plan so the Builder can address the feedback. \
          Do not do the work yourself.\n\n\
          {PLAN_MODE_HINT}"
     )
 }
 
-/// Reviewer prompt after all plan-mode steps are Done.
+/// Reviewer prompt after the leader has produced a Plan-mode checklist, before
+/// any configured Builder is dispatched.
 pub fn plan_review_prompt(task: &str, steps_summary: &str, verify_command: Option<&str>) -> String {
     let summary = if steps_summary.trim().is_empty() {
         "(no steps recorded)"
@@ -247,18 +248,19 @@ pub fn plan_review_prompt(task: &str, steps_summary: &str, verify_command: Optio
     };
     let gate = match verify_command.map(str::trim).filter(|s| !s.is_empty()) {
         Some(cmd) => format!(
-            "The project verification gate is `{cmd}` — run it (or the equivalent checks) yourself.\n\n"
+            "The Builder will be expected to satisfy the project verification gate `{cmd}`. \
+             Check that the plan includes work needed to make that realistic.\n\n"
         ),
         None => String::new(),
     };
     format!(
-        "You are the reviewer in plan mode.\n\n\
+        "You are the reviewer in plan mode. This is a plan review before implementation.\n\n\
          Task:\n{task}\n\n\
          Completed checklist:\n{summary}\n\n\
-         Inspect the actual changes (`git status` / `git diff`) and run the project's checks \
-         yourself rather than trusting the checklist text. {gate}\
-         Judge the work on substance — do not be swayed by how confident or polished the report sounds. \
-         Decide whether the work is ready or needs changes.\n\n\
+         Check that the checklist is complete, correctly ordered, testable, and addresses the \
+         task's important risks and acceptance criteria. No implementation has been dispatched yet, \
+         so judge the plan itself rather than code changes. {gate}\
+         Approve only when the plan is ready to hand to a Builder; otherwise request concrete changes.\n\n\
          {REVIEW_PROTOCOL_HINT}"
     )
 }
@@ -471,12 +473,13 @@ mod tests {
         let prompt = plan_review_prompt("task", "#1 [builder] foo — ok", None);
         assert!(prompt.contains("task"));
         assert!(prompt.contains("#1 [builder] foo"));
-        assert!(prompt.contains("substance"));
+        assert!(prompt.contains("before implementation"));
+        assert!(prompt.contains("judge the plan itself rather than code changes"));
         assert!(prompt.ends_with(REVIEW_PROTOCOL_HINT) || prompt.contains(REVIEW_PROTOCOL_HINT));
     }
 
     #[test]
-    fn plan_progress_prompt_mentions_unowned_steps() {
+    fn plan_progress_prompt_mentions_builder_handoff() {
         let prompt = plan_progress_prompt(
             "task",
             &["#1 [?] blocked Wire UI — waiting for secret".into()],
@@ -485,7 +488,7 @@ mod tests {
             Some("a member run failed this round — reassign or adjust the plan"),
         );
         assert!(prompt.contains("waiting for secret"));
-        assert!(prompt.contains("assign an owner"));
+        assert!(prompt.contains("configured Builder"));
         assert!(prompt.contains("member run failed"));
         assert!(prompt.contains(PLAN_MODE_HINT));
     }

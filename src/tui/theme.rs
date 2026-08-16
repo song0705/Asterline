@@ -13,6 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::domain::event::{LogLevel, MemberStatus, RunStatus};
+use crate::domain::mode::TerminalMode;
 use crate::domain::team::BackendKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +140,52 @@ pub fn success_bold() -> Style {
     success().add_modifier(Modifier::BOLD)
 }
 
+pub fn diff_add() -> Style {
+    Style::default().fg(diff_add_fg()).bg(diff_add_bg())
+}
+
+pub fn diff_delete() -> Style {
+    Style::default().fg(diff_delete_fg()).bg(diff_delete_bg())
+}
+
+/// Path / header signs: same green/red ink, no fill. The file-changes
+/// summary row is not a hunk and should not look like one.
+pub fn diff_add_text() -> Style {
+    Style::default().fg(diff_add_fg())
+}
+
+pub fn diff_delete_text() -> Style {
+    Style::default().fg(diff_delete_fg())
+}
+
+fn diff_add_fg() -> Color {
+    match theme_variant() {
+        ThemeVariant::Dark => Color::Rgb(158, 206, 106),
+        ThemeVariant::Light => Color::Rgb(22, 101, 52),
+    }
+}
+
+fn diff_add_bg() -> Color {
+    match theme_variant() {
+        ThemeVariant::Dark => Color::Rgb(6, 56, 6),
+        ThemeVariant::Light => Color::Rgb(218, 251, 225),
+    }
+}
+
+fn diff_delete_fg() -> Color {
+    match theme_variant() {
+        ThemeVariant::Dark => Color::Rgb(247, 118, 142),
+        ThemeVariant::Light => Color::Rgb(153, 27, 27),
+    }
+}
+
+fn diff_delete_bg() -> Color {
+    match theme_variant() {
+        ThemeVariant::Dark => Color::Rgb(66, 14, 20),
+        ThemeVariant::Light => Color::Rgb(255, 235, 233),
+    }
+}
+
 pub fn warning() -> Style {
     Style::default().fg(warning_color())
 }
@@ -195,8 +242,31 @@ pub fn editor_field_focus() -> Style {
     warning_bold()
 }
 
+/// Stable colors for collaboration modes. These are semantic identities, not
+/// status colors or backend identities.
+pub fn mode_color(mode: TerminalMode) -> Color {
+    match (theme_variant(), mode) {
+        (ThemeVariant::Dark, TerminalMode::Normal) => Color::Rgb(212, 212, 216),
+        (ThemeVariant::Dark, TerminalMode::Review) => Color::Rgb(192, 132, 252),
+        (ThemeVariant::Dark, TerminalMode::Plan) => Color::Rgb(251, 146, 60),
+        (ThemeVariant::Dark, TerminalMode::Brainstorm) => Color::Rgb(56, 189, 248),
+        (ThemeVariant::Dark, TerminalMode::Team) => Color::Rgb(74, 222, 128),
+        (ThemeVariant::Light, TerminalMode::Normal) => Color::Rgb(63, 63, 70),
+        (ThemeVariant::Light, TerminalMode::Review) => Color::Rgb(126, 34, 206),
+        (ThemeVariant::Light, TerminalMode::Plan) => Color::Rgb(194, 65, 12),
+        (ThemeVariant::Light, TerminalMode::Brainstorm) => Color::Rgb(3, 105, 161),
+        (ThemeVariant::Light, TerminalMode::Team) => Color::Rgb(21, 128, 61),
+    }
+}
+
 pub fn backend_color(backend: BackendKind) -> Color {
-    backend_color_for(theme_variant(), backend)
+    backend_color_shaded(backend, 0)
+}
+
+/// Same-backend teammates share a hue. Later roster siblings get a darker or
+/// lighter step so two Codex (or two Grok) members stay distinguishable.
+pub fn backend_color_shaded(backend: BackendKind, same_backend_index: usize) -> Color {
+    shade_backend_color(theme_variant(), backend, same_backend_index)
 }
 
 fn backend_color_for(variant: ThemeVariant, backend: BackendKind) -> Color {
@@ -244,7 +314,37 @@ fn theme_variant_from(explicit: Option<&str>, colorfgbg: Option<&str>) -> ThemeV
 }
 
 pub fn backend_bold(backend: BackendKind) -> Style {
-    bold(backend_color(backend))
+    backend_bold_shaded(backend, 0)
+}
+
+pub fn backend_bold_shaded(backend: BackendKind, same_backend_index: usize) -> Style {
+    bold(backend_color_shaded(backend, same_backend_index))
+}
+
+fn shade_backend_color(
+    variant: ThemeVariant,
+    backend: BackendKind,
+    same_backend_index: usize,
+) -> Color {
+    let Color::Rgb(red, green, blue) = backend_color_for(variant, backend) else {
+        return backend_color_for(variant, backend);
+    };
+    let factor = match (variant, same_backend_index % 3) {
+        (_, 0) => 1.0,
+        (ThemeVariant::Dark, 1) => 0.78,
+        (ThemeVariant::Dark, _) => 0.60,
+        (ThemeVariant::Light, 1) => 1.38,
+        (ThemeVariant::Light, _) => 0.78,
+    };
+    Color::Rgb(
+        scale_channel(red, factor),
+        scale_channel(green, factor),
+        scale_channel(blue, factor),
+    )
+}
+
+fn scale_channel(channel: u8, factor: f32) -> u8 {
+    (f32::from(channel) * factor).round().clamp(0.0, 255.0) as u8
 }
 
 pub fn status_color(status: MemberStatus) -> Color {
@@ -448,6 +548,24 @@ mod tests {
         }
         for color in light {
             assert!(contrast_ratio(color, Color::White) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn same_backend_shades_differ_by_lightness() {
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            let first = shade_backend_color(ThemeVariant::Dark, backend, 0);
+            let second = shade_backend_color(ThemeVariant::Dark, backend, 1);
+            assert_ne!(first, second, "{backend:?} shades must differ");
+            assert!(
+                contrast_ratio(second, Color::Rgb(30, 30, 30)) >= 4.5,
+                "{backend:?} second shade {second:?} lacks contrast"
+            );
         }
     }
 

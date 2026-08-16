@@ -1,6 +1,6 @@
 [package]
 name = "asterline"
-version = "0.2.9"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 default-run = "asterline"

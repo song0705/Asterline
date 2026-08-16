@@ -12,14 +12,14 @@ impl TeamRuntime {
             ));
             return;
         }
-        let id = match resolve_team_coordinator(&self.config) {
+        let id = match resolve_team_coordinator(&self.effective_config()) {
             Ok(id) => id,
             Err(err) => {
                 step.events.push(RuntimeEvent::Notice(err));
                 return;
             }
         };
-        let limits = match resolve_team_limits(&self.config) {
+        let limits = match resolve_team_limits(&self.effective_config()) {
             Ok(limits) => limits,
             Err(err) => {
                 step.events.push(RuntimeEvent::Notice(err));
@@ -83,7 +83,12 @@ impl TeamRuntime {
             step,
         );
         step.events.push(RuntimeEvent::Notice(format!(
-            "team {run_id} started → {id}"
+            "team {run_id} started → {id} · {}",
+            format_verify_label(
+                limits.auto_verify,
+                limits.verify_command.as_deref(),
+                suggested_verify_command(&self.config.workspace),
+            )
         )));
         self.run_turns.insert(turn, run_id);
         let gate = self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Mode);
@@ -262,7 +267,7 @@ impl TeamRuntime {
             .as_ref()
             .is_some_and(|mode| mode.mode == CollabMode::Team);
         if is_team {
-            let limits = resolve_team_limits(&self.config).unwrap_or_default();
+            let limits = resolve_team_limits(&self.effective_config()).unwrap_or_default();
             if limits.auto_verify
                 && let Some(cmd) = resolve_verify_command(
                     limits.verify_command.as_deref(),
@@ -354,7 +359,7 @@ impl TeamRuntime {
             status.iteration
         };
         let max_iterations = if status.max_iterations == 0 {
-            resolve_team_limits(&self.config)
+            resolve_team_limits(&self.effective_config())
                 .map(|l| l.max_iterations)
                 .unwrap_or(3)
         } else {

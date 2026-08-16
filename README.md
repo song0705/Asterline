@@ -68,7 +68,18 @@ Send the first task to a member shown in the roster:
 @builder audit this repository and fix the highest-risk defect
 ```
 
-Or select a tracked workflow before entering the task:
+Open the mode picker before entering a tracked task:
+
+```text
+/mode
+```
+
+Use `↑`/`↓` to highlight a mode, `Enter` to open its optional fields, and `s`
+to select it and apply any pending overrides to this conversation. If you already
+know the mode, `/mode <name>` remains the direct shortcut. For `review`,
+`plan`, `brainstorm`, or `team`, enter the task as plain text after selecting
+the mode — no `@member` prefix is needed. A fresh `normal` conversation still
+needs an explicit target such as `@builder`:
 
 ```text
 /mode review
@@ -107,7 +118,7 @@ verification results, verdicts, and next action.
 | ------------ | ---------------------------------- | ------------------------------------------------ |
 | `normal`     | Direct chat and delegation         | Route to one member or the full roster           |
 | `review`     | Implementation with a quality gate | Builder, reviewer verdict, bounded revision loop |
-| `plan`       | Multi-step owned work              | Plan, assign, execute, review, verify            |
+| `plan`       | Multi-step planning and execution  | Plan, optional review, build, verify             |
 | `brainstorm` | Exploration before judgment        | Generate, vote privately, rank, synthesize       |
 | `team`       | End-to-end coordinated delivery    | Coordinator-owned execution and integration      |
 
@@ -130,6 +141,7 @@ stored by default in:
 ```text
 <workspace>/.asterline/
 ├── team.json
+├── roster.md
 └── asterline.sqlite3
 ```
 
@@ -155,7 +167,7 @@ second process sandbox beyond the selected backend. Read
 | ---------------------- | ------------------------------------------- |
 | `@<member> <message>`  | Send a task to one member                   |
 | `@all <message>`       | Broadcast to the roster                     |
-| `/mode`                | Select a conversation or collaboration mode |
+| `/mode`                | Open the mode picker                        |
 | `/runs`                | Inspect work state and next actions         |
 | `/team`                | Edit the live roster                        |
 | `/resume`              | Restore a saved conversation                |

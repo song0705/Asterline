@@ -48,7 +48,7 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("focus", "view a member's logs", true),
     ("help", "show commands", false),
     ("logs", "raw logs · stderr · warnings", false),
-    ("mode", "set the mode for subsequent messages", true),
+    ("mode", "open mode panel or switch dispatch mode", true),
     (
         "new",
         "start a fresh chat (new session, cleared transcript)",
@@ -108,11 +108,13 @@ pub fn compute_with_agent_skills(
                     .filter(|(name, _, _)| slash_command_matches(name, &lower))
                     .map(|(name, hint, _)| CompletionItem {
                         label: format!("/{name} — {hint}"),
-                        // Keep the cursor in command-entry mode after any
-                        // accepted command. This also makes no-argument
-                        // commands such as `/team` behave consistently with
-                        // commands that take an argument.
-                        insert: format!("/{name} "),
+                        // `/mode` without an argument opens its required
+                        // picker, so keep the completed command submit-ready.
+                        insert: if *name == "mode" {
+                            format!("/{name}")
+                        } else {
+                            format!("/{name} ")
+                        },
                     })
                     .collect();
                 non_empty("commands", 0, items)
@@ -302,7 +304,7 @@ mod tests {
         assert_eq!(c.token_start, 0);
         assert!(c.items.iter().any(|i| i.insert == "/ask "));
         assert!(c.items.iter().any(|i| i.insert == "/team "));
-        assert!(c.items.iter().any(|i| i.insert == "/mode "));
+        assert!(c.items.iter().any(|i| i.insert == "/mode"));
         assert!(c.items.iter().any(|i| i.insert == "/exit "));
         assert!(c.items.iter().any(|i| i.insert == "/attach "));
         assert!(!c.items.iter().any(|i| i.insert == "/plan "));
@@ -335,7 +337,7 @@ mod tests {
     #[test]
     fn slash_prefix_filters() {
         assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
-        assert_eq!(inserts("/mo"), vec!["/mode ".to_string()]);
+        assert_eq!(inserts("/mo"), vec!["/mode".to_string()]);
         assert!(inserts("/pl").is_empty());
         assert_eq!(inserts("/con"), vec!["/continue ".to_string()]);
         assert_eq!(inserts("/no"), vec!["/note ".to_string()]);

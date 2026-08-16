@@ -6,15 +6,19 @@ pub mod app_state;
 pub mod attach;
 pub mod chat_view;
 pub mod claude_import;
+mod clipboard_image;
 pub mod commands;
 pub mod completion;
 pub mod composer;
 pub mod drawer_view;
 pub mod drawers;
+mod file_diff;
+pub mod grok_import;
 pub mod header;
 mod import_io;
 pub mod keymap;
 pub mod markdown;
+pub mod mode_editor;
 pub mod notify;
 pub mod rollout_import;
 pub mod runs_view;
@@ -24,6 +28,7 @@ pub mod status_indicator;
 pub mod team_builder;
 pub mod team_editor;
 pub mod theme;
+mod tool_display;
 
 use std::io::{self, Read, Write};
 #[cfg(test)]
@@ -54,9 +59,13 @@ use crate::runtime::{RuntimeCommandSend, RuntimeHandle};
 use crate::tui::app_state::AppState;
 use crate::tui::commands::Submission;
 use crate::tui::keymap::Action;
+use crate::tui::mode_editor::ModeEditorOutcome;
 use crate::tui::team_editor::TeamEditorOutcome;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Codex schedules spinner frames at 32ms. The same bound makes queued
+/// runtime events visible promptly when the terminal is otherwise idle.
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(32);
+const RUNTIME_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(32);
 const MAX_RUNTIME_EVENTS_PER_DRAIN: usize = 1_024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const RESET_KEYBOARD_TO_LEGACY: &[u8] = b"\x1b[=0u";
@@ -142,6 +151,7 @@ pub fn run(
     mut state: AppState,
 ) -> io::Result<()> {
     enable_tui_colors();
+    let _paste_cleanup = clipboard_image::PasteCleanup::enter();
     let mut restore = TerminalRestore::default();
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let vscode_pid = std::env::var_os("VSCODE_PID").is_some();
@@ -255,22 +265,43 @@ fn run_loop(
 ) -> io::Result<()> {
     let notify_enabled = notify::enabled_from_env();
     let mut last_layout = None;
+    let mut dirty = true;
     loop {
         state.poll_team_editor_catalog();
-        drain_runtime_events(state, events, notify_enabled);
+        if drain_runtime_events(state, events, notify_enabled) {
+            dirty = true;
+        }
         state.warm_model_catalog_once();
         if let Some(member) = state.take_attach_release_pending()
             && !handle.finish_attach(member, Vec::new())
         {
             state.mark_runtime_unavailable();
+            dirty = true;
         }
 
-        terminal.draw(|frame| {
-            last_layout = chat_view::render(frame, state);
-        })?;
+        if dirty || state.needs_animated_frame() || state.drawer().is_some() {
+            terminal.draw(|frame| {
+                last_layout = chat_view::render(frame, state);
+            })?;
+            if let Some(layout) = last_layout.as_ref() {
+                state.set_chat_page_rows(layout.area.height.saturating_sub(1) as usize);
+                state.clamp_scroll(layout.max_scroll());
+            }
+            dirty = false;
+        }
 
-        if event::poll(POLL_INTERVAL)? {
-            match event::read()? {
+        // Mouse capture emits a Moved event per pixel. Handling one event per
+        // redraw leaves keypresses behind a seconds-long queue. Drain the
+        // whole burst, drop unused motion, and coalesce drags first.
+        let poll_for = if dirty || state.needs_animated_frame() || state.drawer().is_some() {
+            ANIMATION_INTERVAL
+        } else {
+            RUNTIME_EVENT_POLL_INTERVAL
+        };
+        for event in read_pending_input(poll_for)? {
+            dirty = true;
+            match event {
+                Event::Resize(_, _) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if !state.runtime_available() {
                         if keymap::resolve(key) == Some(Action::Interrupt) {
@@ -279,6 +310,9 @@ fn run_loop(
                         continue;
                     }
                     if handle_team_editor_key(key, state, handle) {
+                        continue;
+                    }
+                    if handle_mode_editor_key(key, state, handle) {
                         continue;
                     }
                     if let Some(action) = keymap::resolve(key) {
@@ -292,8 +326,14 @@ fn run_loop(
                     if !state.runtime_available() {
                         continue;
                     }
-                    if !state.insert_team_editor_text(&text) {
-                        state.insert_text(&text);
+                    if !state.insert_team_editor_text(&text)
+                        && !state.insert_mode_editor_text(&text)
+                    {
+                        if text.trim().is_empty() {
+                            paste_clipboard_image(state);
+                        } else {
+                            state.paste_text_or_image(&text);
+                        }
                     }
                 }
                 _ => {}
@@ -301,6 +341,7 @@ fn run_loop(
         }
 
         if let Some(req) = state.take_attach_request() {
+            dirty = true;
             let member = req.member.clone();
             let result = attach_to_member(
                 terminal,
@@ -360,6 +401,12 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             if state.drawer().is_some() {
                 return;
             }
+            if let Some(index) = layout.and_then(|layout| {
+                layout.screen_to_composer_index(state.composer(), mouse.column, mouse.row)
+            }) {
+                state.begin_composer_selection(index);
+                return;
+            }
             match layout.and_then(|layout| {
                 layout
                     .contains(mouse.column, mouse.row)
@@ -371,6 +418,12 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(index) = layout.and_then(|layout| {
+                layout.screen_to_composer_index(state.composer(), mouse.column, mouse.row)
+            }) {
+                state.update_composer_selection(index);
+                return;
+            }
             if let Some(pos) =
                 layout.and_then(|layout| layout.screen_to_content(mouse.column, mouse.row))
             {
@@ -378,6 +431,11 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            let composer_text = state.finish_composer_selection();
+            if !composer_text.is_empty() {
+                copy_to_clipboard(&composer_text);
+                return;
+            }
             if let (Some(layout), Some(selection)) = (layout, state.chat_selection()) {
                 let text = layout.selected_text(selection);
                 if text.trim().is_empty() {
@@ -397,6 +455,49 @@ fn copy_to_clipboard(text: &str) {
     let _ = execute!(out, CopyToClipboard::to_primary_from(text));
 }
 
+/// Wait up to `first_wait` for the next input, then drain everything already
+/// queued. Motion events are dropped while reading so a trackpad burst cannot
+/// allocate or delay the following key.
+fn read_pending_input(first_wait: Duration) -> io::Result<Vec<Event>> {
+    if !event::poll(first_wait)? {
+        return Ok(Vec::new());
+    }
+    let mut events = Vec::new();
+    loop {
+        match event::read()? {
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {}
+            event => events.push(event),
+        }
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
+    }
+    Ok(coalesce_mouse_drags(events))
+}
+
+/// Keep the latest position from a burst of left-button drags so selection
+/// tracks the pointer instead of replaying every intermediate cell.
+fn coalesce_mouse_drags(events: Vec<Event>) -> Vec<Event> {
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
+            {
+                if let Some(Event::Mouse(previous)) = out.last_mut()
+                    && matches!(previous.kind, MouseEventKind::Drag(MouseButton::Left))
+                {
+                    *previous = mouse;
+                    continue;
+                }
+                out.push(Event::Mouse(mouse));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeHandle) -> bool {
     match state.handle_team_editor_key(key.code, key.modifiers) {
         TeamEditorOutcome::Ignored => false,
@@ -407,6 +508,28 @@ fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
             true
         }
         TeamEditorOutcome::Close => {
+            state.close_drawer();
+            true
+        }
+    }
+}
+
+fn handle_mode_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeHandle) -> bool {
+    match state.handle_mode_editor_key(key.code, key.modifiers) {
+        ModeEditorOutcome::Ignored => false,
+        ModeEditorOutcome::Consumed(commands) => {
+            let close_after = commands
+                .iter()
+                .any(|command| matches!(command, crate::domain::event::UiCommand::SetMode { .. }));
+            for command in commands {
+                send_runtime(state, handle, command);
+            }
+            if close_after {
+                state.close_drawer();
+            }
+            true
+        }
+        ModeEditorOutcome::Close => {
             state.close_drawer();
             true
         }
@@ -573,7 +696,21 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::InsertNewline => state.insert_newline(),
         Action::Backspace => state.backspace(),
         Action::DeleteWord => state.delete_word(),
-        Action::ClearLine => state.clear_composer(),
+        Action::ClearLine => state.clear_line(),
+        Action::EditQueued => {
+            send_runtime(
+                state,
+                handle,
+                UiCommand::EditQueuedPrompt {
+                    member: state.last_resolvable_message_target().and_then(
+                        |target| match target {
+                            crate::domain::event::MessageTarget::Member(id) => Some(id),
+                            _ => None,
+                        },
+                    ),
+                },
+            );
+        }
         Action::CursorLeft => {
             if state.drawer() == Some(drawers::Drawer::Runs) {
                 state.select_older_run();
@@ -651,7 +788,9 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::ToggleLogs => state.toggle_drawer(drawers::Drawer::Logs),
         Action::TogglePalette => state.toggle_drawer(drawers::Drawer::Palette),
         Action::HistorySearch => state.start_history_search(),
-        Action::ToggleExpand => state.toggle_tools_expansion(),
+        Action::ToggleThinking => state.toggle_thinking_expansion(),
+        Action::ToggleDiffs => state.toggle_diffs_expansion(),
+        Action::ToggleTools => state.toggle_tools_expansion(),
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
         Action::Complete => {
@@ -674,10 +813,11 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 abort_active_work(state, handle);
             }
         }
+        Action::PasteClipboard => paste_clipboard_image(state),
         Action::Interrupt => {
-            if !abort_active_work(state, handle) && !state.composer().is_empty() {
+            if !abort_active_work(state, handle) && state.has_composer_draft() {
                 state.clear_composer();
-            } else if !state.has_cancelable_work() && state.composer().is_empty() {
+            } else if !state.has_cancelable_work() && !state.has_composer_draft() {
                 state.request_quit();
             }
         }
@@ -909,6 +1049,15 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, boo
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.composer().text();
     let mut reset_scroll = true;
+    if !state.pending_images().is_empty()
+        && (commands::parse_target_only(&text).is_some() || text.trim().is_empty())
+    {
+        submit_image_only(state, handle, &text);
+        if reset_scroll {
+            state.reset_scroll();
+        }
+        return;
+    }
     match commands::parse(&text) {
         Submission::Exit => {
             state.take_composer();
@@ -1038,7 +1187,8 @@ fn drain_runtime_events(
     state: &mut AppState,
     events: &Receiver<RuntimeEvent>,
     notify_enabled: bool,
-) {
+) -> bool {
+    let mut changed = false;
     for _ in 0..MAX_RUNTIME_EVENTS_PER_DRAIN {
         match events.try_recv() {
             Ok(event) => {
@@ -1048,17 +1198,88 @@ fn drain_runtime_events(
                     let _ = out.flush();
                 }
                 state.apply(event);
+                changed = true;
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 state.mark_runtime_unavailable();
+                changed = true;
                 break;
             }
         }
     }
+    changed
+}
+
+fn paste_clipboard_image(state: &mut AppState) {
+    match clipboard_image::paste_clipboard_image(state.workspace()) {
+        Ok(image) => {
+            if let Err(err) = state.attach_pending_image(image) {
+                state.apply(RuntimeEvent::Notice(err));
+            }
+        }
+        // Text-only clipboards are handled by Event::Paste; stay quiet.
+        Err(err) if err.contains("clipboard has no image") => {}
+        Err(err) => state.apply(RuntimeEvent::Notice(err)),
+    }
+}
+
+fn submit_image_only(state: &mut AppState, handle: &RuntimeHandle, text: &str) {
+    let (target, body) = if let Some(target) = commands::parse_target_only(text) {
+        let body = image_only_user_body(&target);
+        (target, body)
+    } else if state.active_mode() != TerminalMode::Normal {
+        (crate::domain::event::MessageTarget::Default, String::new())
+    } else if let Some(target) = state.last_resolvable_message_target() {
+        let body = image_only_user_body(&target);
+        (target, body)
+    } else {
+        state.apply(RuntimeEvent::Notice(
+            "image needs a target prefix: @member, @all, /ask, or /all (draft kept)".to_string(),
+        ));
+        return;
+    };
+    if send_runtime(
+        state,
+        handle,
+        UiCommand::UserMessage {
+            target: target.clone(),
+            body: body.clone(),
+        },
+    ) {
+        if !body.is_empty() {
+            state.record_submission(&body);
+        }
+        state.take_composer();
+        if state.active_mode() == TerminalMode::Normal {
+            state.remember_user_message_target(&target);
+        }
+    }
+}
+
+fn image_only_user_body(target: &crate::domain::event::MessageTarget) -> String {
+    match target {
+        crate::domain::event::MessageTarget::All => "@all".to_string(),
+        crate::domain::event::MessageTarget::Member(member) => format!("@{member}"),
+        crate::domain::event::MessageTarget::Default
+        | crate::domain::event::MessageTarget::Members(_) => String::new(),
+    }
+}
+
+fn attach_pending_images(state: &AppState, command: UiCommand) -> UiCommand {
+    match command {
+        UiCommand::UserMessage { target, mut body } => {
+            for image in state.pending_images() {
+                crate::adapter::prompt_images::append_prompt_image(&mut body, image);
+            }
+            UiCommand::UserMessage { target, body }
+        }
+        other => other,
+    }
 }
 
 fn send_runtime(state: &mut AppState, handle: &RuntimeHandle, command: UiCommand) -> bool {
+    let command = attach_pending_images(state, command);
     match handle.try_send(command) {
         RuntimeCommandSend::Sent => true,
         RuntimeCommandSend::Full => {
@@ -1129,6 +1350,50 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn coalesce_mouse_drags_keeps_the_latest_left_drag() {
+        let events = vec![
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 1),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 8, 3),
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 8, 3),
+        ];
+        let coalesced = coalesce_mouse_drags(events);
+        assert_eq!(coalesced.len(), 3);
+        match &coalesced[1] {
+            Event::Mouse(mouse) => {
+                assert!(matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left)
+                ));
+                assert_eq!((mouse.column, mouse.row), (8, 3));
+            }
+            other => panic!("expected drag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_mouse_drags_does_not_drop_keys_or_scrolls() {
+        let events = vec![
+            mouse_event(MouseEventKind::ScrollUp, 1, 1),
+            Event::Key(KeyEvent::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            mouse_event(MouseEventKind::ScrollDown, 1, 1),
+        ];
+        assert_eq!(coalesce_mouse_drags(events.clone()), events);
     }
 
     #[test]
@@ -1319,6 +1584,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "test".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -1370,6 +1638,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "test".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -1692,6 +1963,31 @@ mod tests {
     }
 
     #[test]
+    fn submitting_bare_mode_opens_the_required_mode_picker() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("/mode");
+
+        handle_action(Action::Submit, &mut state, &handle);
+
+        assert_eq!(state.drawer(), Some(Drawer::Mode));
+        assert!(state.mode_editor().is_some());
+        assert!(state.composer().is_empty());
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
     fn untargeted_text_reuses_previous_target() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
@@ -1705,6 +2001,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "test".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: None,
@@ -1763,6 +2062,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "test".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: None,
@@ -1821,6 +2123,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "mixed".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -1865,6 +2170,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "mixed".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -1917,6 +2225,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "mixed".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -1972,6 +2283,9 @@ mod tests {
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "mixed".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -1992,5 +2306,33 @@ mod tests {
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
+    }
+
+    #[test]
+    fn user_message_picks_up_pending_images() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-pending-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let mut state = AppState::new(Vec::new());
+        let image = crate::adapter::prompt_images::PromptImage::from_path(&path).unwrap();
+        state.attach_pending_image(image).unwrap();
+        let command = attach_pending_images(
+            &state,
+            UiCommand::UserMessage {
+                target: crate::domain::event::MessageTarget::Member(MemberId::new("builder")),
+                body: "@builder look".to_string(),
+            },
+        );
+        match command {
+            UiCommand::UserMessage { body, .. } => {
+                assert!(body.starts_with("@builder look"));
+                assert!(body.contains("[asterline-image]:"));
+                assert!(body.contains("shot.png"));
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

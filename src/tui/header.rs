@@ -13,25 +13,16 @@ use crate::tui::status_indicator;
 use crate::tui::theme;
 use crate::tui::theme::{clip_width, display_width, truncate_width};
 
-/// Header: `Asterline · team    …    workspace`, one chip per member, and a
+/// Header: `Asterline 0.2.9    …    workspace`, one chip per member, and a
 /// thin rule that separates the header block from the conversation.
 pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let width = area.width as usize;
-    // Line 1: title on the left, workspace path on the right.
-    // `custom` is only the bootstrap builder's placeholder team name. It is
-    // not a model, profile, or execution mode, so it should not consume the
-    // most visible part of the header.
-    let title = if state.team() == "custom" {
-        format!(" Asterline · mode:{}", state.active_mode())
-    } else {
-        format!(
-            " Asterline · {} · mode:{}",
-            state.team(),
-            state.active_mode()
-        )
-    };
+    // Line 1: product and version. Team names and the active mode are
+    // metadata, not chrome.
+    let brand = " Asterline";
+    let version = format!(" {}", env!("CARGO_PKG_VERSION"));
     let workspace = state.workspace().to_string();
-    let title_width = display_width(&title);
+    let title_width = display_width(brand) + display_width(&version);
     let space = width.saturating_sub(title_width).saturating_sub(1);
     let workspace = if workspace.is_empty() || space < 8 {
         String::new()
@@ -43,7 +34,8 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         .saturating_sub(display_width(&workspace))
         .saturating_sub(1);
     let title_line = Line::from(vec![
-        Span::styled(title, theme::accent_bold()),
+        Span::styled(brand, theme::accent_bold()),
+        Span::styled(version, theme::muted()),
         Span::raw(" ".repeat(gap)),
         Span::styled(workspace, theme::muted()),
     ]);
@@ -58,7 +50,7 @@ pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         let name_style = if state.header_selected() == Some(i) {
             theme::selection()
         } else {
-            theme::backend_bold(member.backend)
+            theme::backend_bold_shaded(member.backend, state.member_color_index(&member.id))
         };
         chips.push(Span::styled(member.display_name.clone(), name_style));
         chips.push(Span::styled(
@@ -203,6 +195,14 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             text.unwrap_or_default(),
             theme::warning_bold(),
         ));
+        let queued = state.queued_prompt_count();
+        if queued > 0 {
+            parts.push(Span::raw("   "));
+            parts.push(Span::styled(
+                format!("{queued} queued · Esc send · Shift+← edit"),
+                theme::warning_bold(),
+            ));
+        }
     } else if let Some((text, color)) = run_footer_hint(state) {
         if !parts.is_empty() {
             parts.push(Span::raw("   "));
@@ -211,7 +211,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     } else if parts.is_empty() {
         // Idle: one short, faint key-hint line.
         parts.push(Span::styled(
-            "@member first · Enter send · Ctrl+O tools · /help",
+            "@member first · Enter send · /help",
             theme::muted(),
         ));
     }

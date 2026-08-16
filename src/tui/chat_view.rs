@@ -3,22 +3,26 @@
 //! optional drawer overlay. Chat-block rendering lives here; the header,
 //! drawers, and run presentation live in sibling modules.
 
+use std::cell::RefCell;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
-use crate::domain::event::ChatItem;
+use crate::domain::event::{ChatItem, FileChangeItem};
 use crate::domain::team::{DefaultTarget, MemberId};
 use crate::tui::app_state::{AppState, member_status_is_active};
 use crate::tui::completion::Completion;
 use crate::tui::drawer_view::render_drawer;
+use crate::tui::file_diff;
 use crate::tui::header::{render_footer, render_header};
 use crate::tui::markdown;
 use crate::tui::status_indicator;
 use crate::tui::theme;
-use crate::tui::theme::truncate_width;
+use crate::tui::theme::{clip_width, truncate_width};
+use crate::tui::tool_display;
 
 /// Snapshot of the flattened chat layout for the last frame. Used by
 /// content-anchored mouse selection so anchors survive scrolling.
@@ -28,20 +32,55 @@ pub struct ChatLayout {
     pub area: Rect,
     /// Flattened index of the first visible line.
     pub first_line: usize,
+    /// Total flattened lines, including those above/below the viewport.
+    pub total_lines: usize,
     /// Wrap width used to build the lines.
     pub width: usize,
-    /// Plain text of ALL flattened lines (unstyled).
+    /// Plain text of the visible viewport (unstyled). Index 0 is `first_line`.
     pub lines: Vec<String>,
     /// Completion popup bounds when it is visible. This uses screen-space
     /// selection because popup rows do not belong to chat history.
     pub completion_area: Option<Rect>,
+    /// Composer inner rect for drag-select / copy.
+    pub composer_area: Option<Rect>,
+    /// Text wrap width inside the composer (excludes the `> ` gutter).
+    pub composer_wrap: usize,
+    /// Visual rows reserved above composer text (attachment chips).
+    pub composer_text_origin: u16,
 }
 
 impl ChatLayout {
     /// Maximum scroll offset (lines up from the bottom) for this layout.
     pub fn max_scroll(&self) -> usize {
         let height = self.area.height as usize;
-        self.lines.len().saturating_sub(height)
+        self.total_lines.saturating_sub(height)
+    }
+
+    pub fn composer_contains(&self, x: u16, y: u16) -> bool {
+        self.composer_area.is_some_and(|area| {
+            x >= area.x
+                && x < area.x.saturating_add(area.width)
+                && y >= area.y
+                && y < area.y.saturating_add(area.height)
+        })
+    }
+
+    pub fn screen_to_composer_index(
+        &self,
+        composer: &crate::tui::composer::Composer,
+        x: u16,
+        y: u16,
+    ) -> Option<usize> {
+        let area = self.composer_area?;
+        if !self.composer_contains(x, y) {
+            return None;
+        }
+        let wrap = self.composer_wrap.max(1);
+        let row = y
+            .saturating_sub(area.y)
+            .saturating_sub(self.composer_text_origin) as usize;
+        let col = x.saturating_sub(area.x).saturating_sub(2) as usize;
+        Some(composer.index_at_visual(wrap, row, col))
     }
 
     /// Map a screen cell to a content `(line_index, display_column)`, clamping
@@ -56,8 +95,9 @@ impl ChatLayout {
         let line_idx = self
             .first_line
             .saturating_add(row)
-            .min(self.lines.len().saturating_sub(1));
-        let line = self.lines.get(line_idx).map(String::as_str).unwrap_or("");
+            .min(self.total_lines.saturating_sub(1));
+        let local = line_idx.saturating_sub(self.first_line);
+        let line = self.lines.get(local).map(String::as_str).unwrap_or("");
         let width = theme::display_width(line);
         let col = if width == 0 { 0 } else { col.min(width - 1) };
         Some((line_idx, col))
@@ -78,17 +118,15 @@ impl ChatLayout {
             return String::new();
         }
         let (from, to) = selection.normalized();
-        let last = self.lines.len().saturating_sub(1);
-        let start_line = from.0.min(last);
-        let end_line = to.0.min(last);
+        let last = self.total_lines.saturating_sub(1);
+        let start_line = from.0.max(self.first_line).min(last);
+        let end_line = to.0.max(self.first_line).min(last);
         let mut out = String::new();
-        for (index, line) in self
-            .lines
-            .iter()
-            .enumerate()
-            .take(end_line + 1)
-            .skip(start_line)
-        {
+        for (offset, line) in self.lines.iter().enumerate() {
+            let index = self.first_line.saturating_add(offset);
+            if index < start_line || index > end_line {
+                continue;
+            }
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -112,22 +150,30 @@ fn chat_rail(color: Color) -> Span<'static> {
 }
 
 fn member_rail_color(state: &AppState, member: &MemberId) -> Color {
-    state
+    if state
         .members()
         .iter()
-        .find(|candidate| &candidate.id == member)
-        .map(|candidate| candidate.backend)
-        .or_else(|| {
-            state.chat().iter().rev().find_map(|item| match item {
-                ChatItem::Agent {
-                    member: candidate,
-                    backend,
-                    ..
-                } if candidate == member => Some(*backend),
-                _ => None,
-            })
+        .any(|candidate| &candidate.id == member)
+    {
+        return state.member_color(member);
+    }
+    state
+        .chat()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ChatItem::Agent {
+                member: candidate,
+                backend,
+                ..
+            }
+            | ChatItem::Thinking {
+                member: candidate,
+                backend,
+                ..
+            } if candidate == member => Some(theme::backend_color(*backend)),
+            _ => None,
         })
-        .map(theme::backend_color)
         .unwrap_or_else(theme::muted_color)
 }
 
@@ -139,7 +185,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     let composer_avail = frame.area().width.saturating_sub(2) as usize;
     let composer_rows =
         (state.composer().visual_line_count(composer_avail) as u16).clamp(1, MAX_COMPOSER_ROWS);
-    let composer_height = composer_rows + 2; // borders
+    let image_rows = u16::from(!state.pending_images().is_empty());
+    let composer_height = composer_rows + image_rows + 2; // borders + optional chips
     let completion = if state.drawer().is_none() {
         state.completion()
     } else {
@@ -163,6 +210,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     render_header(frame, chunks[0], state);
     let mut layout = render_chat(frame, chunks[1], state);
     render_composer(frame, chunks[2], state);
+    let composer_inner = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .inner(chunks[2]);
+    layout.composer_area = Some(composer_inner);
+    layout.composer_wrap = (composer_inner.width as usize).saturating_sub(2);
+    layout.composer_text_origin = u16::from(!state.pending_images().is_empty());
     if let Some(completion) = completion {
         render_popup(frame, chunks[3], &completion, state.popup_selected());
         layout.completion_area = Some(chunks[3]);
@@ -252,67 +305,438 @@ fn completion_parts(label: &str) -> (&str, Option<&str>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PaintKey {
+    width: usize,
+    roster_revision: u64,
+    thinking_expanded: bool,
+    diffs_expanded: bool,
+    tools_expanded: bool,
+    find_current: Option<usize>,
+}
+
+#[derive(Default)]
+struct ChatPaintCache {
+    key: Option<PaintKey>,
+    item_revs: Vec<u64>,
+    /// Finished prefix kept as one entry so streaming only re-paints the tail.
+    prefix: Option<CachedChunk>,
+    tail: Option<CachedChunk>,
+    live_slots: Vec<LiveSlot>,
+}
+
+#[derive(Clone, Default)]
+struct CachedChunk {
+    item_lo: usize,
+    item_hi: usize,
+    height: usize,
+    lines: Option<Vec<Line<'static>>>,
+    plain: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct LiveSlot {
+    at: usize,
+    member: MemberId,
+    show_header: bool,
+}
+
+thread_local! {
+    static CHAT_PAINT: RefCell<ChatPaintCache> = const { RefCell::new(ChatPaintCache {
+        key: None,
+        item_revs: Vec::new(),
+        prefix: None,
+        tail: None,
+        live_slots: Vec::new(),
+    }) };
+}
+
+enum LiveRender<'a> {
+    #[cfg(test)]
+    Inline,
+    Record(&'a mut Vec<LiveSlot>),
+}
+
+fn paint_key(state: &AppState, width: usize) -> PaintKey {
+    PaintKey {
+        width,
+        roster_revision: state.roster_revision(),
+        thinking_expanded: state.thinking_expanded(),
+        diffs_expanded: state.diffs_expanded(),
+        tools_expanded: state.tools_expanded(),
+        find_current: state.find_current_chat_index(),
+    }
+}
+
+fn line_to_plain(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayout {
     let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let width = inner.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let height = inner.height as usize;
+    let (mut visible, plain, total) = painted_chat(state, width, state.scroll(), height);
 
-    if state.chat().is_empty() {
+    let max_start = total.saturating_sub(height);
+    let start = max_start.saturating_sub(state.scroll());
+    if let Some(selection) = state.chat_selection() {
+        apply_selection_style(&mut visible, start, selection);
+    }
+    frame.render_widget(Paragraph::new(visible), inner);
+
+    ChatLayout {
+        area: inner,
+        first_line: start,
+        total_lines: total,
+        width,
+        lines: plain,
+        completion_area: None,
+        composer_area: None,
+        composer_wrap: 0,
+        composer_text_origin: 0,
+    }
+}
+
+/// Grok Build keeps a pinned header and virtualizes the middle scrollback:
+/// each finished chunk is measured once, off-screen render caches are
+/// dropped, and a live tail is the only thing rebuilt while streaming.
+fn painted_chat(
+    state: &AppState,
+    width: usize,
+    scroll: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, Vec<String>, usize) {
+    CHAT_PAINT.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        ensure_scrollback_cached(state, width, &mut cache);
+        compose_scrollback(&mut cache, state, width, scroll, height)
+    })
+}
+
+fn ensure_scrollback_cached(state: &AppState, width: usize, cache: &mut ChatPaintCache) {
+    let key = paint_key(state, width);
+    let spinner_frame = status_indicator::spinner();
+    let revs: Vec<u64> = state
+        .chat()
+        .iter()
+        .map(|item| paint_item_revision(state, item, spinner_frame))
+        .collect();
+    let flags_changed = cache.key != Some(key);
+    let dirty = if flags_changed {
+        0
+    } else {
+        rewind_work_run(state.chat(), first_rev_mismatch(&cache.item_revs, &revs))
+    };
+    if !flags_changed
+        && cache.item_revs.len() == revs.len()
+        && dirty == revs.len()
+        && cache.tail.is_some()
+    {
+        cache.item_revs = revs;
+        return;
+    }
+
+    if dirty == 0 {
+        cache.prefix = None;
+        cache.tail = None;
+        cache.live_slots.clear();
+    } else if cache
+        .prefix
+        .as_ref()
+        .is_some_and(|prefix| prefix.item_hi > dirty)
+    {
+        cache.prefix = None;
+        cache.live_slots.clear();
+    }
+    if cache.prefix.is_none() && dirty > 0 {
+        cache.live_slots.clear();
+        cache.prefix = Some(render_chunk(state, width, 0, dirty, &mut cache.live_slots));
+    }
+
+    let prefix_height = cache.prefix.as_ref().map_or(0, |prefix| prefix.height);
+    cache.live_slots.retain(|slot| slot.at <= prefix_height);
+    let tail_start = cache.prefix.as_ref().map_or(0, |prefix| prefix.item_hi);
+    let slot_from = cache.live_slots.len();
+    cache.tail = Some(render_chunk(
+        state,
+        width,
+        tail_start,
+        state.chat().len(),
+        &mut cache.live_slots,
+    ));
+    for slot in cache.live_slots.iter_mut().skip(slot_from) {
+        slot.at = slot.at.saturating_add(prefix_height);
+    }
+    cache.item_revs = revs;
+    cache.key = Some(key);
+}
+
+/// Live thinking and in-flight tools both own a spinner. Include its frame in
+/// their cache revision so the virtualized tail is repainted while they run.
+fn paint_item_revision(state: &AppState, item: &ChatItem, spinner_frame: &str) -> u64 {
+    let revision = item_rev(item);
+    match item {
+        ChatItem::Thinking { member, .. } if state.is_thinking_live(member) => {
+            revision ^ fnv1a64_bytes(spinner_frame.as_bytes())
+        }
+        ChatItem::Tool { ok: None, .. } => revision ^ fnv1a64_bytes(spinner_frame.as_bytes()),
+        _ => revision,
+    }
+}
+
+fn first_rev_mismatch(old: &[u64], new: &[u64]) -> usize {
+    let shared = old.len().min(new.len());
+    for index in 0..shared {
+        if old[index] != new[index] {
+            return index;
+        }
+    }
+    shared.min(new.len())
+}
+
+fn rewind_work_run(items: &[ChatItem], dirty: usize) -> usize {
+    if let Some(ChatItem::User { targets, .. }) = items.get(dirty) {
+        // A newly targeted prompt starts a new live region. Repaint that
+        // member's prior region as well, otherwise a cached trailing Working
+        // slot remains attached to the completed answer above it.
+        return targets
+            .iter()
+            .filter_map(|target| {
+                items[..dirty]
+                    .iter()
+                    .rposition(|item| item_member(item).is_some_and(|member| member == target))
+            })
+            .min()
+            .unwrap_or(dirty);
+    }
+    let Some(ChatItem::Tool { member, .. } | ChatItem::Diff { member, .. }) = items.get(dirty)
+    else {
+        return dirty;
+    };
+    let mut start = dirty;
+    while start > 0 {
+        match &items[start - 1] {
+            ChatItem::Tool {
+                member: prev_member,
+                ..
+            }
+            | ChatItem::Diff {
+                member: prev_member,
+                ..
+            } if prev_member == member => start -= 1,
+            _ => break,
+        }
+    }
+    start
+}
+
+fn render_chunk(
+    state: &AppState,
+    width: usize,
+    start: usize,
+    end: usize,
+    live_slots: &mut Vec<LiveSlot>,
+) -> CachedChunk {
+    let mut lines = Vec::new();
+    if start == 0 && state.chat().is_empty() {
         lines.push(Line::raw(""));
         lines.extend(quick_start_lines(state));
         lines.push(Line::raw(""));
     }
-
-    render_chat_history(state, width, 0, &mut lines);
-
-    let omitted_active = state.omitted_active_output_count();
-    if omitted_active > 0 {
+    render_chat_history_range(
+        state,
+        width,
+        start,
+        end,
+        &mut lines,
+        LiveRender::Record(live_slots),
+    );
+    if end == state.chat().len() && state.omitted_active_output_count() > 0 {
+        let omitted = state.omitted_active_output_count();
         let text = format!(
-            "… {omitted_active} active output cell(s) omitted by the TUI memory limit; final results will appear on completion"
+            "… {omitted} active output cell(s) omitted by the TUI memory limit; final results will appear on completion"
         );
         for wrapped in markdown::wrap(&text, width.max(1)) {
             lines.push(Line::from(Span::styled(wrapped, theme::warning_bold())));
         }
         lines.push(Line::raw(""));
     }
-
-    let height = inner.height as usize;
-    let total = lines.len();
-    let max_start = total.saturating_sub(height);
-    let start = max_start.saturating_sub(state.scroll());
-    // Clone only the viewport for the widget. The remaining styled lines are
-    // consumed into the selection snapshot below instead of first duplicating
-    // the entire flattened transcript.
-    let mut visible: Vec<Line> = lines.iter().skip(start).take(height).cloned().collect();
-    if let Some(selection) = state.chat_selection() {
-        apply_selection_style(&mut visible, start, selection);
-    }
-    frame.render_widget(Paragraph::new(visible), inner);
-
-    let plain: Vec<String> = lines
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .into_iter()
-                .map(|span| span.content.into_owned())
-                .collect::<String>()
-        })
-        .collect();
-
-    ChatLayout {
-        area: inner,
-        first_line: start,
-        width,
-        lines: plain,
-        completion_area: None,
+    CachedChunk {
+        item_lo: start,
+        item_hi: end,
+        height: lines.len(),
+        plain: Some(lines.iter().map(line_to_plain).collect()),
+        lines: Some(lines),
     }
 }
 
+fn item_rev(item: &ChatItem) -> u64 {
+    let (tag, len, bytes) = match item {
+        ChatItem::User { body, .. } => (1u64, body.len(), body.as_bytes()),
+        ChatItem::Agent { text, .. } => (2, text.len(), text.as_bytes()),
+        ChatItem::Thinking {
+            text, elapsed_secs, ..
+        } => (3 ^ elapsed_secs.unwrap_or(0), text.len(), text.as_bytes()),
+        ChatItem::Tool { detail, name, .. } => (4, detail.len() + name.len(), detail.as_bytes()),
+        ChatItem::Diff { files, .. } => {
+            let len = files.iter().map(|file| file.path.len()).sum();
+            (
+                5,
+                len,
+                files
+                    .first()
+                    .map(|file| file.path.as_bytes())
+                    .unwrap_or(&[]),
+            )
+        }
+        ChatItem::Route { body, .. } => (6, body.len(), body.as_bytes()),
+        ChatItem::Notice { text } => (7, text.len(), text.as_bytes()),
+        ChatItem::Error { message, .. } => (8, message.len(), message.as_bytes()),
+        ChatItem::Verdict { summary, .. } => (9, summary.len(), summary.as_bytes()),
+    };
+    tag.wrapping_shl(56) ^ (len as u64).wrapping_shl(32) ^ fnv1a64_bytes(bytes)
+}
+
+fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn compose_scrollback(
+    cache: &mut ChatPaintCache,
+    state: &AppState,
+    width: usize,
+    scroll: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, Vec<String>, usize) {
+    let prefix_h = cache.prefix.as_ref().map_or(0, |chunk| chunk.height);
+    let tail_h = cache.tail.as_ref().map_or(0, |chunk| chunk.height);
+    let live = realized_live_slots(cache, state, width);
+    let extra: usize = live.iter().map(|(_, lines)| lines.len()).sum();
+    let total = prefix_h + tail_h + extra;
+    let max_start = total.saturating_sub(height);
+    let start = max_start.saturating_sub(scroll);
+    let end = start.saturating_add(height);
+
+    evict_offscreen_chunk(cache.prefix.as_mut(), 0, start, end);
+    evict_offscreen_chunk(cache.tail.as_mut(), prefix_h, start, end);
+    ensure_chunk_lines(state, width, cache.prefix.as_mut());
+    ensure_chunk_lines(state, width, cache.tail.as_mut());
+
+    let mut visible = Vec::with_capacity(height.min(total));
+    let mut plain = Vec::with_capacity(height.min(total));
+    let mut index = 0usize;
+    let mut live_at = 0usize;
+    let mut emit = |line: &Line<'static>| {
+        if index >= start && visible.len() < height {
+            plain.push(line_to_plain(line));
+            visible.push(line.clone());
+        }
+        index += 1;
+    };
+    let flush_live_at = |at: usize, live_at: &mut usize, emit: &mut dyn FnMut(&Line<'static>)| {
+        while *live_at < live.len() && live[*live_at].0 == at {
+            for live_line in &live[*live_at].1 {
+                emit(live_line);
+            }
+            *live_at += 1;
+        }
+    };
+    let emit_chunk = |chunk: Option<&CachedChunk>,
+                      origin: usize,
+                      live_at: &mut usize,
+                      emit: &mut dyn FnMut(&Line<'static>)| {
+        if let Some(chunk) = chunk
+            && let Some(lines) = chunk.lines.as_ref()
+        {
+            for (offset, line) in lines.iter().enumerate() {
+                flush_live_at(origin + offset, live_at, emit);
+                emit(line);
+            }
+        } else if let Some(chunk) = chunk {
+            for offset in 0..chunk.height {
+                flush_live_at(origin + offset, live_at, emit);
+                emit(&Line::raw(""));
+            }
+        }
+    };
+    emit_chunk(cache.prefix.as_ref(), 0, &mut live_at, &mut emit);
+    emit_chunk(cache.tail.as_ref(), prefix_h, &mut live_at, &mut emit);
+    while live_at < live.len() {
+        for live_line in &live[live_at].1 {
+            emit(live_line);
+        }
+        live_at += 1;
+    }
+    (visible, plain, total)
+}
+
+fn evict_offscreen_chunk(
+    chunk: Option<&mut CachedChunk>,
+    origin: usize,
+    view_start: usize,
+    view_end: usize,
+) {
+    let Some(chunk) = chunk else {
+        return;
+    };
+    let chunk_end = origin.saturating_add(chunk.height);
+    if chunk_end <= view_start || origin >= view_end {
+        chunk.lines = None;
+        chunk.plain = None;
+    }
+}
+
+fn ensure_chunk_lines(state: &AppState, width: usize, chunk: Option<&mut CachedChunk>) {
+    let Some(chunk) = chunk else {
+        return;
+    };
+    if chunk.lines.is_some() {
+        return;
+    }
+    let mut unused = Vec::new();
+    *chunk = render_chunk(state, width, chunk.item_lo, chunk.item_hi, &mut unused);
+}
+
+fn realized_live_slots(
+    cache: &ChatPaintCache,
+    state: &AppState,
+    width: usize,
+) -> Vec<(usize, Vec<Line<'static>>)> {
+    let mut out = Vec::new();
+    for slot in &cache.live_slots {
+        let mut lines = Vec::new();
+        if render_live_member_activity(state, width, &slot.member, slot.show_header, &mut lines) {
+            if slot.show_header {
+                lines.push(Line::raw(""));
+            }
+            out.push((slot.at, lines));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 fn render_chat_history(state: &AppState, width: usize, start: usize, out: &mut Vec<Line<'static>>) {
-    render_chat_history_range(state, width, start, state.chat().len(), out);
+    render_chat_history_range(
+        state,
+        width,
+        start,
+        state.chat().len(),
+        out,
+        LiveRender::Inline,
+    );
 }
 
 fn apply_selection_style(
@@ -392,7 +816,9 @@ fn grouped_chat_indices(items: &[ChatItem], start: usize, end: usize) -> Vec<usi
             if used[j] {
                 continue;
             }
-            if user_breaks_member_region(&items[j], &member) {
+            if user_breaks_member_region(&items[j], &member)
+                || relay_starts_member_region(&items[j], &member)
+            {
                 break;
             }
             if item_member(&items[j]) == Some(&member) {
@@ -402,6 +828,13 @@ fn grouped_chat_indices(items: &[ChatItem], start: usize, end: usize) -> Vec<usi
         }
     }
     out
+}
+
+/// An incoming member relay is a fresh unit of work for its recipient. Do not
+/// pull that recipient's later tools back under their earlier reply just
+/// because another member's route sat between the two in the event timeline.
+fn relay_starts_member_region(item: &ChatItem, member: &MemberId) -> bool {
+    matches!(item, ChatItem::Route { to, .. } if to.iter().any(|target| target == member.as_str()))
 }
 
 fn user_breaks_member_region(item: &ChatItem, member: &MemberId) -> bool {
@@ -428,6 +861,7 @@ fn render_chat_history_range(
     start: usize,
     end: usize,
     out: &mut Vec<Line<'static>>,
+    mut live: LiveRender<'_>,
 ) {
     let items = state.chat();
     let start = start.min(items.len());
@@ -435,8 +869,17 @@ fn render_chat_history_range(
     let order = grouped_chat_indices(items, start, end);
     let mut saw_work_activity = start > 0 && items[..start].iter().any(is_work_activity);
     let mut rendered_live = std::collections::HashSet::new();
+    let mut skip_until = 0usize;
     for (pos, &i) in order.iter().enumerate() {
+        if pos < skip_until {
+            continue;
+        }
         let item = &items[i];
+        // Thinking rows from older saved conversations are retained in the
+        // database for compatibility, but thinking is now transient progress.
+        if matches!(item, ChatItem::Thinking { .. }) {
+            continue;
+        }
         if matches!(item, ChatItem::User { .. }) && saw_work_activity {
             render_turn_separator(width, out);
             saw_work_activity = false;
@@ -445,38 +888,99 @@ fn render_chat_history_range(
             saw_work_activity = true;
         }
         let before = out.len();
-        let previous = pos.checked_sub(1).map(|p| &items[order[p]]);
+        let previous = order[..pos]
+            .iter()
+            .rev()
+            .map(|&p| &items[p])
+            .find(|item| item_renders(item, state))
+            .or_else(|| {
+                (start > 0)
+                    .then(|| {
+                        items[..start]
+                            .iter()
+                            .rev()
+                            .find(|item| item_renders(item, state))
+                    })
+                    .flatten()
+            });
         let previous_sender = previous.and_then(item_sender);
-        // User and agent bubbles keep their own title so a member's later
-        // reply still reads as "member1: second message" in that member's
-        // region. Tools stay attached to the preceding speaker.
-        let show_sender_header = matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
-            || item_sender(item) != previous_sender;
-        let is_find_current = state.find_current_chat_index() == Some(i);
-        render_item(item, width, state, out, show_sender_header);
+        // A new user or agent reply keeps its own title. Mid-turn text after
+        // the same member's work stays on that member header.
+        let show_sender_header = match item {
+            ChatItem::User { .. } => true,
+            ChatItem::Agent { member, .. } => match previous {
+                Some(ChatItem::Agent { member: prev, .. }) if prev == member => true,
+                Some(prev) if item_sender(prev) == Some(ChatSender::Agent(member.clone())) => false,
+                _ => true,
+            },
+            _ => item_sender(item) != previous_sender,
+        };
+        let run_end = consecutive_work_run_end(items, &order, pos);
+        let is_find_current = order[pos..=run_end]
+            .iter()
+            .any(|&idx| state.find_current_chat_index() == Some(idx));
+        if matches!(item, ChatItem::Tool { .. } | ChatItem::Diff { .. }) {
+            let run: Vec<&ChatItem> = order[pos..=run_end].iter().map(|&j| &items[j]).collect();
+            render_work_run(&run, width, state, out, show_sender_header);
+            skip_until = run_end + 1;
+        } else {
+            render_item(item, width, state, out, show_sender_header);
+        }
         if is_find_current && let Some(line) = out.get_mut(before) {
             // Marker in the gutter for the current `/find` match.
             let mut spans = vec![Span::styled("»", theme::selection())];
             spans.append(&mut line.spans);
             line.spans = spans;
         }
-        let next = order.get(pos + 1).map(|&j| &items[j]);
+        let item = &items[order[run_end]];
+        let next = order.get(run_end + 1).map(|&j| &items[j]);
         let member_block_ends = item_member(item)
             .is_some_and(|member| next.and_then(item_member).is_none_or(|next| next != member));
         if member_block_ends
             && let Some(member) = item_member(item)
-            && render_live_member_activity(state, width, member, false, out)
+            && live_activity_belongs_after(items, &order, run_end, member)
         {
-            rendered_live.insert(member.clone());
+            // Thinking is already a live indicator. Mark the region claimed
+            // so the trailing fallback does not reprint Working at the bottom.
+            match &mut live {
+                #[cfg(test)]
+                LiveRender::Inline => {
+                    if matches!(item, ChatItem::Thinking { .. })
+                        || render_live_member_activity(state, width, member, false, out)
+                    {
+                        rendered_live.insert(member.clone());
+                    }
+                }
+                LiveRender::Record(slots) => {
+                    if matches!(item, ChatItem::Thinking { .. }) {
+                        rendered_live.insert(member.clone());
+                    } else {
+                        slots.push(LiveSlot {
+                            at: out.len(),
+                            member: member.clone(),
+                            show_header: false,
+                        });
+                        rendered_live.insert(member.clone());
+                    }
+                }
+            }
         }
-        // Keep one member's answer, tools, routes, diffs, and errors on the
-        // same uninterrupted visual rail. Separate unrelated blocks.
+        // Same-member tools / thinking / diffs stay on one rail. A completed
+        // tool/diff run gets a rail gap before the member's next reply;
+        // distinct replies and members get a plain gap.
         if out.len() > before {
-            let grouped = (is_compact(item) && next.is_some_and(is_compact))
-                || item_sender(item)
-                    .is_some_and(|sender| next.and_then(item_sender).as_ref() == Some(&sender))
-                || next.is_some_and(|next| same_member_thread(item, next));
-            if !grouped {
+            let same_member = next.is_some_and(|next| same_member_thread(item, next));
+            let glued_replies = is_speech_item(item) && next.is_some_and(is_speech_item);
+            let work_to_reply = matches!(item, ChatItem::Tool { .. } | ChatItem::Diff { .. })
+                && matches!(next, Some(ChatItem::Agent { .. }));
+            if work_to_reply && same_member {
+                if let Some(member) = item_member(item) {
+                    out.push(Line::from(vec![
+                        chat_rail(member_rail_color(state, member)),
+                        Span::raw(""),
+                    ]));
+                }
+            } else if !same_member || glued_replies {
                 out.push(Line::raw(""));
             }
         }
@@ -486,14 +990,44 @@ fn render_chat_history_range(
     }
     if end == items.len() {
         for member in state.members() {
-            if member_status_is_active(member.status)
-                && !rendered_live.contains(&member.id)
-                && render_live_member_activity(state, width, &member.id, true, out)
-            {
-                out.push(Line::raw(""));
+            if rendered_live.contains(&member.id) {
+                continue;
+            }
+            match &mut live {
+                #[cfg(test)]
+                LiveRender::Inline => {
+                    if member_status_is_active(member.status)
+                        && render_live_member_activity(state, width, &member.id, true, out)
+                    {
+                        out.push(Line::raw(""));
+                    }
+                }
+                LiveRender::Record(slots) => {
+                    slots.push(LiveSlot {
+                        at: out.len(),
+                        member: member.id.clone(),
+                        show_header: true,
+                    });
+                }
             }
         }
     }
+}
+
+/// Live thinking belongs on this member's latest region, not on an earlier
+/// finished reply. A later prompt only closes the region when it would also
+/// break grouping — talking to someone else while this member is still
+/// working must leave their thinking in their own block.
+fn live_activity_belongs_after(
+    items: &[ChatItem],
+    order: &[usize],
+    pos: usize,
+    member: &MemberId,
+) -> bool {
+    !order.iter().skip(pos + 1).any(|&j| {
+        let later = &items[j];
+        item_member(later) == Some(member) || user_breaks_member_region(later, member)
+    })
 }
 
 fn render_live_member_activity(
@@ -509,34 +1043,523 @@ fn render_live_member_activity(
     if !member_status_is_active(member.status) {
         return false;
     }
-    let show_placeholder = show_placeholder_header && !state.has_active_message(&member.id);
-    let reasoning = state
-        .active_reasoning()
-        .get(&member.id)
-        .map(String::as_str)
-        .filter(|s| !s.is_empty());
-    if !show_placeholder && reasoning.is_none() {
+    // A streaming answer is itself the live view; do not add a second row.
+    if state.has_active_message(&member.id) {
         return false;
     }
-    if show_placeholder {
-        out.push(agent_header_line(&member.display_name, member.backend));
+    if show_placeholder_header {
+        out.push(agent_header_line(
+            &member.display_name,
+            member.backend,
+            state.member_color(&member.id),
+        ));
     }
+    let reasoning = state.active_reasoning().get(member_id).map(String::as_str);
     let line_text = status_indicator::member_activity_text(
         member.status,
         reasoning,
-        member.backend != crate::domain::team::BackendKind::Claude || state.tools_expanded(),
+        reasoning.is_some(),
         state.member_elapsed_secs(&member.id),
         status_indicator::spinner(),
         Some(&state.member_runtime_profile(member)),
     );
     for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
         out.push(Line::from(vec![
-            chat_rail(theme::backend_color(member.backend)),
+            chat_rail(state.member_color(&member.id)),
             Span::raw(" "),
             Span::styled(wrapped, theme::muted_italic()),
         ]));
     }
     true
+}
+
+fn consecutive_work_run_end(items: &[ChatItem], order: &[usize], pos: usize) -> usize {
+    let member = match order.get(pos).map(|&i| &items[i]) {
+        Some(ChatItem::Tool { member, .. } | ChatItem::Diff { member, .. }) => member,
+        _ => return pos,
+    };
+    let mut end = pos;
+    while let Some(&j) = order.get(end + 1) {
+        match &items[j] {
+            ChatItem::Tool { member: next, .. } | ChatItem::Diff { member: next, .. }
+                if next == member =>
+            {
+                end += 1;
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+fn render_work_run(
+    run: &[&ChatItem],
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+    show_sender_header: bool,
+) {
+    let all_tools: Vec<&ChatItem> = run
+        .iter()
+        .copied()
+        .filter(|item| matches!(item, ChatItem::Tool { .. }))
+        .collect();
+    let diffs: Vec<&ChatItem> = run
+        .iter()
+        .copied()
+        .filter(|item| matches!(item, ChatItem::Diff { .. }))
+        .collect();
+    let mut diff_member = None;
+    let mut files = Vec::new();
+    let mut diff_ok = true;
+    if let Some((member, merged, ok)) = merge_diff_run(&diffs) {
+        diff_member = Some(member);
+        files = merged;
+        diff_ok = ok;
+    }
+    let edit_tools: Vec<&ChatItem> = all_tools
+        .iter()
+        .copied()
+        .filter(|item| {
+            is_edit_tool(item)
+                && !matches!(
+                    item,
+                    ChatItem::Tool {
+                        ok: Some(false),
+                        ..
+                    }
+                )
+        })
+        .collect();
+    for tool in &edit_tools {
+        let ChatItem::Tool {
+            name,
+            summary,
+            detail,
+            ok,
+            ..
+        } = tool
+        else {
+            continue;
+        };
+        if let Some(file) = tool_display::file_change_from_edit_tool(name, summary, detail) {
+            merge_file_change(&mut files, file);
+        }
+        diff_ok &= *ok != Some(false);
+    }
+    let tools: Vec<&ChatItem> = all_tools
+        .iter()
+        .copied()
+        .filter(|item| {
+            !is_edit_tool(item)
+                || matches!(
+                    item,
+                    ChatItem::Tool {
+                        ok: Some(false),
+                        ..
+                    }
+                )
+        })
+        .collect();
+    if !tools.is_empty() {
+        render_tool_group(&tools, width, state, out, show_sender_header);
+    }
+    let member = diff_member.or_else(|| {
+        edit_tools.iter().find_map(|item| match item {
+            ChatItem::Tool { member, .. } => Some(member),
+            _ => None,
+        })
+    });
+    if let Some(member) = member.filter(|_| !files.is_empty()) {
+        if tools.is_empty() && show_sender_header {
+            let (display_name, backend) = state.member_meta(member);
+            out.push(agent_header_line(
+                &display_name,
+                backend,
+                state.member_color(member),
+            ));
+        }
+        for (index, files) in split_files_by_edit(&edit_tools, files)
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                out.push(Line::from(vec![
+                    chat_rail(member_rail_color(state, member)),
+                    Span::raw(""),
+                ]));
+            }
+            render_file_changes(state, member, &files, diff_ok, width, out);
+        }
+    }
+}
+
+fn is_edit_tool(item: &ChatItem) -> bool {
+    matches!(item, ChatItem::Tool { name, .. } if tool_display::tool_kind(name) == "Edit")
+}
+
+fn split_files_by_edit(
+    tools: &[&ChatItem],
+    files: Vec<FileChangeItem>,
+) -> Vec<Vec<FileChangeItem>> {
+    let mut assigned = vec![false; files.len()];
+    let mut groups = Vec::new();
+    for tool in tools {
+        let ChatItem::Tool {
+            name,
+            summary,
+            detail,
+            ..
+        } = tool
+        else {
+            continue;
+        };
+        if tool_display::tool_kind(name) != "Edit" {
+            continue;
+        }
+        let target = tool_display::tool_target(name, summary, detail);
+        if target.is_empty() {
+            continue;
+        }
+        let edited = files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                (!assigned[index] && paths_match(&target, &file.path)).then(|| {
+                    assigned[index] = true;
+                    file.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        if !edited.is_empty() {
+            groups.push(edited);
+        }
+    }
+    let unassigned = files
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, file)| (!assigned[index]).then_some(file))
+        .collect::<Vec<_>>();
+    if !unassigned.is_empty() {
+        groups.push(unassigned);
+    }
+    groups
+}
+
+fn paths_match(edit_target: &str, file_path: &str) -> bool {
+    let edit_target = edit_target.trim();
+    edit_target == file_path
+        || file_path
+            .strip_suffix(edit_target)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+        || edit_target
+            .strip_suffix(file_path)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+fn merge_diff_run<'a>(diffs: &[&'a ChatItem]) -> Option<(&'a MemberId, Vec<FileChangeItem>, bool)> {
+    let mut member = None;
+    let mut files: Vec<FileChangeItem> = Vec::new();
+    let mut ok = true;
+    for item in diffs {
+        let ChatItem::Diff {
+            member: next,
+            files: next_files,
+            ok: next_ok,
+        } = item
+        else {
+            continue;
+        };
+        member = Some(next);
+        ok &= *next_ok;
+        for file in next_files {
+            if let Some(existing) = files.iter_mut().find(|seen| seen.path == file.path) {
+                *existing = file.clone();
+            } else {
+                files.push(file.clone());
+            }
+        }
+    }
+    Some((member?, files, ok))
+}
+
+fn merge_file_change(files: &mut Vec<FileChangeItem>, incoming: FileChangeItem) {
+    if let Some(existing) = files
+        .iter_mut()
+        .find(|existing| paths_match(&incoming.path, &existing.path))
+    {
+        if file_change_detail_len(&incoming) > file_change_detail_len(existing) {
+            *existing = incoming;
+        }
+    } else {
+        files.push(incoming);
+    }
+}
+
+fn file_change_detail_len(file: &FileChangeItem) -> usize {
+    file.old_text.as_ref().map_or(0, String::len)
+        + file.new_text.as_ref().map_or(0, String::len)
+        + file.patch.as_ref().map_or(0, String::len)
+}
+
+fn render_tool_group(
+    tools: &[&ChatItem],
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+    show_sender_header: bool,
+) {
+    let Some(ChatItem::Tool { member, .. }) = tools.first().copied() else {
+        return;
+    };
+    if show_sender_header {
+        let (display_name, backend) = state.member_meta(member);
+        out.push(agent_header_line(
+            &display_name,
+            backend,
+            state.member_color(member),
+        ));
+    }
+    let rail_color = member_rail_color(state, member);
+    let all_failed = tools.iter().all(|item| {
+        matches!(
+            item,
+            ChatItem::Tool {
+                ok: Some(false),
+                ..
+            }
+        )
+    });
+    let (marker, title_style) = if all_failed {
+        ("✕", theme::error_bold())
+    } else {
+        ("⚒", theme::accent_bold())
+    };
+    out.push(Line::from(vec![
+        chat_rail(rail_color),
+        Span::styled(format!("   {marker} tools"), title_style),
+    ]));
+    for item in tools {
+        let ChatItem::Tool {
+            name,
+            summary,
+            detail,
+            ok,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        render_tool_row(rail_color, name, summary, detail, *ok, width, state, out);
+    }
+}
+
+fn render_tool_row(
+    rail_color: Color,
+    name: &str,
+    summary: &str,
+    detail: &str,
+    ok: Option<bool>,
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+) {
+    let (prefix, color, text_style) = match ok {
+        None => (
+            status_indicator::spinner(),
+            theme::warning_color(),
+            theme::emphasis(),
+        ),
+        Some(true) => ("·", theme::success_color(), theme::text()),
+        Some(false) => ("✕", theme::error_color(), theme::error()),
+    };
+    let kind = tool_display::tool_kind(name);
+    let target = tool_display::tool_target(name, summary, detail);
+    let kind_col = theme::pad_width(&kind, 6);
+    let rest_width = width.saturating_sub(8).max(10);
+    let mut spans = vec![
+        chat_rail(rail_color),
+        Span::styled(format!("     {prefix} "), Style::default().fg(color)),
+        Span::styled(kind_col, text_style),
+    ];
+    if !target.is_empty() {
+        let shown = truncate_width(&target, rest_width.saturating_sub(8).max(4));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(shown, theme::muted()));
+    }
+    out.push(Line::from(spans));
+    if detail.trim().is_empty() {
+        return;
+    }
+    let detail_style = theme::muted();
+    let detail_width = width.saturating_sub(10).max(1);
+    let expanded = state.tools_expanded();
+    let failure = ok == Some(false);
+    let (lines, clipped) = if failure {
+        let body = tool_display::tool_error_body(detail);
+        if body.is_empty() {
+            (Vec::new(), false)
+        } else if expanded {
+            (markdown::wrap(&body, detail_width), false)
+        } else {
+            let (preview, clipped) = tool_display::compact_tool_error(&body);
+            let wrapped = markdown::wrap(&preview, detail_width);
+            let clipped = clipped || wrapped.len() > 6;
+            (wrapped.into_iter().take(6).collect::<Vec<_>>(), clipped)
+        }
+    } else if expanded {
+        let wrapped = markdown::wrap(&tool_display::tool_body(detail), detail_width);
+        (wrapped, false)
+    } else {
+        (Vec::new(), false)
+    };
+    for (idx, line) in lines.into_iter().enumerate() {
+        let line_style = if failure && is_tool_error_line(&line) {
+            theme::error()
+        } else {
+            detail_style
+        };
+        out.push(Line::from(vec![
+            chat_rail(rail_color),
+            Span::raw(if idx == 0 { "       ↳ " } else { "         " }),
+            Span::styled(line, line_style),
+        ]));
+    }
+    if clipped && !expanded {
+        out.push(Line::from(vec![
+            chat_rail(rail_color),
+            Span::styled(
+                "         … Ctrl+O expand tool output",
+                theme::muted_italic(),
+            ),
+        ]));
+    }
+}
+
+fn is_tool_error_line(line: &str) -> bool {
+    let line = line.trim_start().to_ascii_lowercase();
+    line.starts_with("error:")
+        || line.contains("test result: failed")
+        || line.contains("panicked at")
+        || line.starts_with("failures:")
+        || line.contains("assertion")
+        || line.starts_with("failure:")
+}
+
+fn render_file_changes(
+    state: &AppState,
+    member: &MemberId,
+    files: &[FileChangeItem],
+    ok: bool,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let rail_color = member_rail_color(state, member);
+    let (marker, title_style) = if ok {
+        ("✎", theme::accent_bold())
+    } else {
+        ("✕", theme::error_bold())
+    };
+    if !state.diffs_expanded() {
+        let count = files.len();
+        let summary = if count == 1 {
+            files
+                .first()
+                .map(|file| truncate_width(&file.path, width.saturating_sub(36).max(8)))
+                .unwrap_or_else(|| "1 file".to_string())
+        } else {
+            format!("{count} files")
+        };
+        out.push(Line::from(vec![
+            chat_rail(rail_color),
+            Span::styled(format!("   {marker} file changes"), title_style),
+            Span::styled(
+                format!(" · {summary} · Ctrl+G expand"),
+                theme::muted_italic(),
+            ),
+        ]));
+        return;
+    }
+    out.push(Line::from(vec![
+        chat_rail(rail_color),
+        Span::styled(format!("   {marker} file changes"), title_style),
+        Span::styled(" · Ctrl+G collapse", theme::muted_italic()),
+    ]));
+    for (index, file) in files.iter().enumerate() {
+        if index > 0 {
+            out.push(Line::from(vec![chat_rail(rail_color), Span::raw("")]));
+        }
+        let (sign, style) = match file.kind.as_str() {
+            "add" => ("+", theme::diff_add_text()),
+            "delete" => ("-", theme::diff_delete_text()),
+            _ => ("Edit", theme::text()),
+        };
+        let shown = truncate_width(&file.path, width.saturating_sub(11).max(10));
+        out.push(Line::from(vec![
+            chat_rail(rail_color),
+            Span::styled(format!("     {sign} "), style),
+            Span::styled(shown, theme::warning()),
+        ]));
+        let hunks = file
+            .patch
+            .as_deref()
+            .map(file_diff::unified_hunks)
+            .filter(|hunks| !hunks.is_empty())
+            .unwrap_or_else(
+                || match (file.old_text.as_deref(), file.new_text.as_deref()) {
+                    (None, None) => Vec::new(),
+                    (None, Some(new_text)) => file_diff::line_hunks("", new_text),
+                    (Some(old_text), None) => file_diff::line_hunks(old_text, ""),
+                    (Some(old_text), Some(new_text)) => file_diff::line_hunks(old_text, new_text),
+                },
+            );
+        let max_hunks = 80;
+        let clipped = hunks.len() > max_hunks;
+        let line_number_width = hunks
+            .iter()
+            .filter_map(|line| line.number)
+            .map(|number| number.to_string().len())
+            .max()
+            .unwrap_or(1);
+        for line in hunks.into_iter().take(max_hunks) {
+            let (mark, number_style, content_style) = match line.kind {
+                '+' => ("+", theme::diff_add_text(), theme::diff_add()),
+                '-' => ("-", theme::diff_delete_text(), theme::diff_delete()),
+                _ => (" ", theme::muted(), theme::muted()),
+            };
+            let number = line
+                .number
+                .map(|number| format!("{number:>line_number_width$}"))
+                .unwrap_or_else(|| " ".repeat(line_number_width));
+            let shown = clip_width(
+                &line.text,
+                width.saturating_sub(line_number_width + 8).max(8),
+            );
+            out.push(Line::from(vec![
+                chat_rail(rail_color),
+                Span::styled(format!("     {number} "), number_style),
+                Span::styled(
+                    pad_diff_content(&format!("{mark}{shown}"), width, line_number_width),
+                    content_style,
+                ),
+            ]));
+        }
+        if clipped {
+            out.push(Line::from(vec![
+                chat_rail(rail_color),
+                Span::styled("       …", theme::muted_italic()),
+            ]));
+        }
+    }
+}
+
+fn pad_diff_content(text: &str, width: usize, line_number_width: usize) -> String {
+    let target = width.saturating_sub(line_number_width + 7);
+    let used = theme::display_width(text);
+    if used >= target {
+        return text.to_string();
+    }
+    format!("{text}{}", " ".repeat(target - used))
 }
 
 fn is_work_activity(item: &ChatItem) -> bool {
@@ -546,15 +1569,28 @@ fn is_work_activity(item: &ChatItem) -> bool {
     )
 }
 
-/// Compact items render as one or two lines and cluster without blank lines.
-fn is_compact(item: &ChatItem) -> bool {
-    matches!(
-        item,
-        ChatItem::Tool { .. }
-            | ChatItem::Diff { .. }
-            | ChatItem::Notice { .. }
-            | ChatItem::Verdict { .. }
-    )
+fn is_speech_item(item: &ChatItem) -> bool {
+    matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
+}
+
+fn thinking_label(live: bool, stored: Option<u64>, live_secs: Option<u64>, lines: usize) -> String {
+    let lines = format!("{lines} lines");
+    if live {
+        match live_secs {
+            Some(secs) => format!(
+                "thinking · {} · {lines}",
+                status_indicator::fmt_elapsed_compact(secs)
+            ),
+            None => format!("thinking · {lines}"),
+        }
+    } else if let Some(secs) = stored {
+        format!(
+            "thinking for {} · {lines}",
+            status_indicator::fmt_elapsed_compact(secs)
+        )
+    } else {
+        format!("thought · {lines}")
+    }
 }
 
 fn same_member_thread(current: &ChatItem, next: &ChatItem) -> bool {
@@ -564,12 +1600,25 @@ fn same_member_thread(current: &ChatItem, next: &ChatItem) -> bool {
 fn item_member(item: &ChatItem) -> Option<&MemberId> {
     match item {
         ChatItem::Agent { member, .. }
+        | ChatItem::Thinking { member, .. }
         | ChatItem::Tool { member, .. }
         | ChatItem::Diff { member, .. } => Some(member),
         ChatItem::Route { from, .. } => Some(from),
         ChatItem::Error { member, .. } => member.as_ref(),
         ChatItem::Verdict { member, .. } => Some(member),
         ChatItem::User { .. } | ChatItem::Notice { .. } => None,
+    }
+}
+
+/// Empty closed agent cells stay in the timeline after a tool split but
+/// must not count as a previous speaker, or the next tool loses its header.
+fn item_renders(item: &ChatItem, state: &AppState) -> bool {
+    match item {
+        ChatItem::Agent { text, member, .. } => {
+            !text.is_empty() || state.has_active_message(member)
+        }
+        ChatItem::Thinking { .. } => false,
+        _ => true,
     }
 }
 
@@ -633,7 +1682,7 @@ fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
         .unwrap_or_else(|| "member".to_string());
     let examples = [
         (format!("@{example_member} <message>"), "message one member"),
-        ("/mode plan".to_string(), "select checklist-driven planning"),
+        ("/mode".to_string(), "choose a collaboration mode"),
         ("/help".to_string(), "all commands"),
     ];
     for (i, (cmd, desc)) in examples.iter().enumerate() {
@@ -649,12 +1698,13 @@ fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
 fn agent_header_line(
     display_name: &str,
     backend: crate::domain::team::BackendKind,
+    color: Color,
 ) -> Line<'static> {
     Line::from(vec![
-        chat_rail(theme::backend_color(backend)),
+        chat_rail(color),
         Span::raw(" "),
-        Span::styled("◆ ", theme::backend_bold(backend)),
-        Span::styled(display_name.to_string(), theme::backend_bold(backend)),
+        Span::styled("◆ ", theme::bold(color)),
+        Span::styled(display_name.to_string(), theme::bold(color)),
         Span::styled(format!("  · {}", backend.as_str()), theme::muted()),
     ])
 }
@@ -682,8 +1732,8 @@ fn user_header_line(state: &AppState, targets: &[MemberId]) -> Line<'static> {
         if index > 0 {
             spans.push(Span::styled(", ", theme::muted()));
         }
-        let (name, backend) = state.member_meta(target);
-        spans.push(Span::styled(name, theme::backend_bold(backend)));
+        let (name, _) = state.member_meta(target);
+        spans.push(Span::styled(name, state.member_color_bold(target)));
     }
     Line::from(spans)
 }
@@ -717,14 +1767,19 @@ fn render_item(
         && let Some(member) = item_member(item)
     {
         let (display_name, backend) = state.member_meta(member);
-        out.push(agent_header_line(&display_name, backend));
+        out.push(agent_header_line(
+            &display_name,
+            backend,
+            state.member_color(member),
+        ));
     }
     match item {
         ChatItem::User { body, targets, .. } => {
             if show_sender_header {
                 out.push(user_header_line(state, targets));
             }
-            for line in markdown::wrap(body, width.saturating_sub(2).max(1)) {
+            let body = crate::adapter::prompt_images::display_prompt_images(body);
+            for line in markdown::wrap(&body, width.saturating_sub(2).max(1)) {
                 out.push(Line::from(vec![
                     chat_rail(theme::user_color()),
                     Span::raw(" "),
@@ -743,99 +1798,67 @@ fn render_item(
                 return;
             }
             if show_sender_header {
-                out.push(agent_header_line(display_name, *backend));
+                out.push(agent_header_line(
+                    display_name,
+                    *backend,
+                    state.member_color(member),
+                ));
             }
             for line in markdown::render(text, width.saturating_sub(2).max(1)) {
-                let mut spans = vec![chat_rail(theme::backend_color(*backend)), Span::raw(" ")];
+                let mut spans = vec![chat_rail(state.member_color(member)), Span::raw(" ")];
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
             }
         }
-        ChatItem::Tool {
+        ChatItem::Thinking {
             member,
-            name,
-            summary,
-            detail,
-            ok,
+            text,
+            elapsed_secs,
+            ..
         } => {
-            let (marker, marker_color, text_style) = match ok {
-                None => (
-                    status_indicator::spinner(),
-                    theme::warning_color(),
-                    theme::emphasis(),
-                ),
-                Some(true) => ("✓", theme::success_color(), theme::text()),
-                Some(false) => ("✕", theme::error_color(), theme::error()),
-            };
-            let command = tool_display_text(name, summary);
-            let command_width = width.saturating_sub(6).max(12);
+            if text.is_empty() {
+                return;
+            }
             let rail_color = member_rail_color(state, member);
+            let lines = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                .max(1);
+            let live = elapsed_secs.is_none() && state.is_thinking_live(member);
+            let label =
+                thinking_label(live, *elapsed_secs, state.thinking_live_secs(member), lines);
+            let label = if live {
+                format!("{} {label}", status_indicator::spinner())
+            } else {
+                format!("✻ {label}")
+            };
+            if !state.thinking_expanded() {
+                out.push(Line::from(vec![
+                    chat_rail(rail_color),
+                    Span::raw("   "),
+                    Span::styled(format!("{label} · Ctrl+T expand"), theme::muted_italic()),
+                ]));
+                return;
+            }
             out.push(Line::from(vec![
                 chat_rail(rail_color),
                 Span::raw("   "),
-                Span::styled(format!("{marker} "), theme::bold(marker_color)),
-                Span::styled(truncate_width(&command, command_width), text_style),
+                Span::styled(format!("{label} · Ctrl+T collapse"), theme::muted_italic()),
             ]));
-            if !detail.trim().is_empty() {
-                let detail_style = if *ok == Some(false) {
-                    theme::error()
-                } else {
-                    theme::muted()
-                };
-                let detail_width = width.saturating_sub(8).max(1);
-                let expanded = state.tools_expanded();
-                let failure = *ok == Some(false);
-                let (lines, clipped) = if expanded || failure {
-                    let max_lines = if expanded { usize::MAX } else { 20 };
-                    let wrapped = markdown::wrap(detail.trim(), detail_width);
-                    let clipped = wrapped.len() > max_lines;
-                    (
-                        wrapped.into_iter().take(max_lines).collect::<Vec<_>>(),
-                        clipped,
-                    )
-                } else {
-                    let (summary, clipped) = tool_detail_summary(detail, detail_width);
-                    (vec![summary], clipped)
-                };
-                for (idx, line) in lines.into_iter().enumerate() {
-                    out.push(Line::from(vec![
-                        chat_rail(rail_color),
-                        Span::raw(if idx == 0 { "     ↳ " } else { "       " }),
-                        Span::styled(line, detail_style),
-                    ]));
-                }
-                if clipped && !expanded {
-                    out.push(Line::from(vec![
-                        chat_rail(rail_color),
-                        Span::styled("       … Ctrl+O expand tool output", theme::muted_italic()),
-                    ]));
-                }
-            }
-        }
-        ChatItem::Diff { member, files, ok } => {
-            let rail_color = member_rail_color(state, member);
-            let (marker, title_style) = if *ok {
-                ("✎", theme::accent_bold())
-            } else {
-                ("✕", theme::error_bold())
-            };
-            out.push(Line::from(vec![
-                chat_rail(rail_color),
-                Span::styled(format!("   {marker} file changes"), title_style),
-            ]));
-            for (path, kind) in files {
-                let (sign, color) = match kind.as_str() {
-                    "add" => ("+", theme::success_color()),
-                    "delete" => ("-", theme::error_color()),
-                    _ => ("~", theme::warning_color()),
-                };
-                let shown = truncate_width(path, width.saturating_sub(8).max(10));
+            for line in markdown::wrap(text.trim(), width.saturating_sub(6).max(1)) {
                 out.push(Line::from(vec![
                     chat_rail(rail_color),
-                    Span::styled(format!("     {sign} "), Style::default().fg(color)),
-                    Span::styled(shown, Style::default().fg(color)),
+                    Span::raw("     "),
+                    Span::styled(line, theme::muted_italic()),
                 ]));
             }
+        }
+        ChatItem::Tool { .. } => {
+            render_tool_group(&[item], width, state, out, false);
+        }
+        ChatItem::Diff { member, files, ok } => {
+            render_file_changes(state, member, files, *ok, width, out);
         }
         ChatItem::Route { from, to, body } => {
             let from_backend = member_rail_color(state, from);
@@ -906,25 +1929,6 @@ fn push_wrapped(
     }
 }
 
-fn tool_display_text(name: &str, summary: &str) -> String {
-    let summary = summary.trim();
-    if summary.is_empty() || summary == name {
-        name.to_string()
-    } else {
-        format!("{name}  {summary}")
-    }
-}
-
-/// Keep a useful one-line overview visible while tool output is collapsed.
-/// In particular, streamed Claude inputs begin with `input:\n`; rendering only
-/// the first physical line used to hide the actual arguments until expansion.
-fn tool_detail_summary(detail: &str, width: usize) -> (String, bool) {
-    let collapsed = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    let summary = theme::clip_width(&collapsed, width);
-    let clipped = summary != collapsed;
-    (summary, clipped)
-}
-
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let (border_color, title_text) = if !state.pending_approvals().is_empty() {
         (
@@ -947,8 +1951,15 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     // Open composer: top and bottom rules only, no enclosing side bars.
+    let mode = state.active_mode();
+    let mode_title = Line::from(Span::styled(
+        format!(" mode:{mode} "),
+        theme::bold(theme::mode_color(mode)),
+    ))
+    .right_aligned();
     let block = Block::default()
         .title(title_text)
+        .title_bottom(mode_title)
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
@@ -960,35 +1971,59 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     let avail = (inner.width as usize).saturating_sub(2); // "> " / "  " gutter
 
+    let mut out_lines: Vec<Line> = Vec::new();
+    let mut cursor_screen: Option<(u16, u16)> = None;
+    let mut text_origin = 0usize;
+    if !state.pending_images().is_empty() {
+        let labels = state
+            .pending_images()
+            .iter()
+            .map(|image| image.label())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        out_lines.push(Line::from(Span::styled(
+            format!("📎 {labels}"),
+            theme::muted(),
+        )));
+        text_origin = 1;
+        if rows == 1 {
+            frame.render_widget(Paragraph::new(out_lines), inner);
+            return;
+        }
+    }
+
     // Visual lines with wrapping so long input is fully visible (no horizontal
     // clipping). The cursor maps directly to a screen cell.
     let (visual_lines, cursor_row, cursor_col) = state.composer().visual_lines_with_cursor(avail);
+    let line_starts = state.composer().visual_lines_with_starts(avail);
+    let selection = state.composer().selection_range();
+    let text_rows = rows.saturating_sub(text_origin);
 
     // Vertical scroll so the cursor's visual line stays visible.
-    let top = if cursor_row >= rows {
-        cursor_row - rows + 1
+    let top = if cursor_row >= text_rows {
+        cursor_row - text_rows + 1
     } else {
         0
     };
 
-    let mut out_lines: Vec<Line> = Vec::new();
-    let mut cursor_screen: Option<(u16, u16)> = None;
-    for (offset, row) in (top..top + rows).enumerate() {
+    for (offset, row) in (top..top + text_rows).enumerate() {
         let Some(line) = visual_lines.get(row) else {
             break;
         };
         let prefix = if row == 0 { "> " } else { "  " };
-        let (shown, cursor_width) = if row == cursor_row {
-            (line.clone(), cursor_col)
-        } else {
-            (line.clone(), 0)
-        };
-        out_lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(border_color)),
-            Span::raw(shown),
-        ]));
+        let start_char = line_starts.get(row).map(|(_, start)| *start).unwrap_or(0);
+        let cursor_width = if row == cursor_row { cursor_col } else { 0 };
+        let mut spans = vec![Span::styled(
+            prefix.to_string(),
+            Style::default().fg(border_color),
+        )];
+        spans.extend(style_composer_line(line, start_char, selection));
+        out_lines.push(Line::from(spans));
         if row == cursor_row {
-            cursor_screen = Some((inner.x + 2 + cursor_width as u16, inner.y + offset as u16));
+            cursor_screen = Some((
+                inner.x + 2 + cursor_width as u16,
+                inner.y + (text_origin + offset) as u16,
+            ));
         }
     }
     frame.render_widget(Paragraph::new(out_lines), inner);
@@ -1000,1509 +2035,48 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::event::{
-        MemberStatus, RunEventSummary, RunId, RunStatus, RunStepStatus, RunStepSummary, RunSummary,
-        RunVerification, RuntimeEvent,
+fn style_composer_line(
+    line: &str,
+    start_char: usize,
+    selection: Option<(usize, usize)>,
+) -> Vec<Span<'static>> {
+    let Some((sel_start, sel_end)) = selection else {
+        return vec![Span::raw(line.to_string())];
     };
-    use crate::domain::team::{
-        BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
-    };
-    use crate::tui::drawers::Drawer;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
-
-    fn member_summary(
-        id: &str,
-        display_name: &str,
-        backend: BackendKind,
-        role: &str,
-        status: MemberStatus,
-    ) -> crate::domain::event::MemberSummary {
-        crate::domain::event::MemberSummary {
-            id: MemberId::new(id),
-            display_name: display_name.to_string(),
-            backend,
-            role: role.to_string(),
-            status,
-            session: None,
-            cwd: String::new(),
-            model: None,
-            effort: None,
-            sandbox: SandboxPolicy::ReadOnly,
-            permission_mode: Some(PermissionMode::Default),
-            session_policy: SessionPolicy::Resume,
+    let mut spans = Vec::new();
+    let mut index = start_char;
+    let mut plain = String::new();
+    let mut selected = String::new();
+    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(line, true) {
+        let next = index + grapheme.chars().count();
+        if index >= sel_start && index < sel_end {
+            if !plain.is_empty() {
+                spans.push(Span::raw(std::mem::take(&mut plain)));
+            }
+            selected.push_str(grapheme);
+        } else {
+            if !selected.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut selected),
+                    theme::chat_selection(),
+                ));
+            }
+            plain.push_str(grapheme);
         }
+        index = next;
     }
-
-    fn plain_text(lines: &[Line<'_>]) -> Vec<String> {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect()
+    if !plain.is_empty() {
+        spans.push(Span::raw(plain));
     }
-
-    fn is_separator_text(text: &str) -> bool {
-        let trimmed = text.trim();
-        !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '─')
+    if !selected.is_empty() {
+        spans.push(Span::styled(selected, theme::chat_selection()));
     }
-
-    #[test]
-    fn fmt_elapsed_compact_scales_units() {
-        assert_eq!(status_indicator::fmt_elapsed_compact(8), "8s");
-        assert_eq!(status_indicator::fmt_elapsed_compact(64), "1m 04s");
-        assert_eq!(status_indicator::fmt_elapsed_compact(3723), "1h 02m 03s");
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
     }
-
-    #[test]
-    fn renders_empty_state_quick_start() {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "default-mixed".to_string(),
-            workspace: "/Users/me/proj".to_string(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "implementation",
-                MemberStatus::Idle,
-            )],
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(96, 16)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Members:"));
-        assert!(view.contains("builder (codex, implementation)"));
-        assert!(view.contains("@builder <message>"));
-        assert!(view.contains("/mode plan"));
-        assert!(view.contains("/help"));
-    }
-
-    #[test]
-    fn renders_a_clean_layout_snapshot() {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "default-mixed".to_string(),
-            workspace: "/Users/me/proj".to_string(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![
-                member_summary(
-                    "builder",
-                    "Builder",
-                    BackendKind::Codex,
-                    "implementation",
-                    MemberStatus::Running,
-                ),
-                member_summary(
-                    "reviewer",
-                    "Reviewer",
-                    BackendKind::Claude,
-                    "review",
-                    MemberStatus::Idle,
-                ),
-            ],
-        });
-        state.apply(RuntimeEvent::Notice("welcome to Asterline".to_string()));
-        state.apply(RuntimeEvent::Route {
-            turn: crate::domain::event::TurnId(1),
-            from: MemberId::new("builder"),
-            to: vec!["reviewer".to_string()],
-            body: "please review the parser".to_string(),
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Asterline"));
-        assert!(view.contains("Builder · codex"));
-        assert!(view.contains("builder → reviewer"));
-        // The running member surfaces a working indicator + interrupt hint.
-        assert!(view.contains("Working"));
-        assert!(view.contains("interrupt"));
-        // The composer is open (top/bottom rules only) — no enclosing box or
-        // rounded corners around the conversation or input.
-        assert!(!view.contains('╭'));
-    }
-
-    #[test]
-    fn header_clips_workspace_by_display_width() {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: "/Users/我/很长的项目路径名称超级超级长/子目录".to_string(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            )],
-        });
-
-        // Narrow terminal: the CJK path must clip by display width, not chars.
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Asterline · t"));
-        assert!(view.contains('…'));
-    }
-
-    #[test]
-    fn renders_completion_popup() {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: ".".to_string(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            )],
-        });
-        for ch in "/a".chars() {
-            state.insert_char(ch);
-        }
-
-        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
-        let mut layout = None;
-        terminal
-            .draw(|frame| {
-                layout = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("/ask"));
-        assert!(view.contains("/all"));
-        assert!(view.contains("/attach"));
-        assert!(!view.contains("╭"));
-        assert!(!view.contains("@member to send"));
-        assert!(view.contains("› /ask      send to one member"));
-        assert_eq!(
-            layout.and_then(|layout| layout.completion_area),
-            Some(Rect::new(0, 10, 70, 4))
-        );
-    }
-
-    #[test]
-    fn completion_popup_uses_text_only_selection() {
-        let completion = Completion {
-            title: "commands",
-            token_start: 0,
-            items: vec![
-                crate::tui::completion::CompletionItem {
-                    label: "/ask — send to one member".to_string(),
-                    insert: "/ask ".to_string(),
-                },
-                crate::tui::completion::CompletionItem {
-                    label: "/all — send to everyone".to_string(),
-                    insert: "/all ".to_string(),
-                },
-            ],
-        };
-        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
-        terminal
-            .draw(|frame| render_popup(frame, frame.area(), &completion, 0))
-            .unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let selected_name = buffer.cell((2, 0)).unwrap();
-        let selected_hint = buffer.cell((8, 0)).unwrap();
-        let unselected_name = buffer.cell((2, 1)).unwrap();
-
-        assert_eq!(selected_name.fg, theme::accent_color());
-        assert_eq!(selected_name.bg, Color::Reset);
-        assert_eq!(selected_hint.fg, theme::accent_color());
-        assert_eq!(selected_hint.bg, Color::Reset);
-        assert_eq!(unselected_name.fg, theme::emphasis_color());
-        assert_eq!(unselected_name.bg, Color::Reset);
-    }
-
-    #[test]
-    fn running_status_shows_model_and_effort() {
-        let mut builder = member_summary(
-            "builder",
-            "Builder",
-            BackendKind::Codex,
-            "impl",
-            MemberStatus::Running,
-        );
-        builder.model = Some("gpt-5-codex".to_string());
-        builder.effort = Some(Effort::High);
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![builder],
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        // The activity line spells the profile out; the header stays compact.
-        assert!(view.contains("model: gpt-5-codex · high"));
-    }
-
-    #[test]
-    fn queued_waiting_and_approval_are_active_in_header_and_footer() {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![
-                member_summary(
-                    "builder",
-                    "Builder",
-                    BackendKind::Codex,
-                    "impl",
-                    MemberStatus::Queued,
-                ),
-                member_summary(
-                    "reviewer",
-                    "Reviewer",
-                    BackendKind::Claude,
-                    "review",
-                    MemberStatus::Waiting,
-                ),
-                member_summary(
-                    "qa",
-                    "QA",
-                    BackendKind::Codex,
-                    "verify",
-                    MemberStatus::NeedsApproval,
-                ),
-            ],
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(150, 18)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-
-        assert!(view.contains("Active 3 members"));
-        assert!(view.contains("Builder queued"));
-        assert!(view.contains("Reviewer waiting"));
-        assert!(view.contains("QA approval"));
-        assert!(!view.contains("○ Reviewer"));
-        assert!(!view.contains("@member first"));
-    }
-
-    #[test]
-    fn pure_conversation_does_not_show_work_separator() {
-        let state = AppState::new(vec![
-            ChatItem::User {
-                body: "explain this function".to_string(),
-                targets: vec![MemberId::new("builder")],
-                interrupted: Vec::new(),
-            },
-            ChatItem::Agent {
-                member: MemberId::new("builder"),
-                display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
-                text: "It parses the request.".to_string(),
-            },
-        ]);
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 40, 0, &mut lines);
-
-        let text = plain_text(&lines);
-        assert!(!text.iter().any(|line| is_separator_text(line)));
-        assert!(text.iter().any(|line| line.contains("◆ You")));
-        assert!(
-            text.iter()
-                .any(|line| line.contains("explain this function"))
-        );
-    }
-
-    #[test]
-    fn consecutive_agent_messages_keep_a_title_on_each_reply() {
-        let state = AppState::new(vec![
-            ChatItem::Agent {
-                member: MemberId::new("builder"),
-                display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
-                text: "first reply".to_string(),
-            },
-            ChatItem::Agent {
-                member: MemberId::new("builder"),
-                display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
-                text: "second reply".to_string(),
-            },
-            ChatItem::Agent {
-                member: MemberId::new("reviewer"),
-                display_name: "Reviewer".to_string(),
-                backend: BackendKind::Claude,
-                text: "review reply".to_string(),
-            },
-        ]);
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 60, 0, &mut lines);
-
-        let text = plain_text(&lines);
-        let builder_headers = text
-            .iter()
-            .filter(|line| line.contains("Builder") && line.contains("codex"))
-            .count();
-        let reviewer_headers = text
-            .iter()
-            .filter(|line| line.contains("Reviewer") && line.contains("claude"))
-            .count();
-        assert_eq!(builder_headers, 2);
-        assert_eq!(reviewer_headers, 1);
-        assert!(text.iter().any(|line| line.contains("first reply")));
-        assert!(text.iter().any(|line| line.contains("second reply")));
-        let first = text
-            .iter()
-            .position(|line| line.contains("first reply"))
-            .unwrap();
-        let second = text
-            .iter()
-            .position(|line| line.contains("second reply"))
-            .unwrap();
-        assert!(first < second);
-    }
-
-    #[test]
-    fn concurrent_members_keep_each_members_work_together() {
-        use crate::domain::event::{MessageId, TurnId};
-
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![
-                member_summary(
-                    "builder",
-                    "Builder",
-                    BackendKind::Codex,
-                    "impl",
-                    MemberStatus::Idle,
-                ),
-                member_summary(
-                    "planer",
-                    "Planer",
-                    BackendKind::Claude,
-                    "plan",
-                    MemberStatus::Idle,
-                ),
-            ],
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(1),
-            targets: vec![MemberId::new("builder")],
-            body: "fix the parser".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageStarted {
-            msg: MessageId(1),
-            turn: TurnId(1),
-            member: MemberId::new("builder"),
-        });
-        state.apply(RuntimeEvent::MessageDelta {
-            msg: MessageId(1),
-            text: "builder started".to_string(),
-        });
-        state.apply(RuntimeEvent::MemberStatus {
-            member: MemberId::new("builder"),
-            status: MemberStatus::Running,
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(2),
-            targets: vec![MemberId::new("planer")],
-            body: "draft the plan".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageStarted {
-            msg: MessageId(2),
-            turn: TurnId(2),
-            member: MemberId::new("planer"),
-        });
-        state.apply(RuntimeEvent::MessageDelta {
-            msg: MessageId(2),
-            text: "planer started".to_string(),
-        });
-        state.apply(RuntimeEvent::ToolStarted {
-            member: MemberId::new("builder"),
-            tool_id: "b1".to_string(),
-            name: "shell".to_string(),
-            summary: "cargo test".to_string(),
-        });
-        state.apply(RuntimeEvent::ToolCompleted {
-            member: MemberId::new("builder"),
-            tool_id: "b1".to_string(),
-            ok: true,
-            output: "ok".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageCompleted {
-            msg: MessageId(1),
-            text: "builder started\nbuilder done".to_string(),
-        });
-        state.apply(RuntimeEvent::ToolStarted {
-            member: MemberId::new("planer"),
-            tool_id: "p1".to_string(),
-            name: "read_file".to_string(),
-            summary: "docs".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageCompleted {
-            msg: MessageId(2),
-            text: "planer started\nplaner done".to_string(),
-        });
-
-        let mut lines = Vec::new();
-        render_chat_history(&state, 80, 0, &mut lines);
-        let text = plain_text(&lines);
-        let joined = text.join("\n");
-        let builder_start = joined.find("builder started").expect(&joined);
-        let builder_tool = joined.find("cargo test").expect(&joined);
-        let plan_prompt = joined.find("draft the plan").expect(&joined);
-        let planer_start = joined.find("planer started").expect(&joined);
-        let planer_tool = joined.find("read_file").expect(&joined);
-        assert!(
-            joined.contains("You → Builder") && joined.contains("You → Planer"),
-            "{joined}"
-        );
-        assert!(
-            builder_start < builder_tool
-                && builder_tool < plan_prompt
-                && plan_prompt < planer_start
-                && planer_start < planer_tool,
-            "{joined}"
-        );
-    }
-
-    #[test]
-    fn sequential_turns_stay_chronological_when_nobody_else_is_working() {
-        use crate::domain::event::{MessageId, TurnId};
-
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![
-                member_summary(
-                    "builder",
-                    "Builder",
-                    BackendKind::Codex,
-                    "impl",
-                    MemberStatus::Idle,
-                ),
-                member_summary(
-                    "planer",
-                    "Planer",
-                    BackendKind::Claude,
-                    "plan",
-                    MemberStatus::Idle,
-                ),
-            ],
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(1),
-            targets: vec![MemberId::new("builder")],
-            body: "first job".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageStarted {
-            msg: MessageId(1),
-            turn: TurnId(1),
-            member: MemberId::new("builder"),
-        });
-        state.apply(RuntimeEvent::MessageCompleted {
-            msg: MessageId(1),
-            text: "builder finished first".to_string(),
-        });
-        state.apply(RuntimeEvent::MemberStatus {
-            member: MemberId::new("builder"),
-            status: MemberStatus::Idle,
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(2),
-            targets: vec![MemberId::new("planer")],
-            body: "second job".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageStarted {
-            msg: MessageId(2),
-            turn: TurnId(2),
-            member: MemberId::new("planer"),
-        });
-        state.apply(RuntimeEvent::MessageCompleted {
-            msg: MessageId(2),
-            text: "planer reply".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageStarted {
-            msg: MessageId(3),
-            turn: TurnId(1),
-            member: MemberId::new("builder"),
-        });
-        state.apply(RuntimeEvent::MessageCompleted {
-            msg: MessageId(3),
-            text: "late builder note".to_string(),
-        });
-
-        let mut lines = Vec::new();
-        render_chat_history(&state, 80, 0, &mut lines);
-        let joined = plain_text(&lines).join("\n");
-        let first = joined.find("builder finished first").expect(&joined);
-        let second_prompt = joined.find("second job").expect(&joined);
-        let planer = joined.find("planer reply").expect(&joined);
-        let late = joined.find("late builder note").expect(&joined);
-        assert!(
-            first < second_prompt && second_prompt < planer && planer < late,
-            "{joined}"
-        );
-    }
-
-    #[test]
-    fn tool_block_introduces_its_member_before_the_tool_and_final_reply() {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Grok,
-                "implementation",
-                MemberStatus::Idle,
-            )],
-        });
-        state.apply(RuntimeEvent::ToolStarted {
-            member: MemberId::new("builder"),
-            tool_id: "read-1".to_string(),
-            name: "read_file".to_string(),
-            summary: "src/lib.rs".to_string(),
-        });
-        state.apply(RuntimeEvent::ToolCompleted {
-            member: MemberId::new("builder"),
-            tool_id: "read-1".to_string(),
-            ok: true,
-            output: "ok".to_string(),
-        });
-        state.apply(RuntimeEvent::MessageStarted {
-            msg: crate::domain::event::MessageId(1),
-            turn: crate::domain::event::TurnId(1),
-            member: MemberId::new("builder"),
-        });
-        state.apply(RuntimeEvent::MessageCompleted {
-            msg: crate::domain::event::MessageId(1),
-            text: "final reply".to_string(),
-        });
-
-        let mut lines = Vec::new();
-        render_chat_history(&state, 70, 0, &mut lines);
-        let text = plain_text(&lines);
-        let header = text
-            .iter()
-            .position(|line| line.contains("Builder") && line.contains("grok"))
-            .expect("member header");
-        let tool = text
-            .iter()
-            .position(|line| line.contains("read_file"))
-            .expect("tool line");
-        let reply = text
-            .iter()
-            .position(|line| line.contains("final reply"))
-            .expect("final reply");
-        assert!(header < tool && tool < reply, "{text:?}");
-        assert!(
-            text.iter()
-                .filter(|line| line.contains("Builder") && line.contains("grok"))
-                .count()
-                >= 1
-        );
-    }
-
-    #[test]
-    fn member_activity_uses_one_full_height_unbroken_rail() {
-        let member = MemberId::new("builder");
-        let state = AppState::new(vec![
-            ChatItem::Agent {
-                member: member.clone(),
-                display_name: "Builder".to_string(),
-                backend: BackendKind::Codex,
-                text: "checking now".to_string(),
-            },
-            ChatItem::Tool {
-                member: member.clone(),
-                name: "shell".to_string(),
-                summary: "cargo test".to_string(),
-                detail: "test result: ok".to_string(),
-                ok: Some(true),
-            },
-            ChatItem::Diff {
-                member: member.clone(),
-                files: vec![("src/lib.rs".to_string(), "modify".to_string())],
-                ok: true,
-            },
-            ChatItem::Error {
-                member: Some(member),
-                message: "follow-up failed".to_string(),
-            },
-        ]);
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 70, 0, &mut lines);
-
-        let text = plain_text(&lines);
-        let start = text
-            .iter()
-            .position(|line| line.contains("checking now"))
-            .unwrap();
-        let end = text
-            .iter()
-            .position(|line| line.contains("follow-up failed"))
-            .unwrap();
-        assert!(text[start..=end].iter().all(|line| !line.trim().is_empty()));
-        assert!(lines[start..=end].iter().all(|line| {
-            line.spans.first().is_some_and(|span| {
-                span.content.as_ref() == " "
-                    && span.style.bg == Some(theme::backend_color(BackendKind::Codex))
-            })
-        }));
-
-        let rail_lines = lines[start..=end].to_vec();
-        let height = u16::try_from(rail_lines.len()).unwrap();
-        let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(rail_lines.clone()), frame.area());
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        for y in 0..height {
-            assert_eq!(
-                buffer.cell((0, y)).unwrap().bg,
-                theme::backend_color(BackendKind::Codex),
-                "rail cell at row {y} must have a full-cell background"
-            );
-        }
-    }
-
-    #[test]
-    fn failed_file_change_has_a_failure_marker() {
-        let state = AppState::new(vec![ChatItem::Diff {
-            member: MemberId::new("builder"),
-            files: vec![("src/lib.rs".to_string(), "update".to_string())],
-            ok: false,
-        }]);
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 70, 0, &mut lines);
-
-        assert!(
-            plain_text(&lines)
-                .iter()
-                .any(|line| line.contains("✕ file changes"))
-        );
-    }
-
-    #[test]
-    fn agent_markdown_header_and_table_share_one_continuous_rail() {
-        let state = AppState::new(Vec::new());
-        let item = ChatItem::Agent {
-            member: MemberId::new("builder"),
-            display_name: "Builder".to_string(),
-            backend: BackendKind::Codex,
-            text: "## Plan\n\n| access | codex |\n|---|---|\n| `read-only` | `-s read-only` |"
-                .to_string(),
-        };
-        let mut lines = Vec::new();
-
-        render_item(&item, 80, &state, &mut lines, true);
-
-        assert!(!lines.is_empty());
-        assert!(lines.iter().all(|line| {
-            line.spans.first().is_some_and(|span| {
-                span.content.as_ref() == " "
-                    && span.style.bg == Some(theme::backend_color(BackendKind::Codex))
-            })
-        }));
-        let text = plain_text(&lines).join("\n");
-        assert!(text.contains("read-only"));
-        assert!(!text.contains("read-only-s read-only"));
-    }
-
-    #[test]
-    fn completed_work_turn_gets_separator_before_next_user_message() {
-        use crate::domain::event::TurnId;
-
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            )],
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(1),
-            targets: vec![MemberId::new("builder")],
-            body: "run tests".to_string(),
-        });
-        state.apply(RuntimeEvent::ToolStarted {
-            member: MemberId::new("builder"),
-            tool_id: "t1".to_string(),
-            name: "shell".to_string(),
-            summary: "cargo test".to_string(),
-        });
-        state.apply(RuntimeEvent::ToolCompleted {
-            member: MemberId::new("builder"),
-            tool_id: "t1".to_string(),
-            ok: true,
-            output: "test result: ok".to_string(),
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(2),
-            targets: vec![MemberId::new("builder")],
-            body: "now summarize".to_string(),
-        });
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 40, 0, &mut lines);
-
-        let text = plain_text(&lines);
-        let separators: Vec<_> = text
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| is_separator_text(line))
-            .collect();
-        assert_eq!(separators.len(), 1);
-        let separator_index = separators[0].0;
-        assert!(
-            text[..separator_index]
-                .iter()
-                .any(|line| line.contains("shell"))
-        );
-        assert!(
-            text[separator_index + 1..]
-                .iter()
-                .any(|line| line.contains("now summarize"))
-        );
-    }
-
-    #[test]
-    fn consecutive_tool_lines_stay_grouped() {
-        use crate::domain::event::TurnId;
-
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(1),
-            targets: vec![MemberId::new("builder")],
-            body: "go".to_string(),
-        });
-        for (id, cmd) in [("t1", "cargo build"), ("t2", "cargo test")] {
-            state.apply(RuntimeEvent::ToolStarted {
-                member: MemberId::new("builder"),
-                tool_id: id.to_string(),
-                name: "shell".to_string(),
-                summary: cmd.to_string(),
-            });
-            state.apply(RuntimeEvent::ToolCompleted {
-                member: MemberId::new("builder"),
-                tool_id: id.to_string(),
-                ok: true,
-                output: "ok".to_string(),
-            });
-        }
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 60, 0, &mut lines);
-
-        let text = plain_text(&lines);
-        let build_idx = text
-            .iter()
-            .position(|line| line.contains("cargo build"))
-            .unwrap();
-        let test_idx = text
-            .iter()
-            .position(|line| line.contains("cargo test"))
-            .unwrap();
-        // Tool blocks (including their output lines) stay adjacent.
-        assert!(test_idx > build_idx);
-        assert!(
-            text[build_idx + 1..test_idx]
-                .iter()
-                .all(|line| !line.trim().is_empty())
-        );
-    }
-
-    #[test]
-    fn renders_markdown_agent_message() {
-        let chat = vec![ChatItem::Agent {
-            member: MemberId::new("reviewer"),
-            display_name: "Reviewer".to_string(),
-            backend: BackendKind::Claude,
-            text: "## Findings\n\nThe parser drops a **trailing newline**. Use `trim_end`.\n\n- check the lexer\n- add a test\n\n```rust\nlet x = 1;\n```"
-                .to_string(),
-        }];
-        let state = AppState::new(chat);
-
-        let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Findings")); // heading, '##' stripped
-        assert!(view.contains("• check the lexer")); // bullet marker
-        assert!(view.contains("let x = 1;")); // code block body
-        assert!(!view.contains("```")); // fences stripped
-        assert!(!view.contains("**")); // bold markers consumed
-    }
-
-    #[test]
-    fn renders_user_band_and_compact_tool() {
-        use crate::domain::event::TurnId;
-
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: Vec::new(),
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            )],
-        });
-        state.apply(RuntimeEvent::UserMessage {
-            turn: TurnId(1),
-            targets: vec![MemberId::new("builder")],
-            body: "run the tests".to_string(),
-        });
-        let long = "/bin/zsh -lc \"rg -n 'Codex is OpenAIs coding agent' /var/folders/ym/abc/openai-docs-cache/codex-manual.md and a lot more text that used to wrap\"";
-        state.apply(RuntimeEvent::ToolStarted {
-            member: MemberId::new("builder"),
-            tool_id: "t1".to_string(),
-            name: "shell".to_string(),
-            summary: long.to_string(),
-        });
-        state.apply(RuntimeEvent::ToolCompleted {
-            member: MemberId::new("builder"),
-            tool_id: "t1".to_string(),
-            ok: true,
-            output: "matches found".to_string(),
-        });
-        let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("◆ You"));
-        assert!(view.contains("run the tests"));
-        // The long command is truncated to a single line (ellipsis), not wrapped.
-        assert!(view.contains('…'));
-        assert!(view.contains("✓ shell"));
-        assert!(view.contains("matches found"));
-    }
-
-    #[test]
-    fn collapsed_tool_shows_input_summary_instead_of_bare_label() {
-        let state = AppState::new(vec![ChatItem::Tool {
-            member: MemberId::new("builder"),
-            name: "Bash".to_string(),
-            summary: "Bash".to_string(),
-            detail: "input:\n{\"command\":\"cargo test\",\"timeout\":120}\n".to_string(),
-            ok: None,
-        }]);
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 70, 0, &mut lines);
-
-        let text = plain_text(&lines);
-        assert!(
-            text.iter()
-                .any(|line| line.contains("↳ input: {\"command\":\"cargo test\"")),
-            "collapsed tool input should include its arguments: {text:?}"
-        );
-        assert!(
-            !text
-                .iter()
-                .any(|line| line.trim_end().ends_with("↳ input:"))
-        );
-    }
-
-    #[test]
-    fn failed_tool_shows_error_output_without_expanding() {
-        let state = AppState::new(vec![ChatItem::Tool {
-            member: MemberId::new("builder"),
-            name: "shell".to_string(),
-            summary: "cargo test".to_string(),
-            detail: "error: test parser failed\nexpected true, got false".to_string(),
-            ok: Some(false),
-        }]);
-        let mut lines = Vec::new();
-
-        render_chat_history(&state, 70, 0, &mut lines);
-
-        let text = plain_text(&lines).join("\n");
-        assert!(text.contains("✕ shell"));
-        assert!(text.contains("cargo test"));
-        assert!(text.contains("error: test parser failed"));
-        assert!(text.contains("expected true, got false"));
-    }
-
-    #[test]
-    fn renders_verdict_card_with_title_and_summary() {
-        let state = AppState::new(vec![
-            ChatItem::Verdict {
-                member: MemberId::new("reviewer"),
-                approve: true,
-                summary: "Looks good; ship it.".to_string(),
-            },
-            ChatItem::Verdict {
-                member: MemberId::new("reviewer"),
-                approve: false,
-                summary: "Needs a regression test.".to_string(),
-            },
-        ]);
-        let mut lines = Vec::new();
-        render_chat_history(&state, 70, 0, &mut lines);
-        let text = plain_text(&lines).join("\n");
-        assert!(
-            text.contains("✓ review approved"),
-            "missing approve title: {text}"
-        );
-        assert!(
-            text.contains("Looks good; ship it."),
-            "missing approve summary: {text}"
-        );
-        assert!(
-            text.contains("✗ changes requested"),
-            "missing reject title: {text}"
-        );
-        assert!(
-            text.contains("Needs a regression test."),
-            "missing reject summary: {text}"
-        );
-    }
-
-    #[test]
-    fn drag_selection_only_restyles_the_covered_columns() {
-        let line = Line::from(vec![
-            Span::styled("hello ", theme::text()),
-            Span::styled("world", theme::emphasis()),
-        ]);
-        let styled = restyle_column_range(&line, 6, 11);
-        assert_eq!(styled.spans.len(), 2);
-        assert_eq!(styled.spans[0].content, "hello ");
-        assert_eq!(styled.spans[0].style, theme::text());
-        assert_eq!(styled.spans[1].content, "world");
-        assert_eq!(styled.spans[1].style, theme::chat_selection());
-    }
-
-    #[test]
-    fn selected_text_joins_visible_chat_lines() {
-        let layout = ChatLayout {
-            area: Rect::new(0, 0, 20, 4),
-            first_line: 0,
-            width: 20,
-            lines: vec!["hello world".into(), "second line".into()],
-            completion_area: None,
-        };
-        let text = layout.selected_text(crate::tui::app_state::ChatSelection {
-            start: (0, 0),
-            end: (1, 5),
-        });
-        assert_eq!(text, "hello world\nsecond");
-    }
-
-    #[test]
-    fn renders_scrollable_diff_drawer() {
-        let mut state = AppState::new(Vec::new());
-        state.set_diff(
-            "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context"
-                .to_string(),
-        );
-        state.toggle_drawer(Drawer::Diff);
-
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Working-tree diff"));
-        assert!(view.contains("scroll"));
-        assert!(view.contains("+new line"));
-        assert!(view.contains("-old line"));
-    }
-
-    fn ready_with_run(run: RunSummary) -> AppState {
-        let mut state = AppState::new(Vec::new());
-        state.apply(RuntimeEvent::Ready {
-            team: "t".to_string(),
-            workspace: String::new(),
-            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
-            runs: vec![run],
-            members: vec![member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            )],
-        });
-        state
-    }
-
-    #[test]
-    fn renders_run_footer_next_step() {
-        let state = ready_with_run(RunSummary {
-            id: RunId(7),
-            goal: "ship parser".to_string(),
-            status: RunStatus::Done,
-            coordinator: Some(MemberId::new("builder")),
-            verification: None,
-            created_at: "2026-06-28 10:00:00".to_string(),
-            updated_at: "2026-06-28 10:00:00".to_string(),
-            attempt: 1,
-            events: Vec::new(),
-            steps: Vec::new(),
-            mode: None,
-            legacy_mode: None,
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("run-7 done"));
-        assert!(view.contains("/verify to check"));
-        assert!(view.contains("/runs details"));
-    }
-
-    #[test]
-    fn renders_run_footer_step_progress() {
-        let state = ready_with_run(RunSummary {
-            id: RunId(7),
-            goal: "ship parser".to_string(),
-            status: RunStatus::Running,
-            coordinator: Some(MemberId::new("builder")),
-            verification: None,
-            created_at: "2026-06-28 10:00:00".to_string(),
-            updated_at: "2026-06-28 10:00:00".to_string(),
-            attempt: 1,
-            events: Vec::new(),
-            steps: vec![
-                RunStepSummary {
-                    number: 1,
-                    status: RunStepStatus::Done,
-                    owner: None,
-                    title: "Map parser states".to_string(),
-                    note: None,
-                    updated_at: "2026-06-28 10:05:00".to_string(),
-                },
-                RunStepSummary {
-                    number: 2,
-                    status: RunStepStatus::Doing,
-                    owner: None,
-                    title: "Wire checklist UI".to_string(),
-                    note: None,
-                    updated_at: "2026-06-28 10:10:00".to_string(),
-                },
-            ],
-            mode: None,
-            legacy_mode: None,
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("run-7 running"));
-        assert!(view.contains("1/2 done"));
-        assert!(view.contains("1 doing"));
-        assert!(view.contains("/runs details"));
-    }
-
-    #[test]
-    fn renders_runs_drawer() {
-        let mut state = ready_with_run(RunSummary {
-            id: RunId(1),
-            goal: "ship parser".to_string(),
-            status: RunStatus::Done,
-            coordinator: Some(MemberId::new("builder")),
-            verification: Some(RunVerification {
-                command: "cargo test".to_string(),
-                ok: true,
-                summary: "ok".to_string(),
-            }),
-            created_at: "2026-06-28 10:00:00".to_string(),
-            updated_at: "2026-06-28 10:15:00".to_string(),
-            attempt: 1,
-            events: vec![
-                RunEventSummary {
-                    kind: "note".to_string(),
-                    title: "User note".to_string(),
-                    detail: Some("checkpoint saved".to_string()),
-                    created_at: "2026-06-28 10:10:00".to_string(),
-                    attempt: 1,
-                },
-                RunEventSummary {
-                    kind: "verification_passed".to_string(),
-                    title: "Verification passed".to_string(),
-                    detail: Some("cargo test\nok".to_string()),
-                    created_at: "2026-06-28 10:15:00".to_string(),
-                    attempt: 1,
-                },
-            ],
-            steps: vec![
-                RunStepSummary {
-                    number: 1,
-                    status: RunStepStatus::Done,
-                    owner: Some(MemberId::new("builder")),
-                    title: "Map parser states".to_string(),
-                    note: None,
-                    updated_at: "2026-06-28 10:05:00".to_string(),
-                },
-                RunStepSummary {
-                    number: 2,
-                    status: RunStepStatus::Blocked,
-                    owner: None,
-                    title: "Document edge cases".to_string(),
-                    note: Some("waiting for reviewer".to_string()),
-                    updated_at: "2026-06-28 10:12:00".to_string(),
-                },
-            ],
-            mode: None,
-            legacy_mode: None,
-        });
-        state.toggle_drawer(Drawer::Runs);
-
-        let mut terminal = Terminal::new(TestBackend::new(90, 34)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Runs"));
-        assert!(view.contains("Enter status"));
-        assert!(view.contains("Tab dispatch"));
-        assert!(view.contains("x details"));
-        assert!(view.contains("←→ run"));
-        assert!(view.contains("View: compact"));
-        assert!(view.contains("Selected: run-1"));
-        assert!(view.contains("Goal: ship parser"));
-        assert!(view.contains("Progress:"));
-        assert!(view.contains("Action: /mode plan"));
-        assert!(view.contains("Steps:"));
-        // Compact mode hides the deep-dive fields.
-        assert!(!view.contains("Owners:"));
-        assert!(!view.contains("Next:"));
-        assert!(!view.contains("Outcome:"));
-        assert!(!view.contains("Stages:"));
-        assert!(!view.contains("Timeline:"));
-        assert!(!view.contains("checkpoint saved"));
-
-        assert!(state.toggle_runs_detail());
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("x compact"));
-        assert!(view.contains("History: 1 run"));
-        assert!(view.contains("View: details"));
-        assert!(view.contains("1 verified"));
-        assert!(view.contains("Selected: run-1"));
-        assert!(view.contains("Goal: ship parser"));
-        assert!(view.contains("Owner: builder"));
-        assert!(view.contains("Attempt: #1"));
-        assert!(view.contains("Time: created 06-28 10:00"));
-        assert!(view.contains("updated 06-28 10:15"));
-        assert!(view.contains("Progress:"));
-        assert!(view.contains("1/2 done"));
-        assert!(view.contains("1 blocked"));
-        assert!(view.contains("Owners:"));
-        assert!(view.contains("@builder 0/1 done"));
-        assert!(view.contains("unassigned 1/1 1 blocked"));
-        assert!(view.contains("Outcome: verified by cargo test"));
-        assert!(view.contains("Next: verified"));
-        assert!(view.contains("Action: /mode plan"));
-        assert!(view.contains("Stages:"));
-        assert!(view.contains("Steps:"));
-        assert!(view.contains("@builder"));
-        assert!(view.contains("Map parser states"));
-        assert!(view.contains("Document edge cases"));
-        assert!(view.contains("waiting for reviewer"));
-        assert!(view.contains("Timeline:"));
-        assert!(view.contains("User note"));
-        assert!(view.contains("checkpoint saved"));
-        assert!(view.contains("Verification passed"));
-        assert!(view.contains("plan done"));
-        assert!(view.contains("work done"));
-        assert!(view.contains("verify done"));
-        assert!(view.contains("run-1"));
-        assert!(view.contains("Try"));
-        assert!(view.contains("Steps"));
-        assert!(view.contains("#1"));
-        assert!(view.contains("Updated"));
-        assert!(view.contains("06-28 10:15"));
-        assert!(view.contains("ship parser"));
-        assert!(view.contains("cargo test"));
-        assert!(view.contains("ok"));
-    }
-
-    #[test]
-    fn renders_selected_run_step_action() {
-        let mut state = ready_with_run(RunSummary {
-            id: RunId(1),
-            goal: "ship parser".to_string(),
-            status: RunStatus::Running,
-            coordinator: Some(MemberId::new("builder")),
-            verification: None,
-            created_at: "2026-06-28 10:00:00".to_string(),
-            updated_at: "2026-06-28 10:15:00".to_string(),
-            attempt: 1,
-            events: Vec::new(),
-            steps: vec![RunStepSummary {
-                number: 1,
-                status: RunStepStatus::Doing,
-                owner: Some(MemberId::new("builder")),
-                title: "Wire checklist UI".to_string(),
-                note: None,
-                updated_at: "2026-06-28 10:05:00".to_string(),
-            }],
-            mode: None,
-            legacy_mode: None,
-        });
-        state.toggle_drawer(Drawer::Runs);
-        state.select_next_run_step();
-
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Action: /step done run-1 1"));
-        assert!(view.contains("Dispatch: @builder Continue run-1 step #1"));
-        assert!(view.contains("@builder"));
-        assert!(view.contains("› 1."));
-        assert!(view.contains("Wire checklist UI"));
-    }
-
-    #[test]
-    fn renders_failed_run_continue_action() {
-        let mut state = ready_with_run(RunSummary {
-            id: RunId(1),
-            goal: "ship parser".to_string(),
-            status: RunStatus::Failed,
-            coordinator: Some(MemberId::new("builder")),
-            verification: Some(RunVerification {
-                command: "cargo test".to_string(),
-                ok: false,
-                summary: "tests failed".to_string(),
-            }),
-            created_at: "2026-06-28 10:00:00".to_string(),
-            updated_at: "2026-06-28 10:15:00".to_string(),
-            attempt: 2,
-            events: vec![RunEventSummary {
-                kind: "verification_failed".to_string(),
-                title: "Verification failed".to_string(),
-                detail: Some("cargo test\ntests failed".to_string()),
-                created_at: "2026-06-28 10:15:00".to_string(),
-                attempt: 2,
-            }],
-            steps: Vec::new(),
-            mode: None,
-            legacy_mode: None,
-        });
-        state.toggle_drawer(Drawer::Runs);
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        assert!(view.contains("Outcome: verification failed: cargo test"));
-        assert!(view.contains("Timeline:"));
-        assert!(view.contains("Verification failed"));
-        assert!(view.contains("Attempt: #2"));
-        assert!(view.contains("Next: run the Action command to continue fixes"));
-        assert!(view.contains("Action: /continue run-1 fix failing verification"));
-        assert!(view.contains("#2"));
-    }
-
-    #[test]
-    fn renders_multiline_composer() {
-        let mut state = AppState::new(Vec::new());
-        for ch in "line one".chars() {
-            state.insert_char(ch);
-        }
-        state.insert_newline();
-        for ch in "line two".chars() {
-            state.insert_char(ch);
-        }
-
-        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = render(frame, &state);
-            })
-            .unwrap();
-        let view = format!("{}", terminal.backend());
-        eprintln!("\n{view}");
-
-        // Both composer lines are visible (first with the prompt gutter).
-        assert!(view.contains("> line one"));
-        assert!(view.contains("line two"));
-    }
-
-    #[test]
-    fn screen_to_content_round_trip_edges() {
-        let layout = ChatLayout {
-            area: Rect::new(2, 3, 20, 4),
-            first_line: 1,
-            width: 20,
-            lines: vec![
-                "hello world".into(),
-                "second line".into(),
-                "third".into(),
-                "fourth line here".into(),
-                "fifth".into(),
-            ],
-            completion_area: None,
-        };
-        // Top-left of area → first_line, col 0.
-        assert_eq!(
-            layout.screen_to_content(layout.area.x, layout.area.y),
-            Some((1, 0))
-        );
-        // Bottom row of area: first_line 1 + row 3 = line 4, col 3 of "fifth".
-        let bottom_y = layout.area.y + layout.area.height - 1;
-        assert_eq!(
-            layout.screen_to_content(layout.area.x + 3, bottom_y),
-            Some((4, 3))
-        );
-        // Out-of-area clamp: above and left of area.
-        assert_eq!(layout.screen_to_content(0, 0), Some((1, 0)));
-        // Past right edge of a short line clamps to last cell.
-        assert_eq!(
-            layout.screen_to_content(layout.area.x + 50, layout.area.y),
-            Some((1, theme::display_width("second line") - 1))
-        );
-    }
-
-    #[test]
-    fn large_chat_is_trimmed_before_frame_flattening() {
-        let chat = (0..5_000)
-            .map(|index| ChatItem::Notice {
-                text: format!("notice {index}"),
-            })
-            .collect();
-        let state = AppState::new(chat);
-        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
-        let mut flattened = 0;
-
-        terminal
-            .draw(|frame| {
-                flattened = render(frame, &state).unwrap().lines.len();
-            })
-            .unwrap();
-
-        assert!(state.chat().len() <= super::super::app_state::MAX_CHAT_ITEMS);
-        assert!(
-            flattened < 10_000,
-            "frame work must be bounded: {flattened}"
-        );
-    }
+    spans
 }
+
+#[cfg(test)]
+#[path = "chat_view_tests/mod.rs"]
+mod tests;

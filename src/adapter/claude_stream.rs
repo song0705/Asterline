@@ -110,7 +110,9 @@ impl StreamAdapter for ClaudeStreamAdapter {
             // Claude officially accepts print-mode prompts on stdin. Keeping
             // user text out of argv prevents prompts such as `--version` from
             // being reinterpreted as CLI options.
-            stdin: Some(prompt.to_string()),
+            stdin: Some(crate::adapter::prompt_images::prompt_with_image_paths(
+                prompt,
+            )),
         }
     }
 
@@ -430,6 +432,19 @@ mod tests {
         assert!(!command.args.iter().any(|arg| arg == "--allowed-tools"));
         assert_eq!(command.stdin.as_deref(), Some("hello"));
         assert!(!command.args.iter().any(|arg| arg == "hello"));
+        let img_dir =
+            std::env::temp_dir().join(format!("asterline-claude-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&img_dir);
+        let img = img_dir.join("shot.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let with_image = adapter.build_command(
+            &format!("hello\n[asterline-image]: {}", img.display()),
+            None,
+            None,
+        );
+        let expected = format!("hello\n(attached image: {})", img.display());
+        assert_eq!(with_image.stdin.as_deref(), Some(expected.as_str()));
+        let _ = std::fs::remove_dir_all(&img_dir);
         // The product path never disables session persistence.
         assert!(!command.args.iter().any(|a| a == "--no-session-persistence"));
     }

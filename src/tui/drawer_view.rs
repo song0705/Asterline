@@ -51,6 +51,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
     let lines = match drawer {
         Drawer::Logs => drawer_logs(state),
         Drawer::Team => drawer_team(state, content.width as usize),
+        Drawer::Mode => drawer_mode(state),
         Drawer::Runs => drawer_runs(state, content.width as usize),
         Drawer::Palette => drawer_palette(),
         Drawer::Diff => drawer_diff(state),
@@ -126,6 +127,36 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
                 "↑↓ field · Enter edit/choose · Esc members"
             }
             Drawer::Team => "↑↓ member · Enter fields · Esc close",
+            Drawer::Mode
+                if state
+                    .mode_editor()
+                    .is_some_and(|editor| editor.editing().is_some()) =>
+            {
+                "Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit"
+            }
+            Drawer::Mode
+                if state
+                    .mode_editor()
+                    .is_some_and(|editor| editor.member_picker().is_some()) =>
+            {
+                if state
+                    .mode_editor()
+                    .and_then(|editor| editor.member_picker())
+                    .is_some_and(|picker| picker.multi())
+                {
+                    "↑↓ member · Space toggle · Enter confirm · Esc cancel"
+                } else {
+                    "↑↓ member · Enter choose · Esc cancel"
+                }
+            }
+            Drawer::Mode
+                if state
+                    .mode_editor()
+                    .is_some_and(|editor| editor.field_mode()) =>
+            {
+                "↑↓ field · Enter edit · ←/→ step · s select + apply · w team.json · Esc list"
+            }
+            Drawer::Mode => "↑↓ select · Enter fields · Esc close",
             _ => "↑↓ scroll · Esc close",
         };
         frame.render_widget(
@@ -136,6 +167,11 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
 
     if matches!(drawer, Drawer::Team)
         && let Some(edit) = state.team_editor().and_then(|editor| editor.editing())
+    {
+        crate::tui::team_builder::render_edit_box(frame, content, edit);
+    }
+    if matches!(drawer, Drawer::Mode)
+        && let Some(edit) = state.mode_editor().and_then(|editor| editor.editing())
     {
         crate::tui::team_builder::render_edit_box(frame, content, edit);
     }
@@ -280,6 +316,29 @@ fn table_header(cells: &[&str], widths: &[usize], tail: &str) -> (Line<'static>,
     )
 }
 
+fn active_mode_run_banner(state: &AppState) -> Option<String> {
+    state.runs().iter().find_map(|run| {
+        let mode = run.mode.as_ref()?;
+        if !matches!(
+            run.status,
+            crate::domain::event::RunStatus::Running | crate::domain::event::RunStatus::Verifying
+        ) {
+            return None;
+        }
+        Some(format!(
+            "{} {} in progress — changes apply to the next run",
+            mode.mode, run.id
+        ))
+    })
+}
+
+fn drawer_mode(state: &AppState) -> Vec<Line<'static>> {
+    let Some(editor) = state.mode_editor() else {
+        return vec![Line::styled("mode panel unavailable", theme::muted())];
+    };
+    editor.lines(active_mode_run_banner(state).as_deref())
+}
+
 fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
     if let Some(editor) = state.team_editor() {
         return drawer_team_editor(state, editor, width);
@@ -296,7 +355,8 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
 
     for member in state.members() {
-        let color = theme::backend_color(member.backend);
+        let color =
+            theme::backend_color_shaded(member.backend, state.member_color_index(&member.id));
         let status_label = theme::status_label(member.status);
         // Header line: ● Name  backend · role  ·  status
         lines.push(Line::from(vec![
@@ -402,7 +462,11 @@ fn drawer_team_editor(
 
     for (idx, member) in editor.members().iter().enumerate() {
         let selected = idx == editor.selected();
-        let color = theme::backend_color(member.backend);
+        let shade = editor.members()[..idx]
+            .iter()
+            .filter(|candidate| candidate.backend == member.backend)
+            .count();
+        let color = theme::backend_color_shaded(member.backend, shade);
         let row_style = if selected {
             theme::bold(theme::emphasis_color())
         } else {
@@ -694,6 +758,7 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::domain::event::{MemberStatus, MemberSummary, RuntimeEvent};
+    use crate::domain::mode::{ModesConfig, PlanModeConfig, TerminalMode};
     use crate::domain::team::{
         BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     };
@@ -705,6 +770,9 @@ mod tests {
     fn ready_state_for(backend: BackendKind) -> AppState {
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
             team: "t".to_string(),
             workspace: "/tmp/ws".to_string(),
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
@@ -850,5 +918,158 @@ mod tests {
         assert_eq!(positions(&header, '│'), expected);
         assert_eq!(positions(&rule, '┼'), expected);
         assert_eq!(positions(&row, '│'), expected);
+    }
+
+    fn mode_ready_state() -> AppState {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            modes: ModesConfig {
+                plan: Some(PlanModeConfig {
+                    builder: Some(MemberId::new("builder")),
+                    ..PlanModeConfig::default()
+                }),
+                ..ModesConfig::default()
+            },
+            mode_overrides: Default::default(),
+            suggested_verify: Some("cargo test".to_string()),
+            team: "t".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                MemberSummary {
+                    id: MemberId::new("builder"),
+                    display_name: "Builder".to_string(),
+                    backend: BackendKind::Codex,
+                    role: "implementation".to_string(),
+                    status: MemberStatus::Idle,
+                    session: None,
+                    cwd: "/tmp/ws".to_string(),
+                    model: None,
+                    effort: None,
+                    sandbox: SandboxPolicy::WorkspaceWrite,
+                    permission_mode: Some(PermissionMode::Default),
+                    session_policy: SessionPolicy::Resume,
+                },
+                MemberSummary {
+                    id: MemberId::new("reviewer"),
+                    display_name: "Reviewer".to_string(),
+                    backend: BackendKind::Claude,
+                    role: "review".to_string(),
+                    status: MemberStatus::Idle,
+                    session: None,
+                    cwd: "/tmp/ws".to_string(),
+                    model: None,
+                    effort: None,
+                    sandbox: SandboxPolicy::WorkspaceWrite,
+                    permission_mode: Some(PermissionMode::Default),
+                    session_policy: SessionPolicy::Resume,
+                },
+            ],
+        });
+        state
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn mode_list_names_share_a_column() {
+        let mut state = mode_ready_state();
+        state.toggle_drawer(Drawer::Mode);
+        let lines = drawer_mode(&state);
+        let rows = TerminalMode::ALL
+            .iter()
+            .map(|mode| {
+                lines
+                    .iter()
+                    .map(line_text)
+                    .find(|text| {
+                        !text.contains("this chat")
+                            && (text.contains(&format!("▶ {}", mode.as_str()))
+                                || text.contains(&format!("● {}", mode.as_str()))
+                                || text.contains(&format!("  {}", mode.as_str())))
+                    })
+                    .unwrap_or_else(|| panic!("missing {mode} row"))
+            })
+            .collect::<Vec<_>>();
+        let name_starts = rows
+            .iter()
+            .zip(TerminalMode::ALL.iter())
+            .map(|(row, mode)| {
+                let idx = row.find(mode.as_str()).expect("mode name");
+                theme::display_width(&row[..idx])
+            })
+            .collect::<Vec<_>>();
+        assert!(name_starts.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn mode_list_names_use_mode_identity_colors() {
+        let mut state = mode_ready_state();
+        state.toggle_drawer(Drawer::Mode);
+        let lines = drawer_mode(&state);
+
+        for mode in TerminalMode::ALL {
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.trim() == mode.as_str())
+                .unwrap_or_else(|| panic!("missing {mode} name"));
+            assert_eq!(span.style.fg, Some(theme::mode_color(mode)));
+        }
+    }
+
+    #[test]
+    fn mode_editor_shows_field_focus_only_after_enter() {
+        let mut state = mode_ready_state();
+        state.toggle_drawer(Drawer::Mode);
+        let before = drawer_mode(&state);
+        assert!(
+            before
+                .iter()
+                .all(|line| !line_text(line).contains("builder:"))
+        );
+
+        state.handle_mode_editor_key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        state.handle_mode_editor_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let lines = drawer_mode(&state);
+        let focused = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("builder:") && span.content.contains('›'))
+            .expect("focused builder field");
+        assert_eq!(focused.style.fg, Some(theme::warning_color()));
+        let colons = lines
+            .iter()
+            .map(line_text)
+            .filter(|text| {
+                [
+                    "builder:",
+                    "reviewer:",
+                    "max_iterations:",
+                    "auto_verify:",
+                    "verify_command:",
+                ]
+                .iter()
+                .any(|label| text.contains(label))
+            })
+            .map(|text| {
+                let byte = text.find(':').expect("field colon");
+                theme::display_width(&text[..byte])
+            })
+            .collect::<Vec<_>>();
+        assert!(colons.len() >= 5);
+        assert!(colons.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }

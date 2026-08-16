@@ -50,7 +50,25 @@ Asterline 由 GitHub Actions 构建和发布。Release tag 必须与 `Cargo.toml
    gh run watch "$run_id" --exit-status
    ```
 
-8. 仅当该 commit 全绿后，从它创建并推送 annotated tag：
+8. 从该候选 commit 手动运行 **Release** workflow，输入不带 `v` 的版本号。它会完整构建、
+   打包并 smoke-test 所有发布资产，但不会创建 tag、Release 或 Homebrew PR。运行期间不要向
+   `main` 推送新的 commit；确认运行的 commit 仍是第 7 步保存的 `$commit`：
+
+   ```bash
+   gh workflow run Release --ref main -f version="$version"
+   run_id=""
+   for _ in $(seq 1 30); do
+     run_id="$(gh run list --workflow Release --event workflow_dispatch --commit "$commit" \
+       --limit 1 --json databaseId --jq '.[0].databaseId')"
+     test -n "$run_id" && break
+     sleep 2
+   done
+   test -n "$run_id"
+   gh run watch "$run_id" --exit-status
+   test "$(git rev-parse HEAD)" = "$commit"
+   ```
+
+9. 仅当 preflight 全绿后，从它创建并推送 annotated tag：
 
    ```bash
    version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
@@ -62,10 +80,12 @@ Asterline 由 GitHub Actions 构建和发布。Release tag 必须与 `Cargo.toml
 
 ## 自动发布
 
-推送 tag 会启动 `.github/workflows/release.yml`。workflow 会：
+手动触发的 Release preflight 会先运行下面第 1–8 项，但会跳过发布和 Homebrew 更新。只有
+推送 tag 才会启动正式发布流程，并运行 `.github/workflows/release.yml` 的全部步骤；没有同一
+commit 的成功 preflight，正式发布会在质量门直接拒绝：
 
-1. 验证 annotated tag 与 Cargo 版本匹配、解析到触发 commit、包含在 `origin/main` 中，且没有
-   已发布 Release；
+1. 验证 annotated tag 与 Cargo 版本匹配、解析到触发 commit、包含在 `origin/main` 中，有同一
+   commit 的成功 preflight，且没有已发布 Release；
 2. 在 Linux 执行格式化和无 warning Clippy，然后在 Linux、macOS、Windows 运行测试套件；
 3. 在按 digest 固定且受支持的 PyPA `manylinux_2_28` 容器内构建 Linux x86-64 和 ARM64，
    并在原生 runner 构建 macOS Intel、macOS Apple silicon、Windows x86-64 MSVC；
@@ -111,6 +131,23 @@ P12 必须包含所列 Developer ID Application 与 Developer ID Installer ident
 secret 时，workflow 会输出 warning 并发布未签名、未公证 DMG；其二进制仅 ad-hoc 签名。
 `SHA256SUMS` 和 GitHub artifact attestation 仍覆盖该文件，但不能替代 Developer ID 签名或
 Apple 公证。
+
+## Homebrew Formula 自动更新
+
+发布前，在 `song0705/Asterline` 的 Actions secret 中配置 `HOMEBREW_TAP_TOKEN`。请创建仅限
+`song0705/homebrew-asterline` 的 fine-grained token，授予 **Contents: Read and write** 与
+**Pull requests: Read and write**；不要把宽权限个人 token 交给 CI。
+
+使用以下命令设置 token，避免其进入 shell history：
+
+```bash
+gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline
+```
+
+GitHub Release 发布后，workflow 会下载其 `SHA256SUMS`，更新 tap 中
+`Formula/asterline.rb` 的四个预编译归档 URL 和校验和，在 macOS 验证 Formula，然后在 tap
+创建或更新 `automation/asterline-v<version>` 拉取请求。quality gate 缺少此 secret 时会拒绝
+启动，确保每个已发布版本都至少尝试更新一次 Formula。
 
 Linux 归档有意使用 `*-unknown-linux-gnu`，而不是 musl。release workflow 使用 PyPA 维护的
 `manylinux_2_28` 镜像，为 x86-64 和 ARM64 提供 glibc 2.28 构建基线。构建后脚本会拒绝要求

@@ -552,6 +552,7 @@ mod tests {
             .unwrap();
         let prompt = builder.system_prompt.as_ref().unwrap();
         assert!(prompt.contains("$asterline-team"));
+        assert!(!prompt.contains(".asterline/roster.md"));
         assert!(prompt.contains("reviewer"));
     }
 
@@ -651,7 +652,12 @@ mod tests {
         let mut saved = launch.clone();
         saved.members[0].effort = Some(crate::domain::team::Effort::High);
         store
-            .save_conversation_snapshot(&saved, &[], crate::domain::TerminalMode::Normal)
+            .save_conversation_snapshot(
+                &saved,
+                &[],
+                crate::domain::TerminalMode::Normal,
+                &crate::domain::mode::ModesConfig::default(),
+            )
             .unwrap();
         let turn = store.create_turn().unwrap();
         store
@@ -721,7 +727,12 @@ mod tests {
         stale.members[0].effort = Some(crate::domain::team::Effort::High);
         stale.members[0].display_name = "Stale snapshot member".to_string();
         store
-            .save_conversation_snapshot(&stale, &[], crate::domain::TerminalMode::Normal)
+            .save_conversation_snapshot(
+                &stale,
+                &[],
+                crate::domain::TerminalMode::Normal,
+                &crate::domain::mode::ModesConfig::default(),
+            )
             .unwrap();
         drop(store);
 

@@ -11,6 +11,8 @@ pub struct Composer {
     chars: Vec<char>,
     cursor: usize,
     bytes: usize,
+    /// Other end of a drag / Shift selection, if any.
+    selection_anchor: Option<usize>,
 }
 
 impl Composer {
@@ -31,8 +33,60 @@ impl Composer {
         self.cursor
     }
 
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        let (start, end) = if anchor <= self.cursor {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        };
+        (start < end).then_some((start, end))
+    }
+
+    pub fn selected_text(&self) -> String {
+        let Some((start, end)) = self.selection_range() else {
+            return String::new();
+        };
+        self.chars[start..end].iter().collect()
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    pub fn set_cursor_index(&mut self, index: usize) {
+        self.cursor = self.grapheme_boundary_at_or_after(index.min(self.chars.len()));
+    }
+
+    pub fn begin_selection_at(&mut self, index: usize) {
+        self.set_cursor_index(index);
+        self.selection_anchor = Some(self.cursor);
+    }
+
+    pub fn extend_selection_to(&mut self, index: usize) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+        self.set_cursor_index(index);
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            return false;
+        };
+        self.bytes -= self.chars[start..end]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum::<usize>();
+        self.chars.drain(start..end);
+        self.cursor = start;
+        self.selection_anchor = None;
+        true
+    }
+
     /// Insert one scalar, returning whether it fit within the hard input cap.
     pub fn insert(&mut self, ch: char) -> bool {
+        self.delete_selection();
         if self.bytes.saturating_add(ch.len_utf8()) > MAX_COMPOSER_BYTES {
             return false;
         }
@@ -46,6 +100,7 @@ impl Composer {
     /// Insert a paste in one operation, leaving the cursor after the retained
     /// UTF-8 prefix. Returns false when the input had to be truncated.
     pub fn insert_text(&mut self, text: &str) -> bool {
+        self.delete_selection();
         let remaining = MAX_COMPOSER_BYTES.saturating_sub(self.bytes);
         let end = utf8_prefix_len(text, remaining);
         let inserted = text[..end].chars().collect::<Vec<_>>();
@@ -63,6 +118,9 @@ impl Composer {
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor > 0 {
             let start = self.previous_grapheme_boundary(self.cursor);
             self.bytes -= self.chars[start..self.cursor]
@@ -74,8 +132,38 @@ impl Composer {
         }
     }
 
+    /// Delete the logical line that contains the cursor. Other lines stay.
+    /// The line break that belonged to this line is removed so a middle line
+    /// does not leave a blank gap.
+    pub fn delete_line(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.chars.is_empty() {
+            return;
+        }
+        let (start, end) = self.line_bounds();
+        let (drain_start, drain_end, cursor) = if end < self.chars.len() {
+            (start, end + 1, start)
+        } else if start > 0 {
+            (start - 1, end, start - 1)
+        } else {
+            (start, end, 0)
+        };
+        self.bytes -= self.chars[drain_start..drain_end]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum::<usize>();
+        self.chars.drain(drain_start..drain_end);
+        self.cursor = cursor.min(self.chars.len());
+        self.cursor = self.grapheme_boundary_at_or_after(self.cursor);
+    }
+
     /// Delete the word (and preceding whitespace) before the cursor.
     pub fn delete_word(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let mut end = self.cursor;
         while end > 0 && self.chars[end - 1].is_whitespace() {
             end -= 1;
@@ -96,21 +184,26 @@ impl Composer {
         self.chars.clear();
         self.cursor = 0;
         self.bytes = 0;
+        self.selection_anchor = None;
     }
 
     pub fn left(&mut self) {
+        self.selection_anchor = None;
         self.cursor = self.previous_grapheme_boundary(self.cursor);
     }
 
     pub fn right(&mut self) {
+        self.selection_anchor = None;
         self.cursor = self.next_grapheme_boundary(self.cursor);
     }
 
     pub fn home(&mut self) {
+        self.selection_anchor = None;
         self.cursor = self.line_bounds().0;
     }
 
     pub fn end(&mut self) {
+        self.selection_anchor = None;
         self.cursor = self.line_bounds().1;
     }
 
@@ -163,6 +256,7 @@ impl Composer {
     /// Move the cursor up one visual line, keeping the column. Returns false if
     /// already on the first line (so the caller can fall back to history recall).
     pub fn up(&mut self) -> bool {
+        self.selection_anchor = None;
         let (row, col) = self.cursor_row_col();
         if row == 0 {
             return false;
@@ -177,6 +271,7 @@ impl Composer {
     /// Move the cursor down one visual line, keeping the column. Returns false if
     /// already on the last line.
     pub fn down(&mut self) -> bool {
+        self.selection_anchor = None;
         let (row, col) = self.cursor_row_col();
         let starts = self.line_starts();
         if row + 1 >= starts.len() {
@@ -228,11 +323,75 @@ impl Composer {
     /// Replace the entire contents, leaving the cursor at the end. Used by
     /// prompt-history recall to load a previous submission into the composer.
     pub fn set_text(&mut self, text: &str) -> bool {
+        self.selection_anchor = None;
         let end = utf8_prefix_len(text, MAX_COMPOSER_BYTES);
         self.chars = text[..end].chars().collect();
         self.bytes = end;
         self.cursor = self.chars.len();
         end == text.len()
+    }
+
+    /// Map a visual (row, column) in wrapped composer space to a char index.
+    pub fn index_at_visual(&self, width: usize, row: usize, col: usize) -> usize {
+        let width = width.max(1);
+        let mut visual_row = 0usize;
+        let mut visual_col = 0usize;
+        let mut index = 0usize;
+        let text = self.text();
+        for grapheme in text.graphemes(true) {
+            if visual_row > row {
+                return index;
+            }
+            if grapheme == "\n" {
+                if visual_row == row {
+                    return index;
+                }
+                visual_row += 1;
+                visual_col = 0;
+                index += grapheme.chars().count();
+                continue;
+            }
+            let w = UnicodeWidthStr::width(grapheme);
+            if visual_col > 0 && visual_col + w > width {
+                visual_row += 1;
+                visual_col = 0;
+            }
+            if visual_row == row && visual_col >= col {
+                return index;
+            }
+            if visual_row == row && visual_col + w > col {
+                return index;
+            }
+            visual_col += w;
+            index += grapheme.chars().count();
+        }
+        self.chars.len()
+    }
+
+    /// Wrapped lines with the starting char index of each visual line.
+    pub fn visual_lines_with_starts(&self, width: usize) -> Vec<(String, usize)> {
+        let width = width.max(1);
+        let mut lines = vec![(String::new(), 0usize)];
+        let mut col = 0usize;
+        let mut index = 0usize;
+        let text = self.text();
+        for grapheme in text.graphemes(true) {
+            if grapheme == "\n" {
+                index += grapheme.chars().count();
+                lines.push((String::new(), index));
+                col = 0;
+                continue;
+            }
+            let w = UnicodeWidthStr::width(grapheme);
+            if col > 0 && col + w > width {
+                lines.push((String::new(), index));
+                col = 0;
+            }
+            lines.last_mut().unwrap().0.push_str(grapheme);
+            col += w;
+            index += grapheme.chars().count();
+        }
+        lines
     }
 
     fn grapheme_boundaries(&self) -> Vec<usize> {
@@ -361,6 +520,25 @@ mod tests {
     }
 
     #[test]
+    fn drag_selection_copies_range_and_insert_replaces_it() {
+        let mut c = typed("hello world");
+        c.begin_selection_at(0);
+        c.extend_selection_to(5);
+        assert_eq!(c.selected_text(), "hello");
+        assert!(c.insert_text("hey"));
+        assert_eq!(c.text(), "hey world");
+        assert!(c.selected_text().is_empty());
+    }
+
+    #[test]
+    fn index_at_visual_hits_wrapped_column() {
+        let c = typed("abcdefghij");
+        assert_eq!(c.index_at_visual(4, 0, 2), 2);
+        assert_eq!(c.index_at_visual(4, 1, 1), 5);
+        assert_eq!(c.index_at_visual(4, 9, 0), 10);
+    }
+
+    #[test]
     fn insert_and_take() {
         let mut c = typed("hello");
         assert_eq!(c.text(), "hello");
@@ -476,6 +654,40 @@ mod tests {
         assert!(c.down());
         assert_eq!(c.cursor_row_col().0, 1);
         assert!(!c.down());
+    }
+
+    #[test]
+    fn delete_line_removes_only_the_current_logical_line() {
+        let mut middle = typed("keep\nremove\nkeep");
+        middle.home();
+        middle.left(); // end of "remove"
+        middle.delete_line();
+        assert_eq!(middle.text(), "keep\nkeep");
+        assert_eq!(middle.cursor(), 5); // start of the following "keep"
+
+        let mut first = typed("gone\nstay");
+        first.home();
+        assert!(first.up());
+        first.delete_line();
+        assert_eq!(first.text(), "stay");
+        assert_eq!(first.cursor(), 0);
+
+        let mut last = typed("stay\ngone");
+        last.delete_line();
+        assert_eq!(last.text(), "stay");
+        assert_eq!(last.cursor(), 4);
+
+        let mut only = typed("all of this");
+        only.home();
+        only.right();
+        only.delete_line();
+        assert!(only.is_empty());
+        assert_eq!(only.cursor(), 0);
+
+        let mut blank = typed("stay\n\nstay");
+        blank.up();
+        blank.delete_line();
+        assert_eq!(blank.text(), "stay\nstay");
     }
 
     #[test]

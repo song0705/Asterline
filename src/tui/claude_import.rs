@@ -42,6 +42,28 @@ pub struct ClaudeSnapshot {
     started: SystemTime,
 }
 
+/// Load every importable message from a bound Claude session file.
+pub(crate) fn messages_for_session(session_id: &str, cwd: &str) -> Vec<ImportedMessage> {
+    let Some(root) = default_projects_root() else {
+        return Vec::new();
+    };
+    let Some(path) = claude_session_path(&projects_dir_for(&root, cwd), session_id) else {
+        return Vec::new();
+    };
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    let mut retained_bytes = 0_usize;
+    import_io::for_each_json_value(&path, |value| {
+        let Some(message) = classify_row(&value) else {
+            return true;
+        };
+        import_io::push_imported_bounded(&mut items, &mut retained_bytes, message)
+    });
+    items
+}
+
 /// Snapshot the Claude session for `session_id` (if any) before attaching.
 pub fn snapshot(session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
     match default_projects_root() {

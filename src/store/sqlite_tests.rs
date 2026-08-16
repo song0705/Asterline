@@ -1,5 +1,7 @@
 use super::*;
-use crate::domain::team::{BackendKind, TeamConfig, TeamMember};
+use crate::domain::event::FileChangeItem;
+use crate::domain::mode::{ModesConfig, ReviewModeConfig};
+use crate::domain::team::{BackendKind, MemberId, TeamConfig, TeamMember};
 
 fn store() -> SqliteStore {
     SqliteStore::in_memory().expect("store initializes")
@@ -193,6 +195,18 @@ fn legacy_conversation_snapshot_defaults_to_normal_mode() {
 }
 
 #[test]
+fn native_import_cursor_round_trips() {
+    let store = store();
+    let member = MemberId::new("builder");
+    let session = AgentSessionId("sess-1".to_string());
+    assert_eq!(store.native_import_cursor(&member, &session).unwrap(), 0);
+    store
+        .set_native_import_cursor(&member, &session, 7)
+        .unwrap();
+    assert_eq!(store.native_import_cursor(&member, &session).unwrap(), 7);
+}
+
+#[test]
 fn conversation_snapshots_drive_resume_list_and_restore_data() {
     let store = store();
     let first = store.create_conversation().unwrap();
@@ -209,7 +223,12 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
         session_id: "codex-session-1".to_string(),
     }];
     store
-        .save_conversation_snapshot(&team, &sessions, TerminalMode::Review)
+        .save_conversation_snapshot(
+            &team,
+            &sessions,
+            TerminalMode::Review,
+            &ModesConfig::default(),
+        )
         .unwrap();
     let turn = store.create_turn().unwrap();
     store
@@ -219,7 +238,7 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
     let second = store.create_conversation().unwrap();
     store.set_conversation(second).unwrap();
     store
-        .save_conversation_snapshot(&team, &[], TerminalMode::Normal)
+        .save_conversation_snapshot(&team, &[], TerminalMode::Normal, &ModesConfig::default())
         .unwrap();
 
     let choices = store.resumable_conversations().unwrap();
@@ -233,6 +252,7 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
     assert_eq!(restored.team, team);
     assert_eq!(restored.sessions, sessions);
     assert_eq!(restored.mode, TerminalMode::Review);
+    assert_eq!(restored.mode_overrides, ModesConfig::default());
     assert_eq!(
         store.replay_chat_for(first).unwrap(),
         vec![ChatItem::User {
@@ -243,6 +263,32 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
     );
     store.set_conversation(first).unwrap();
     assert_eq!(store.current_conversation().unwrap(), first);
+}
+
+#[test]
+fn conversation_snapshot_round_trips_mode_overrides() {
+    let store = store();
+    let conversation = store.create_conversation().unwrap();
+    store.set_conversation(conversation).unwrap();
+    let team = TeamConfig::new("saved", "/tmp/ws").with_member(TeamMember::new(
+        "builder",
+        "Builder",
+        BackendKind::Codex,
+        "build",
+    ));
+    let overrides = ModesConfig {
+        review: Some(ReviewModeConfig {
+            max_iterations: Some(5),
+            ..ReviewModeConfig::default()
+        }),
+        ..ModesConfig::default()
+    };
+    store
+        .save_conversation_snapshot(&team, &[], TerminalMode::Review, &overrides)
+        .unwrap();
+    let restored = store.conversation_snapshot(conversation).unwrap().unwrap();
+    assert_eq!(restored.mode, TerminalMode::Review);
+    assert_eq!(restored.mode_overrides, overrides);
 }
 
 #[test]
@@ -257,7 +303,7 @@ fn resume_preview_skips_imported_codex_plugin_inventory() {
         "build",
     ));
     store
-        .save_conversation_snapshot(&team, &[], TerminalMode::Normal)
+        .save_conversation_snapshot(&team, &[], TerminalMode::Normal, &ModesConfig::default())
         .unwrap();
     let turn = store.create_turn().unwrap();
     store
@@ -274,7 +320,7 @@ fn resume_preview_skips_imported_codex_plugin_inventory() {
     let active = store.create_conversation().unwrap();
     store.set_conversation(active).unwrap();
     store
-        .save_conversation_snapshot(&team, &[], TerminalMode::Normal)
+        .save_conversation_snapshot(&team, &[], TerminalMode::Normal, &ModesConfig::default())
         .unwrap();
 
     let choices = store.resumable_conversations().unwrap();
@@ -473,7 +519,7 @@ fn active_team_restore_keeps_launch_workspace_and_snapshot_effort() {
     ));
     saved.members[0].effort = Some(Effort::High);
     store
-        .save_conversation_snapshot(&saved, &[], TerminalMode::Normal)
+        .save_conversation_snapshot(&saved, &[], TerminalMode::Normal, &ModesConfig::default())
         .unwrap();
     let mut launch = saved.clone();
     launch.workspace = "/launch/workspace".into();
@@ -543,6 +589,28 @@ fn replays_chat_in_insertion_order() {
             backend: BackendKind::Claude,
             ..
         }
+    ));
+}
+
+#[test]
+fn replay_keeps_the_first_message_when_the_conversation_fits() {
+    let store = store();
+    let conversation = store.current_conversation().unwrap();
+    for index in 0..80 {
+        store
+            .record_notice(None, &format!("item-{index:03}"))
+            .unwrap();
+    }
+
+    let items = store.replay_chat_for(conversation).unwrap();
+    assert_eq!(items.len(), 80);
+    assert!(matches!(
+        items.first(),
+        Some(ChatItem::Notice { text }) if text == "item-000"
+    ));
+    assert!(matches!(
+        items.last(),
+        Some(ChatItem::Notice { text }) if text == "item-079"
     ));
 }
 
@@ -1318,8 +1386,8 @@ fn diff_round_trips_through_replay() {
     let store = store();
     let turn = store.create_turn().unwrap();
     let files = vec![
-        ("src/a.rs".to_string(), "update".to_string()),
-        ("src/b.rs".to_string(), "add".to_string()),
+        FileChangeItem::new("src/a.rs", "update"),
+        FileChangeItem::new("src/b.rs", "add"),
     ];
     store
         .record_diff(turn, &MemberId::new("builder"), &files, false)

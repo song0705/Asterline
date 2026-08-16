@@ -169,7 +169,9 @@ impl StreamAdapter for AgyStreamAdapter {
             // Agy print mode reads a missing positional prompt from stdin.
             // This avoids exposing prompts in process listings and Windows'
             // command-line length limit.
-            stdin: Some(self.prompt_with_system(prompt)),
+            stdin: Some(self.prompt_with_system(
+                &crate::adapter::prompt_images::prompt_with_image_paths(prompt),
+            )),
         }
     }
 
@@ -257,9 +259,8 @@ impl AgyLineParser {
                 name: name.clone(),
                 summary: tool
                     .get("parameters")
-                    .map(|value| tool_value(value, TOOL_SUMMARY_MAX))
+                    .map(crate::adapter::parser::tool_brief)
                     .filter(|value| !value.is_empty())
-                    .map(|parameters| format!("{name}: {parameters}"))
                     .map(|value| summarize(&value, TOOL_SUMMARY_MAX))
                     .unwrap_or(name),
             });
@@ -458,6 +459,31 @@ mod tests {
         assert!(command.args.windows(2).any(|w| w == ["--mode", "plan"]));
         assert_eq!(command.args.last().map(String::as_str), Some("--print"));
         assert!(command.stdin.as_deref().unwrap().contains("hi there"));
+        let img_dir =
+            std::env::temp_dir().join(format!("asterline-agy-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&img_dir);
+        let img = img_dir.join("shot.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let with_image = adapter.build_command(
+            &format!("hi there\n[asterline-image]: {}", img.display()),
+            None,
+            None,
+        );
+        assert!(
+            with_image
+                .stdin
+                .as_deref()
+                .unwrap()
+                .contains(&format!("(attached image: {})", img.display()))
+        );
+        let _ = std::fs::remove_dir_all(&img_dir);
+        assert!(
+            !with_image
+                .stdin
+                .as_deref()
+                .unwrap()
+                .contains("[asterline-image]")
+        );
     }
 
     #[test]

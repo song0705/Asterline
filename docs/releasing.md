@@ -55,7 +55,26 @@ guidance](https://docs.github.com/en/code-security/how-tos/secure-your-supply-ch
    gh run watch "$run_id" --exit-status
    ```
 
-8. Only after that commit is green, create and push an annotated tag from it:
+8. Manually run the **Release** workflow from that candidate commit, supplying the version without
+   the `v` prefix. It builds, packages, and smoke-tests every release asset but creates no tag,
+   Release, or Homebrew PR. Do not push another commit to `main` while it runs; confirm the run
+   still targets the `$commit` saved in step 7:
+
+   ```bash
+   gh workflow run Release --ref main -f version="$version"
+   run_id=""
+   for _ in $(seq 1 30); do
+     run_id="$(gh run list --workflow Release --event workflow_dispatch --commit "$commit" \
+       --limit 1 --json databaseId --jq '.[0].databaseId')"
+     test -n "$run_id" && break
+     sleep 2
+   done
+   test -n "$run_id"
+   gh run watch "$run_id" --exit-status
+   test "$(git rev-parse HEAD)" = "$commit"
+   ```
+
+9. Only after the preflight is green, create and push an annotated tag from it:
 
    ```bash
    version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
@@ -67,11 +86,13 @@ guidance](https://docs.github.com/en/code-security/how-tos/secure-your-supply-ch
 
 ## Automated release
 
-Pushing the tag starts `.github/workflows/release.yml`. The workflow:
+The manually dispatched Release preflight runs items 1–8 below but skips publication and the
+Homebrew update. Only a tag push starts the full `.github/workflows/release.yml`; the quality
+gate rejects it unless the same commit has a successful preflight:
 
 1. verifies that an annotated tag matches the Cargo version, resolves to the
-   triggering commit, is contained in `origin/main`, and has no published
-   Release;
+   triggering commit, is contained in `origin/main`, has a successful preflight
+   for that same commit, and has no published Release;
 2. runs formatting and warning-free Clippy on Linux, then runs the test suite
    on Linux, macOS, and Windows;
 3. builds Linux x86-64 and ARM64 in digest-pinned, supported PyPA
@@ -131,6 +152,25 @@ Installer identities. If any secret is absent, the workflow emits a warning and
 publishes an unsigned, unnotarized DMG instead; its binaries are ad-hoc signed
 only. `SHA256SUMS` and GitHub artifact attestations still cover that file, but
 they do not replace Developer ID signing or Apple notarization.
+
+## Homebrew Formula updates
+
+Before releasing, configure `HOMEBREW_TAP_TOKEN` as an Actions secret in
+`song0705/Asterline`. Use a fine-grained token restricted to
+`song0705/homebrew-asterline`, with **Contents: Read and write** and **Pull
+requests: Read and write** permissions. Do not use a broad personal token.
+Set the token without placing it in shell history:
+
+```bash
+gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline
+```
+
+After the GitHub Release is published, the workflow downloads its `SHA256SUMS`,
+updates the four prebuilt archive URLs and checksums in `Formula/asterline.rb`,
+validates the Formula on macOS, and opens or updates an
+`automation/asterline-v<version>` pull request in the tap. The Release quality
+gate refuses to start without this secret, so every published version has a
+corresponding Formula-update attempt.
 
 The Linux archives intentionally target `*-unknown-linux-gnu`, not musl. The
 release workflow uses PyPA's maintained `manylinux_2_28` images, which provide a

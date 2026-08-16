@@ -85,8 +85,10 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
     },
     "plan": {
       "leader": "builder",
+      "builder": "builder",
       "reviewer": "reviewer",
       "max_iterations": 3,
+      "auto_execute": true,
       "auto_verify": true
     },
     "brainstorm": {
@@ -123,12 +125,17 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
 
 ### 协作模式（`modes`）
 
-可为 `/mode review`、`/mode plan`、`/mode brainstorm` 和 `/mode team` 设置可选绑定。字段
-省略时，Asterline 会从成员 role 和 `default_target` 推导（builder ≈ 默认目标或第一位非
-reviewer；reviewer ≈ role 含 `review`；leader ≈ role 含 `plan` 或 `lead`，否则为第一位
-participant；participants = 完整 roster）。预算默认值为：`max_iterations = 3`、
-`generation_rounds = 3`、`ideas_per_round = 4`、`auto_verify = true`。Brainstorm 至少要求两位
+可为 `/mode review`、`/mode plan`、`/mode brainstorm` 和 `/mode team` 设置可选绑定。除
+Plan 的 `builder` 和 `reviewer` 外，省略的角色字段会从成员 role 和 `default_target` 推导（Review 的
+builder ≈ 默认目标或第一位非 reviewer；reviewer ≈ role 含 `review`；leader ≈ role 含
+`plan` 或 `lead`，否则为第一位 participant；participants = 完整 roster）。Plan 的
+`builder` 是必填项且不会自动推导。`reviewer` 可省略，省略后可执行 checklist 会直接交给
+Builder。`auto_execute` 默认 `true`；设为 `false` 时，最终 checklist 会等待 `/approve` 后才派给
+Builder。预算默认值为：`max_iterations = 3`、`generation_rounds = 3`、
+`ideas_per_round = 4`、`auto_execute = true`、`auto_verify = true`。Brainstorm 至少要求两位
 不同的已解析 participant；重复 ID 或同一成员同时以 ID 和显示名引用都会被拒绝。
+`/mode` 面板里 `s` 选择当前模式并应用其 pending 覆盖，`w` 把当前模式的本对话覆盖写入
+`team.json`。
 
 Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向每位 participant 展示轮转的
 匿名同伴样本，用于构建、合并、变异和延展想法。早期贡献留在已持久化的 idea set 中。
@@ -138,15 +145,16 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 
 | 字段 | 模式 | 含义 |
 | --- | --- | --- |
-| `builder` | review | 实现更改的成员 |
-| `reviewer` | review/plan | 发出 `@@review` verdict 的成员 |
-| `leader` | plan | 编写负责 checklist 的成员 |
+| `builder` | review/plan | Review 中实现更改的成员；Plan 中必填，负责执行最终 checklist |
+| `reviewer` | review/plan | 发出 `@@review` verdict；Plan 中可选，仅审核 checklist |
+| `leader` | plan | 编写并修订 checklist 的成员 |
 | `participants` | brainstorm | 所有生成轮的 roster |
 | `generation_rounds` | brainstorm | 种子/构建/延展轮预算（默认 3，最少 2） |
 | `ideas_per_round` | brainstorm | 每位成员/每轮请求的 idea card（默认 4，最少 3） |
 | `coordinator` | team | 协调整个团队 Run 的成员 |
 | `max_iterations` | review/plan/team | 阻塞或验证失败前的循环预算（默认 3） |
-| `auto_verify` | review/plan/team | 审批/完成后运行验证（默认 true） |
+| `auto_execute` | plan | 自动派发最终计划（默认 true）；false 时须 `/approve` |
+| `auto_verify` | review/plan/team | Review 批准后，或已配置的 Plan Builder 完成后运行验证（默认 true） |
 | `verify_command` | review/plan/team | 显式自动验证 shell 命令（否则启发式） |
 
 每种 mode 都有自己的配置形状；不相关字段会被 Serde 拒绝，而不是被静默接受后忽略。
@@ -184,6 +192,9 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 | `allowed_tools` | 否 | 后端特定的工具 allowlist |
 | `session_policy` | 否 | `resume`（默认）或 `fresh` |
 | `session_id` | 否 | 要恢复的原生 CLI session/conversation ID |
+
+启动时，已绑定 session 的 `resume` 成员会扫描 Asterline 关闭期间写进原生会话的新记录
+（Grok CLI、Codex、Claude），只把尚未出现过的消息导入当前对话。
 
 在 `/team` 中，`resume` 成员直接显示已绑定的原生 session ID。尚未绑定时显示
 `select a session`，明确要求使用 picker 或手动填写 ID；`fresh` 成员显示 `not set (fresh)`。
@@ -316,6 +327,7 @@ Asterline 在进程、adapter、runtime、import 和 UI 边界应用明确上限
 ```text
 <workspace>/.asterline/
 ├── team.json
+├── roster.md
 └── asterline.sqlite3
 ```
 
@@ -367,7 +379,10 @@ Asterline 本地启动后端 CLI，并继承其凭据、环境变量、文件系
 ## Agent 间协作
 
 Asterline 缺失时会创建 `.agents/skills/asterline-team/SKILL.md`，并将紧凑 skill hint 注入每位
-成员的 system instructions。完整协议留在 workspace，而不是在每个 prompt 重复。
+成员的 system instructions。完整协议留在 workspace，普通聊天不再每轮重复。Codex 只在 team
+run 和队友 relay 时再次带上 `$asterline-team`，需要完整 skill 时才加载。自身和队员的
+实时身份与状态写在 `.asterline/roster.md`，团队或成员状态变化时更新。去哪读由
+`$asterline-team` skill 标明，不会再写进每一轮 prompt。
 
 它也会在缺失时创建 `.agents/skills/asterline-brainstorm/SKILL.md`。Brainstorm mode 会为每次
 生成、投票和综合派发加载该文件。已有副本永不升级或覆盖，因此部署可以自定义方法，同时

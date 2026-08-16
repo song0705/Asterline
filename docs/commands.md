@@ -390,14 +390,32 @@ missing required arguments also open this palette.
 ### `/mode`
 
 ```text
+/mode
 /mode <normal|review|plan|brainstorm|team>
 ```
 
-Choose how subsequent plain-text prompts are dispatched. `/mode` only selects
-the mode; enter the task as the next message. The choice remains active in the
-current conversation until another `/mode` changes it. `/new` resets the new
-conversation to `normal`, while `/resume` restores the selected conversation's
-mode.
+`/mode` with no argument opens a small overlay on the chat (the same kind
+of drawer as `/team`). The first layer lists every mode with its resolved
+binding line and lands on the current conversation mode. Enter is the only
+key that opens the highlighted mode's fields. Esc or q closes without
+applying unsaved edits.
+
+Each field shows the value currently in effect and where it came from:
+`default`, `team.json`, or `this chat`. Edits stay pending until you apply
+them. `s` selects that mode and applies its pending overrides to this
+conversation. `w` writes the current mode's conversation overrides into
+`team.json` as that team's defaults. `r`
+clears the selected field's this-chat override so it falls back. Closing
+without `s` or `w` discards pending edits.
+
+`/mode <name>` stays the keyboard fast path: it switches immediately and
+does not open the panel. After selecting `review`, `plan`, `brainstorm`, or
+`team`, enter the task as the next plain message — do **not** add an
+`@member` prefix. That message starts the selected mode with its configured
+participants. `@member <message>` deliberately remains a one-to-one
+instruction and bypasses the collaboration run. `/new` resets the new
+conversation to `normal` and clears this-chat overrides; `/resume` restores
+the selected conversation's mode and overrides.
 
 #### `/mode normal`
 
@@ -408,7 +426,12 @@ Use ordinary direct-message dispatch. A fresh chat requires `@member`,
 
 Start a builder/reviewer loop. The builder works, the reviewer emits a
 structured `@@review` verdict, and revision continues until approval or
-`max_iterations`. If the limit is reached, the run becomes blocked.
+`max_iterations`. If the limit is reached, the run becomes blocked. The
+reviewer is asked to inspect the working tree and run the project's checks
+itself; after approval, auto-verify (when enabled) runs the verify command
+again as a deliberate second, independent gate — it is not a redundant step
+to switch off. A reviewer reply without a structured verdict is nudged once,
+then treated as `request_changes` (a notice says so) and costs an iteration.
 
 ```text
 /mode review
@@ -417,8 +440,14 @@ Refactor the parser without changing its public behavior
 
 #### `/mode plan`
 
-Start a leader-driven planning run. The leader creates a checklist, dispatches
-work, tracks step state, and uses a reviewer loop before completion.
+Start a leader-driven planning run. Plan needs a configured Builder; the leader
+creates a checklist (steps do not need owners), then the complete checklist is
+sent to that Builder. The Reviewer is optional. When configured, it audits only
+the plan — completeness, ordering, risks, acceptance criteria, testability —
+never code or diffs; requested changes return to the Leader for a revised
+checklist. `modes.plan.auto_execute` defaults to `true`; set it to `false` to
+pause at an explicit `/approve` before the Builder is sent the finalized plan.
+Builder completion then runs verification when configured.
 
 ```text
 /mode plan
@@ -483,6 +512,12 @@ Resume a blocked or failed mode/team run, optionally giving the coordinator or
 mode engine a note. Without a run ID, the latest run in this conversation is
 selected. An already active run cannot be continued, and legacy runs without
 persisted mode state cannot be reconstructed.
+
+Resume re-enters the phase the run was blocked in: review runs re-dispatch the
+builder (or reviewer, if a review was pending), plan runs return to the leader
+or re-dispatch unfinished owned steps, brainstorm runs re-run the current
+generation wave (or voting/synthesis), and verification restarts when the run
+was mid-verify. All roster members recorded in the run must still exist.
 
 ```text
 /continue run-4 retry with the newly installed dependency
@@ -598,6 +633,12 @@ Set or clear the owner. `member` may be written with or without `@`.
 
 ## Global keyboard controls
 
+While a member is working, `Enter` queues the next message instead of
+starting a second run. `Esc` interrupts the live member and then sends the
+queued message. If that queued text has not started yet and you want to
+change it, `Shift+←` pulls it back into the composer. The current
+conversation can be scrolled all the way to its first message.
+
 | Key                            | Action                                                        |
 | ------------------------------ | ------------------------------------------------------------- |
 | `Enter`                        | Send or accept the active selection                           |
@@ -607,18 +648,32 @@ Set or clear the owner. `member` may be written with or without `@`.
 | `Tab`                          | Accept completion                                             |
 | `Ctrl+R`                       | Reverse-search prompt history                                 |
 | `n` / `p`                      | Next/previous `/find` match when composer is empty            |
-| `PageUp` / `PageDown`          | Scroll chat or the open drawer                                |
-| Mouse drag                     | Select and copy chat, status-bar, or drawer text              |
+| `PageUp` / `PageDown`          | Scroll chat or the open drawer by a page                      |
+| `Shift+←`                      | Pull the last queued, not-yet-started message back to edit    |
+| Mouse drag                     | Select and copy chat, composer, status-bar, or drawer text    |
 | Mouse wheel                    | Scroll chat or the open drawer                                |
-| `Esc`                          | Close an overlay, clear find, or cancel running work          |
-| `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | Expand or collapse detailed output (tools + Claude thinking)  |
+| `Esc`                          | Close overlay/find, or stop work and send the queued message  |
+| `Ctrl+T`                       | Expand or collapse thinking                                   |
+| `Ctrl+G`                       | Expand or collapse file-change diffs                          |
+| `Ctrl+O`                       | Expand or collapse tool output                                |
 | `Ctrl+L`                       | Open logs                                                     |
 | `Ctrl+P`                       | Open command palette                                          |
 | `Ctrl+N` / `Ctrl+B`            | Focus next/previous member                                    |
 | `Ctrl+A` / `Ctrl+E`            | Move to line start/end                                        |
-| `Ctrl+U`                       | Clear current line                                            |
+| `Ctrl+U` / `Cmd+Backspace`     | Clear the current composer line (other lines stay)            |
 | `Ctrl+W`                       | Delete previous word                                          |
 | `Ctrl+C`                       | Cancel, clear composer, or arm quit when idle                 |
+| `Ctrl+V` / `Cmd+V`             | Attach a clipboard image to the next send (not Ctrl+C)        |
+
+Screenshots and copied images are copied under the process temp directory
+(`std::env::temp_dir()/asterline-pasted/<pid>/`: `%TEMP%` on Windows, `$TMPDIR`
+on macOS, `/tmp` on Linux). Asterline deletes them itself — unused attachments
+when you backspace or clear the composer, this process's directory on exit,
+and leftover directories from dead processes on the next start. They are sent
+natively: Codex `localImage`, Grok ACP image blocks, Claude/Agy as a readable
+attached-image path. Up to four images per message. Pasting a PNG/JPEG/GIF/WebP
+file path copies that file into the temp dir instead of inserting the path as
+text.
 
 Prompt history behaves like a shell: `↑` and `↓` preserve the current draft
 while browsing older submissions. During `Ctrl+R`, type to refine the match,

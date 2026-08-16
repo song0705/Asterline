@@ -1,8 +1,8 @@
 ---
 name: asterline-team
-description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster. A visible roster only lists available members and does not by itself trigger messaging or delegation.
+description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 12
+  version: 16
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -12,25 +12,25 @@ Asterline reads special control lines from your final output. Put each control l
 
 ## Roster And Messaging Policy
 
-The roster is an availability directory, not an assignment or an instruction to contact anyone. Work independently by default.
+Read `.asterline/roster.md` for the current default target and every member's id, role, backend, and status. Asterline rewrites that file when the team or a status changes.
 
-Do not send a teammate message merely because teammates are listed, because another member has a relevant role, or because the task involves search, research, review, or planning. Send a message only when at least one of these conditions holds:
-
-- The user explicitly requests collaboration, delegation, or a teammate's input.
-- The active Asterline run explicitly requires a handoff or coordinated multi-member work.
-- You are blocked on information or action that a specific teammate must provide and you cannot complete the task independently.
-
-If you can complete the request yourself, do not emit `@@team_message`. Do not send unsolicited status updates or FYI messages.
+Do not send `@@team_message` merely because teammates are listed, another member has a relevant role, or the task involves search, research, review, or planning. Message only when the user asks for collaboration, the active run requires a handoff, or you are blocked on a specific teammate. If you can finish the request yourself, do not emit `@@team_message`.
 
 ## Every Received Message Must Be Answered
 
-When you receive an Asterline relay from another member, remember the sender. Before ending your turn, you MUST emit exactly one `@@team_message` back to that sender with a substantive answer, result, question, or blocker. This rule applies in normal chat and every collaboration mode.
+When you receive an Asterline relay from another member, remember the sender. Before ending your turn, you MUST emit exactly one `@@team_message` back to that sender. This rule applies in normal chat and every collaboration mode.
 
 ```text
-@@team_message {"to":"original-sender","kind":"reply","body":"Result, decision, question, or blocker"}
+@@team_message {"to":"original-sender","kind":"reply","body":"The full deliverable, decision, question, or blocker"}
 ```
 
-Visible response text, checklist updates, and tool output do not count as replying to the sender. For delegated work, update every owned run step to `done` or `block`, then send the reply with results, changed files, checks run, and blockers.
+Visible response text, checklist updates, and tool output do not count as delivering to the sender. Writing the plan, review, or patch "for the user" is not delivery. The teammate who asked cannot see your user-facing prose; they only see this `@@team_message` body.
+
+If the sender asked you to plan, design, review, implement, or investigate, the `body` MUST contain the actual artifact: the full plan, the field list, the verdict, the findings. A pointer such as "方案已写给用户" or "see the chat" is not a reply.
+
+Put the deliverable in `body` even when it is long. Escape newlines as `\n` so the control line stays one line of JSON.
+
+For delegated checklist work, update every owned run step to `done` or `block`, then send the reply with results, changed files, checks run, and blockers.
 
 To stop acknowledgement loops, a message with `"kind":"reply"` does not require another reply unless its body contains a new question, request, correction, or blocker requiring action.
 
