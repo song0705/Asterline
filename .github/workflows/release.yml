@@ -69,7 +69,7 @@ jobs:
             printf 'tag_object=%s\n' "$tag_object" >> "$GITHUB_OUTPUT"
             preflight_count=$(gh api --paginate \
               "repos/$GITHUB_REPOSITORY/actions/runs?event=workflow_dispatch&head_sha=$GITHUB_SHA&status=completed&per_page=100" \
-              | jq --slurp '[.[] | .workflow_runs[] | select(.name == "Release" and .conclusion == "success")] | length')
+              | jq --slurp '[.[] | .workflow_runs[] | select(.path == ".github/workflows/release.yml" and .conclusion == "success")] | length')
             if test "$preflight_count" -lt 1; then
               echo "A successful Release preflight for $GITHUB_SHA is required before pushing $release_tag." >&2
               exit 1
