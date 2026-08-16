@@ -8,6 +8,7 @@ use crate::tui::drawers::Drawer;
 
 /// What submitting the composer should do.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Runtime commands stay unboxed at the UI boundary.
 pub enum Submission {
     /// Exit the Asterline TUI and begin normal runtime shutdown.
     Exit,

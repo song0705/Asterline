@@ -221,6 +221,7 @@ pub(crate) struct ModeEditor {
 }
 
 impl ModeEditor {
+    #[allow(clippy::too_many_arguments)] // Editor state mirrors the mode drawer's inputs.
     pub(crate) fn new(
         team: impl Into<String>,
         workspace: impl Into<PathBuf>,
@@ -1342,11 +1343,7 @@ impl ModeEditor {
         }
 
         lines.push(Line::raw(""));
-        let preview_mode = if self.field_mode {
-            self.selected_mode()
-        } else {
-            self.selected_mode()
-        };
+        let preview_mode = self.selected_mode();
         let preview = format_mode_binding(
             &self.preview_config(),
             preview_mode,

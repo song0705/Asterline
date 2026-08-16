@@ -17,6 +17,7 @@ use crate::tui::team_builder::{
 };
 
 #[derive(Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Keep direct runtime commands at this UI boundary.
 pub(crate) enum TeamEditorOutcome {
     Ignored,
     Consumed(Option<UiCommand>),

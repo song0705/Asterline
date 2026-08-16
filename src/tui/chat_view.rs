@@ -1225,10 +1225,12 @@ fn split_files_by_edit(
             .iter()
             .enumerate()
             .filter_map(|(index, file)| {
-                (!assigned[index] && paths_match(&target, &file.path)).then(|| {
+                if !assigned[index] && paths_match(&target, &file.path) {
                     assigned[index] = true;
-                    file.clone()
-                })
+                    Some(file.clone())
+                } else {
+                    None
+                }
             })
             .collect::<Vec<_>>();
         if !edited.is_empty() {
@@ -1354,6 +1356,7 @@ fn render_tool_group(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The row maps directly from a tool event and render context.
 fn render_tool_row(
     rail_color: Color,
     name: &str,

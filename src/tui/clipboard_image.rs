@@ -480,7 +480,10 @@ mod tests {
         let _guard = lock_paste();
         let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 2];
         let image = persist_image_bytes("", &png).unwrap();
-        let orphan = paste_root().join("4294967294");
+        // Keep this in the range accepted by Windows `tasklist`; the previous
+        // u32::MAX-ish value made the command fail and intentionally fail
+        // closed as if the process were still alive.
+        let orphan = paste_root().join("999999");
         std::fs::create_dir_all(&orphan).unwrap();
         std::fs::write(orphan.join("leftover.png"), png).unwrap();
         sweep_orphan_pastes();

@@ -24,9 +24,7 @@ pub(crate) fn messages_for_session(session_id: &str) -> Vec<ImportedMessage> {
 }
 
 fn find_chat_history(session_id: &str) -> Option<PathBuf> {
-    if import_io::safe_session_id(session_id).is_none() {
-        return None;
-    }
+    import_io::safe_session_id(session_id)?;
     let root = config::user_home_dir()?.join(".grok").join("sessions");
     find_chat_history_under(&root, session_id)
 }

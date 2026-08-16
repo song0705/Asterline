@@ -274,6 +274,7 @@ pub struct ImportedMessage {
 
 /// Commands sent from the TUI to the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Queue events intentionally carry their complete payload.
 pub enum UiCommand {
     /// Select the mode used by subsequent messages in this terminal session.
     SetMode { mode: TerminalMode },

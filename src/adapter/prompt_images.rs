@@ -42,11 +42,11 @@ pub fn extract_prompt_images(prompt: &str) -> (String, Vec<PromptImage>) {
     let mut text = String::new();
     let mut images = Vec::new();
     for line in prompt.lines() {
-        if let Some(path) = line.strip_prefix(MARKER) {
-            if let Some(image) = PromptImage::from_path(path.trim()) {
-                images.push(image);
-                continue;
-            }
+        if let Some(path) = line.strip_prefix(MARKER)
+            && let Some(image) = PromptImage::from_path(path.trim())
+        {
+            images.push(image);
+            continue;
         }
         if !text.is_empty() {
             text.push('\n');
@@ -153,10 +153,11 @@ pub fn looks_like_image_path(text: &str) -> Option<PathBuf> {
         .strip_prefix("file://")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(trimmed));
-    if !path.is_absolute() && !path.starts_with("~") {
-        if trimmed.lines().count() != 1 || trimmed.contains(' ') {
-            return None;
-        }
+    if !path.is_absolute()
+        && !path.starts_with("~")
+        && (trimmed.lines().count() != 1 || trimmed.contains(' '))
+    {
+        return None;
     }
     let expanded = if let Some(rest) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
         dirs_home().map(|home| home.join(rest))?

@@ -3134,7 +3134,7 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
     }
 }
 
-fn trim_initial_chat(chat: &mut Vec<ChatItem>) {
+fn trim_initial_chat(chat: &mut [ChatItem]) {
     // Bound each item, but keep the conversation from its first message.
     for item in chat.iter_mut() {
         let original = std::mem::replace(item, chat_truncation_notice());

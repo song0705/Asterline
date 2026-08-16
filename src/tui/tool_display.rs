@@ -103,9 +103,11 @@ pub(crate) fn file_change_from_edit_tool(
         .map(str::to_string)
         .unwrap_or_else(|| {
             let target = tool_target(name, summary, detail);
-            (!target.is_empty())
-                .then_some(target)
-                .unwrap_or_else(|| "edited file".to_string())
+            if target.is_empty() {
+                "edited file".to_string()
+            } else {
+                target
+            }
         });
     let kind = match (old_text, new_text) {
         (None, Some(_)) => "add",
