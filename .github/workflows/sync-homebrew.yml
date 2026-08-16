@@ -67,13 +67,17 @@ jobs:
               }
             ' "$checksums"
           }
+          macos_arm64_checksum=$(checksum_for "asterline-$version-aarch64-apple-darwin.tar.gz")
+          macos_x86_64_checksum=$(checksum_for "asterline-$version-x86_64-apple-darwin.tar.gz")
+          linux_arm64_checksum=$(checksum_for "asterline-v$version-Linux-arm64.tar.gz")
+          linux_x86_64_checksum=$(checksum_for "asterline-v$version-Linux-x86_64.tar.gz")
           ruby scripts/update-homebrew-formula.rb \
             homebrew-asterline/Formula/asterline.rb \
             "$version" \
-            "$(checksum_for "asterline-$version-aarch64-apple-darwin.tar.gz)" \
-            "$(checksum_for "asterline-$version-x86_64-apple-darwin.tar.gz)" \
-            "$(checksum_for "asterline-v$version-Linux-arm64.tar.gz)" \
-            "$(checksum_for "asterline-v$version-Linux-x86_64.tar.gz)"
+            "$macos_arm64_checksum" \
+            "$macos_x86_64_checksum" \
+            "$linux_arm64_checksum" \
+            "$linux_x86_64_checksum"
       - name: Validate the Formula on macOS
         working-directory: homebrew-asterline
         shell: bash
