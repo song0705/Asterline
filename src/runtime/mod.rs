@@ -2520,7 +2520,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SqliteStore::open(&path).unwrap();
         let external = rusqlite::Connection::open(&path).unwrap();
-        let (evt_tx, _evt_rx) = mpsc::sync_channel(1);
+        let (evt_tx, evt_rx) = mpsc::sync_channel(1);
+        let event_sink = evt_tx.clone();
         let (ui_tx, ui_rx) = mpsc::sync_channel(64);
         let (control_tx, control_rx) = mpsc::sync_channel(4);
         let (worker_tx, worker_rx) = mpsc::sync_channel(64);
@@ -2545,13 +2546,22 @@ mod tests {
             );
         });
 
+        // Wait until startup has emitted Ready, then put it back to keep the
+        // sole output slot full. This avoids counting Windows thread startup
+        // time against the command-processing assertion below.
+        let ready = evt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runtime must emit Ready");
+        assert!(matches!(ready, RuntimeEvent::Ready { .. }));
+        event_sink.send(ready).unwrap();
+
         ui_tx
             .send(UiCommand::UserMessage {
                 target: MessageTarget::Default,
                 body: "hold canonical events".to_string(),
             })
             .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let users: i64 = external
                 .query_row(
@@ -2589,7 +2599,7 @@ mod tests {
 
         control_tx.send(UiCommand::Cancel { member: None }).unwrap();
         control_tx.send(UiCommand::Shutdown).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !join.is_finished() && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
