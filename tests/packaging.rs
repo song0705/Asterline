@@ -16,6 +16,18 @@ fn installers_are_tested_checksummed_and_attested() {
             "needs: [quality, build, build-linux, package-debian, smoke-deb-ubuntu, package-rpm, smoke-rpm-fedora, package-macos, smoke-windows-installer]"
         )
     );
+    assert!(
+        RELEASE_WORKFLOW.contains("cp LICENSE README.md README.en.md"),
+        "release archives must ship the Chinese default README and English counterpart"
+    );
+    assert!(
+        RELEASE_WORKFLOW.contains("Copy-Item LICENSE, README.md, README.en.md"),
+        "Windows archives must ship the same README pair"
+    );
+    assert!(
+        !RELEASE_WORKFLOW.contains("README.zh-CN.md"),
+        "the retired root README.zh-CN.md must not be copied into archives"
+    );
     assert!(RELEASE_WORKFLOW.contains("sha256sum \"${assets[@]}\" > SHA256SUMS"));
     assert!(RELEASE_WORKFLOW.contains("Validate the exact release asset set"));
     let exact_assets = release_workflow

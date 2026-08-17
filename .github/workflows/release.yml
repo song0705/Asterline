@@ -160,7 +160,7 @@ jobs:
           mkdir -p "dist/$package"
           cp "target/${{ matrix.target }}/release/asterline" "dist/$package/"
           cp "target/${{ matrix.target }}/release/ast" "dist/$package/"
-          cp LICENSE README.md README.zh-CN.md "dist/$package/"
+          cp LICENSE README.md README.en.md "dist/$package/"
           strip "dist/$package/asterline" "dist/$package/ast"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           rm -rf "dist/$package"
@@ -173,7 +173,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/asterline.exe" "dist/$package/"
           Copy-Item "target/${{ matrix.target }}/release/ast.exe" "dist/$package/"
-          Copy-Item LICENSE, README.md, README.zh-CN.md "dist/$package/"
+          Copy-Item LICENSE, README.md, README.en.md "dist/$package/"
           Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
           Remove-Item -Recurse -Force "dist/$package"
       - name: Package Windows installer
@@ -246,7 +246,7 @@ jobs:
           mkdir -p "dist/$archive_root"
           cp "target/${{ matrix.target }}/release/asterline" "dist/$archive_root/"
           cp "target/${{ matrix.target }}/release/ast" "dist/$archive_root/"
-          cp LICENSE README.md README.zh-CN.md "dist/$archive_root/"
+          cp LICENSE README.md README.en.md "dist/$archive_root/"
           strip "dist/$archive_root/asterline" "dist/$archive_root/ast"
           tar -C dist -czf "dist/asterline-v${version}-Linux-${{ matrix.release_arch }}.tar.gz" "$archive_root"
           rm -rf "dist/$archive_root"
