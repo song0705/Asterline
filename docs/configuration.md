@@ -262,9 +262,12 @@ at `<workspace>/.asterline/team.json` is also bound to that containing
 workspace: on a project move, Asterline corrects a stale serialized workspace
 before launching members, so new native transcripts remain associated with the
 project you opened. Native session pickers filter by working directory. Claude
-print-mode sessions are resumable with `claude --resume <id>`, but some Claude
-Code versions intentionally omit print-mode sessions from their interactive
-picker.
+Code intentionally omits sessions created by `claude -p` or the Agent SDK from
+its interactive picker. Asterline's Team editor does not apply that filter:
+select the member's **session id** field and press `Enter` to choose one of
+those transcripts, then press `s` to bind it. Asterline resumes the selection
+directly with `claude --resume <id>`; `/attach <member>` uses the same direct-ID
+path.
 
 Permission modes, sandbox mappings, and allowed-tool behavior depend on the
 backend. Do not assume a field has the same effect across all four CLIs.
@@ -474,12 +477,13 @@ limits what the underlying process can access.
 ## Agent-to-agent coordination
 
 Asterline creates `.agents/skills/asterline-team/SKILL.md` when it is missing
-and injects a compact skill hint into each member's system instructions. The
-full protocol remains in the workspace instead of being repeated in every
-ordinary chat turn. Codex only sees `$asterline-team` again on team runs and
-teammate relays, where loading the skill is actually needed. Live roster identity and member status are rewritten to
-`.asterline/roster.md` whenever the team or a member's status changes. The
-team skill tells agents to read that file; it is not copied into each prompt.
+and tells each member that this team skill is available at that path. The full
+protocol remains in the workspace instead of being repeated in every ordinary
+chat turn; this reminder deliberately does not invoke `$asterline-team`, so it
+does not force Codex to expand the whole skill. Live roster identity and member
+status are rewritten to `.asterline/roster.md` whenever the team or a member's
+status changes. The team skill tells agents to read that file; it is not copied
+into each prompt.
 
 It also creates `.agents/skills/asterline-brainstorm/SKILL.md` when missing.
 Brainstorm mode loads that file for every generation, vote, and synthesis

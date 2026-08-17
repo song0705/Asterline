@@ -283,6 +283,34 @@ can identify safely; a Claude fork is imported only when its prior transcript
 proves the lineage. Ambiguous native sessions are never guessed. Grok and Agy
 can resume their sessions but do not yet import attached messages.
 
+Claude's own interactive resume picker intentionally hides sessions created by
+`claude -p` or the Agent SDK. To attach one of those Asterline sessions, open
+`/team`, select the member's **session id** field, press `Enter`, choose the
+session, and press `s`; then run `/attach <member>`. Asterline discovers the
+transcript itself and resumes its UUID directly.
+
+### `/import`
+
+```text
+/import <session_id>
+/import <member> <session_id>
+@member /import <session_id>
+```
+
+Import messages from a native Claude Code, Codex, or Grok session transcript into the
+Asterline chat and bind that session to the member.
+
+### `/export`
+
+```text
+/export
+/export claude
+```
+
+Export the current Asterline conversation history into Claude Code's native session
+JSONL storage (`~/.claude/projects/.../<session_id>.jsonl`), making it directly
+visible and resumable via `claude --resume` (`claude -r`) in the project directory.
+
 ### `/exit`
 
 ```text

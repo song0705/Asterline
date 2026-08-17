@@ -551,7 +551,8 @@ mod tests {
             .member(&crate::domain::team::MemberId::new("builder"))
             .unwrap();
         let prompt = builder.system_prompt.as_ref().unwrap();
-        assert!(prompt.contains("$asterline-team"));
+        assert!(prompt.contains("Asterline team skill"));
+        assert!(!prompt.contains("$asterline-team"));
         assert!(!prompt.contains(".asterline/roster.md"));
         assert!(prompt.contains("reviewer"));
     }

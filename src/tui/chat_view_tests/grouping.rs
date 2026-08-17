@@ -1131,7 +1131,7 @@ fn reasoning_status_shows_a_spinner_then_disappears() {
         members: vec![member_summary(
             "builder",
             "Builder",
-            BackendKind::Grok,
+            BackendKind::Codex,
             "implementation",
             MemberStatus::Running,
         )],
@@ -1184,7 +1184,7 @@ fn active_tool_spinner_invalidates_the_cached_tail() {
 }
 
 #[test]
-fn completed_reasoning_leaves_no_history_item() {
+fn completed_reasoning_leaves_no_history_item_for_codex() {
     let builder = MemberId::new("builder");
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
@@ -1198,7 +1198,7 @@ fn completed_reasoning_leaves_no_history_item() {
         members: vec![member_summary(
             "builder",
             "Builder",
-            BackendKind::Grok,
+            BackendKind::Codex,
             "implementation",
             MemberStatus::Running,
         )],
@@ -1218,6 +1218,47 @@ fn completed_reasoning_leaves_no_history_item() {
     assert!(!rendered.contains("secret scratch work"), "{rendered}");
     assert!(
         !state
+            .chat()
+            .iter()
+            .any(|item| matches!(item, ChatItem::Thinking { .. }))
+    );
+}
+
+#[test]
+fn non_codex_reasoning_retains_collapsible_thinking_item() {
+    let builder = MemberId::new("builder");
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: String::new(),
+        default_target: Some(DefaultTarget::Member(builder.clone())),
+        runs: Vec::new(),
+        members: vec![member_summary(
+            "builder",
+            "Builder",
+            BackendKind::Claude,
+            "implementation",
+            MemberStatus::Running,
+        )],
+    });
+    state.apply(RuntimeEvent::Reasoning {
+        member: builder.clone(),
+        text: "Thinking about refactoring the module".to_string(),
+    });
+    state.apply(RuntimeEvent::ReasoningCompleted {
+        member: builder.clone(),
+    });
+
+    let mut lines = Vec::new();
+    render_chat_history(&state, 80, 0, &mut lines);
+    let rendered = plain_text(&lines).join("\n");
+    assert!(rendered.contains("thinking"), "{rendered}");
+    assert!(rendered.contains("Ctrl+T expand"), "{rendered}");
+    assert!(
+        state
             .chat()
             .iter()
             .any(|item| matches!(item, ChatItem::Thinking { .. }))

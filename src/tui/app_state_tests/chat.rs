@@ -149,6 +149,22 @@ fn reasoning_status_extracts_the_first_bold_heading() {
 }
 
 #[test]
+fn reasoning_status_falls_back_to_first_line_for_plain_text() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    let builder = MemberId::new("builder");
+    state.apply(RuntimeEvent::Reasoning {
+        member: builder.clone(),
+        text: "Analyzing user request and searching codebase\nNext line should not be in header"
+            .to_string(),
+    });
+    assert_eq!(
+        state.active_reasoning().get(&builder).map(String::as_str),
+        Some("Analyzing user request and searching codebase")
+    );
+}
+
+#[test]
 fn streamed_message_and_tool_detail_have_total_memory_bounds() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());

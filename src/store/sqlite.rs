@@ -90,8 +90,9 @@ impl SqliteStore {
         // short write lock. Wait for it instead of failing the runtime on the
         // first SQLITE_BUSY response.
         self.conn.busy_timeout(Duration::from_secs(5))?;
-        self.conn
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
+        )?;
         self.create_schema()
     }
 

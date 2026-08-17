@@ -8,6 +8,18 @@ pub const MAX_PROMPT_IMAGES: usize = 4;
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MARKER: &str = "[asterline-image]: ";
 
+pub fn image_placeholder(number: usize) -> String {
+    format!("[Image #{number}]")
+}
+
+pub fn strip_image_placeholders(text: &str, count: usize) -> String {
+    let mut out = text.to_string();
+    for number in 1..=count {
+        out = out.replace(&image_placeholder(number), "");
+    }
+    out
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptImage {
     pub path: PathBuf,
@@ -87,13 +99,14 @@ pub fn display_prompt_images(prompt: &str) -> String {
         return prompt.to_string();
     }
     let mut out = text;
-    for image in images {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
+    for number in 1..=images.len() {
+        let placeholder = image_placeholder(number);
+        if !out.contains(&placeholder) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&placeholder);
         }
-        out.push('📎');
-        out.push(' ');
-        out.push_str(&image.label());
     }
     out
 }
@@ -289,7 +302,7 @@ mod tests {
         assert_eq!(text, "look at this");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].path, path);
-        assert!(display_prompt_images(&prompt).contains("📎 shot.png"));
+        assert!(display_prompt_images(&prompt).contains("[Image #1]"));
         assert!(
             prompt_with_image_paths(&prompt)
                 .contains(&format!("(attached image: {})", path.display()))

@@ -155,6 +155,7 @@ const RUNTIME_INPUT_QUEUE_CAPACITY: usize = 256;
 const RUNTIME_UI_QUEUE_CAPACITY: usize = 256;
 const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 32;
 const RUNTIME_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_millis(500);
 
 enum RuntimeEventSender {
     Unbounded(Sender<RuntimeEvent>),
@@ -387,7 +388,7 @@ fn run_loop(
     loop {
         if !flush_runtime_events(&events, &mut pending_events) {
             let _ = prepare_shutdown(&mut runtime, &mut active_verifications, &mut agent_workers);
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             return;
         }
         if pending_events.is_empty() {
@@ -595,7 +596,7 @@ fn run_loop(
             )));
             step.events.extend(cleanup.events);
             let _ = enqueue_runtime_events(&events, &mut pending_events, step.events);
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             return;
         }
 
@@ -644,7 +645,7 @@ fn run_loop(
 
         if !enqueue_runtime_events(&events, &mut pending_events, step.events) {
             let _ = prepare_shutdown(&mut runtime, &mut active_verifications, &mut agent_workers);
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             return;
         }
         if release_attach_after_step {
@@ -691,7 +692,7 @@ fn run_loop(
         }
 
         if shutdown {
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             break;
         }
         reap_finished_workers(&mut agent_workers);

@@ -318,6 +318,13 @@ pub enum UiCommand {
         member: MemberId,
         items: Vec<ImportedMessage>,
     },
+    /// Import an existing native session (Claude, Codex, Grok) by session ID into the chat.
+    ImportSession {
+        member: Option<MemberId>,
+        session_id: String,
+    },
+    /// Export the current session to Claude Code native format (~/.claude/projects/...).
+    ExportSession { format: Option<String> },
     /// Ask the runtime to reserve exclusive access to one member's native
     /// interactive session. This travels through the ordered work queue so it
     /// cannot overtake earlier user commands.

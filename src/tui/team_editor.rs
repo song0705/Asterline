@@ -364,6 +364,36 @@ impl TeamEditor {
                     Some("default target set to all members; press s to apply".to_string());
                 TeamEditorOutcome::Consumed(None)
             }
+            KeyCode::Char('y') if !self.field_mode => {
+                if let Some(member) = self.selected_member() {
+                    let text = member
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| member.id.to_string());
+                    crate::tui::copy_to_clipboard(&text);
+                    self.notice = Some(format!("copied '{}' to clipboard", text));
+                }
+                TeamEditorOutcome::Consumed(None)
+            }
+            KeyCode::Char('y') if self.field_mode => {
+                if let Some(member) = self.selected_member() {
+                    let text = if self.selected_field() == Field::SessionId {
+                        member
+                            .session_id
+                            .clone()
+                            .unwrap_or_else(|| self.field_value(member, Field::SessionId))
+                    } else {
+                        self.field_value(member, self.selected_field())
+                    };
+                    if !text.is_empty() {
+                        crate::tui::copy_to_clipboard(&text);
+                        self.notice = Some(format!("copied '{}' to clipboard", text));
+                    } else {
+                        self.notice = Some("nothing to copy (field is empty)".to_string());
+                    }
+                }
+                TeamEditorOutcome::Consumed(None)
+            }
             KeyCode::Char('s') => TeamEditorOutcome::Consumed(self.apply_command()),
             KeyCode::Char('r') => {
                 self.notice = Some("discard changes by closing and reopening /team".to_string());
@@ -499,6 +529,18 @@ impl TeamEditor {
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.session_picker.as_mut().unwrap().clear_query();
             }
+            KeyCode::Char('y') | KeyCode::Char('c')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let Some(entry) = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(SessionPicker::selected_entry)
+                {
+                    crate::tui::copy_to_clipboard(&entry.id);
+                    self.notice = Some(format!("copied session ID '{}' to clipboard", entry.id));
+                }
+            }
             KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
                 self.session_picker.as_mut().unwrap().push_query(ch);
             }
@@ -530,6 +572,13 @@ impl TeamEditor {
         match code {
             KeyCode::Esc => {}
             KeyCode::Enter => self.commit_edit(edit),
+            KeyCode::Char('y') | KeyCode::Char('c')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                crate::tui::copy_to_clipboard(&edit.buffer);
+                self.notice = Some(format!("copied '{}' to clipboard", edit.buffer));
+                self.editing = Some(edit);
+            }
             _ => {
                 edit.apply_key(code, modifiers);
                 self.editing = Some(edit);
@@ -620,10 +669,14 @@ impl TeamEditor {
             let cwd = member.resolved_cwd(&self.workspace);
             let picker = SessionPicker::discover(backend, &cwd);
             self.notice = picker.error().map(str::to_string).or_else(|| {
-                Some(format!(
-                    "{} session(s) found · type to filter",
-                    picker.visible_len()
-                ))
+                Some(if backend == BackendKind::Claude {
+                    format!(
+                        "{} session(s) found · includes print/SDK sessions hidden by Claude's native picker",
+                        picker.visible_len()
+                    )
+                } else {
+                    format!("{} session(s) found · type to filter", picker.visible_len())
+                })
             });
             self.session_picker = Some(picker);
         } else if field.is_text() {
@@ -1217,6 +1270,22 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_created_session_is_displayed_as_bound() {
+        let mut editor = editor();
+        editor.members[0].session_policy = crate::domain::team::SessionPolicy::Fresh;
+        editor.members[0].session_id = Some("fresh-thread-123".to_string());
+
+        assert_eq!(
+            editor.field_value(&editor.members[0], Field::Session),
+            "bound"
+        );
+        assert_eq!(
+            editor.field_value(&editor.members[0], Field::SessionId),
+            "fresh-thread-123"
+        );
+    }
+
+    #[test]
     fn escape_cancels_focused_field_edit() {
         let mut editor = editor();
         editor.field_mode = true;
@@ -1336,5 +1405,32 @@ mod tests {
         assert!(editor.model_picker.is_none());
         assert_eq!(editor.members[0].model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(editor.members[0].effort, None);
+    }
+
+    #[test]
+    fn y_key_copies_session_id_and_field_values_to_clipboard() {
+        let mut editor = editor();
+        editor.members[0].session_id = Some("4bd591d1-552b-4cec-a837-d6ada19057c7".to_string());
+
+        // In member list mode, 'y' copies the member's session_id
+        editor.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(
+            editor.notice(),
+            Some("copied '4bd591d1-552b-4cec-a837-d6ada19057c7' to clipboard")
+        );
+
+        // In field mode on session id
+        editor.field_mode = true;
+        let session_id_idx = editor
+            .fields()
+            .iter()
+            .position(|f| *f == Field::SessionId)
+            .unwrap();
+        editor.field = session_id_idx;
+        editor.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(
+            editor.notice(),
+            Some("copied '4bd591d1-552b-4cec-a837-d6ada19057c7' to clipboard")
+        );
     }
 }

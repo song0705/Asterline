@@ -227,6 +227,35 @@ fn parse_slash(rest: &str) -> Submission {
                 Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
             }
         }
+        "import" => {
+            let (first, rest) = split_first_word(arg);
+            if first.is_empty() {
+                Submission::Help
+            } else if rest.is_empty() {
+                Submission::Runtime(UiCommand::ImportSession {
+                    member: None,
+                    session_id: first.to_string(),
+                })
+            } else {
+                Submission::Runtime(UiCommand::ImportSession {
+                    member: Some(MemberId::new(first)),
+                    session_id: rest.to_string(),
+                })
+            }
+        }
+        "export" => {
+            let (first, extra) = split_first_word(arg);
+            if !extra.is_empty() {
+                Submission::Invalid(
+                    "/export accepts at most one format argument (e.g. `/export claude`); draft kept"
+                        .to_string(),
+                )
+            } else {
+                Submission::Runtime(UiCommand::ExportSession {
+                    format: (!first.is_empty()).then(|| first.to_string()),
+                })
+            }
+        }
         "help" if arg.is_empty() => Submission::Help,
         "team" | "runs" | "logs" | "diff" | "new" | "clear" | "resume" | "exit" | "retry"
         | "approve" | "reject" | "help" => {
@@ -253,6 +282,20 @@ fn parse_targeted_slash(member: &str, body: &str) -> Option<Submission> {
                 member: MemberId::new(member),
             },
             _ => Submission::Invalid("/attach does not accept arguments; draft kept".to_string()),
+        });
+    }
+    if let Some(rest) = targeted_command_rest(body, "import") {
+        return Some(match (member, rest.is_empty()) {
+            ("all", _) => Submission::Invalid(
+                "/import needs one member; use @member /import <session_id>".to_string(),
+            ),
+            (_, true) => {
+                Submission::Invalid("use `@member /import <session_id>` (draft kept)".to_string())
+            }
+            _ => Submission::Runtime(UiCommand::ImportSession {
+                member: Some(MemberId::new(member)),
+                session_id: rest.to_string(),
+            }),
         });
     }
     Some(if member == "all" {
@@ -896,5 +939,42 @@ mod tests {
     fn removed_abort_command_falls_back_to_help() {
         assert_eq!(parse("/abort"), Submission::Help);
         assert_eq!(parse("/abort extra"), Submission::Help);
+    }
+
+    #[test]
+    fn import_and_export_commands_parse_correctly() {
+        assert_eq!(
+            parse("/import sess-1234"),
+            Submission::Runtime(UiCommand::ImportSession {
+                member: None,
+                session_id: "sess-1234".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("/import builder sess-1234"),
+            Submission::Runtime(UiCommand::ImportSession {
+                member: Some(MemberId::new("builder")),
+                session_id: "sess-1234".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("@builder /import sess-1234"),
+            Submission::Runtime(UiCommand::ImportSession {
+                member: Some(MemberId::new("builder")),
+                session_id: "sess-1234".to_string(),
+            })
+        );
+        assert_eq!(parse("/import"), Submission::Help);
+
+        assert_eq!(
+            parse("/export"),
+            Submission::Runtime(UiCommand::ExportSession { format: None })
+        );
+        assert_eq!(
+            parse("/export claude"),
+            Submission::Runtime(UiCommand::ExportSession {
+                format: Some("claude".to_string())
+            })
+        );
     }
 }

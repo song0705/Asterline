@@ -5,6 +5,7 @@
 pub mod app_state;
 pub mod attach;
 pub mod chat_view;
+pub mod claude_export;
 pub mod claude_import;
 mod clipboard_image;
 pub mod commands;
@@ -449,7 +450,7 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
     }
 }
 
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     let mut out = io::stdout();
     let _ = execute!(out, CopyToClipboard::to_clipboard_from(text));
     let _ = execute!(out, CopyToClipboard::to_primary_from(text));
@@ -815,9 +816,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         }
         Action::PasteClipboard => paste_clipboard_image(state),
         Action::Interrupt => {
-            if !abort_active_work(state, handle) && state.has_composer_draft() {
-                state.clear_composer();
-            } else if !state.has_cancelable_work() && !state.has_composer_draft() {
+            if state.is_quit_armed() {
+                state.quit();
+            } else {
+                let aborted = abort_active_work(state, handle);
+                if !aborted && state.has_composer_draft() {
+                    state.clear_composer();
+                }
                 state.request_quit();
             }
         }
@@ -1049,10 +1054,15 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, boo
 fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.composer().text();
     let mut reset_scroll = true;
+    let text_without_images = crate::adapter::prompt_images::strip_image_placeholders(
+        &text,
+        state.pending_images().len(),
+    );
     if !state.pending_images().is_empty()
-        && (commands::parse_target_only(&text).is_some() || text.trim().is_empty())
+        && (commands::parse_target_only(&text_without_images).is_some()
+            || text_without_images.trim().is_empty())
     {
-        submit_image_only(state, handle, &text);
+        submit_image_only(state, handle, &text_without_images);
         if reset_scroll {
             state.reset_scroll();
         }

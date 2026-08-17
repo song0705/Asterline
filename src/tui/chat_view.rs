@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::domain::event::{ChatItem, FileChangeItem};
-use crate::domain::team::{DefaultTarget, MemberId};
+use crate::domain::team::{BackendKind, DefaultTarget, MemberId};
 use crate::tui::app_state::{AppState, member_status_is_active};
 use crate::tui::completion::Completion;
 use crate::tui::drawer_view::render_drawer;
@@ -185,8 +185,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     let composer_avail = frame.area().width.saturating_sub(2) as usize;
     let composer_rows =
         (state.composer().visual_line_count(composer_avail) as u16).clamp(1, MAX_COMPOSER_ROWS);
-    let image_rows = u16::from(!state.pending_images().is_empty());
-    let composer_height = composer_rows + image_rows + 2; // borders + optional chips
+    let composer_height = composer_rows + 2; // top and bottom rules
     let completion = if state.drawer().is_none() {
         state.completion()
     } else {
@@ -196,12 +195,15 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         .as_ref()
         .map(completion_popup_height)
         .unwrap_or(1);
+    let queued_preview = queued_input_preview_lines(state, frame.area().width as usize);
+    let queued_height = queued_preview.len() as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
+            Constraint::Length(queued_height),
             Constraint::Length(composer_height),
             Constraint::Length(bottom_height),
         ])
@@ -209,18 +211,19 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
 
     render_header(frame, chunks[0], state);
     let mut layout = render_chat(frame, chunks[1], state);
-    render_composer(frame, chunks[2], state);
+    frame.render_widget(Paragraph::new(queued_preview), chunks[2]);
+    render_composer(frame, chunks[3], state);
     let composer_inner = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .inner(chunks[2]);
+        .inner(chunks[3]);
     layout.composer_area = Some(composer_inner);
     layout.composer_wrap = (composer_inner.width as usize).saturating_sub(2);
-    layout.composer_text_origin = u16::from(!state.pending_images().is_empty());
+    layout.composer_text_origin = 0;
     if let Some(completion) = completion {
-        render_popup(frame, chunks[3], &completion, state.popup_selected());
-        layout.completion_area = Some(chunks[3]);
+        render_popup(frame, chunks[4], &completion, state.popup_selected());
+        layout.completion_area = Some(chunks[4]);
     } else {
-        render_footer(frame, chunks[3], state);
+        render_footer(frame, chunks[4], state);
     }
 
     if let Some(drawer) = state.drawer() {
@@ -229,6 +232,51 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         return None;
     }
     Some(layout)
+}
+
+const QUEUED_PREVIEW_LINE_LIMIT: usize = 3;
+
+fn queued_input_preview_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    if state.queued_prompt_count() == 0 || width < 4 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("• ", theme::muted()),
+        Span::styled("Queued follow-up inputs", theme::muted()),
+    ])];
+    let content_width = width.saturating_sub(4).max(1);
+
+    for member in state.members() {
+        for prompt in state.queued_prompts_for(&member.id) {
+            let wrapped = markdown::wrap(prompt, content_width);
+            let wrapped_len = wrapped.len();
+            for (index, text) in wrapped
+                .into_iter()
+                .take(QUEUED_PREVIEW_LINE_LIMIT)
+                .enumerate()
+            {
+                let prefix = if index == 0 {
+                    format!("  ↳ @{} ", member.display_name)
+                } else {
+                    "    ".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, theme::muted()),
+                    Span::styled(text, theme::muted().italic()),
+                ]));
+            }
+            if wrapped_len > QUEUED_PREVIEW_LINE_LIMIT {
+                lines.push(Line::from(Span::styled("    …", theme::muted().italic())));
+            }
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        "    Shift+← edit last queued message",
+        theme::muted(),
+    )));
+    lines
 }
 
 const MAX_COMPLETION_ROWS: usize = 6;
@@ -875,9 +923,13 @@ fn render_chat_history_range(
             continue;
         }
         let item = &items[i];
-        // Thinking rows from older saved conversations are retained in the
-        // database for compatibility, but thinking is now transient progress.
-        if matches!(item, ChatItem::Thinking { .. }) {
+        if matches!(
+            item,
+            ChatItem::Thinking {
+                backend: BackendKind::Codex,
+                ..
+            }
+        ) {
             continue;
         }
         if matches!(item, ChatItem::User { .. }) && saw_work_activity {
@@ -1620,7 +1672,7 @@ fn item_renders(item: &ChatItem, state: &AppState) -> bool {
         ChatItem::Agent { text, member, .. } => {
             !text.is_empty() || state.has_active_message(member)
         }
-        ChatItem::Thinking { .. } => false,
+        ChatItem::Thinking { text, .. } => !text.is_empty(),
         _ => true,
     }
 }
@@ -1976,24 +2028,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     let mut out_lines: Vec<Line> = Vec::new();
     let mut cursor_screen: Option<(u16, u16)> = None;
-    let mut text_origin = 0usize;
-    if !state.pending_images().is_empty() {
-        let labels = state
-            .pending_images()
-            .iter()
-            .map(|image| image.label())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        out_lines.push(Line::from(Span::styled(
-            format!("📎 {labels}"),
-            theme::muted(),
-        )));
-        text_origin = 1;
-        if rows == 1 {
-            frame.render_widget(Paragraph::new(out_lines), inner);
-            return;
-        }
-    }
+    let text_origin = 0usize;
 
     // Visual lines with wrapping so long input is fully visible (no horizontal
     // clipping). The cursor maps directly to a screen cell.

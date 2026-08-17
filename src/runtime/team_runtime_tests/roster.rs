@@ -21,7 +21,7 @@ fn replace_team_adds_member_and_requests_runner() {
     assert!(step.runner_changes.iter().any(|change| matches!(
         change,
         RunnerChange::Upsert { member, .. } if member.id == MemberId::new("researcher")
-            && member.system_prompt.as_deref().unwrap_or("").contains("$asterline-team")
+            && member.system_prompt.as_deref().unwrap_or("").contains("Asterline team skill")
     )));
     let persisted = step.persist_team.expect("team persisted");
     let researcher = persisted.member(&MemberId::new("researcher")).unwrap();
@@ -213,7 +213,8 @@ fn team_mode_kicks_off_via_a_coordinator() {
     )));
     assert_eq!(step.actions.len(), 1);
     assert!(step.actions[0].prompt.contains("ship the parser"));
-    assert!(step.actions[0].prompt.contains("$asterline-team"));
+    assert!(step.actions[0].prompt.contains("Asterline team skill"));
+    assert!(!step.actions[0].prompt.contains("$asterline-team"));
     assert!(
         step.actions[0].prompt.contains("@@run_step"),
         "start prompt must require checklist-first discipline"
@@ -751,7 +752,8 @@ fn continue_run_resumes_failed_run() {
             .prompt
             .contains("User note: fix verification")
     );
-    assert!(step.actions[0].prompt.contains("$asterline-team"));
+    assert!(step.actions[0].prompt.contains("Asterline team skill"));
+    assert!(!step.actions[0].prompt.contains("$asterline-team"));
 
     let step = rt.on_agent_event(
         &MemberId::new("builder"),

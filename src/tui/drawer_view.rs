@@ -7,14 +7,14 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
-use crate::domain::event::LogEntry;
+use crate::domain::event::{LogEntry, MemberStatus};
 use crate::domain::team::MemberId;
 use crate::tui::app_state::AppState;
 use crate::tui::drawers::Drawer;
 use crate::tui::markdown;
 use crate::tui::runs_view::drawer_runs;
 use crate::tui::team_builder::Field;
-use crate::tui::team_builder::{backend_picker_lines, model_picker_lines};
+use crate::tui::team_builder::{backend_picker_lines, model_picker_lines, session_status_label};
 use crate::tui::theme;
 use crate::tui::theme::pad_width;
 
@@ -371,6 +371,11 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
             }),
         ]));
         // Detail line 1: session · model · effort
+        let session_status = session_status_label(
+            member.session_policy,
+            member.session.as_deref(),
+            member.status == MemberStatus::Running,
+        );
         let session = member.session.clone().unwrap_or_else(|| "—".to_string());
         let model = member
             .model
@@ -382,6 +387,8 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
             .unwrap_or_else(|| "default".to_string());
         lines.push(Line::from(vec![
             Span::styled("  session ", theme::muted()),
+            Span::styled(session_status, theme::text()),
+            Span::styled(" · ", theme::muted()),
             Span::styled(session, theme::text()),
             Span::styled("  ·  model ", theme::muted()),
             Span::styled(model.to_string(), theme::text()),
@@ -438,9 +445,9 @@ fn drawer_team_editor(
     ]));
     lines.push(Line::styled(
         if editor.field_mode() {
-            " ↑/↓ field · Enter edit/choose · t reload model · e manual model/session · s apply · Esc members"
+            " ↑/↓ field · Enter edit/choose · y copy · t reload model · e manual model/session · s apply · Esc members"
         } else {
-            " ↑/↓ member · Enter fields · a add · d delete · t target · * all · s apply · Esc close"
+            " ↑/↓ member · Enter fields · y copy session · a add · d delete · t target · * all · s apply · Esc close"
         },
         theme::muted(),
     ));
@@ -793,6 +800,30 @@ mod tests {
             }],
         });
         state
+    }
+
+    #[test]
+    fn team_roster_shows_resume_then_freshing_until_a_session_is_bound() {
+        let mut state = ready_state();
+        let text = drawer_team(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("session resume · —"), "{text}");
+
+        state.apply(RuntimeEvent::MemberStatus {
+            member: MemberId::new("builder"),
+            status: MemberStatus::Running,
+        });
+        let text = drawer_team(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("session freshing · —"), "{text}");
     }
 
     #[test]

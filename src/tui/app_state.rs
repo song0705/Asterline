@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::adapter::parser::{append_bounded_text, bounded_text, summarize};
 use crate::adapter::prompt_images::{
-    MAX_IMAGE_BYTES, MAX_PROMPT_IMAGES, PromptImage, mime_from_bytes,
+    MAX_IMAGE_BYTES, MAX_PROMPT_IMAGES, PromptImage, image_placeholder, mime_from_bytes,
 };
 use crate::domain::config::{DetectedBackends, detect_backends};
 use crate::domain::event::{
@@ -68,10 +68,31 @@ pub(crate) fn member_status_is_active(status: MemberStatus) -> bool {
 }
 
 fn reasoning_status_header(text: &str) -> Option<String> {
-    let (_, after_start) = text.split_once("**")?;
-    let (header, _) = after_start.split_once("**")?;
-    let header = summarize(header, MAX_REASONING_STATUS_HEADER_CHARS);
+    if let Some((_, after_start)) = text.split_once("**")
+        && let Some((header, _)) = after_start.split_once("**")
+    {
+        let header = summarize(header.trim(), MAX_REASONING_STATUS_HEADER_CHARS);
+        if !header.is_empty() {
+            return Some(header);
+        }
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_start_matches(['#', '*', '-', '`', ' ', '\t']);
+    let header = summarize(first_line, MAX_REASONING_STATUS_HEADER_CHARS);
     (!header.is_empty()).then_some(header)
+}
+
+fn literal_char_range(text: &str, literal: &str) -> Option<(usize, usize)> {
+    let start_byte = text.find(literal)?;
+    let start = text[..start_byte].chars().count();
+    Some((start, start + literal.chars().count()))
 }
 
 #[derive(Clone, Debug)]
@@ -423,7 +444,18 @@ impl AppState {
                     editor.set_active_mode(mode);
                 }
             }
-            RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {}
+            RuntimeEvent::TurnStarted { .. } => {}
+            RuntimeEvent::TurnFinished { .. } => {
+                if crate::tui::claude_export::is_sync_enabled() {
+                    let workspace = std::path::Path::new(&self.workspace);
+                    let session_id = self.members.iter().find_map(|m| m.session.as_deref());
+                    if let Some(session_id) = session_id {
+                        let _ = crate::tui::claude_export::export_chat_items_to_claude_jsonl(
+                            workspace, session_id, &self.chat,
+                        );
+                    }
+                }
+            }
             RuntimeEvent::UserMessage { body, targets, .. } => {
                 let interrupted = self
                     .members
@@ -453,6 +485,7 @@ impl AppState {
                 }
                 let _ = self.composer.set_text(&body);
                 self.composer.home();
+                self.reconcile_pending_images();
             }
             RuntimeEvent::MemberStatus { member, status } => {
                 if !member_status_is_active(status) {
@@ -850,6 +883,11 @@ impl AppState {
                 self.chat_selection = None;
                 self.queued_prompts.clear();
                 self.stash_team_editor_catalog();
+                for member in &mut self.members {
+                    member.session = None;
+                    member.session_policy = SessionPolicy::Fresh;
+                    member.status = MemberStatus::Idle;
+                }
             }
             RuntimeEvent::ResumeChoices { conversations } => {
                 self.resume_choices = conversations;
@@ -1065,8 +1103,8 @@ impl AppState {
         if let Some(view) = self.members.iter_mut().find(|m| &m.id == member) {
             view.status = status;
         }
-        // Queued means a run is still active and another prompt is waiting;
-        // keep the original elapsed timer until the runtime explicitly idles.
+        // Every active state keeps the original elapsed timer until the runtime
+        // explicitly idles. Queue depth is tracked separately from member status.
         if member_status_is_active(status) {
             self.running_since
                 .entry(member.clone())
@@ -1102,14 +1140,37 @@ impl AppState {
         self.thinking_started
             .entry(member.clone())
             .or_insert_with(Instant::now);
-        let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
-        if delta.starts_with(buffer.as_str()) {
-            *buffer = delta;
-        } else if !buffer.ends_with(&delta) {
-            let _ = append_bounded_text(buffer, &delta, MAX_CHAT_ITEM_BYTES);
-        }
-        if let Some(header) = reasoning_status_header(buffer) {
-            self.active_reasoning.insert(member, header);
+        let current_text = {
+            let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
+            if delta.starts_with(buffer.as_str()) {
+                *buffer = delta;
+            } else if !buffer.ends_with(&delta) {
+                let _ = append_bounded_text(buffer, &delta, MAX_CHAT_ITEM_BYTES);
+            }
+            if let Some(header) = reasoning_status_header(buffer) {
+                self.active_reasoning.insert(member.clone(), header);
+            }
+            buffer.clone()
+        };
+        let (display_name, backend) = self.member_meta(&member);
+        if backend != BackendKind::Codex {
+            if let Some(&idx) = self.open_thinking.get(&member) {
+                if let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx) {
+                    *text = current_text;
+                    self.touch_chat();
+                }
+            } else {
+                let idx = self.chat.len();
+                self.chat.push(ChatItem::Thinking {
+                    member: member.clone(),
+                    display_name,
+                    backend,
+                    text: current_text,
+                    elapsed_secs: None,
+                });
+                self.open_thinking.insert(member, idx);
+                self.touch_chat();
+            }
         }
     }
 
@@ -1450,11 +1511,13 @@ impl AppState {
         self.disarm_quit();
         self.chat_selection = None;
         self.composer_dragging = true;
+        let index = self.image_placeholder_boundary(index, None);
         self.composer.begin_selection_at(index);
     }
 
     pub fn update_composer_selection(&mut self, index: usize) {
         if self.composer_dragging {
+            let index = self.image_placeholder_boundary(index, None);
             self.composer.extend_selection_to(index);
         }
     }
@@ -1466,6 +1529,13 @@ impl AppState {
 
     pub fn queued_prompt_count(&self) -> usize {
         self.queued_prompts.values().map(Vec::len).sum()
+    }
+
+    pub fn queued_prompts_for(&self, member: &MemberId) -> &[String] {
+        self.queued_prompts
+            .get(member)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn clamp_scroll(&mut self, max: usize) {
@@ -1696,11 +1766,66 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.insert(ch);
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
     pub fn pending_images(&self) -> &[PromptImage] {
         &self.pending_images
+    }
+
+    fn image_placeholder_boundary(&self, index: usize, prefer_end: Option<bool>) -> usize {
+        let text = self.composer.text();
+        for number in 1..=self.pending_images.len() {
+            let placeholder = image_placeholder(number);
+            let Some((start, end)) = literal_char_range(&text, &placeholder) else {
+                continue;
+            };
+            if start < index && index < end {
+                return match prefer_end {
+                    Some(true) => end,
+                    Some(false) => start,
+                    None if index - start < end - index => start,
+                    None => end,
+                };
+            }
+        }
+        index
+    }
+
+    fn snap_cursor_around_image(&mut self, prefer_end: Option<bool>) {
+        let index = self.image_placeholder_boundary(self.composer.cursor(), prefer_end);
+        self.composer.set_cursor_index(index);
+    }
+
+    fn reconcile_pending_images(&mut self) {
+        if self.pending_images.is_empty() {
+            return;
+        }
+        let text = self.composer.text();
+        let mut retained = Vec::new();
+        for (index, image) in std::mem::take(&mut self.pending_images)
+            .into_iter()
+            .enumerate()
+        {
+            let placeholder = image_placeholder(index + 1);
+            if text.contains(&placeholder) {
+                retained.push((placeholder, image));
+            } else {
+                super::clipboard_image::remove_managed_paste(&image.path);
+            }
+        }
+        for (index, (old_placeholder, _)) in retained.iter().enumerate() {
+            let new_placeholder = image_placeholder(index + 1);
+            if old_placeholder == &new_placeholder {
+                continue;
+            }
+            let text = self.composer.text();
+            if let Some((start, end)) = literal_char_range(&text, old_placeholder) {
+                let _ = self.composer.replace_range(start, end, &new_placeholder);
+            }
+        }
+        self.pending_images = retained.into_iter().map(|(_, image)| image).collect();
     }
 
     pub fn has_composer_draft(&self) -> bool {
@@ -1729,9 +1854,22 @@ impl AppState {
         {
             return Ok(());
         }
+        let next_placeholder = image_placeholder(self.pending_images.len() + 1);
+        if !self.composer.can_insert_text_exact(&next_placeholder) {
+            return Err(COMPOSER_INPUT_TRUNCATED.to_string());
+        }
         self.disarm_quit();
         self.header_selected = None;
+        if self.composer.delete_selection() {
+            self.reconcile_pending_images();
+        }
+        let next_placeholder = image_placeholder(self.pending_images.len() + 1);
+        if !self.composer.insert_text_exact(&next_placeholder) {
+            return Err(COMPOSER_INPUT_TRUNCATED.to_string());
+        }
         self.pending_images.push(image);
+        self.history_cursor = None;
+        self.reset_popup();
         Ok(())
     }
 
@@ -1762,6 +1900,7 @@ impl AppState {
         let pre_truncated = end < text.len();
         let text = text[..end].replace("\r\n", "\n").replace('\r', "\n");
         let fully_inserted = self.composer.insert_text(&text) && !pre_truncated;
+        self.reconcile_pending_images();
         if !fully_inserted
             && !matches!(
                 self.chat.last(),
@@ -1779,6 +1918,7 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.insert_newline();
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1786,24 +1926,37 @@ impl AppState {
     /// already on the first line (so the caller recalls history instead).
     pub fn composer_up(&mut self) -> bool {
         self.disarm_quit();
-        self.composer.up()
+        let moved = self.composer.up();
+        self.snap_cursor_around_image(None);
+        moved
     }
     /// Move the cursor down within a multi-line composer; returns false if it is
     /// already on the last line.
     pub fn composer_down(&mut self) -> bool {
         self.disarm_quit();
-        self.composer.down()
+        let moved = self.composer.down();
+        self.snap_cursor_around_image(None);
+        moved
     }
     pub fn backspace(&mut self) {
         self.disarm_quit();
         self.header_selected = None;
-        if self.composer.is_empty() {
-            if let Some(image) = self.pending_images.pop() {
-                super::clipboard_image::remove_managed_paste(&image.path);
-            }
+        let cursor = self.composer.cursor();
+        let text = self.composer.text();
+        let image_range = (self.composer.selection_range().is_none())
+            .then(|| {
+                (1..=self.pending_images.len()).find_map(|number| {
+                    let placeholder = image_placeholder(number);
+                    literal_char_range(&text, &placeholder).filter(|(_, end)| *end == cursor)
+                })
+            })
+            .flatten();
+        if let Some((start, end)) = image_range {
+            self.composer.delete_range(start, end);
         } else {
             self.composer.backspace();
         }
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1811,6 +1964,7 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.delete_word();
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1818,6 +1972,7 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.delete_line();
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1832,11 +1987,13 @@ impl AppState {
     pub fn cursor_left(&mut self) {
         self.disarm_quit();
         self.composer.left();
+        self.snap_cursor_around_image(Some(false));
         self.reset_popup();
     }
     pub fn cursor_right(&mut self) {
         self.disarm_quit();
         self.composer.right();
+        self.snap_cursor_around_image(Some(true));
         self.reset_popup();
     }
     pub fn cursor_home(&mut self) {
@@ -1893,6 +2050,7 @@ impl AppState {
         let insert = completion.items[index].insert.clone();
         let before = self.composer.text();
         self.composer.replace_token(completion.token_start, &insert);
+        self.reconcile_pending_images();
         self.reset_popup();
         self.composer.text() != before
     }
@@ -1917,6 +2075,10 @@ impl AppState {
     /// to the newest entry; further steps walk backwards.
     pub fn history_prev(&mut self) {
         self.disarm_quit();
+        if !self.pending_images.is_empty() {
+            self.composer.home();
+            return;
+        }
         if self.prompt_history.is_empty() {
             return;
         }
@@ -2733,6 +2895,10 @@ impl AppState {
         self.scroll = 0;
     }
 
+    pub fn is_quit_armed(&self) -> bool {
+        self.quit_armed
+    }
+
     pub fn quit(&mut self) {
         self.quit_armed = false;
         self.should_quit = true;
@@ -2912,9 +3078,7 @@ fn chat_item_search_text(item: &ChatItem) -> String {
     match item {
         ChatItem::User { body, .. } => crate::adapter::prompt_images::display_prompt_images(body),
         ChatItem::Agent { text, .. } => text.clone(),
-        // Thinking is transient progress. Retained legacy rows must not
-        // produce invisible `/find` results.
-        ChatItem::Thinking { .. } => String::new(),
+        ChatItem::Thinking { text, .. } => text.clone(),
         ChatItem::Tool {
             name,
             summary,
@@ -2948,7 +3112,7 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
                 text.lines().count().max(1) + 1 // +1 for header
             }
         }
-        ChatItem::Thinking { .. } => 0,
+        ChatItem::Thinking { .. } => 1,
         ChatItem::Tool { detail, .. } => 2 + usize::from(!detail.is_empty()),
         ChatItem::Diff { files, .. } => 1 + files.len(),
         ChatItem::Route { body, .. } => 1 + body.lines().count().max(1),

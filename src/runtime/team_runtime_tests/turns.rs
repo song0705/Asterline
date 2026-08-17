@@ -591,6 +591,46 @@ fn new_chat_leaves_the_new_transcript_empty() {
 }
 
 #[test]
+fn new_chat_resets_members_to_fresh_policy_and_clears_sessions() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+    rt.on_ui_command(user("initial prompt"));
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::SessionDiscovered(AgentSessionId("bound-session-1".to_string())),
+    );
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    let reset = rt.on_ui_command(UiCommand::NewSession);
+    assert!(
+        reset
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset))
+    );
+
+    let ready = rt.ready_event();
+    if let RuntimeEvent::Ready { members, .. } = ready {
+        for m in members {
+            assert_eq!(m.session, None);
+            assert_eq!(m.session_policy, SessionPolicy::Fresh);
+            assert_eq!(m.status, MemberStatus::Idle);
+        }
+    } else {
+        panic!("expected Ready event");
+    }
+
+    let next_turn = rt.on_ui_command(user("start of fresh chat"));
+    assert_eq!(next_turn.actions[0].session, None);
+}
+
+#[test]
 fn new_chat_keeps_current_state_when_atomic_reset_fails() {
     let path = std::env::temp_dir().join(format!(
         "asterline-new-chat-reset-failure-{}.sqlite3",
@@ -1033,7 +1073,7 @@ fn agent_can_add_teammate_with_team_member_envelope() {
     assert!(step.runner_changes.iter().any(|change| matches!(
         change,
         RunnerChange::Upsert { member, .. } if member.id == MemberId::new("qa")
-            && member.system_prompt.as_deref().unwrap_or("").contains("$asterline-team")
+            && member.system_prompt.as_deref().unwrap_or("").contains("Asterline team skill")
     )));
     let persisted = step.persist_team.expect("team persisted");
     let qa = persisted.member(&MemberId::new("qa")).unwrap();
@@ -1117,12 +1157,32 @@ fn second_message_to_busy_member_is_queued_then_runs() {
         target: MessageTarget::Member(builder.clone()),
         body: "second".to_string(),
     });
-    assert!(step.events.iter().any(|e| matches!(
-        e,
+    assert_eq!(
+        rt.members.get(&builder).map(|state| state.status),
+        Some(MemberStatus::Running),
+        "queue depth must not replace the active run status"
+    );
+    assert!(!step.events.iter().any(|event| matches!(
+        event,
         RuntimeEvent::MemberStatus {
             status: MemberStatus::Queued,
             ..
         }
+    )));
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::QueueUpdated { prompts, .. } if prompts == &["second".to_string()]
+    )));
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::UserMessage { body, .. } if body == "second"
+        )),
+        "an unsent queued message must stay out of chat history"
+    );
+    assert!(!rt.store.replay_chat().unwrap().iter().any(|item| matches!(
+        item,
+        ChatItem::User { body, .. } if body == "second"
     )));
     assert!(
         step.actions.is_empty(),
@@ -1143,6 +1203,69 @@ fn second_message_to_busy_member_is_queued_then_runs() {
             .iter()
             .any(|a| a.prompt.contains("second") && !a.prompt.contains("$asterline-team"))
     );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. } if body == "second"
+    )));
+    assert!(rt.store.replay_chat().unwrap().iter().any(|item| matches!(
+        item,
+        ChatItem::User { body, .. } if body == "second"
+    )));
+}
+
+#[test]
+fn queued_message_for_multiple_members_enters_chat_once() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+    rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(builder.clone()),
+        body: "builder first".to_string(),
+    });
+    rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(reviewer.clone()),
+        body: "reviewer first".to_string(),
+    });
+
+    let queued = rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::All,
+        body: "queued for both".to_string(),
+    });
+    assert!(!queued.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. } if body == "queued for both"
+    )));
+
+    let builder_exit = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    assert_eq!(
+        builder_exit
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RuntimeEvent::UserMessage { body, .. } if body == "queued for both"
+            ))
+            .count(),
+        1
+    );
+
+    let reviewer_exit = rt.on_agent_event(
+        &reviewer,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    assert!(!reviewer_exit.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. } if body == "queued for both"
+    )));
 }
 
 #[test]

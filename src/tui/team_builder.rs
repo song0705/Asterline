@@ -1552,6 +1552,30 @@ impl BuilderState {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {}
             KeyCode::Char('a') if !self.field_mode => self.add_member(),
             KeyCode::Char('d') if !self.field_mode => self.delete_member(),
+            KeyCode::Char('y') if !self.field_mode => {
+                let member = self.selected_member();
+                let text = member
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| member.id.to_string());
+                crate::tui::copy_to_clipboard(&text);
+                self.notice = Some(format!("copied '{}' to clipboard", text));
+            }
+            KeyCode::Char('y') if self.field_mode => {
+                let member = self.selected_member();
+                let text = if self.selected_field() == Field::SessionId {
+                    member
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| self.field_value(member, Field::SessionId))
+                } else {
+                    self.field_value(member, self.selected_field())
+                };
+                if !text.is_empty() {
+                    crate::tui::copy_to_clipboard(&text);
+                    self.notice = Some(format!("copied '{}' to clipboard", text));
+                }
+            }
             KeyCode::Char('s') => return true,
             KeyCode::Char('t') if self.field_mode && self.selected_field() == Field::Model => {
                 self.refresh_model_catalog()
@@ -2155,15 +2179,28 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
             }
         },
         Field::Permission => permission_value(member),
-        Field::Session => match member.session_policy {
-            SessionPolicy::Resume => "resume".to_string(),
-            SessionPolicy::Fresh => "fresh".to_string(),
-        },
+        Field::Session => {
+            session_status_label(member.session_policy, member.session_id.as_deref(), false)
+                .to_string()
+        }
         Field::SessionId => match (&member.session_policy, &member.session_id) {
-            (SessionPolicy::Resume, Some(session_id)) => session_id.clone(),
-            (SessionPolicy::Resume, None) => "select a session".to_string(),
-            (SessionPolicy::Fresh, _) => "not set (fresh)".to_string(),
+            (_, Some(session_id)) => session_id.clone(),
+            (SessionPolicy::Resume, None) => "select a session · Enter to choose".to_string(),
+            (SessionPolicy::Fresh, None) => "created on next send".to_string(),
         },
+    }
+}
+
+pub(crate) fn session_status_label(
+    policy: SessionPolicy,
+    session_id: Option<&str>,
+    creating: bool,
+) -> &'static str {
+    match (session_id.is_some(), creating, policy) {
+        (true, _, _) => "bound",
+        (false, true, _) => "freshing",
+        (false, false, SessionPolicy::Resume) => "resume",
+        (false, false, SessionPolicy::Fresh) => "fresh",
     }
 }
 
@@ -2926,17 +2963,35 @@ mod tests {
     }
 
     #[test]
-    fn session_id_field_shows_a_real_resume_id_or_an_honest_unbound_state() {
+    fn session_fields_show_resume_freshing_and_bound_states() {
         let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
 
         assert_eq!(field_value(&member, Field::Model), "default");
-        assert_eq!(field_value(&member, Field::SessionId), "select a session");
+        assert_eq!(field_value(&member, Field::Session), "resume");
+        assert_eq!(
+            field_value(&member, Field::SessionId),
+            "select a session · Enter to choose"
+        );
 
         member.session_id = Some("thread-abc123".to_string());
+        assert_eq!(field_value(&member, Field::Session), "bound");
         assert_eq!(field_value(&member, Field::SessionId), "thread-abc123");
 
         member.session_policy = SessionPolicy::Fresh;
-        assert_eq!(field_value(&member, Field::SessionId), "not set (fresh)");
+        assert_eq!(field_value(&member, Field::Session), "bound");
+        assert_eq!(field_value(&member, Field::SessionId), "thread-abc123");
+
+        member.session_id = None;
+        assert_eq!(field_value(&member, Field::Session), "fresh");
+        assert_eq!(
+            field_value(&member, Field::SessionId),
+            "created on next send"
+        );
+
+        assert_eq!(
+            session_status_label(SessionPolicy::Resume, None, true),
+            "freshing"
+        );
     }
 
     #[test]

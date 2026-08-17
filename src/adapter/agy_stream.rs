@@ -161,17 +161,16 @@ impl StreamAdapter for AgyStreamAdapter {
         {
             args.push("--dangerously-skip-permissions".to_string());
         }
+        let prompt_text = self.prompt_with_system(
+            &crate::adapter::prompt_images::prompt_with_image_paths(prompt),
+        );
         args.push("--print".to_string());
+        args.push(prompt_text);
         AdapterCommand {
             program: self.binary.clone(),
             args,
             cwd: self.cwd.clone(),
-            // Agy print mode reads a missing positional prompt from stdin.
-            // This avoids exposing prompts in process listings and Windows'
-            // command-line length limit.
-            stdin: Some(self.prompt_with_system(
-                &crate::adapter::prompt_images::prompt_with_image_paths(prompt),
-            )),
+            stdin: None,
         }
     }
 
@@ -253,6 +252,7 @@ impl AgyLineParser {
         let state = str_field(step, "state").unwrap_or_default();
 
         if state == "ACTIVE" && !self.active_tools.contains_key(&index) {
+            self.close_message(out);
             self.active_tools.insert(index, name.clone());
             out.push(AgentEvent::ToolStarted {
                 id,
@@ -457,8 +457,8 @@ mod tests {
         );
         assert!(command.args.contains(&"--sandbox".to_string()));
         assert!(command.args.windows(2).any(|w| w == ["--mode", "plan"]));
-        assert_eq!(command.args.last().map(String::as_str), Some("--print"));
-        assert!(command.stdin.as_deref().unwrap().contains("hi there"));
+        assert!(command.args.last().unwrap().contains("hi there"));
+        assert_eq!(command.stdin, None);
         let img_dir =
             std::env::temp_dir().join(format!("asterline-agy-img-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&img_dir);
@@ -471,16 +471,16 @@ mod tests {
         );
         assert!(
             with_image
-                .stdin
-                .as_deref()
+                .args
+                .last()
                 .unwrap()
                 .contains(&format!("(attached image: {})", img.display()))
         );
         let _ = std::fs::remove_dir_all(&img_dir);
         assert!(
             !with_image
-                .stdin
-                .as_deref()
+                .args
+                .last()
                 .unwrap()
                 .contains("[asterline-image]")
         );
@@ -614,13 +614,47 @@ mod tests {
     fn final_response_repairs_replacement_characters_in_stream_deltas() {
         let mut parser = AgyLineParser::default();
         let mut events = parser.parse_line(
-            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"拓扑���索"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"拓扑索"}}"#,
         );
         events.extend(parser.parse_line(
             r#"{"event":"result","result":{"conversation_id":"x","status":"SUCCESS","response":"拓扑检索"}}"#,
         ));
 
-        assert!(events.contains(&AgentEvent::TextDelta("拓扑���索".to_string())));
+        assert!(events.contains(&AgentEvent::TextDelta("拓扑索".to_string())));
         assert!(events.contains(&AgentEvent::MessageCompleted("拓扑检索".to_string())));
+    }
+
+    #[test]
+    fn intermediate_text_before_tool_is_emitted_ahead_of_tool_event() {
+        let mut parser = AgyLineParser::default();
+        let mut events = Vec::new();
+        for line in [
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Let me check."}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls"}}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls"},"output":"file.txt"}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"Done."}}"#,
+            r#"{"event":"result","result":{"conversation_id":"x","status":"SUCCESS","response":"Done."}}"#,
+        ] {
+            events.extend(parser.parse_line(line));
+        }
+
+        let first_msg = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::MessageCompleted(t) if t == "Let me check."))
+            .expect("intermediate message");
+        let tool_start = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolStarted { id, .. } if id == "agy-step-2"))
+            .expect("tool started");
+        let tool_done = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolCompleted { id, .. } if id == "agy-step-2"))
+            .expect("tool done");
+        let final_msg = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::MessageCompleted(t) if t == "Done."))
+            .expect("final message");
+
+        assert!(first_msg < tool_start && tool_start < tool_done && tool_done < final_msg);
     }
 }

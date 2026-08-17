@@ -131,6 +131,12 @@ struct QueuedPrompt {
     prompt: String,
 }
 
+struct PendingUserMessage {
+    targets: Vec<MemberId>,
+    body: String,
+    persisted: bool,
+}
+
 struct MemberState {
     status: MemberStatus,
     queue: VecDeque<QueuedPrompt>,
@@ -195,6 +201,8 @@ pub struct TeamRuntime {
     paused_routes: VecDeque<PausedRoute>,
     held_approvals: HashMap<ApprovalId, HeldApproval>,
     native_approvals: HashMap<ApprovalId, NativeApproval>,
+    /// Direct user messages waiting for their first actual member dispatch.
+    pending_user_messages: HashMap<TurnId, PendingUserMessage>,
     run_turns: HashMap<TurnId, RunId>,
     failed_runs: HashSet<RunId>,
     mode_sessions: HashMap<RunId, ModeSession>,
@@ -294,6 +302,7 @@ impl TeamRuntime {
             paused_routes: VecDeque::new(),
             held_approvals: HashMap::new(),
             native_approvals: HashMap::new(),
+            pending_user_messages: HashMap::new(),
             run_turns: HashMap::new(),
             failed_runs: HashSet::new(),
             mode_sessions: HashMap::new(),
@@ -565,6 +574,10 @@ impl TeamRuntime {
             UiCommand::ImportTranscript { .. } => step.events.push(RuntimeEvent::Notice(
                 "ignored direct transcript import without an attach reservation".to_string(),
             )),
+            UiCommand::ImportSession { member, session_id } => {
+                self.handle_import_session(member, session_id, &mut step)
+            }
+            UiCommand::ExportSession { format } => self.handle_export_session(format, &mut step),
             UiCommand::RequestAttach { member } => self.handle_request_attach(member, &mut step),
             // The transport owns the attach reservation. A stray completion
             // delivered directly to the synchronous core is intentionally a
@@ -765,16 +778,21 @@ impl TeamRuntime {
                 return None;
             }
         };
-        if let Err(err) = self.store.record_user(turn, &targets, &body) {
+        let approval_kind = (self.approvals_enabled
+            && self.matcher.applies_to(ApprovalSurface::User))
+        .then(|| self.matcher.classify(&body))
+        .flatten();
+        let starts_immediately = targets.iter().any(|member| {
+            self.members
+                .get(member)
+                .is_some_and(|state| state.running.is_none())
+        });
+        let defer_persistence = approval_kind.is_none() && !starts_immediately;
+        if !defer_persistence && let Err(err) = self.store.record_user(turn, &targets, &body) {
             self.report_store_error("save the user message", err, step);
             return None;
         }
         step.events.push(RuntimeEvent::TurnStarted { turn });
-        step.events.push(RuntimeEvent::UserMessage {
-            turn,
-            targets: targets.clone(),
-            body: body.clone(),
-        });
 
         let targets_str: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
         if let Some(first_target) = targets.first() {
@@ -785,10 +803,12 @@ impl TeamRuntime {
             );
         }
 
-        if self.approvals_enabled
-            && self.matcher.applies_to(ApprovalSurface::User)
-            && let Some(kind) = self.matcher.classify(&body)
-        {
+        if let Some(kind) = approval_kind {
+            step.events.push(RuntimeEvent::UserMessage {
+                turn,
+                targets: targets.clone(),
+                body: body.clone(),
+            });
             match self.store.insert_approval(Some(turn), None, &kind, &body) {
                 Ok(id) => {
                     self.held_approvals.insert(
@@ -816,6 +836,14 @@ impl TeamRuntime {
             return Some(turn);
         }
 
+        self.pending_user_messages.insert(
+            turn,
+            PendingUserMessage {
+                targets: targets.clone(),
+                body: body.clone(),
+                persisted: !defer_persistence,
+            },
+        );
         for member in targets {
             self.enqueue_prompt(&member, turn, body.clone(), step);
         }
@@ -975,6 +1003,7 @@ impl TeamRuntime {
         let mut snapshot_team = strip_team_protocols(self.config.clone());
         for member in &mut snapshot_team.members {
             member.session_id = None;
+            member.session_policy = SessionPolicy::Fresh;
         }
         match self
             .store
@@ -994,6 +1023,12 @@ impl TeamRuntime {
         self.sessions = SessionRegistry::new();
         for member in &mut self.config.members {
             member.session_id = None;
+            member.session_policy = SessionPolicy::Fresh;
+        }
+        for state in self.members.values_mut() {
+            state.status = MemberStatus::Idle;
+            state.running = None;
+            state.tools.clear();
         }
         // Drop any in-flight turn state from the previous chat.
         self.paused_routes.clear();
@@ -1005,6 +1040,7 @@ impl TeamRuntime {
             });
         }
         step.events.push(RuntimeEvent::SessionReset);
+        self.note_roster_write(step);
     }
 
     fn handle_request_resume(&self, step: &mut RuntimeStep) {
@@ -1547,6 +1583,99 @@ impl TeamRuntime {
             )));
         }
         step.events.push(RuntimeEvent::TurnFinished { turn });
+    }
+
+    fn handle_import_session(
+        &mut self,
+        target_member: Option<MemberId>,
+        session_id: String,
+        step: &mut RuntimeStep,
+    ) {
+        let member_id = match target_member {
+            Some(m) => m,
+            None => match &self.config.default_target {
+                Some(DefaultTarget::Member(id)) => id.clone(),
+                _ => match self.config.members.first() {
+                    Some(m) => m.id.clone(),
+                    None => {
+                        step.events.push(RuntimeEvent::Notice(
+                            "team has no members to import into".to_string(),
+                        ));
+                        return;
+                    }
+                },
+            },
+        };
+        let (backend, cwd) = match self.config.member(&member_id) {
+            Some(member) => (member.backend, member.resolved_cwd(&self.config.workspace)),
+            None => {
+                step.events
+                    .push(RuntimeEvent::Notice(format!("unknown member: {member_id}")));
+                return;
+            }
+        };
+        let native = native_session_messages(backend, &session_id, &cwd);
+        if native.is_empty() {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "no messages found in {backend} session '{session_id}'"
+            )));
+            return;
+        }
+        let count = native.len();
+        let agent_session = AgentSessionId(session_id.clone());
+        self.sessions.set(member_id.clone(), agent_session.clone());
+        let _ = self
+            .store
+            .upsert_session(&member_id, backend, &agent_session);
+        let _ = self
+            .store
+            .set_native_import_cursor(&member_id, &agent_session, count);
+
+        self.handle_import_transcript(member_id.clone(), native, step);
+        step.events.push(RuntimeEvent::SessionUpdated {
+            member: member_id.clone(),
+            session: agent_session,
+        });
+        step.events.push(RuntimeEvent::Notice(format!(
+            "successfully imported {count} message(s) from {backend} session '{session_id}' into @{member_id}"
+        )));
+    }
+
+    fn handle_export_session(&mut self, _format: Option<String>, step: &mut RuntimeStep) {
+        let session_id = self
+            .config
+            .members
+            .iter()
+            .find_map(|m| self.sessions.get(&m.id).map(|s| s.0))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let chat_items = match self.store.replay_chat() {
+            Ok(items) => items,
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "failed to load conversation for export: {err}"
+                )));
+                return;
+            }
+        };
+
+        match crate::tui::claude_export::export_chat_items_to_claude_jsonl(
+            &self.config.workspace,
+            &session_id,
+            &chat_items,
+        ) {
+            Ok(path) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "successfully exported session to Claude format: {}",
+                    path.display()
+                )));
+            }
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "failed to export Claude session: {err}"
+                )));
+            }
+        }
     }
 
     fn handle_approval(
@@ -2729,12 +2858,7 @@ impl TeamRuntime {
                     turn,
                     prompt: stripped_prompt,
                 });
-                state.status = MemberStatus::Queued;
             }
-            step.events.push(RuntimeEvent::MemberStatus {
-                member: member.clone(),
-                status: MemberStatus::Queued,
-            });
             self.emit_queue_updated(member, step);
             self.note_roster_write(step);
         } else {
@@ -2761,6 +2885,10 @@ impl TeamRuntime {
             if let Some(run_id) = self.run_turns.get(&turn).copied() {
                 self.block_mode_run(run_id, &message, step);
             }
+            self.check_turn_complete(turn, step);
+            return;
+        }
+        if !self.publish_pending_user_message(turn, step) {
             self.check_turn_complete(turn, step);
             return;
         }
@@ -2797,6 +2925,30 @@ impl TeamRuntime {
             cancel,
             effort,
         });
+    }
+
+    fn publish_pending_user_message(&mut self, turn: TurnId, step: &mut RuntimeStep) -> bool {
+        let Some(pending) = self.pending_user_messages.get(&turn) else {
+            return true;
+        };
+        if !pending.persisted
+            && let Err(err) = self
+                .store
+                .record_user(turn, &pending.targets, &pending.body)
+        {
+            self.report_store_error("save the queued user message", err, step);
+            return false;
+        }
+        let pending = self
+            .pending_user_messages
+            .remove(&turn)
+            .expect("pending user message exists");
+        step.events.push(RuntimeEvent::UserMessage {
+            turn,
+            targets: pending.targets,
+            body: pending.body,
+        });
+        true
     }
 
     fn roster_snapshot(&self) -> String {
@@ -2884,6 +3036,7 @@ impl TeamRuntime {
 
     fn check_turn_complete(&mut self, turn: TurnId, step: &mut RuntimeStep) {
         if !self.turn_active(turn) {
+            self.pending_user_messages.remove(&turn);
             self.relay.reset_turn(turn);
             let run_id = self.run_turns.get(&turn).copied();
             let completion_saved = match run_id {

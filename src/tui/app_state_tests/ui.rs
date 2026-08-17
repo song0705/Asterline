@@ -924,7 +924,7 @@ fn paste_image_path_attaches_instead_of_inserting_text() {
 
     let mut state = AppState::new(Vec::new());
     state.paste_text_or_image(path.to_str().unwrap());
-    assert!(state.composer().is_empty());
+    assert_eq!(state.composer().text(), "[Image #1]");
     assert_eq!(state.pending_images().len(), 1);
     assert!(state.has_composer_draft());
     let attached = state.pending_images()[0].path.clone();
@@ -938,6 +938,12 @@ fn paste_image_path_attaches_instead_of_inserting_text() {
         [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
     );
 
+    state.insert_text("123");
+    for _ in 0..3 {
+        state.backspace();
+    }
+    assert_eq!(state.composer().text(), "[Image #1]");
+    assert_eq!(state.pending_images().len(), 1);
     state.backspace();
     assert!(state.pending_images().is_empty());
     assert!(!state.has_composer_draft());
@@ -949,6 +955,42 @@ fn paste_image_path_attaches_instead_of_inserting_text() {
     assert!(state.pending_images().is_empty());
     assert!(sent.exists(), "sent copies stay until stale prune");
     let _ = std::fs::remove_file(&sent);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deleting_an_image_placeholder_removes_and_renumbers_attachments() {
+    let dir = std::env::temp_dir().join(format!("asterline-ui-images-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let first = dir.join("first.png");
+    let second = dir.join("second.png");
+    let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    std::fs::write(&first, png).unwrap();
+    std::fs::write(&second, png).unwrap();
+
+    let mut state = AppState::new(Vec::new());
+    state
+        .attach_pending_image(
+            crate::adapter::prompt_images::PromptImage::from_path(&first).unwrap(),
+        )
+        .unwrap();
+    state
+        .attach_pending_image(
+            crate::adapter::prompt_images::PromptImage::from_path(&second).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(state.composer().text(), "[Image #1][Image #2]");
+
+    state.begin_composer_selection(0);
+    state.update_composer_selection("[Image #1]".chars().count());
+    state.backspace();
+
+    assert_eq!(state.composer().text(), "[Image #1]");
+    assert_eq!(state.pending_images().len(), 1);
+    assert_eq!(
+        state.pending_images()[0].path,
+        std::fs::canonicalize(&second).unwrap()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

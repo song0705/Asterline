@@ -74,6 +74,14 @@ impl Composer {
         let Some((start, end)) = self.selection_range() else {
             return false;
         };
+        self.delete_range(start, end);
+        true
+    }
+
+    /// Delete a character range and leave the cursor at its start.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        let start = start.min(self.chars.len());
+        let end = end.min(self.chars.len()).max(start);
         self.bytes -= self.chars[start..end]
             .iter()
             .map(|ch| ch.len_utf8())
@@ -81,7 +89,68 @@ impl Composer {
         self.chars.drain(start..end);
         self.cursor = start;
         self.selection_anchor = None;
+    }
+
+    /// Replace an exact character range without truncating the replacement.
+    pub fn replace_range(&mut self, start: usize, end: usize, text: &str) -> bool {
+        let start = start.min(self.chars.len());
+        let end = end.min(self.chars.len()).max(start);
+        let old_cursor = self.cursor;
+        let removed_bytes = self.chars[start..end]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum::<usize>();
+        if self
+            .bytes
+            .saturating_sub(removed_bytes)
+            .saturating_add(text.len())
+            > MAX_COMPOSER_BYTES
+        {
+            return false;
+        }
+        let inserted = text.chars().collect::<Vec<_>>();
+        let inserted_chars = inserted.len();
+        self.chars.splice(start..end, inserted);
+        self.bytes = self.bytes - removed_bytes + text.len();
+        self.cursor = if old_cursor <= start {
+            old_cursor
+        } else if old_cursor < end {
+            start + inserted_chars
+        } else {
+            old_cursor - (end - start) + inserted_chars
+        };
+        self.selection_anchor = None;
         true
+    }
+
+    /// Insert all of `text` or leave the composer untouched.
+    pub fn insert_text_exact(&mut self, text: &str) -> bool {
+        if !self.can_insert_text_exact(text) {
+            return false;
+        }
+        self.delete_selection();
+        let inserted = text.chars().collect::<Vec<_>>();
+        let count = inserted.len();
+        self.chars.splice(self.cursor..self.cursor, inserted);
+        self.bytes += text.len();
+        self.cursor += count;
+        true
+    }
+
+    pub fn can_insert_text_exact(&self, text: &str) -> bool {
+        let selected_bytes = self
+            .selection_range()
+            .map(|(start, end)| {
+                self.chars[start..end]
+                    .iter()
+                    .map(|ch| ch.len_utf8())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        self.bytes
+            .saturating_sub(selected_bytes)
+            .saturating_add(text.len())
+            <= MAX_COMPOSER_BYTES
     }
 
     /// Insert one scalar, returning whether it fit within the hard input cap.

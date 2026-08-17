@@ -448,6 +448,49 @@ fn queued_waiting_and_approval_are_active_in_header_and_footer() {
     assert!(!view.contains("○ Reviewer"));
     assert!(!view.contains("@member first"));
 }
+
+#[test]
+fn queued_follow_up_is_previewed_above_the_composer() {
+    let mut state = AppState::new(vec![ChatItem::Notice {
+        text: "existing chat".to_string(),
+    }]);
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: String::new(),
+        default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+        runs: Vec::new(),
+        members: vec![member_summary(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "impl",
+            MemberStatus::Running,
+        )],
+    });
+    state.apply(RuntimeEvent::QueueUpdated {
+        member: MemberId::new("builder"),
+        prompts: vec!["fix the queued follow-up".to_string()],
+    });
+
+    let chat_len = state.chat().len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+    let view = format!("{}", terminal.backend());
+
+    assert_eq!(state.chat().len(), chat_len);
+    assert_eq!(state.members()[0].status, MemberStatus::Running);
+    assert!(view.contains("Queued follow-up inputs"));
+    assert!(view.contains("@Builder fix the queued follow-up"));
+    assert!(view.contains("Shift+← edit last queued message"));
+    assert!(view.contains("Working"));
+}
 #[test]
 fn renders_markdown_agent_message() {
     let chat = vec![ChatItem::Agent {
@@ -1167,6 +1210,32 @@ fn renders_multiline_composer() {
     // Both composer lines are visible (first with the prompt gutter).
     assert!(view.contains("> line one"));
     assert!(view.contains("line two"));
+}
+
+#[test]
+fn renders_attached_image_inside_the_composer() {
+    let dir = std::env::temp_dir().join(format!("asterline-composer-image-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("shot.png");
+    std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+    let mut state = AppState::new(Vec::new());
+    state
+        .attach_pending_image(crate::adapter::prompt_images::PromptImage::from_path(&path).unwrap())
+        .unwrap();
+    state.insert_text("123");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+    let view = format!("{}", terminal.backend());
+
+    assert!(view.contains("> [Image #1]123"), "{view}");
+    assert!(!view.contains("📎"), "{view}");
+    assert!(!view.contains("shot.png"), "{view}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

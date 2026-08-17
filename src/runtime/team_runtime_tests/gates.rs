@@ -85,6 +85,8 @@ fn approved_relay_dispatches_wrapped_prompt() {
         "ordinary relays must require a reply to their sender: {}",
         action.prompt
     );
+    assert!(action.prompt.contains("Asterline team skill"));
+    assert!(!action.prompt.contains("$asterline-team"));
 }
 
 #[test]

@@ -44,9 +44,11 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("continue", "resume latest or selected run", true),
     ("diff", "show working-tree git diff", false),
     ("exit", "exit Asterline", false),
+    ("export", "export session to Claude Code format", true),
     ("find", "search the transcript", true),
     ("focus", "view a member's logs", true),
     ("help", "show commands", false),
+    ("import", "import native session transcript into chat", true),
     ("logs", "raw logs · stderr · warnings", false),
     ("mode", "open mode panel or switch dispatch mode", true),
     (

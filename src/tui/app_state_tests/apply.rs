@@ -165,6 +165,47 @@ fn new_chat_clears_conversation_scoped_controls() {
 }
 
 #[test]
+fn new_chat_resets_member_sessions_to_fresh() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: ModesConfig::default(),
+        mode_overrides: ModesConfig::default(),
+        suggested_verify: None,
+        team: "Test Team".to_string(),
+        workspace: "/tmp".to_string(),
+        default_target: None,
+        members: vec![MemberSummary {
+            id: MemberId::new("builder"),
+            display_name: "Builder".to_string(),
+            backend: BackendKind::Codex,
+            role: "builder".to_string(),
+            status: MemberStatus::Running,
+            session: Some("old-session-123".to_string()),
+            cwd: "/tmp".to_string(),
+            model: None,
+            effort: None,
+            sandbox: SandboxPolicy::WorkspaceWrite,
+            permission_mode: None,
+            session_policy: SessionPolicy::Resume,
+        }],
+        runs: Vec::new(),
+    });
+
+    assert_eq!(
+        state.members()[0].session.as_deref(),
+        Some("old-session-123")
+    );
+    assert_eq!(state.members()[0].session_policy, SessionPolicy::Resume);
+    assert_eq!(state.members()[0].status, MemberStatus::Running);
+
+    state.apply(RuntimeEvent::SessionReset);
+
+    assert_eq!(state.members()[0].session, None);
+    assert_eq!(state.members()[0].session_policy, SessionPolicy::Fresh);
+    assert_eq!(state.members()[0].status, MemberStatus::Idle);
+}
+
+#[test]
 fn queued_prompt_can_be_returned_to_the_composer() {
     let mut state = AppState::new(Vec::new());
     let builder = MemberId::new("builder");

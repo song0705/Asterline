@@ -12,10 +12,22 @@ pub(crate) fn tool_kind(name: &str) -> String {
     if raw.is_empty() {
         return "tool".to_string();
     }
+    let lower_raw = raw.to_ascii_lowercase();
+    if lower_raw == "skill"
+        || lower_raw.starts_with("skill:")
+        || lower_raw.starts_with("skill ")
+        || lower_raw.starts_with("skill_")
+        || lower_raw.starts_with("skill-")
+    {
+        return "Skill".to_string();
+    }
     let tail = raw.rsplit([':', '/', '.']).next().unwrap_or(raw).trim();
     let key = tail.to_ascii_lowercase().replace('-', "_");
     let key = key.strip_prefix("mcp_").unwrap_or(&key);
     let kind = match key {
+        "skill" | "use_skill" | "read_skill" | "load_skill" | "run_skill" | "execute_skill" => {
+            "skill"
+        }
         "read" | "read_file" | "readfile" | "view" | "view_file" | "cat" | "open" => "read",
         "write" | "write_file" | "writefile" | "create" | "create_file" => "write",
         "edit" | "edit_file" | "str_replace" | "search_replace" | "replace" | "apply_patch"
@@ -64,11 +76,123 @@ fn title_case_words(text: &str) -> String {
 
 /// Path / command / query after the kind has been split off the title.
 pub(crate) fn tool_target(name: &str, summary: &str, detail: &str) -> String {
-    let headline = tool_headline(name, summary, detail);
     let kind = tool_kind(name);
+    if kind == "Skill"
+        && let Some(target) = skill_tool_target(name, summary, detail)
+    {
+        return target;
+    }
+    let headline = tool_headline(name, summary, detail);
     strip_leading_label(&headline, name)
         .or_else(|| strip_leading_label(&headline, &kind))
         .unwrap_or(headline)
+}
+
+fn skill_tool_target(name: &str, summary: &str, detail: &str) -> Option<String> {
+    let name_trimmed = name.trim();
+    // 1. Try to extract skill payload from JSON in detail or summary
+    let json_val = split_json_payload(detail)
+        .or_else(|| split_json_payload(summary))
+        .map(|(_, val, _)| val);
+    if let Some(Value::Object(map)) = json_val {
+        let skill_name = map
+            .get("skill")
+            .or_else(|| map.get("skill_name"))
+            .or_else(|| map.get("name"))
+            .or_else(|| map.get("command"))
+            .or_else(|| map.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let action = map
+            .get("args")
+            .or_else(|| map.get("arguments"))
+            .or_else(|| map.get("input"))
+            .or_else(|| map.get("query"))
+            .or_else(|| map.get("prompt"))
+            .or_else(|| map.get("action"))
+            .or_else(|| map.get("description"))
+            .or_else(|| map.get("instruction"))
+            .or_else(|| map.get("params"))
+            .or_else(|| map.get("message"))
+            .or_else(|| map.get("body"))
+            .and_then(json_stringish)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(skill) = skill_name {
+            if let Some(act) = action {
+                return Some(format!("{skill}  {act}"));
+            }
+            let mut other_parts = Vec::new();
+            for (k, v) in &map {
+                if matches!(
+                    k.as_str(),
+                    "skill" | "skill_name" | "name" | "command" | "id" | "type"
+                ) {
+                    continue;
+                }
+                if let Some(s) = json_stringish(v)
+                    && !s.trim().is_empty()
+                {
+                    other_parts.push(s.trim().to_string());
+                }
+            }
+            if !other_parts.is_empty() {
+                return Some(format!("{skill}  {}", other_parts.join(" ")));
+            }
+            return Some(skill.to_string());
+        }
+    }
+
+    // 2. Check if name itself specifies the skill (e.g. `Skill: frontend-design` or `skill_review`)
+    let cleaned_name = name_trimmed
+        .strip_prefix("mcp_")
+        .unwrap_or(name_trimmed)
+        .trim();
+    for prefix in ["skill:", "skill-", "skill_", "skill "] {
+        if cleaned_name.len() > prefix.len()
+            && cleaned_name[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            let skill_name = cleaned_name[prefix.len()..].trim();
+            if !skill_name.is_empty() {
+                let action = friendly_tool_text(summary);
+                let action = if action.is_empty() {
+                    friendly_tool_text(detail)
+                } else {
+                    action
+                };
+                let action = strip_leading_label(&action, skill_name).unwrap_or(action);
+                if !action.is_empty() {
+                    return Some(format!("{skill_name}  {action}"));
+                }
+                return Some(skill_name.to_string());
+            }
+        }
+    }
+
+    // 3. Check if summary or detail is a text string like "Skill: <name> - <action>" or "<name>: <action>"
+    let summary_clean = friendly_tool_text(summary);
+    let text = if summary_clean.is_empty() {
+        friendly_tool_text(detail)
+    } else {
+        summary_clean
+    };
+    let text = strip_leading_label(&text, "skill")
+        .or_else(|| strip_leading_label(&text, "Skill"))
+        .unwrap_or(text);
+    let text = text.trim_start_matches([':', '-', '·']).trim();
+    if let Some((skill_name, rest)) = text.split_once([':', '—', '-', '·']) {
+        let skill_name = skill_name.trim();
+        let rest = rest.trim();
+        if !skill_name.is_empty() && !rest.is_empty() {
+            return Some(format!("{skill_name}  {rest}"));
+        }
+    }
+    if !text.is_empty() {
+        return Some(text.to_string());
+    }
+
+    None
 }
 
 /// Claude-style edit tools do not emit a separate file-change event. Recover
@@ -687,6 +811,9 @@ mod tests {
         assert_eq!(tool_kind("functions.Grep"), "Search");
         assert_eq!(tool_kind("mcp_web_fetch"), "Fetch");
         assert_eq!(tool_kind("edit_file"), "Edit");
+        assert_eq!(tool_kind("Skill"), "Skill");
+        assert_eq!(tool_kind("use_skill"), "Skill");
+        assert_eq!(tool_kind("Skill: frontend-design"), "Skill");
     }
 
     #[test]
@@ -706,6 +833,26 @@ mod tests {
                 "input:\n{\"command\":\"cargo test\",\"timeout\":120}\n"
             ),
             "cargo test"
+        );
+        assert_eq!(
+            tool_target(
+                "Skill",
+                r#"{"skill":"frontend-design","args":"create a button"}"#,
+                ""
+            ),
+            "frontend-design  create a button"
+        );
+        assert_eq!(
+            tool_target(
+                "use_skill",
+                r#"{"name":"review","query":"check src/lib.rs"}"#,
+                ""
+            ),
+            "review  check src/lib.rs"
+        );
+        assert_eq!(
+            tool_target("Skill: asterline-team", "add member", ""),
+            "asterline-team  add member"
         );
     }
 

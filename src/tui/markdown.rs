@@ -114,6 +114,9 @@ struct Renderer {
     quote_depth: usize,
     /// First-line prefix for the current list item (consumed on first flush).
     pending_prefix: Option<String>,
+    /// Pulldown may split malformed emphasis markers into one-character text
+    /// events; coalesce adjacent equal-style text before tolerant recovery.
+    normal_text: Option<(String, Style)>,
 }
 
 impl Renderer {
@@ -131,6 +134,7 @@ impl Renderer {
             lists: Vec::new(),
             quote_depth: 0,
             pending_prefix: None,
+            normal_text: None,
         }
     }
 
@@ -142,6 +146,9 @@ impl Renderer {
     }
 
     fn handle(&mut self, event: Event<'_>) {
+        if !matches!(&event, Event::Text(_) | Event::SoftBreak) {
+            self.flush_normal_text();
+        }
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
@@ -154,12 +161,12 @@ impl Renderer {
                     self.push_units(&code, style);
                 }
             }
-            Event::SoftBreak => self.push_units(" ", self.inline_style()),
+            Event::SoftBreak => self.text(" "),
             Event::HardBreak => self.flush_block(),
             Event::Rule => {
                 self.block_separator();
                 self.out.push(Line::from(Span::styled(
-                    "─".repeat(self.width.min(40)),
+                    "---",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -181,6 +188,7 @@ impl Renderer {
     }
 
     fn start(&mut self, tag: Tag<'_>) {
+        self.flush_normal_text();
         match tag {
             Tag::Heading { level, .. } => {
                 self.block_separator();
@@ -259,6 +267,7 @@ impl Renderer {
     }
 
     fn end(&mut self, tag: TagEnd) {
+        self.flush_normal_text();
         match tag {
             TagEnd::Paragraph => self.flush_block(),
             TagEnd::Heading(_) => {
@@ -310,9 +319,56 @@ impl Renderer {
             Mode::Table(t) => t.cell.push_str(text),
             Mode::Normal => {
                 let style = self.inline_style();
-                self.push_units(text, style);
+                let same_style = self
+                    .normal_text
+                    .as_ref()
+                    .is_some_and(|(_, current)| *current == style);
+                if !same_style {
+                    self.flush_normal_text();
+                    self.normal_text = Some((String::new(), style));
+                }
+                if let Some((buffer, _)) = self.normal_text.as_mut() {
+                    buffer.push_str(text);
+                }
             }
         }
+    }
+
+    fn flush_normal_text(&mut self) {
+        if let Some((text, style)) = self.normal_text.take() {
+            self.push_loose_strong(&text, style);
+        }
+    }
+
+    /// Some model output puts whitespace inside the closing strong delimiter
+    /// (`**macOS: **`). CommonMark leaves that text literal; accept this one
+    /// unambiguous near-miss without changing code blocks or valid Markdown.
+    fn push_loose_strong(&mut self, text: &str, style: Style) {
+        let mut rest = text;
+        while let Some(open) = rest.find("**") {
+            self.push_units(&rest[..open], style);
+            let after_open = &rest[open + 2..];
+            let Some(close) = after_open.find("**") else {
+                self.push_units(&rest[open..], style);
+                return;
+            };
+            let inner = &after_open[..close];
+            self.emit_loose_strong(inner, style);
+            rest = &after_open[close + 2..];
+        }
+        self.push_units(rest, style);
+    }
+
+    fn emit_loose_strong(&mut self, inner: &str, style: Style) {
+        let content = inner.trim_end();
+        if content.is_empty() || content.len() == inner.len() {
+            self.push_units("**", style);
+            self.push_units(inner, style);
+            self.push_units("**", style);
+            return;
+        }
+        self.push_units(content, style.add_modifier(Modifier::BOLD));
+        self.push_units(&inner[content.len()..], style);
     }
 
     fn push_units(&mut self, text: &str, style: Style) {
@@ -359,6 +415,7 @@ impl Renderer {
     /// Wrap and emit the accumulated inline content as one block, applying the
     /// current list-item / blockquote prefix.
     fn flush_block(&mut self) {
+        self.flush_normal_text();
         let (first, cont) = self.prefixes();
         let prefix_style = if self.quote_depth > 0 {
             Style::default().fg(Color::DarkGray)
@@ -807,6 +864,16 @@ mod tests {
     }
 
     #[test]
+    fn loose_strong_with_trailing_space_is_rendered_without_markers() {
+        let lines = render("- **macOS: **Download the installer", 80);
+        let spans = &lines[0].spans;
+        assert!(spans.iter().any(|span| span.content.as_ref() == "macOS:"
+            && span.style.add_modifier.contains(Modifier::BOLD)));
+        let joined: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(joined, "• macOS: Download the installer");
+    }
+
+    #[test]
     fn plain_paragraph_wraps() {
         let lines = render("one two three four", 8);
         assert!(lines.len() >= 2);
@@ -856,5 +923,20 @@ mod tests {
                 .iter()
                 .all(|span| span.style.fg != Some(Color::Yellow))
         }));
+    }
+
+    #[test]
+    fn horizontal_rule_emits_literal_dashes() {
+        let lines = render("before\n\n---\n\nafter", 80);
+        let t = texts(&lines);
+        assert_eq!(
+            t,
+            vec![
+                "before".to_string(),
+                "".to_string(),
+                "---".to_string(),
+                "after".to_string()
+            ]
+        );
     }
 }

@@ -566,6 +566,25 @@ mod tests {
     }
 
     #[test]
+    fn discovers_claude_sdk_sessions_hidden_by_the_native_picker() {
+        let root = fixture_root("claude-sdk");
+        let project = root.join("-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("sdk-session.jsonl"),
+            r#"{"type":"user","sessionId":"sdk-session","cwd":"/tmp/project","entrypoint":"sdk-cli","message":{"role":"user","content":"Continue the Asterline run"}}"#,
+        )
+        .unwrap();
+
+        let entries = discover_in(BackendKind::Claude, &root);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "sdk-session");
+        assert_eq!(entries[0].title, "Continue the Asterline run");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn picker_navigation_is_bounded() {
         let entries = (0..10)
             .map(|index| SessionEntry {

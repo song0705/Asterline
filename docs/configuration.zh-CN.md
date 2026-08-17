@@ -216,9 +216,11 @@ Server 的 `thread.id`，通过 `thread/resume` 恢复；Claude、Grok、Agy 分
 Asterline 会把自己的 Codex thread 和 Claude session 命名为 `Asterline · <成员名>`，以便在
 会显示标题的原生历史中辨认。`<workspace>/.asterline/team.json` 保存的 roster 也绑定到其
 所在 workspace：项目移动后，Asterline 会在启动成员前修正过期的已序列化 workspace，使新的
-原生 transcript 仍归属你实际打开的项目。原生 session picker 会按工作目录过滤。Claude 的
-print-mode session 可通过 `claude --resume <id>` 恢复，但部分 Claude Code 版本会有意不在
-交互式 picker 中列出 print-mode session。
+原生 transcript 仍归属你实际打开的项目。原生 session picker 会按工作目录过滤。Claude
+Code 会有意不在交互式 picker 中列出由 `claude -p` 或 Agent SDK 创建的 session。
+Asterline 的 Team editor 不做这项过滤：选中该成员的 **session id** 字段并按 `Enter`
+即可选择这些 transcript，再按 `s` 绑定。Asterline 会直接执行
+`claude --resume <id>` 恢复所选会话；`/attach <member>` 也使用同一条指定 ID 的路径。
 
 权限模式、sandbox 映射和 allowed-tool 行为取决于后端。不要假定同一个字段在四个 CLI 上
 有相同效果。
@@ -378,11 +380,11 @@ Asterline 本地启动后端 CLI，并继承其凭据、环境变量、文件系
 
 ## Agent 间协作
 
-Asterline 缺失时会创建 `.agents/skills/asterline-team/SKILL.md`，并将紧凑 skill hint 注入每位
-成员的 system instructions。完整协议留在 workspace，普通聊天不再每轮重复。Codex 只在 team
-run 和队友 relay 时再次带上 `$asterline-team`，需要完整 skill 时才加载。自身和队员的
-实时身份与状态写在 `.asterline/roster.md`，团队或成员状态变化时更新。去哪读由
-`$asterline-team` skill 标明，不会再写进每一轮 prompt。
+Asterline 缺失时会创建 `.agents/skills/asterline-team/SKILL.md`，并告诉每位成员这个 team
+skill 位于该路径。完整协议留在 workspace，普通聊天不再每轮重复；该提示刻意不调用
+`$asterline-team`，因此不会强制 Codex 展开整份 skill。自身和队员的实时身份与状态写在
+`.asterline/roster.md`，团队或成员状态变化时更新。team skill 会说明该文件的用途，不会再写进
+每一轮 prompt。
 
 它也会在缺失时创建 `.agents/skills/asterline-brainstorm/SKILL.md`。Brainstorm mode 会为每次
 生成、投票和综合派发加载该文件。已有副本永不升级或覆盖，因此部署可以自定义方法，同时

@@ -110,7 +110,7 @@ fn is_managed_skill(text: &str) -> bool {
 
 pub fn team_skill_hint() -> String {
     format!(
-        "${ASTERLINE_TEAM_SKILL_NAME} documents optional Asterline team controls. If skills are unavailable, read {ASTERLINE_TEAM_SKILL_PATH}."
+        "The Asterline team skill is available at {ASTERLINE_TEAM_SKILL_PATH}. Read this skill when you need its team controls."
     )
 }
 
@@ -870,8 +870,9 @@ mod tests {
 
         inject_team_protocol(&mut config);
         let prompt = config.members[0].system_prompt.as_ref().unwrap();
-        assert!(prompt.contains("$asterline-team"));
+        assert!(prompt.contains("Asterline team skill"));
         assert!(prompt.contains(ASTERLINE_TEAM_SKILL_PATH));
+        assert!(!prompt.contains("$asterline-team"));
         assert!(!prompt.contains(ASTERLINE_ROSTER_PATH));
         assert!(!prompt.contains("@@team_message"));
         assert!(!prompt.contains("@@team_member"));

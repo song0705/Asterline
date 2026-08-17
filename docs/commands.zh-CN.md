@@ -256,6 +256,30 @@ Codex Skill 的 `@<Codex 成员> /skill` 才会转换。`@member /` 会列出真
 唯一证明谱系时才会导入。存在歧义的原生会话绝不靠猜测导入。Grok 和 Agy 可以恢复会话，
 但目前尚不会导入接入期间的消息。
 
+Claude 自带的交互式 resume picker 会有意隐藏由 `claude -p` 或 Agent SDK 创建的
+session。要接入这类 Asterline 会话，打开 `/team`，选中成员的 **session id** 字段并按
+`Enter`，选择会话后按 `s` 保存，再执行 `/attach <member>`。Asterline 会自行发现
+transcript，并直接用 UUID 恢复。
+
+### `/import`
+
+```text
+/import <session_id>
+/import <member> <session_id>
+@member /import <session_id>
+```
+
+从 Claude Code、Codex 或 Grok 的原生会话记录（JSONL）中导入历史消息到 Asterline 聊天流中，并将该会话绑定到对应成员。
+
+### `/export`
+
+```text
+/export
+/export claude
+```
+
+将 Asterline 当前会话记录导出为 Claude Code 原生 JSONL 格式（存储于 `~/.claude/projects/.../<session_id>.jsonl`），以便在项目目录下直接通过 `claude --resume`（`claude -r`）查看与继续对话。
+
 ### `/exit`
 
 ```text
