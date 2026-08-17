@@ -7,7 +7,8 @@ pub(super) use crate::domain::mode::{
     resolve_mode_roles,
 };
 pub(super) use crate::domain::team::{
-    ApprovalSurface, BackendKind, DefaultTarget, Effort, SessionPolicy, TeamMember,
+    ApprovalSurface, BackendKind, DefaultTarget, Effort, PermissionMode, SandboxPolicy,
+    SessionPolicy, TeamMember,
 };
 pub(super) use crate::runtime::mode_prompts::{
     BRAINSTORM_BUILD_HINT, BRAINSTORM_PROPOSE_HINT, BRAINSTORM_STRETCH_HINT,

@@ -21,6 +21,9 @@ pub(crate) fn tool_kind(name: &str) -> String {
     {
         return "Skill".to_string();
     }
+    if let Some(kind) = crate::adapter::parser::file_change_tool_class(raw) {
+        return title_case_kind(kind);
+    }
     let tail = raw.rsplit([':', '/', '.']).next().unwrap_or(raw).trim();
     let key = tail.to_ascii_lowercase().replace('-', "_");
     let key = key.strip_prefix("mcp_").unwrap_or(&key);
@@ -29,10 +32,6 @@ pub(crate) fn tool_kind(name: &str) -> String {
             "skill"
         }
         "read" | "read_file" | "readfile" | "view" | "view_file" | "cat" | "open" => "read",
-        "write" | "write_file" | "writefile" | "create" | "create_file" => "write",
-        "edit" | "edit_file" | "str_replace" | "search_replace" | "replace" | "apply_patch"
-        | "applypatch" => "edit",
-        "delete" | "delete_file" | "remove" | "rm" => "delete",
         "bash"
         | "shell"
         | "run_terminal_command"
@@ -216,10 +215,24 @@ pub(crate) fn file_change_from_edit_tool(
         return Some(file);
     }
     let old_text = input.as_ref().and_then(|value| {
-        crate::adapter::parser::json_string_field(value, &["old_string", "oldText", "before"])
+        crate::adapter::parser::json_string_field(
+            value,
+            &["old_string", "oldText", "before", "target_content"],
+        )
     });
     let new_text = input.as_ref().and_then(|value| {
-        crate::adapter::parser::json_string_field(value, &["new_string", "newText", "after"])
+        crate::adapter::parser::json_string_field(
+            value,
+            &[
+                "code_content",
+                "replacement_content",
+                "replacement",
+                "new_string",
+                "newText",
+                "after",
+                "contents",
+            ],
+        )
     });
     let path = input
         .as_ref()
@@ -846,6 +859,8 @@ mod tests {
         assert_eq!(tool_kind("functions.Grep"), "Search");
         assert_eq!(tool_kind("mcp_web_fetch"), "Fetch");
         assert_eq!(tool_kind("edit_file"), "Edit");
+        assert_eq!(tool_kind("write_to_file"), "Write");
+        assert_eq!(tool_kind("replace_file_content"), "Edit");
         assert_eq!(tool_kind("Skill"), "Skill");
         assert_eq!(tool_kind("use_skill"), "Skill");
         assert_eq!(tool_kind("Skill: frontend-design"), "Skill");

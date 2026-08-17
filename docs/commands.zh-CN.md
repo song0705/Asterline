@@ -1,7 +1,7 @@
 # Asterline 命令与键盘完整参考
 
 本文档完整说明 Asterline 的启动参数、输入语法、斜杠命令、抽屉界面和键盘操作。
-安装与产品概览请返回[中文 README](../README.zh-CN.md)。也可查看
+安装与产品概览请返回[中文 README](../README.md)。也可查看
 [英文版](commands.md)。
 
 ## 快速上手

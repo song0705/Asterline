@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::domain::config::default_member;
 use crate::domain::event::{RouteTo, RunStepRequest, RunStepStatus, TeamMessage};
 use crate::domain::mode::{BrainstormCard, BrainstormVote, ReviewVerdict, ReviewVerdictKind};
 use crate::domain::team::{
@@ -86,7 +87,7 @@ struct TeamMemberRaw {
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default)]
-    sandbox: SandboxPolicy,
+    sandbox: Option<SandboxPolicy>,
     #[serde(default)]
     permission_mode: Option<PermissionMode>,
     #[serde(default)]
@@ -374,6 +375,9 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
         }
     };
     let display_name = display_name.unwrap_or_else(|| id.to_string());
+    // Omitted write policy is Asterline's backend default, not serde's
+    // ReadOnly / None — that pair forces Agy into `--sandbox` + `--mode plan`.
+    let defaults = default_member(raw.backend);
 
     Ok(TeamMember {
         id,
@@ -383,9 +387,9 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
         cwd: raw.cwd,
         model: raw.model,
         system_prompt: raw.system_prompt,
-        sandbox: raw.sandbox,
-        permission_mode: raw.permission_mode,
-        approvals_reviewer: Default::default(),
+        sandbox: raw.sandbox.unwrap_or(defaults.sandbox),
+        permission_mode: raw.permission_mode.or(defaults.permission_mode),
+        approvals_reviewer: defaults.approvals_reviewer,
         allowed_tools: raw.allowed_tools,
         session_policy: raw.session_policy,
         session_id: raw
@@ -880,6 +884,24 @@ mod tests {
 
         assert_eq!(parsed.members[0].display_name, "qa");
         assert_eq!(parsed.members[0].backend, BackendKind::Agy);
+        assert_eq!(parsed.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(
+            parsed.members[0].permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
+    }
+
+    #[test]
+    fn team_member_keeps_explicit_permission_override() {
+        let parsed = parse_agent_output(
+            r#"@@team_member {"id":"qa","backend":"agy","role":"tests","permission_mode":"plan","sandbox":"read-only"}"#,
+        );
+
+        assert_eq!(parsed.members[0].sandbox, SandboxPolicy::ReadOnly);
+        assert_eq!(
+            parsed.members[0].permission_mode,
+            Some(PermissionMode::Plan)
+        );
     }
 
     #[test]

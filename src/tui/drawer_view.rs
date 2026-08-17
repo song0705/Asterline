@@ -74,6 +74,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
         })
         .sum();
     let max_scroll = visual_count.saturating_sub(content.height as usize);
+    state.note_drawer_viewport(content.height as usize);
     let offset = state.drawer_scroll().min(max_scroll) as u16;
     frame.render_widget(
         Paragraph::new(lines)

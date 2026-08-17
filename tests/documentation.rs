@@ -51,10 +51,16 @@ const COMMAND_DOCS: &[(&str, &str)] = &[
 ];
 const BILINGUAL_DOCUMENTS: &[(&str, &str, &str, &str)] = &[
     (
+        "README.en.md",
+        include_str!("../README.en.md"),
         "README.md",
         include_str!("../README.md"),
-        "README.zh-CN.md",
-        include_str!("../README.zh-CN.md"),
+    ),
+    (
+        "docs/README.en.md",
+        include_str!("../docs/README.en.md"),
+        "docs/README.md",
+        include_str!("../docs/README.md"),
     ),
     (
         "docs/installation.md",
@@ -107,7 +113,9 @@ const BILINGUAL_DOCUMENTS: &[(&str, &str, &str, &str)] = &[
 ];
 const DOCUMENTS: &[(&str, &str)] = &[
     ("README.md", include_str!("../README.md")),
-    ("README.zh-CN.md", include_str!("../README.zh-CN.md")),
+    ("README.en.md", include_str!("../README.en.md")),
+    ("docs/README.md", include_str!("../docs/README.md")),
+    ("docs/README.en.md", include_str!("../docs/README.en.md")),
     ("docs/commands.md", include_str!("../docs/commands.md")),
     (
         "docs/commands.zh-CN.md",
@@ -257,8 +265,15 @@ fn codex_app_server_permission_mapping_is_documented() {
 fn readmes_use_real_product_images_without_a_handwritten_ui_mockup() {
     for (path, document) in &DOCUMENTS[..2] {
         for image in [
-            "docs/assets/asterline-codex-to-agy.webp",
-            "docs/assets/asterline-team.webp",
+            "docs/assets/chat.webp",
+            "docs/assets/team.webp",
+            "docs/assets/mode.webp",
+            "docs/assets/review.webp",
+            "docs/assets/plan.webp",
+            "docs/assets/brainstorm.webp",
+            "docs/assets/team-run.webp",
+            "docs/assets/team-done.webp",
+            "docs/assets/runs.webp",
         ] {
             assert!(
                 document.contains(image),

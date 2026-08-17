@@ -1685,10 +1685,14 @@ fn thinking_label(live: bool, stored: Option<u64>, live_secs: Option<u64>, lines
             None => format!("thinking · {lines}"),
         }
     } else if let Some(secs) = stored {
-        format!(
-            "thinking for {} · {lines}",
-            status_indicator::fmt_elapsed_compact(secs)
-        )
+        if secs == 0 {
+            format!("thought · {lines}")
+        } else {
+            format!(
+                "thinking for {} · {lines}",
+                status_indicator::fmt_elapsed_compact(secs)
+            )
+        }
     } else {
         format!("thought · {lines}")
     }
@@ -1917,7 +1921,8 @@ fn render_item(
             elapsed_secs,
             ..
         } => {
-            if text.is_empty() {
+            let live = elapsed_secs.is_none() && state.is_thinking_live(member);
+            if text.is_empty() && !live {
                 return;
             }
             let rail_color = member_rail_color(state, member);
@@ -1926,7 +1931,6 @@ fn render_item(
                 .filter(|line| !line.trim().is_empty())
                 .count()
                 .max(1);
-            let live = elapsed_secs.is_none() && state.is_thinking_live(member);
             let label =
                 thinking_label(live, *elapsed_secs, state.thinking_live_secs(member), lines);
             let label = if live {

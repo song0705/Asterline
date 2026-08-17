@@ -1045,6 +1045,83 @@ fn plan_resume_after_abort_redispatches_leader() {
 }
 
 #[test]
+fn plan_keeps_going_when_a_member_is_denied_a_command() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    let step = rt.on_ui_command(run_plan("permission deny must not block"));
+    let run_id = find_run_id(&step);
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Build the game\"}",
+    );
+    complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ready\"}",
+    );
+    assert_eq!(latest_run(&rt).status, RunStatus::Running);
+
+    let mut step = rt.on_agent_event(
+        &builder,
+        AgentEvent::ToolCompleted {
+            id: "agy-step-4".into(),
+            ok: false,
+            summary: "User denied permission to run command:\n  node -c snake-game/game.js".into(),
+        },
+    );
+    let fatal = rt.on_agent_event(
+        &builder,
+        AgentEvent::Fatal(
+            "User denied permission to run command: node -c snake-game/game.js".into(),
+        ),
+    );
+    let exit = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+    step.events.extend(fatal.events);
+    step.actions.extend(fatal.actions);
+    step.events.extend(exit.events);
+    step.actions.extend(exit.actions);
+    assert!(
+        !rt.failed_runs.contains(&run_id),
+        "a denied command is not a failed member run"
+    );
+    assert_eq!(
+        rt.store.run(run_id).unwrap().status,
+        RunStatus::Running,
+        "plan must stay running after a permission denial"
+    );
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RunUpdated { run }
+                if run.id == run_id && run.status == RunStatus::Blocked
+        )),
+        "plan must not block: {:?}",
+        step.events
+    );
+    assert!(
+        step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(text)
+                if text.contains("denied permission to run")
+                    && text.contains("node -c snake-game/game.js")
+                    && text.contains("the run continues")
+        )),
+        "expected a notice that names the denied command: {:?}",
+        step.events
+    );
+}
+
+#[test]
 fn continue_refuses_when_mode_member_left_roster() {
     let mut rt = runtime();
     let step = rt.on_ui_command(run_mode("review this"));

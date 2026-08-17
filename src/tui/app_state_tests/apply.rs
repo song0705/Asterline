@@ -366,6 +366,11 @@ fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
         state.selected_resume_command(),
         Some(UiCommand::ResumeConversation { conversation: 3 })
     );
+    assert_eq!(
+        state.drawer_scroll(),
+        0,
+        "two short chats still fit; do not scroll just because we can"
+    );
 
     state.apply(RuntimeEvent::ConversationResumed {
         conversation: 3,
@@ -383,6 +388,46 @@ fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
             targets: Vec::new(),
             interrupted: Vec::new(),
         }]
+    );
+}
+
+#[test]
+fn resume_scrolls_only_after_the_selection_hits_the_bottom() {
+    let conversations = (1..=12)
+        .map(|id| ConversationSummary {
+            id,
+            created_at: "2026-08-18 12:00:00".to_string(),
+            preview: format!("chat {id}"),
+            message_count: 1,
+            member_count: 1,
+        })
+        .collect();
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::ResumeChoices { conversations });
+    state.note_drawer_viewport(10);
+
+    assert_eq!(state.drawer_scroll(), 0);
+    state.select_next_resume();
+    assert_eq!(state.selected_resume(), 1);
+    assert_eq!(
+        state.drawer_scroll(),
+        0,
+        "the second card still fits; stay put"
+    );
+
+    state.select_next_resume();
+    assert_eq!(state.selected_resume(), 2);
+    assert_eq!(
+        state.drawer_scroll(),
+        1,
+        "the selected card crossed the bottom, so scroll just enough"
+    );
+
+    state.select_previous_resume();
+    assert_eq!(
+        state.drawer_scroll(),
+        1,
+        "moving up while still visible must not jump the list"
     );
 }
 

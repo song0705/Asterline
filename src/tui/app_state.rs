@@ -2,6 +2,7 @@
 //! [`AppState::apply`]; the renderer reads it and the key handler mutates the
 //! composer / drawer / scroll. No state is inferred from matching strings.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -28,6 +29,13 @@ use crate::domain::team::{
 
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, AgentSkill, Completion};
+
+const RESUME_LIST_HEADER_LINES: usize = 2;
+const RESUME_CHOICE_LINES: usize = 3;
+
+fn resume_choice_line(index: usize) -> usize {
+    RESUME_LIST_HEADER_LINES + index.saturating_mul(RESUME_CHOICE_LINES)
+}
 use crate::tui::composer::{Composer, MAX_COMPOSER_BYTES};
 use crate::tui::drawers::Drawer;
 use crate::tui::mode_editor::{ModeEditor, ModeEditorOutcome};
@@ -252,6 +260,9 @@ pub struct AppState {
     find: Option<FindState>,
     /// Vertical scroll offset for the open drawer (logs / team / diff).
     drawer_scroll: usize,
+    /// Last painted drawer body height. Resume selection uses it so we only
+    /// scroll when the highlighted chat would leave the viewport.
+    drawer_viewport: Cell<usize>,
     /// Captured working-tree diff text for the diff drawer (`/diff`).
     diff_text: Option<String>,
     /// Editable draft shown by the `/team` drawer.
@@ -349,6 +360,7 @@ impl AppState {
             history_search: None,
             find: None,
             drawer_scroll: 0,
+            drawer_viewport: Cell::new(0),
             diff_text: None,
             team_editor: None,
             mode_editor: None,
@@ -1172,14 +1184,11 @@ impl AppState {
 
     fn update_reasoning_status(&mut self, member: MemberId, delta: &str) {
         let delta = bounded_text(delta, MAX_CHAT_ITEM_BYTES);
-        if delta.is_empty() {
-            return;
-        }
         self.thinking_started
             .entry(member.clone())
             .or_insert_with(Instant::now);
-        let current_text = {
-            let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
+        let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
+        if !delta.is_empty() {
             if delta.starts_with(buffer.as_str()) {
                 *buffer = delta;
             } else if !buffer.ends_with(&delta) {
@@ -1188,12 +1197,14 @@ impl AppState {
             if let Some(header) = reasoning_status_header(buffer) {
                 self.active_reasoning.insert(member.clone(), header);
             }
-            buffer.clone()
-        };
+        }
+        let current_text = buffer.clone();
         let (display_name, backend) = self.member_meta(&member);
         if backend != BackendKind::Codex {
             if let Some(&idx) = self.open_thinking.get(&member) {
-                if let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx) {
+                if !current_text.is_empty()
+                    && let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx)
+                {
                     *text = current_text;
                     self.touch_chat();
                 }
@@ -2521,13 +2532,34 @@ impl AppState {
 
     pub fn select_previous_resume(&mut self) {
         self.selected_resume = self.selected_resume.saturating_sub(1);
-        self.drawer_scroll = self.selected_resume.saturating_mul(3);
+        self.reveal_selected_resume();
     }
 
     pub fn select_next_resume(&mut self) {
         if self.selected_resume + 1 < self.resume_choices.len() {
             self.selected_resume += 1;
-            self.drawer_scroll = self.selected_resume.saturating_mul(3);
+            self.reveal_selected_resume();
+        }
+    }
+
+    pub fn note_drawer_viewport(&self, height: usize) {
+        self.drawer_viewport.set(height);
+    }
+
+    /// Keep the highlighted resume chat in view. Scroll only when it would
+    /// leave the top or bottom of the drawer, not on every selection change.
+    fn reveal_selected_resume(&mut self) {
+        let viewport = self.drawer_viewport.get();
+        if viewport == 0 {
+            return;
+        }
+        let start = resume_choice_line(self.selected_resume);
+        let end = start.saturating_add(RESUME_CHOICE_LINES);
+        if end > self.drawer_scroll.saturating_add(viewport) {
+            self.drawer_scroll = end.saturating_sub(viewport);
+        }
+        if start < self.drawer_scroll {
+            self.drawer_scroll = start;
         }
     }
 

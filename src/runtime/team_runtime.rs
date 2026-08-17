@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::parser::{
     MAX_MESSAGE_TEXT_BYTES, MAX_TOOL_DETAIL_BYTES, append_bounded_text, bounded_text,
+    format_permission_denial, is_permission_denied_tool,
 };
 use crate::domain::config::{
     ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_ROSTER_PATH, brainstorm_skill_text,
@@ -119,6 +120,9 @@ struct RunningState {
     reasoning: String,
     reasoning_started: Option<Instant>,
     failed: bool,
+    permission_denied: bool,
+    denied_reason: Option<String>,
+    permission_noticed: bool,
     raw_persistence_failed: bool,
 }
 
@@ -727,12 +731,11 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) {
         self.last_user = Some((target.clone(), body.clone()));
-        // A collaboration run owns its orchestration task, but an explicit
-        // member route is still a normal, one-to-one instruction.  Do not
-        // reinterpret it as a second mode task while the run is active.
+        // Plain text starts the selected mode. An explicit @member / @all is
+        // always a direct chat, even after a team run has finished — team
+        // runs do not use ModeSession, so "run is active" is the wrong gate.
         if !matches!(self.active_mode, TerminalMode::Normal)
-            && matches!(target, MessageTarget::Member(_))
-            && !self.mode_sessions.is_empty()
+            && !matches!(target, MessageTarget::Default)
         {
             self.handle_user_message(target, body, step);
             return;
@@ -1974,6 +1977,9 @@ impl TeamRuntime {
                 {
                     self.report_store_error("save a tool result", err, &mut step);
                 }
+                if !ok && is_permission_denied_tool(&output) {
+                    self.record_permission_denial(member, &output, &mut step);
+                }
                 step.events.push(RuntimeEvent::ToolCompleted {
                     member: member.clone(),
                     tool_id: id,
@@ -2088,18 +2094,22 @@ impl TeamRuntime {
                 self.log(member, LogEntry::warn(member.as_str(), message), &mut step)
             }
             AgentEvent::Fatal(message) => {
-                let (turn, cancelled) = self
+                let permission_denied = is_permission_denied_tool(&message);
+                let (turn, cancelled, already_denied) = self
                     .members
                     .get_mut(member)
                     .and_then(|state| state.running.as_mut())
                     .map(|running| {
                         let cancelled = running.cancel.load(Ordering::Relaxed);
-                        if !cancelled {
+                        if permission_denied {
+                            running.permission_denied = true;
+                        } else if !cancelled && !running.permission_denied {
                             running.failed = true;
                         }
-                        (running.turn, cancelled)
+                        (running.turn, cancelled, running.permission_denied)
                     })
-                    .unzip();
+                    .map(|(turn, cancelled, denied)| (Some(turn), Some(cancelled), denied))
+                    .unwrap_or((None, None, permission_denied));
                 if cancelled == Some(true) {
                     self.log(
                         member,
@@ -2109,6 +2119,8 @@ impl TeamRuntime {
                         ),
                         &mut step,
                     );
+                } else if permission_denied || already_denied {
+                    self.record_permission_denial(member, &message, &mut step);
                 } else {
                     if let Some(turn) = turn
                         && let Err(err) =
@@ -2646,12 +2658,15 @@ impl TeamRuntime {
             self.complete_message(member, text, step);
         }
 
-        let (turn, cancelled, failed) =
+        let (turn, cancelled, failed, permission_denied, denied_reason, permission_noticed) =
             match self.members.get_mut(member).and_then(|s| s.running.take()) {
                 Some(running) => (
                     running.turn,
                     running.cancel.load(Ordering::Relaxed),
                     running.failed,
+                    running.permission_denied,
+                    running.denied_reason,
+                    running.permission_noticed,
                 ),
                 None => return,
             };
@@ -2667,6 +2682,16 @@ impl TeamRuntime {
             // A structured backend failure remains authoritative even when the
             // child process subsequently exits with status 0.
             self.mark_run_turn(turn, RunStatus::Failed, step)
+        } else if !ok && permission_denied {
+            // Agy/Claude print-mode auto-deny is a tool result. The member may
+            // exit non-zero; Plan must keep going instead of blocking.
+            if !permission_noticed {
+                let reason = denied_reason.unwrap_or_else(|| "a command".to_string());
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "{member} was denied permission to run {reason}; the run continues"
+                )));
+            }
+            true
         } else if !ok {
             let message = format!(
                 "{} exited without success (code {})",
@@ -2719,6 +2744,42 @@ impl TeamRuntime {
             self.emit_queue_updated(member, step);
             self.start_run(member, queued.turn, queued.prompt, step);
         }
+    }
+
+    fn record_permission_denial(
+        &mut self,
+        member: &MemberId,
+        detail: &str,
+        step: &mut RuntimeStep,
+    ) {
+        let reason = format_permission_denial(detail);
+        let already_noticed = self
+            .members
+            .get(member)
+            .and_then(|state| state.running.as_ref())
+            .is_some_and(|running| running.permission_noticed);
+        if let Some(running) = self
+            .members
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+        {
+            running.permission_denied = true;
+            if running.denied_reason.is_none() {
+                running.denied_reason = Some(reason.clone());
+            }
+            running.permission_noticed = true;
+        }
+        if already_noticed {
+            return;
+        }
+        self.log(
+            member,
+            LogEntry::warn(member.as_str(), format!("tool permission denied: {detail}")),
+            step,
+        );
+        step.events.push(RuntimeEvent::Notice(format!(
+            "{member} was denied permission to run {reason}; the run continues"
+        )));
     }
 
     fn emit_queue_updated(&self, member: &MemberId, step: &mut RuntimeStep) {
@@ -2865,6 +2926,9 @@ impl TeamRuntime {
                 reasoning: String::new(),
                 reasoning_started: None,
                 failed: false,
+                permission_denied: false,
+                denied_reason: None,
+                permission_noticed: false,
                 raw_persistence_failed: false,
             });
             state.status = MemberStatus::Running;
@@ -3058,15 +3122,15 @@ impl TeamRuntime {
 
     fn append_reasoning(&mut self, member: &MemberId, text: &str) -> Option<String> {
         let text = bounded_text(text, MAX_MESSAGE_TEXT_BYTES);
-        if text.is_empty() {
-            return None;
-        }
         self.members
             .get_mut(member)
             .and_then(|state| state.running.as_mut())
             .and_then(|running| {
                 if running.reasoning_started.is_none() {
                     running.reasoning_started = Some(Instant::now());
+                }
+                if text.is_empty() {
+                    return Some(String::new());
                 }
                 if text.starts_with(running.reasoning.as_str()) {
                     if text == running.reasoning {

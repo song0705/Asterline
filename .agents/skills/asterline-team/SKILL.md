@@ -2,7 +2,7 @@
 name: asterline-team
 description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 19
+  version: 20
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -60,6 +60,10 @@ When adding is allowed and the roster lacks a needed specialty, request a new te
 
 Required fields: `display_name`, `backend`, `role`.
 Optional fields: `id`, `model`, `effort`, `cwd`, `sandbox`, `permission_mode`, `allowed_tools`, `session_policy`, `session_id`, `system_prompt`.
+
+Omitted `sandbox` and `permission_mode` use Asterline's write defaults for
+that backend (Agy: `accept-edits` with sandbox off). Set them only to
+override. Do not send `plan` unless the user asked for a plan-first seat.
 
 Rules:
 - `backend` must be `codex`, `claude`, `grok`, or `agy`.

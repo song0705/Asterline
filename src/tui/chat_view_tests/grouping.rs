@@ -1117,6 +1117,62 @@ fn legacy_thinking_is_hidden_without_hiding_tool_output() {
 }
 
 #[test]
+fn claude_empty_reasoning_starts_a_live_thinking_clock() {
+    let planner = MemberId::new("planner");
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: String::new(),
+        default_target: Some(DefaultTarget::Member(planner.clone())),
+        runs: Vec::new(),
+        members: vec![member_summary(
+            "planner",
+            "Planner",
+            BackendKind::Claude,
+            "plan",
+            MemberStatus::Running,
+        )],
+    });
+    state.apply(RuntimeEvent::Reasoning {
+        member: planner.clone(),
+        text: String::new(),
+    });
+    assert!(state.is_thinking_live(&planner));
+    assert!(state.thinking_live_secs(&planner).is_some());
+
+    let mut lines = Vec::new();
+    render_chat_history(&state, 80, 0, &mut lines);
+    let view = plain_text(&lines).join("\n");
+    assert!(
+        view.contains("thinking"),
+        "Claude should show a live thinking clock before any text: {view}"
+    );
+    assert!(
+        !view.contains("thinking for 0s"),
+        "an open clock must not be stored as 0s: {view}"
+    );
+}
+
+#[test]
+fn stored_zero_second_thinking_does_not_claim_a_duration() {
+    let state = AppState::new(vec![ChatItem::Thinking {
+        member: MemberId::new("planner"),
+        display_name: "Planner".to_string(),
+        backend: BackendKind::Claude,
+        text: "Let me check the team skill.".to_string(),
+        elapsed_secs: Some(0),
+    }]);
+    let mut lines = Vec::new();
+    render_chat_history(&state, 80, 0, &mut lines);
+    let view = plain_text(&lines).join("\n");
+    assert!(view.contains("thought"), "{view}");
+    assert!(!view.contains("thinking for 0s"), "{view}");
+}
+
+#[test]
 fn reasoning_status_shows_a_spinner_then_disappears() {
     let builder = MemberId::new("builder");
     let mut state = AppState::new(Vec::new());
@@ -1255,7 +1311,10 @@ fn non_codex_reasoning_retains_collapsible_thinking_item() {
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
     let rendered = plain_text(&lines).join("\n");
-    assert!(rendered.contains("thinking"), "{rendered}");
+    assert!(
+        rendered.contains("thought") || rendered.contains("thinking"),
+        "{rendered}"
+    );
     assert!(rendered.contains("Ctrl+T expand"), "{rendered}");
     assert!(
         state
@@ -1810,6 +1869,48 @@ fn write_tools_are_file_change_cards_not_tools() {
     assert!(
         !text.iter().any(|line| line.contains("Write")),
         "Write belongs in file changes, not tools: {joined}"
+    );
+}
+
+#[test]
+fn agy_write_to_file_is_a_file_change_card_not_a_tool() {
+    let state = AppState::new(vec![ChatItem::Tool {
+        member: MemberId::new("uidev"),
+        name: "write_to_file".to_string(),
+        summary: "TargetFile snake-game/index.html".to_string(),
+        detail: String::new(),
+        ok: Some(true),
+    }]);
+    let mut lines = Vec::new();
+    render_chat_history(&state, 80, 0, &mut lines);
+    let joined = plain_text(&lines).join("\n");
+
+    assert!(joined.contains("file changes"), "{joined}");
+    assert!(joined.contains("snake-game/index.html"), "{joined}");
+    assert!(
+        !joined.contains("tools"),
+        "agy write_to_file must not stay under tools: {joined}"
+    );
+}
+
+#[test]
+fn agy_write_shows_added_file_content_when_expanded() {
+    let state = AppState::new(vec![ChatItem::Diff {
+        member: MemberId::new("uidev"),
+        files: vec![
+            FileChangeItem::new("/tmp/brain/snake_game_plan.md", "add")
+                .with_texts(None::<String>, Some("# Snake\n\nUse a canvas.\n")),
+        ],
+        ok: true,
+    }]);
+    let mut lines = Vec::new();
+    render_chat_history(&state, 80, 0, &mut lines);
+    let joined = plain_text(&lines).join("\n");
+    assert!(joined.contains("file changes"), "{joined}");
+    assert!(joined.contains("snake_game_plan.md"), "{joined}");
+    assert!(
+        joined.contains("# Snake") && joined.contains("Use a canvas."),
+        "expanded file changes must show the added body: {joined}"
     );
 }
 

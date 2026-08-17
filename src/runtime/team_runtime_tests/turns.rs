@@ -1187,6 +1187,31 @@ fn agent_can_add_teammate_with_team_member_envelope() {
 }
 
 #[test]
+fn agent_added_agy_member_gets_write_defaults() {
+    let mut rt = runtime();
+    rt.config.modes.team = Some(TeamModeConfig {
+        allow_add_members: Some(true),
+        ..TeamModeConfig::default()
+    });
+    start_team(&mut rt, "ship the parser");
+    let builder = MemberId::new("builder");
+
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::MessageCompleted(
+            r#"@@team_member {"display_name":"QA","backend":"agy","role":"tests"}"#.to_string(),
+        ),
+    );
+
+    let qa = rt.config.member(&MemberId::new("qa")).expect("qa added");
+    assert_eq!(qa.backend, BackendKind::Agy);
+    assert_eq!(qa.sandbox, SandboxPolicy::WorkspaceWrite);
+    assert_eq!(qa.permission_mode, Some(PermissionMode::AcceptEdits));
+    assert_eq!(qa.sandbox_native_label(), "off");
+    assert_eq!(qa.permission_native_label(), "accept-edits");
+}
+
+#[test]
 fn agent_teammate_addition_skips_relay_approval() {
     let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
     rt.on_ui_command(user("plan it"));
@@ -1266,6 +1291,83 @@ fn team_mode_free_add_joins_immediately_without_approval() {
             .iter()
             .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
     );
+}
+
+#[test]
+fn team_mode_at_member_is_a_direct_message_not_a_run() {
+    let mut rt = runtime();
+    rt.on_ui_command(UiCommand::SetMode {
+        mode: TerminalMode::Team,
+    });
+
+    let step = rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(MemberId::new("builder")),
+        body: "@builder follow up without opening a run".to_string(),
+    });
+
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::RunUpdated { .. })),
+        "explicit @member must not start a team run: {:?}",
+        step.events
+    );
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::UserMessage { body, .. } if body.starts_with("[team ")
+        )),
+        "direct @member must not be labeled as a team run: {:?}",
+        step.events
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. }
+            if body.contains("follow up without opening a run")
+    )));
+    assert_eq!(step.actions.len(), 1);
+    assert_eq!(step.actions[0].member, MemberId::new("builder"));
+}
+
+#[test]
+fn team_mode_at_member_after_a_finished_run_is_still_direct() {
+    let mut rt = runtime();
+    start_team(&mut rt, "ship the parser");
+    let builder = MemberId::new("builder");
+    complete_ok(&mut rt, &builder, "checklist done");
+
+    let step = rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(builder.clone()),
+        body: "@builder create one more teammate".to_string(),
+    });
+
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RunUpdated { run }
+                if run.goal.contains("create one more teammate")
+                    || run.goal.contains("@builder")
+        )),
+        "a later @leader message must not become team run-N: {:?}",
+        step.events
+    );
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(text) if text.contains("already active")
+        )),
+        "direct @member must not be blocked as a second run: {:?}",
+        step.events
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. } if body.contains("create one more teammate")
+    )));
+    assert!(!step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserMessage { body, .. } if body.starts_with("[team ")
+    )));
 }
 
 #[test]

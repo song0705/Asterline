@@ -133,6 +133,10 @@ pub struct ClaudeLineParser {
     tool_blocks: HashMap<u64, String>,
     tool_input_started: HashSet<u64>,
     result_seen: bool,
+    /// True after we announced that Claude is thinking. Keeps `thinking_tokens`
+    /// from flooding the runtime while still starting the elapsed clock before
+    /// the first `thinking_delta` arrives.
+    thinking_clock: bool,
 }
 
 impl ClaudeLineParser {
@@ -144,6 +148,14 @@ impl ClaudeLineParser {
         }
     }
 
+    fn note_thinking_started(&mut self, out: &mut Vec<AgentEvent>) {
+        if self.thinking_clock {
+            return;
+        }
+        self.thinking_clock = true;
+        out.push(AgentEvent::Reasoning(String::new()));
+    }
+
     fn handle_stream_event(&mut self, event: &Value, out: &mut Vec<AgentEvent>) {
         match str_field(event, "type") {
             Some("message_start") => {
@@ -152,7 +164,12 @@ impl ClaudeLineParser {
             }
             Some("content_block_start") => {
                 let block = &event["content_block"];
+                if str_field(block, "type") == Some("thinking") {
+                    self.note_thinking_started(out);
+                    return;
+                }
                 if str_field(block, "type") == Some("tool_use") {
+                    self.thinking_clock = false;
                     self.flush_message(out);
                     let id = str_field(block, "id").unwrap_or_default().to_string();
                     let name = str_field(block, "name").unwrap_or("tool").to_string();
@@ -199,6 +216,7 @@ impl ClaudeLineParser {
                     && let Some(thinking) = str_field(delta, "thinking")
                     && !thinking.is_empty()
                 {
+                    self.note_thinking_started(out);
                     out.push(AgentEvent::Reasoning(thinking.to_string()));
                 }
             }
@@ -271,7 +289,9 @@ impl LineParser for ClaudeLineParser {
                 // (observed on claude 2.1.207); logging each would flood the
                 // logs drawer.
                 let subtype = str_field(&value, "subtype");
-                if subtype != Some("init") && subtype != Some("thinking_tokens") {
+                if subtype == Some("thinking_tokens") {
+                    self.note_thinking_started(&mut out);
+                } else if subtype != Some("init") {
                     out.push(AgentEvent::Log(format!(
                         "claude system/{}",
                         subtype.unwrap_or("event")
@@ -490,13 +510,26 @@ mod tests {
     fn thinking_tokens_progress_rows_are_not_logged() {
         let events = parse_all(&[
             r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":15,"session_id":"sess-abc"}"#,
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":40,"session_id":"sess-abc"}"#,
         ]);
-        // Session id still tracked (deduped downstream), but no Log spam.
-        assert_eq!(
-            events,
-            vec![AgentEvent::SessionDiscovered(AgentSessionId(
+        // Start the thinking clock once; do not log every progress row.
+        assert!(
+            events.contains(&AgentEvent::SessionDiscovered(AgentSessionId(
                 "sess-abc".to_string()
-            ))]
+            )))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Reasoning(text) if text.is_empty()))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Log(_))),
+            "{events:?}"
         );
         let events = parse_all(&[r#"{"type":"system","subtype":"compact_boundary"}"#]);
         assert!(
@@ -589,8 +622,17 @@ mod tests {
     #[test]
     fn thinking_delta_is_forwarded_as_reasoning() {
         let events = parse_all(&[
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking invariants"}}}"#,
         ]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Reasoning(text) if text.is_empty()))
+                .count(),
+            1,
+            "thinking block start must open the clock once: {events:?}"
+        );
         assert!(events.contains(&AgentEvent::Reasoning("checking invariants".to_string())));
     }
 

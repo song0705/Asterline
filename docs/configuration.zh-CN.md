@@ -3,7 +3,7 @@
 [English](configuration.md)
 
 本页涵盖团队文件、运行时数据、权限、CLI 参数、Agent 协作和故障排查。产品概览请返回
-[中文 README](../README.zh-CN.md)；交互控制请参阅[命令参考](commands.zh-CN.md)。
+[中文 README](../README.md)；交互控制请参阅[命令参考](commands.zh-CN.md)。
 
 ## Asterline 如何解析团队
 
@@ -403,8 +403,9 @@ Agent 可请求缺失的专长：
 @@team_member {"display_name":"QA","backend":"codex","role":"tests"}
 ```
 
-Asterline 校验重复 ID 与名称、启动 runner、保存 roster 并广播更新团队。Agent envelope 可以
-添加成员但不能删除；删除仍然是 `/team` 操作。
+Asterline 校验重复 ID 与名称、启动 runner、保存 roster 并广播更新团队。未写
+`sandbox` / `permission_mode` 时用该后端的写入默认（Agy：`accept-edits`，沙箱
+off）。Agent envelope 可以添加成员但不能删除；删除仍然是 `/team` 操作。
 
 ### Run checklist 更新
 

@@ -4,7 +4,7 @@
 
 This page covers team files, runtime data, permissions, CLI options, agent
 coordination, and troubleshooting. For the product overview, return to the
-[main README](../README.md). For interactive controls, see the
+[English README](../README.en.md). For interactive controls, see the
 [command reference](commands.md).
 
 ## How Asterline resolves a team
@@ -506,8 +506,10 @@ An agent may request a missing specialty:
 ```
 
 Asterline validates duplicate IDs and names, starts the runner, saves the
-roster, and broadcasts the updated team. Agent envelopes can add members but
-cannot delete them; deletion remains a `/team` action.
+roster, and broadcasts the updated team. Omitted `sandbox` and
+`permission_mode` take that backend's write defaults (Agy: `accept-edits`,
+sandbox off). Agent envelopes can add members but cannot delete them;
+deletion remains a `/team` action.
 
 ### Run checklist updates
 

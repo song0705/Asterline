@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::adapter::parser::{
-    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, file_change_from_params, str_field,
-    summarize, tool_detail, tool_value,
+    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, file_change_from_params,
+    is_permission_denied_tool, str_field, summarize, tool_detail, tool_value,
 };
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::config::check_agy_version;
@@ -276,6 +276,7 @@ pub struct AgyLineParser {
     active_tools: HashMap<u64, String>,
     completed_tools: HashSet<u64>,
     result_seen: bool,
+    permission_denied: bool,
 }
 
 impl AgyLineParser {
@@ -373,6 +374,9 @@ impl AgyLineParser {
                 .map(|value| tool_value(value, TOOL_OUTPUT_MAX))
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| name.clone());
+            if is_permission_denied_tool(&summary) {
+                self.permission_denied = true;
+            }
             out.push(AgentEvent::ToolCompleted {
                 id,
                 ok: state == "DONE",
@@ -437,12 +441,20 @@ impl LineParser for AgyLineParser {
                 }
                 self.close_message(&mut out);
                 if str_field(result, "status") != Some("SUCCESS") {
-                    out.push(AgentEvent::Fatal(
-                        str_field(result, "error")
-                            .or_else(|| str_field(result, "status"))
-                            .unwrap_or("agy run failed")
-                            .to_string(),
-                    ));
+                    let error = str_field(result, "error")
+                        .or_else(|| str_field(result, "status"))
+                        .unwrap_or("agy run failed")
+                        .to_string();
+                    // A refused shell is already a failed tool. Do not fail the
+                    // whole print run — Plan would otherwise block the mode.
+                    if self.permission_denied || is_permission_denied_tool(&error) {
+                        self.permission_denied = true;
+                        out.push(AgentEvent::Log(format!(
+                            "agy tool permission denied: {error}"
+                        )));
+                    } else {
+                        out.push(AgentEvent::Fatal(error));
+                    }
                 }
             }
             Some(other) => out.push(AgentEvent::Log(format!("agy event: {other}"))),
@@ -738,12 +750,53 @@ mod tests {
     }
 
     #[test]
+    fn write_to_file_is_a_file_change() {
+        use crate::domain::event::FileChangeItem;
+
+        let mut parser = AgyLineParser::default();
+        let events = parser.parse_line(
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"tool","tool_name":"write_to_file","tool_info":{"name":"write_to_file","parameters":{"TargetFile":"snake-game/style.css","CodeContent":"body{}\n"},"output":"Wrote file"}}}"#,
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolStarted { name, .. } if name == "write_to_file")
+        ));
+        assert!(events.contains(&AgentEvent::FileChange {
+            files: vec![
+                FileChangeItem::new("snake-game/style.css", "add")
+                    .with_texts(None::<String>, Some("body{}\n"))
+            ],
+            ok: true,
+        }));
+    }
+
+    #[test]
     fn failed_result_is_fatal() {
         let mut parser = AgyLineParser::default();
         let events = parser.parse_line(
             r#"{"event":"result","result":{"conversation_id":"x","status":"ERROR","error":"rate limited"}}"#,
         );
         assert!(events.contains(&AgentEvent::Fatal("rate limited".to_string())));
+    }
+
+    #[test]
+    fn permission_denied_result_is_not_fatal() {
+        let mut parser = AgyLineParser::default();
+        let _ = parser.parse_line(
+            r#"{"event":"step_update","step_update":{"step_index":4,"state":"ERROR","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","error":"User denied permission to run command:\n  node -c snake-game/game.js"}}}"#,
+        );
+        let events = parser.parse_line(
+            r#"{"event":"result","result":{"conversation_id":"x","status":"ERROR","error":"User denied permission to run command: node -c snake-game/game.js"}}"#,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_))),
+            "permission denial must not fail the print run: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Log(message) if message.contains("permission denied")
+        )));
     }
 
     #[test]

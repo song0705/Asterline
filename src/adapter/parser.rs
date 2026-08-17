@@ -12,6 +12,38 @@ pub const MAX_MESSAGE_TEXT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOOL_DETAIL_BYTES: usize = 1024 * 1024;
 const OUTPUT_TRUNCATION_MARKER: &str = "\n[asterline: output truncated]\n";
 
+/// Claude/Agy print this when a command is refused. It is a tool result, not a
+/// crashed member run — Plan/Team must not treat it as a terminal failure.
+pub fn is_permission_denied_tool(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("user denied permission") || lower.contains("denied permission to run command")
+}
+
+/// The refused command, when the backend included it after `to run command:`.
+pub fn permission_denied_command(text: &str) -> Option<&str> {
+    let lower = text.to_ascii_lowercase();
+    let marker = "to run command:";
+    let index = lower.find(marker)?;
+    let rest = text[index + marker.len()..].trim();
+    let line = rest.lines().next().unwrap_or(rest).trim();
+    (!line.is_empty()).then_some(line)
+}
+
+pub fn format_permission_denial(text: &str) -> String {
+    permission_denied_command(text)
+        .map(|command| format!("`{command}`"))
+        .unwrap_or_else(|| text.lines().next().unwrap_or(text).trim().to_string())
+}
+
+/// Classify Write/Edit/Delete tools, including Agy `write_to_file`.
+pub fn file_change_tool_class(name: &str) -> Option<&'static str> {
+    match file_tool_kind(name)? {
+        FileToolKind::Write => Some("write"),
+        FileToolKind::Edit => Some("edit"),
+        FileToolKind::Delete => Some("delete"),
+    }
+}
+
 /// Append a UTF-8 chunk without letting the retained string exceed `max`
 /// bytes. The first overflow appends a visible marker; subsequent chunks are
 /// ignored. The returned delta is exactly what was appended.
@@ -277,11 +309,20 @@ pub fn file_change_from_params(name: &str, params: &Value) -> Option<FileChangeI
     .filter(|path| !path.is_empty())?;
     let old_text = json_string_field(
         params,
-        &["old_string", "old_text", "before", "old_contents"],
+        &[
+            "old_string",
+            "old_text",
+            "before",
+            "old_contents",
+            "target_content",
+        ],
     );
     let new_text = json_string_field(
         params,
         &[
+            "code_content",
+            "replacement_content",
+            "replacement",
             "new_string",
             "new_text",
             "after",
@@ -322,10 +363,18 @@ fn file_tool_kind(name: &str) -> Option<FileToolKind> {
     let key = tail.to_ascii_lowercase().replace('-', "_");
     let key = key.strip_prefix("mcp_").unwrap_or(&key);
     match key {
-        "write" | "write_file" | "writefile" | "create" | "create_file" => {
-            Some(FileToolKind::Write)
-        }
-        "edit" | "edit_file" | "str_replace" | "search_replace" | "replace" | "apply_patch"
+        "write" | "write_file" | "writefile" | "write_to_file" | "writetofile" | "create"
+        | "create_file" => Some(FileToolKind::Write),
+        "edit"
+        | "edit_file"
+        | "str_replace"
+        | "search_replace"
+        | "replace"
+        | "replace_file_content"
+        | "replacefilecontent"
+        | "multi_replace_file_content"
+        | "multireplacefilecontent"
+        | "apply_patch"
         | "applypatch" => Some(FileToolKind::Edit),
         "delete" | "delete_file" | "remove" | "rm" => Some(FileToolKind::Delete),
         _ => None,
@@ -384,6 +433,30 @@ pub fn tool_value(value: &Value, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn permission_denied_tool_matches_agy_and_claude_wording() {
+        assert!(is_permission_denied_tool(
+            "User denied permission to run command:\n  node -c game.js"
+        ));
+        assert!(is_permission_denied_tool(
+            "denied permission to run command: python3 -m pytest"
+        ));
+        assert!(!is_permission_denied_tool("rate limited"));
+        assert!(!is_permission_denied_tool(
+            "permission denied opening /etc/shadow"
+        ));
+        assert_eq!(
+            permission_denied_command(
+                "User denied permission to run command:\n  node -c snake-game/game.js"
+            ),
+            Some("node -c snake-game/game.js")
+        );
+        assert_eq!(
+            format_permission_denial("User denied permission to run command: python3 -m pytest"),
+            "`python3 -m pytest`"
+        );
+    }
 
     #[test]
     fn str_field_reads_string() {
@@ -452,6 +525,40 @@ mod tests {
         assert_eq!(file.kind, "add");
         assert_eq!(file.new_text.as_deref(), Some("body { margin: 0; }\n"));
         assert!(file.old_text.is_none());
+    }
+
+    #[test]
+    fn agy_write_to_file_is_a_file_change() {
+        let file = file_change_from_params(
+            "write_to_file",
+            &json!({
+                "TargetFile": "snake-game/index.html",
+                "CodeContent": "<html></html>\n"
+            }),
+        )
+        .expect("agy write_to_file");
+        assert_eq!(file.path, "snake-game/index.html");
+        assert_eq!(file.kind, "add");
+        assert_eq!(file.new_text.as_deref(), Some("<html></html>\n"));
+        assert_eq!(file_change_tool_class("write_to_file"), Some("write"));
+        assert_eq!(file_change_tool_class("replace_file_content"), Some("edit"));
+    }
+
+    #[test]
+    fn agy_replace_file_content_keeps_before_and_after() {
+        let file = file_change_from_params(
+            "replace_file_content",
+            &json!({
+                "TargetFile": "snake-game/game.js",
+                "TargetContent": "let score = 0;\n",
+                "ReplacementContent": "let score = 1;\n"
+            }),
+        )
+        .expect("agy replace");
+        assert_eq!(file.path, "snake-game/game.js");
+        assert_eq!(file.kind, "update");
+        assert_eq!(file.old_text.as_deref(), Some("let score = 0;\n"));
+        assert_eq!(file.new_text.as_deref(), Some("let score = 1;\n"));
     }
 
     #[test]

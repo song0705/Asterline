@@ -2,8 +2,9 @@
 
 This is the complete reference for Asterline's startup options, composer
 syntax, slash commands, drawers, and keyboard controls. For installation and
-the product overview, return to the [main README](../README.md). A
-[Chinese version](commands.zh-CN.md) is also available.
+the product overview, return to the [English README](../README.en.md). A
+[Chinese version](commands.zh-CN.md) is also available. The default product
+page is the [Chinese README](../README.md).
 
 ## Quick start
 
