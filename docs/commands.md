@@ -12,7 +12,6 @@ the product overview, return to the [main README](../README.md). A
 /mode brainstorm
 How could we reduce indexing latency?
 /runs
-/verify run-2 cargo test
 /new
 /resume
 ```
@@ -455,11 +454,11 @@ Use ordinary direct-message dispatch. A fresh chat requires `@member`,
 Start a builder/reviewer loop. The builder works, the reviewer emits a
 structured `@@review` verdict, and revision continues until approval or
 `max_iterations`. If the limit is reached, the run becomes blocked. The
-reviewer is asked to inspect the working tree and run the project's checks
-itself; after approval, auto-verify (when enabled) runs the verify command
-again as a deliberate second, independent gate — it is not a redundant step
-to switch off. A reviewer reply without a structured verdict is nudged once,
-then treated as `request_changes` (a notice says so) and costs an iteration.
+reviewer is asked to inspect the working tree rather than trusting the
+builder's report. An optional `reviewer_hint` is appended to that prompt.
+A reviewer reply
+without a structured verdict is nudged once, then treated as
+`request_changes` (a notice says so) and costs an iteration.
 
 ```text
 /mode review
@@ -498,18 +497,16 @@ How could we make graph retrieval robust without node text?
 #### `/mode team`
 
 Start a coordinator-driven team run. The coordinator creates and owns the
-checklist, dispatches work to teammates, integrates results, and can
-automatically verify completion according to `modes.team` configuration.
-Verification failure can return to the coordinator for repair until the
-configured iteration limit is reached.
+checklist, dispatches work to teammates, and integrates results. Repair
+loops continue until the configured iteration limit is reached.
 
 ```text
 /mode team
 Implement the feature, review it, update docs, and run the test suite
 ```
 
-Mode roles, participants, iteration limits, and verification settings are
-defined in `team.json`. Reviewers communicate a one-line verdict such as:
+Mode roles, participants, and iteration limits are defined in `team.json`.
+Reviewers communicate a one-line verdict such as:
 
 ```text
 @@review {"verdict":"approve","summary":"LGTM"}
@@ -577,26 +574,6 @@ verified must be aborted before it can be blocked manually.
 ```text
 /block run-4 waiting for the schema decision
 ```
-
-### `/verify`
-
-```text
-/verify [run-<id>] [command]
-```
-
-Run a verification command in the workspace in the background and store its
-result on the run. Without a command, Asterline detects a suitable project
-check such as `cargo test`, `npm test`, or `pytest`. Without a run ID, it uses
-the latest run.
-
-```text
-/verify
-/verify run-4 cargo test --all-targets
-```
-
-Verification cannot start while the selected run is active or another
-verification is already running. In configured mode/team runs, failure may
-trigger an automatic repair iteration.
 
 ### `/step`
 

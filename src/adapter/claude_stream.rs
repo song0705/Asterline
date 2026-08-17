@@ -376,6 +376,19 @@ mod tests {
     }
 
     #[test]
+    fn default_claude_member_passes_accept_edits() {
+        let member = crate::domain::config::default_member(BackendKind::Claude);
+        let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let command = adapter.build_command("hello", None, None);
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "acceptEdits"])
+        );
+    }
+
+    #[test]
     fn command_uses_stream_json_and_resume() {
         let mut member = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
         member.permission_mode = Some(PermissionMode::Plan);

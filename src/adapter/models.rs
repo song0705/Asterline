@@ -628,10 +628,10 @@ fn codex_permission_from_config() -> Option<String> {
 }
 
 fn grok_permission_from_config() -> Option<String> {
-    toml_root_string(
-        user_home_dir()?.join(".grok/config.toml"),
-        "permission_mode",
-    )
+    let path = user_home_dir()?.join(".grok/config.toml");
+    toml_section_string(path.clone(), "ui", "permission_mode")
+        .or_else(|| toml_root_string(path, "permission_mode"))
+        .map(|mode| crate::domain::team::normalize_grok_permission_label(&mode).to_string())
 }
 
 fn agy_permission_from_settings() -> Option<String> {
@@ -679,10 +679,40 @@ fn toml_root_string(path: PathBuf, key: &str) -> Option<String> {
     if contents.len() as u64 > LOCAL_SETTINGS_MAX_BYTES {
         return None;
     }
+    toml_string_in_section(&contents, None, key)
+}
+
+fn toml_section_string(path: PathBuf, section: &str, key: &str) -> Option<String> {
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > LOCAL_SETTINGS_MAX_BYTES {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    if contents.len() as u64 > LOCAL_SETTINGS_MAX_BYTES {
+        return None;
+    }
+    toml_string_in_section(&contents, Some(section), key)
+}
+
+fn toml_string_in_section(contents: &str, section: Option<&str>, key: &str) -> Option<String> {
+    if contents.len() as u64 > LOCAL_SETTINGS_MAX_BYTES {
+        return None;
+    }
+    let mut in_section = section.is_none();
     for line in contents.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
-            break;
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            in_section = section.is_some_and(|wanted| header.trim() == wanted);
+            if section.is_none() {
+                break;
+            }
+            continue;
+        }
+        if !in_section {
+            continue;
         }
         let Some((candidate, value)) = line.split_once('=') else {
             continue;
@@ -1198,6 +1228,23 @@ mod tests {
         assert_eq!(models[1].name, "Gemini 3.5 Flash (High)");
         assert!(models[1].is_default);
         assert!(!models[0].is_default);
+    }
+
+    #[test]
+    fn grok_reads_ui_permission_mode_as_its_product_name() {
+        assert_eq!(
+            toml_string_in_section(
+                "[ui]\npermission_mode = \"always-approve\"\n",
+                Some("ui"),
+                "permission_mode",
+            )
+            .as_deref(),
+            Some("always-approve")
+        );
+        assert_eq!(
+            crate::domain::team::normalize_grok_permission_label("bypassPermissions"),
+            "always-approve"
+        );
     }
 
     #[test]

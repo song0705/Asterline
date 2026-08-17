@@ -63,7 +63,6 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("runs", "run status · next action", false),
     ("step", "manage run checklist", true),
     ("team", "edit roster · sessions · approvals", false),
-    ("verify", "verify latest or selected run", true),
 ];
 
 /// (name, hint) entries shown after `/mode `.

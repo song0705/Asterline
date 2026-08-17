@@ -35,22 +35,17 @@ enum ModeField {
     ReviewBuilder,
     ReviewReviewer,
     ReviewMaxIterations,
-    ReviewAutoVerify,
-    ReviewVerifyCommand,
+    ReviewReviewerHint,
     PlanLeader,
     PlanBuilder,
     PlanReviewer,
     PlanAutoExecute,
     PlanMaxIterations,
-    PlanAutoVerify,
-    PlanVerifyCommand,
     BrainstormParticipants,
     BrainstormRounds,
     BrainstormIdeas,
     TeamCoordinator,
     TeamMaxIterations,
-    TeamAutoVerify,
-    TeamVerifyCommand,
 }
 
 impl ModeField {
@@ -61,8 +56,7 @@ impl ModeField {
                 Self::ReviewBuilder,
                 Self::ReviewReviewer,
                 Self::ReviewMaxIterations,
-                Self::ReviewAutoVerify,
-                Self::ReviewVerifyCommand,
+                Self::ReviewReviewerHint,
             ],
             TerminalMode::Plan => &[
                 Self::PlanLeader,
@@ -70,20 +64,13 @@ impl ModeField {
                 Self::PlanReviewer,
                 Self::PlanAutoExecute,
                 Self::PlanMaxIterations,
-                Self::PlanAutoVerify,
-                Self::PlanVerifyCommand,
             ],
             TerminalMode::Brainstorm => &[
                 Self::BrainstormParticipants,
                 Self::BrainstormRounds,
                 Self::BrainstormIdeas,
             ],
-            TerminalMode::Team => &[
-                Self::TeamCoordinator,
-                Self::TeamMaxIterations,
-                Self::TeamAutoVerify,
-                Self::TeamVerifyCommand,
-            ],
+            TerminalMode::Team => &[Self::TeamCoordinator, Self::TeamMaxIterations],
         }
     }
 
@@ -97,11 +84,8 @@ impl ModeField {
             Self::ReviewMaxIterations | Self::PlanMaxIterations | Self::TeamMaxIterations => {
                 "max_iterations"
             }
-            Self::ReviewAutoVerify | Self::PlanAutoVerify | Self::TeamAutoVerify => "auto_verify",
             Self::PlanAutoExecute => "auto_execute",
-            Self::ReviewVerifyCommand | Self::PlanVerifyCommand | Self::TeamVerifyCommand => {
-                "verify_command"
-            }
+            Self::ReviewReviewerHint => "reviewer_hint",
             Self::BrainstormRounds => "generation_rounds",
             Self::BrainstormIdeas => "ideas_per_round",
         }
@@ -143,20 +127,11 @@ impl ModeField {
     }
 
     fn is_toggle(self) -> bool {
-        matches!(
-            self,
-            Self::ReviewAutoVerify
-                | Self::PlanAutoExecute
-                | Self::PlanAutoVerify
-                | Self::TeamAutoVerify
-        )
+        matches!(self, Self::PlanAutoExecute)
     }
 
     fn is_command(self) -> bool {
-        matches!(
-            self,
-            Self::ReviewVerifyCommand | Self::PlanVerifyCommand | Self::TeamVerifyCommand
-        )
+        matches!(self, Self::ReviewReviewerHint)
     }
 }
 
@@ -210,7 +185,6 @@ pub(crate) struct ModeEditor {
     defaults: ModesConfig,
     applied: ModesConfig,
     pending: ModesConfig,
-    suggested_verify: Option<String>,
     active_mode: TerminalMode,
     selected: usize,
     field: usize,
@@ -229,7 +203,6 @@ impl ModeEditor {
         members: Vec<TeamMember>,
         defaults: ModesConfig,
         overrides: ModesConfig,
-        suggested_verify: Option<String>,
         active_mode: TerminalMode,
     ) -> Self {
         let selected = TerminalMode::ALL
@@ -244,7 +217,6 @@ impl ModeEditor {
             defaults,
             applied: overrides.clone(),
             pending: overrides,
-            suggested_verify,
             active_mode,
             selected,
             field: 0,
@@ -631,15 +603,10 @@ impl ModeEditor {
             | ModeField::BrainstormIdeas => {
                 let _ = self.set_number_field(field, None);
             }
-            ModeField::ReviewAutoVerify
-            | ModeField::PlanAutoExecute
-            | ModeField::PlanAutoVerify
-            | ModeField::TeamAutoVerify => {
+            ModeField::PlanAutoExecute => {
                 self.set_toggle_field(field, None);
             }
-            ModeField::ReviewVerifyCommand
-            | ModeField::PlanVerifyCommand
-            | ModeField::TeamVerifyCommand => self.set_command_field(field, None),
+            ModeField::ReviewReviewerHint => self.set_command_field(field, None),
         }
         prune_empty_mode_overrides(&mut self.pending);
         self.notice = Some("fell back to team.json / default".to_string());
@@ -745,22 +712,15 @@ impl ModeEditor {
     }
 
     fn set_toggle_field(&mut self, field: ModeField, value: Option<bool>) {
-        match field {
-            ModeField::ReviewAutoVerify => self.review_mut().auto_verify = value,
-            ModeField::PlanAutoExecute => self.plan_mut().auto_execute = value,
-            ModeField::PlanAutoVerify => self.plan_mut().auto_verify = value,
-            ModeField::TeamAutoVerify => self.team_mut().auto_verify = value,
-            _ => {}
+        if field == ModeField::PlanAutoExecute {
+            self.plan_mut().auto_execute = value;
         }
         prune_empty_mode_overrides(&mut self.pending);
     }
 
     fn set_command_field(&mut self, field: ModeField, value: Option<String>) {
-        match field {
-            ModeField::ReviewVerifyCommand => self.review_mut().verify_command = value,
-            ModeField::PlanVerifyCommand => self.plan_mut().verify_command = value,
-            ModeField::TeamVerifyCommand => self.team_mut().verify_command = value,
-            _ => {}
+        if field == ModeField::ReviewReviewerHint {
+            self.review_mut().reviewer_hint = value;
         }
         prune_empty_mode_overrides(&mut self.pending);
     }
@@ -785,17 +745,11 @@ impl ModeEditor {
                 .as_ref()
                 .and_then(|cfg| cfg.max_iterations)
                 .is_some(),
-            ModeField::ReviewAutoVerify => self
+            ModeField::ReviewReviewerHint => self
                 .pending
                 .review
                 .as_ref()
-                .and_then(|cfg| cfg.auto_verify)
-                .is_some(),
-            ModeField::ReviewVerifyCommand => self
-                .pending
-                .review
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.as_ref())
+                .and_then(|cfg| cfg.reviewer_hint.as_ref())
                 .is_some(),
             ModeField::PlanLeader => self
                 .pending
@@ -827,18 +781,6 @@ impl ModeEditor {
                 .as_ref()
                 .and_then(|cfg| cfg.max_iterations)
                 .is_some(),
-            ModeField::PlanAutoVerify => self
-                .pending
-                .plan
-                .as_ref()
-                .and_then(|cfg| cfg.auto_verify)
-                .is_some(),
-            ModeField::PlanVerifyCommand => self
-                .pending
-                .plan
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.as_ref())
-                .is_some(),
             ModeField::BrainstormParticipants => self
                 .pending
                 .brainstorm
@@ -868,18 +810,6 @@ impl ModeEditor {
                 .team
                 .as_ref()
                 .and_then(|cfg| cfg.max_iterations)
-                .is_some(),
-            ModeField::TeamAutoVerify => self
-                .pending
-                .team
-                .as_ref()
-                .and_then(|cfg| cfg.auto_verify)
-                .is_some(),
-            ModeField::TeamVerifyCommand => self
-                .pending
-                .team
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.as_ref())
                 .is_some(),
         }
     }
@@ -904,17 +834,11 @@ impl ModeEditor {
                 .as_ref()
                 .and_then(|cfg| cfg.max_iterations)
                 .is_some(),
-            ModeField::ReviewAutoVerify => self
+            ModeField::ReviewReviewerHint => self
                 .defaults
                 .review
                 .as_ref()
-                .and_then(|cfg| cfg.auto_verify)
-                .is_some(),
-            ModeField::ReviewVerifyCommand => self
-                .defaults
-                .review
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.as_ref())
+                .and_then(|cfg| cfg.reviewer_hint.as_ref())
                 .is_some(),
             ModeField::PlanLeader => self
                 .defaults
@@ -946,18 +870,6 @@ impl ModeEditor {
                 .as_ref()
                 .and_then(|cfg| cfg.max_iterations)
                 .is_some(),
-            ModeField::PlanAutoVerify => self
-                .defaults
-                .plan
-                .as_ref()
-                .and_then(|cfg| cfg.auto_verify)
-                .is_some(),
-            ModeField::PlanVerifyCommand => self
-                .defaults
-                .plan
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.as_ref())
-                .is_some(),
             ModeField::BrainstormParticipants => self
                 .defaults
                 .brainstorm
@@ -987,18 +899,6 @@ impl ModeEditor {
                 .team
                 .as_ref()
                 .and_then(|cfg| cfg.max_iterations)
-                .is_some(),
-            ModeField::TeamAutoVerify => self
-                .defaults
-                .team
-                .as_ref()
-                .and_then(|cfg| cfg.auto_verify)
-                .is_some(),
-            ModeField::TeamVerifyCommand => self
-                .defaults
-                .team
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.as_ref())
                 .is_some(),
         }
     }
@@ -1098,25 +998,7 @@ impl ModeEditor {
     fn effective_auto_verify(&self, field: ModeField) -> bool {
         let config = self.preview_config();
         match field {
-            ModeField::ReviewAutoVerify => crate::domain::mode::resolve_mode_roles(
-                &config,
-                crate::domain::mode::CollabMode::Review,
-            )
-            .ok()
-            .map(|(_, limits)| limits.auto_verify)
-            .unwrap_or(true),
-            ModeField::PlanAutoVerify => crate::domain::mode::resolve_mode_roles(
-                &config,
-                crate::domain::mode::CollabMode::Plan,
-            )
-            .ok()
-            .map(|(_, limits)| limits.auto_verify)
-            .unwrap_or(true),
             ModeField::PlanAutoExecute => crate::domain::mode::resolve_plan_auto_execute(&config),
-            ModeField::TeamAutoVerify => crate::domain::mode::resolve_team_limits(&config)
-                .ok()
-                .map(|limits| limits.auto_verify)
-                .unwrap_or(true),
             _ => true,
         }
     }
@@ -1124,18 +1006,10 @@ impl ModeEditor {
     fn override_or_default_command(&self, field: ModeField) -> Option<String> {
         let merged = apply_mode_overrides(&self.base_config(), &self.pending).modes;
         match field {
-            ModeField::ReviewVerifyCommand => merged
+            ModeField::ReviewReviewerHint => merged
                 .review
                 .as_ref()
-                .and_then(|cfg| cfg.verify_command.clone()),
-            ModeField::PlanVerifyCommand => merged
-                .plan
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.clone()),
-            ModeField::TeamVerifyCommand => merged
-                .team
-                .as_ref()
-                .and_then(|cfg| cfg.verify_command.clone()),
+                .and_then(|cfg| cfg.reviewer_hint.clone()),
             _ => None,
         }
     }
@@ -1199,11 +1073,16 @@ impl ModeEditor {
             if let Some(command) = self.override_or_default_command(field) {
                 return (command, None);
             }
-            let placeholder = self
-                .suggested_verify
-                .as_deref()
-                .map(|command| format!("auto: {command}"));
-            return (String::new(), placeholder);
+            if field == ModeField::ReviewReviewerHint {
+                return (
+                    String::new(),
+                    Some("optional — appended to the reviewer prompt".to_string()),
+                );
+            }
+            return (
+                String::new(),
+                Some("optional — set to run after this mode finishes".to_string()),
+            );
         }
         (String::new(), None)
     }
@@ -1263,7 +1142,7 @@ impl ModeEditor {
                     "  "
                 };
                 let config = self.preview_config();
-                let binding = format_mode_binding(&config, *mode, self.suggested_verify.as_deref());
+                let binding = format_mode_binding(&config, *mode);
                 let error = mode_binding_is_error(&config, *mode);
                 let binding_style = if error {
                     theme::warning()
@@ -1344,11 +1223,7 @@ impl ModeEditor {
 
         lines.push(Line::raw(""));
         let preview_mode = self.selected_mode();
-        let preview = format_mode_binding(
-            &self.preview_config(),
-            preview_mode,
-            self.suggested_verify.as_deref(),
-        );
+        let preview = format_mode_binding(&self.preview_config(), preview_mode);
         let preview_error = mode_binding_is_error(&self.preview_config(), preview_mode);
         lines.push(Line::from(vec![
             Span::styled(" preview ", theme::muted()),
@@ -1429,7 +1304,6 @@ mod tests {
             ],
             ModesConfig::default(),
             ModesConfig::default(),
-            Some("cargo test".to_string()),
             TerminalMode::Review,
         )
     }

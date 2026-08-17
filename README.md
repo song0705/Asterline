@@ -128,7 +128,6 @@ Runs remain actionable when work pauses:
 /block waiting for the staging client secret
 /note secret requested from the platform team
 /continue secret is now available
-/verify cargo test
 ```
 
 ### Local, resumable history

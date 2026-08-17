@@ -12,7 +12,7 @@ use crate::domain::team::{BackendKind, DefaultTarget, MemberId, TeamConfig, Team
 use crate::tui::session_picker::SessionPicker;
 use crate::tui::team_builder::{
     BackendPicker, EditState, Field, ModelCatalog, ModelChoices, ModelPicker,
-    cycle_permission_for_backend, cycle_sandbox, field_value, normalize_member_id,
+    apply_permission_cycle, apply_sandbox_cycle, field_value, normalize_member_id,
     unique_display_name, unique_display_name_except, unique_member_id,
 };
 
@@ -782,16 +782,12 @@ impl TeamEditor {
         match field {
             Field::Sandbox => {
                 if let Some(member) = self.selected_member_mut() {
-                    member.sandbox = cycle_sandbox(member.sandbox);
+                    apply_sandbox_cycle(member);
                 }
             }
             Field::Permission => {
                 if let Some(member) = self.selected_member_mut() {
-                    member.permission_mode = cycle_permission_for_backend(
-                        member.backend,
-                        member.sandbox,
-                        member.permission_mode,
-                    );
+                    apply_permission_cycle(member);
                 }
             }
             Field::Session => {

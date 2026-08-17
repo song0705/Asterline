@@ -70,9 +70,19 @@ impl GrokAcpRunner {
             "--sandbox".to_string(),
             self.sandbox.grok_arg().to_string(),
         ];
-        if let Some(mode) = self.permission_mode {
-            args.push("--permission-mode".to_string());
-            args.push(mode.grok_arg().to_string());
+        match self.permission_mode {
+            Some(PermissionMode::BypassPermissions) => {
+                // Confirmed on grok 1.0.4: `--permission-mode always-approve`
+                // is rejected. The accepted switch is the global flag.
+                args.push("--always-approve".to_string());
+            }
+            Some(mode) => {
+                if let Some(arg) = mode.grok_permission_mode_arg() {
+                    args.push("--permission-mode".to_string());
+                    args.push(arg.to_string());
+                }
+            }
+            None => {}
         }
         args.push("agent".to_string());
         // Asterline owns the process lifecycle. Avoid silently attaching to a
@@ -85,9 +95,6 @@ impl GrokAcpRunner {
         if let Some(effort) = effort {
             args.push("--reasoning-effort".to_string());
             args.push(effort.as_str().to_string());
-        }
-        if self.permission_mode == Some(PermissionMode::BypassPermissions) {
-            args.push("--always-approve".to_string());
         }
         args.push("stdio".to_string());
         args

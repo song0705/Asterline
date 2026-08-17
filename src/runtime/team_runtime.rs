@@ -28,11 +28,10 @@ use crate::domain::event::{
 };
 use crate::domain::mode::{
     BrainstormCard, CollabMode, ModeStatusSummary, ModesConfig, ReviewVerdict, ReviewVerdictKind,
-    TerminalMode, apply_mode_overrides, clear_mode_overrides, format_mode_binding,
-    format_verify_label, merge_modes, mode_overrides_for, prune_empty_mode_overrides,
-    resolve_mode_roles, resolve_plan_auto_execute, resolve_plan_builder, resolve_plan_reviewer,
-    resolve_team_coordinator, resolve_team_limits, resolve_verify_command, validate_mode_overrides,
-    validate_terminal_mode,
+    TerminalMode, apply_mode_overrides, clear_mode_overrides, format_mode_binding, merge_modes,
+    mode_overrides_for, prune_empty_mode_overrides, resolve_mode_roles, resolve_plan_auto_execute,
+    resolve_plan_builder, resolve_plan_reviewer, resolve_team_coordinator, resolve_team_limits,
+    validate_mode_overrides, validate_terminal_mode,
 };
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
@@ -40,7 +39,7 @@ use crate::domain::team::{
 };
 use crate::fs_safety;
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
-use crate::run_support::suggested_verify_command;
+
 use crate::runtime::approval::ApprovalMatcher;
 use crate::runtime::mode_prompts::{
     brainstorm_build_prompt, brainstorm_propose_prompt, brainstorm_stretch_prompt,
@@ -461,14 +460,14 @@ impl TeamRuntime {
                 effort: self.members.get(&m.id).and_then(|s| s.effort),
                 sandbox: m.sandbox,
                 permission_mode: m.permission_mode,
+                approvals_reviewer: m.approvals_reviewer,
                 session_policy: m.session_policy,
             })
             .collect();
         RuntimeEvent::Ready {
             modes: self.config.modes.clone(),
             mode_overrides: self.session_mode_overrides.clone(),
-            suggested_verify: suggested_verify_command(&self.config.workspace)
-                .map(ToString::to_string),
+            suggested_verify: None,
             team: self.config.name.clone(),
             workspace: self.config.workspace.display().to_string(),
             default_target: self.config.default_target.clone(),
@@ -494,7 +493,6 @@ impl TeamRuntime {
                 }
                 | UiCommand::ResolvePausedRoute { resume: true }
                 | UiCommand::ContinueRun { .. }
-                | UiCommand::VerifyRun { .. }
                 | UiCommand::RunMode { .. }
         );
         if requires_reconciled_startup && !self.startup_reconciled {
@@ -590,9 +588,6 @@ impl TeamRuntime {
             UiCommand::BlockRun { run_id, reason } => {
                 self.handle_block_run(run_id, reason, &mut step)
             }
-            UiCommand::VerifyRun { run_id, command } => {
-                self.handle_verify_run(run_id, command, &mut step)
-            }
             UiCommand::AddRunStep {
                 run_id,
                 owner,
@@ -646,11 +641,7 @@ impl TeamRuntime {
                 "mode → normal — next plain text uses the last @target".to_string()
             }
             _ => {
-                let binding = format_mode_binding(
-                    &self.effective_config(),
-                    mode,
-                    suggested_verify_command(&self.config.workspace),
-                );
+                let binding = format_mode_binding(&self.effective_config(), mode);
                 format!(
                     "mode → {mode} — next plain text starts this run ({binding}); @member still sends directly"
                 )
@@ -2992,10 +2983,7 @@ impl TeamRuntime {
             .unwrap_or(MemberStatus::Idle);
         let model = member.model.as_deref().unwrap_or("-");
         let effort = member.effort.map(Effort::as_str).unwrap_or("-");
-        let permission = member
-            .permission_mode
-            .map(|mode| mode.claude_arg())
-            .unwrap_or("-");
+        let permission = member.permission_native_label();
         let allowed_tools = if member.allowed_tools.is_empty() {
             "-".to_string()
         } else {
@@ -3014,7 +3002,7 @@ impl TeamRuntime {
                 .resolved_cwd(&self.config.workspace)
                 .display()
                 .to_string(),
-            member.sandbox.codex_arg(),
+            member.sandbox_native_label(),
             permission,
             session_policy_label(member.session_policy),
             allowed_tools,

@@ -83,12 +83,7 @@ impl TeamRuntime {
             step,
         );
         step.events.push(RuntimeEvent::Notice(format!(
-            "team {run_id} started → {id} · {}",
-            format_verify_label(
-                limits.auto_verify,
-                limits.verify_command.as_deref(),
-                suggested_verify_command(&self.config.workspace),
-            )
+            "team {run_id} started → {id}"
         )));
         self.run_turns.insert(turn, run_id);
         let gate = self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Mode);
@@ -253,81 +248,8 @@ impl TeamRuntime {
             .join(", ")
     }
 
-    /// Finish a non-mode-session run turn: team runs may auto-verify; others Done.
+    /// Finish a non-mode-session run turn.
     fn finish_plain_or_team_run(&mut self, run_id: RunId, step: &mut RuntimeStep) -> bool {
-        let run = match self.store.run(run_id) {
-            Ok(run) => run,
-            Err(err) => {
-                self.report_store_error("load the finishing run", err, step);
-                return false;
-            }
-        };
-        let is_team = run
-            .mode
-            .as_ref()
-            .is_some_and(|mode| mode.mode == CollabMode::Team);
-        if is_team {
-            let limits = resolve_team_limits(&self.effective_config()).unwrap_or_default();
-            if limits.auto_verify
-                && let Some(cmd) = resolve_verify_command(
-                    limits.verify_command.as_deref(),
-                    suggested_verify_command(&self.config.workspace),
-                )
-            {
-                // Persist iteration/max_iterations (and verifying phase) before the UI event.
-                let mut status = run
-                    .mode
-                    .as_ref()
-                    .map(|m| m.state.clone())
-                    .unwrap_or_default();
-                if status.iteration == 0 {
-                    status.iteration = 1;
-                }
-                if status.max_iterations == 0 {
-                    status.max_iterations = limits.max_iterations;
-                }
-                status.phase = "verifying".to_string();
-                let json = match serde_json::to_string(&status) {
-                    Ok(json) => json,
-                    Err(err) => {
-                        step.events.push(RuntimeEvent::Notice(format!(
-                            "could not encode team verification state: {err}"
-                        )));
-                        return false;
-                    }
-                };
-                match self.store.update_run_mode_state(run_id, &json) {
-                    Ok(updated) => step
-                        .events
-                        .push(RuntimeEvent::RunUpdated { run: updated }),
-                    Err(err) => {
-                        self.report_store_error("save team verification state", err, step);
-                        return false;
-                    }
-                }
-                match self
-                    .store
-                    .update_run_status(run_id, RunStatus::Verifying)
-                {
-                    Ok(updated) => step
-                        .events
-                        .push(RuntimeEvent::RunUpdated { run: updated }),
-                    Err(err) => {
-                        self.report_store_error("save team verification status", err, step);
-                        return false;
-                    }
-                }
-                step.events
-                    .push(RuntimeEvent::Notice(format!("verifying {run_id}: {cmd}")));
-                step.verify_actions.push(VerifyAction {
-                    run_id,
-                    command: cmd,
-                    workspace: self.config.workspace.clone(),
-                    cancel: Arc::new(AtomicBool::new(false)),
-                });
-                return true;
-            }
-        }
         match self.store.update_run_status(run_id, RunStatus::Done) {
             Ok(updated) => {
                 step.events.push(RuntimeEvent::RunUpdated { run: updated });
@@ -498,66 +420,6 @@ impl TeamRuntime {
                 "could not mark run blocked: {err}"
             ))),
         }
-    }
-
-    fn handle_verify_run(
-        &mut self,
-        run_id: Option<RunId>,
-        command: Option<String>,
-        step: &mut RuntimeStep,
-    ) {
-        let Some(run) = self.run_or_latest(run_id, "verify", step) else {
-            return;
-        };
-        // The mode engine owns verification for live sessions; a manual /verify
-        // mid-phase would fight the FSM over the run status.
-        if self.mode_sessions.contains_key(&run.id)
-            || self.run_turns.values().any(|active| *active == run.id)
-        {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{} is an active mode run — press Esc to cancel it before manual verification",
-                run.id
-            )));
-            return;
-        }
-        if run.status == RunStatus::Verifying {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{} is already verifying",
-                run.id
-            )));
-            return;
-        }
-        let command = command
-            .or_else(|| suggested_verify_command(&self.config.workspace).map(ToString::to_string));
-        let Some(command) = command else {
-            step.events.push(RuntimeEvent::Notice(
-                "no verification command found (pass /verify [run-id] <command>)".to_string(),
-            ));
-            return;
-        };
-
-        let run_id = run.id;
-        let updated = match self
-            .store
-            .update_run_status(run_id, RunStatus::Verifying)
-        {
-            Ok(run) => run,
-            Err(err) => {
-                self.report_store_error("start verification", err, step);
-                return;
-            }
-        };
-        step.events.push(RuntimeEvent::RunUpdated { run: updated });
-        step.events.push(RuntimeEvent::Notice(format!(
-            "verifying {}: {command}",
-            run_id
-        )));
-        step.verify_actions.push(VerifyAction {
-            run_id,
-            command,
-            workspace: self.config.workspace.clone(),
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
     }
 
     fn handle_add_run_step(

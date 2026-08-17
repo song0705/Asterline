@@ -251,7 +251,13 @@ impl ModelCatalog {
         let cwd = member.resolved_cwd(workspace);
         match self.loads.get(&(member.backend, cwd)) {
             Some(ModelLoad::Loading(_)) => Some("loading…".to_string()),
-            Some(ModelLoad::Ready(Ok(catalog))) => catalog.native_permission.clone(),
+            Some(ModelLoad::Ready(Ok(catalog))) => catalog.native_permission.clone().map(|mode| {
+                if member.backend == BackendKind::Grok {
+                    crate::domain::team::normalize_grok_permission_label(&mode).to_string()
+                } else {
+                    mode
+                }
+            }),
             Some(ModelLoad::Ready(Err(_))) => Some("unavailable".to_string()),
             None => None,
         }
@@ -1131,6 +1137,16 @@ impl Field {
         Field::SessionId,
     ];
 
+    const CODEX_FIELDS: &'static [Field] = &[
+        Field::Name,
+        Field::Backend,
+        Field::Role,
+        Field::Model,
+        Field::Permission,
+        Field::Session,
+        Field::SessionId,
+    ];
+
     const CLAUDE_FIELDS: &'static [Field] = &[
         Field::Name,
         Field::Backend,
@@ -1141,27 +1157,14 @@ impl Field {
         Field::SessionId,
     ];
 
-    const NO_SEPARATE_EFFORT_FIELDS: &'static [Field] = &[
-        Field::Name,
-        Field::Backend,
-        Field::Role,
-        Field::Model,
-        Field::Sandbox,
-        Field::Permission,
-        Field::Session,
-        Field::SessionId,
-    ];
-
     pub(crate) fn for_backend(backend: BackendKind) -> &'static [Field] {
         match backend {
-            BackendKind::Codex => Self::ALL,
-            // Claude has no sandbox CLI parameter. Showing Codex's three
-            // sandbox names here made a saved Team setting look effective
-            // when the adapter deliberately did not pass it.
-            BackendKind::Claude => Self::CLAUDE_FIELDS,
-            // Model selection owns effort for every backend. Keep the member
-            // form focused on independent settings only.
-            BackendKind::Grok | BackendKind::Agy => Self::NO_SEPARATE_EFFORT_FIELDS,
+            BackendKind::Codex => Self::CODEX_FIELDS,
+            // Native mode pickers do not offer a sandbox row: Claude has no
+            // sandbox flag, Grok Shift+Tab is Normal/Plan/Always-approve,
+            // Agy Shift+Tab is default/accept-edits/plan. Adapters still
+            // apply each backend's default sandbox underneath.
+            BackendKind::Claude | BackendKind::Grok | BackendKind::Agy => Self::CLAUDE_FIELDS,
         }
     }
 
@@ -1180,10 +1183,9 @@ impl Field {
 
     pub(crate) fn label_for_backend(self, backend: BackendKind) -> &'static str {
         match (self, backend) {
-            (Self::Permission, BackendKind::Codex) => "approval policy",
+            (Self::Permission, BackendKind::Codex) => "permissions",
             (Self::Permission, BackendKind::Claude | BackendKind::Grok) => "permission mode",
             (Self::Permission, BackendKind::Agy) => "execution mode",
-            (Self::Sandbox, BackendKind::Agy) => "terminal sandbox",
             _ => self.label(),
         }
     }
@@ -1834,18 +1836,8 @@ impl BuilderState {
 
     fn cycle_field(&mut self, field: Field) {
         match field {
-            Field::Sandbox => {
-                let next = cycle_sandbox(self.selected_member().sandbox);
-                self.selected_member_mut().sandbox = next;
-            }
-            Field::Permission => {
-                let next = cycle_permission_for_backend(
-                    self.selected_member().backend,
-                    self.selected_member().sandbox,
-                    self.selected_member().permission_mode,
-                );
-                self.selected_member_mut().permission_mode = next;
-            }
+            Field::Sandbox => apply_sandbox_cycle(self.selected_member_mut()),
+            Field::Permission => apply_permission_cycle(self.selected_member_mut()),
             Field::Session => {
                 let next = match self.selected_member().session_policy {
                     SessionPolicy::Resume => SessionPolicy::Fresh,
@@ -2166,18 +2158,7 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
             .model
             .clone()
             .unwrap_or_else(|| "default".to_string()),
-        Field::Sandbox => match member.backend {
-            BackendKind::Codex => member.sandbox.codex_arg().to_string(),
-            BackendKind::Claude => "not passed".to_string(),
-            BackendKind::Grok => member.sandbox.grok_arg().to_string(),
-            BackendKind::Agy => {
-                if member.sandbox == SandboxPolicy::DangerFullAccess {
-                    "off".to_string()
-                } else {
-                    "on".to_string()
-                }
-            }
-        },
+        Field::Sandbox => sandbox_value(member),
         Field::Permission => permission_value(member),
         Field::Session => {
             session_status_label(member.session_policy, member.session_id.as_deref(), false)
@@ -2204,52 +2185,59 @@ pub(crate) fn session_status_label(
     }
 }
 
-pub(crate) fn cycle_sandbox(current: SandboxPolicy) -> SandboxPolicy {
-    match current {
-        SandboxPolicy::ReadOnly => SandboxPolicy::WorkspaceWrite,
-        SandboxPolicy::WorkspaceWrite => SandboxPolicy::DangerFullAccess,
-        SandboxPolicy::DangerFullAccess => SandboxPolicy::ReadOnly,
+fn sandbox_value(member: &TeamMember) -> String {
+    member.sandbox_native_label().to_string()
+}
+
+pub(crate) fn cycle_sandbox(backend: BackendKind, current: SandboxPolicy) -> SandboxPolicy {
+    match backend {
+        // Agy's CLI flag is boolean. Two stored off-states exist only so
+        // `--dangerously-skip-permissions` can be gated; both display as `off`.
+        BackendKind::Agy => match current {
+            SandboxPolicy::ReadOnly => SandboxPolicy::WorkspaceWrite,
+            SandboxPolicy::WorkspaceWrite | SandboxPolicy::DangerFullAccess => {
+                SandboxPolicy::ReadOnly
+            }
+        },
+        _ => match current {
+            SandboxPolicy::ReadOnly => SandboxPolicy::WorkspaceWrite,
+            SandboxPolicy::WorkspaceWrite => SandboxPolicy::DangerFullAccess,
+            SandboxPolicy::DangerFullAccess => SandboxPolicy::ReadOnly,
+        },
+    }
+}
+
+pub(crate) fn apply_sandbox_cycle(member: &mut TeamMember) {
+    member.sandbox = cycle_sandbox(member.backend, member.sandbox);
+    if member.backend == BackendKind::Agy
+        && member.sandbox == SandboxPolicy::ReadOnly
+        && member.permission_mode == Some(PermissionMode::BypassPermissions)
+    {
+        member.permission_mode = Some(PermissionMode::Plan);
     }
 }
 
 fn permission_value(member: &TeamMember) -> String {
-    match member.backend {
-        // The stored values are an adapter compatibility layer. Render the
-        // actual App Server policy instead of leaking Claude's names into the
-        // Codex editor. `never` is Asterline's product default, rather than a
-        // deferred local Codex setting.
-        BackendKind::Codex => match member.permission_mode {
-            None | Some(PermissionMode::Default) => "never".to_string(),
-            Some(PermissionMode::AcceptEdits | PermissionMode::Plan) => "untrusted".to_string(),
-            Some(PermissionMode::Auto) => "on-request".to_string(),
-            Some(PermissionMode::DontAsk | PermissionMode::BypassPermissions) => {
-                "never".to_string()
-            }
-        },
-        BackendKind::Claude | BackendKind::Grok => member
-            .permission_mode
-            .map(|mode| mode.claude_arg().to_string())
-            .unwrap_or_else(|| "default".to_string()),
-        BackendKind::Agy => match member.permission_mode {
-            None
-            | Some(PermissionMode::Default | PermissionMode::Auto | PermissionMode::DontAsk) => {
-                "CLI default".to_string()
-            }
-            Some(PermissionMode::AcceptEdits) => "accept-edits".to_string(),
-            Some(PermissionMode::Plan) => "plan".to_string(),
-            Some(PermissionMode::BypassPermissions)
-                if member.sandbox == SandboxPolicy::DangerFullAccess =>
-            {
-                "dangerously-skip-permissions".to_string()
-            }
-            Some(PermissionMode::BypassPermissions) => "requires terminal sandbox off".to_string(),
-        },
+    member.permission_native_label()
+}
+
+pub(crate) fn apply_permission_cycle(member: &mut TeamMember) {
+    if member.backend == BackendKind::Codex {
+        member.cycle_codex_permissions();
+        return;
     }
+    let current = if member.backend == BackendKind::Agy && member.sandbox == SandboxPolicy::ReadOnly
+    {
+        Some(PermissionMode::Plan)
+    } else {
+        member.permission_mode
+    };
+    member.permission_mode = cycle_permission_for_backend(member.backend, current);
+    member.apply_visible_mode_sandbox();
 }
 
 pub(crate) fn cycle_permission_for_backend(
     backend: BackendKind,
-    sandbox: SandboxPolicy,
     current: Option<PermissionMode>,
 ) -> Option<PermissionMode> {
     match backend {
@@ -2261,12 +2249,21 @@ pub(crate) fn cycle_permission_for_backend(
                 Some(PermissionMode::AcceptEdits)
             }
         },
-        BackendKind::Claude | BackendKind::Grok => match current {
+        BackendKind::Claude => match current {
             None | Some(PermissionMode::Default) => Some(PermissionMode::AcceptEdits),
             Some(PermissionMode::AcceptEdits) => Some(PermissionMode::Plan),
             Some(PermissionMode::Plan) => Some(PermissionMode::Auto),
             Some(PermissionMode::Auto) => Some(PermissionMode::DontAsk),
             Some(PermissionMode::DontAsk) => Some(PermissionMode::BypassPermissions),
+            Some(PermissionMode::BypassPermissions) => None,
+        },
+        // Grok CLI-accepted cycle: default, auto, plan, always-approve.
+        BackendKind::Grok => match current {
+            None | Some(PermissionMode::Default | PermissionMode::DontAsk) => {
+                Some(PermissionMode::Auto)
+            }
+            Some(PermissionMode::AcceptEdits | PermissionMode::Auto) => Some(PermissionMode::Plan),
+            Some(PermissionMode::Plan) => Some(PermissionMode::BypassPermissions),
             Some(PermissionMode::BypassPermissions) => None,
         },
         BackendKind::Agy => match current {
@@ -2275,10 +2272,7 @@ pub(crate) fn cycle_permission_for_backend(
                 Some(PermissionMode::AcceptEdits)
             }
             Some(PermissionMode::AcceptEdits) => Some(PermissionMode::Plan),
-            Some(PermissionMode::Plan) if sandbox == SandboxPolicy::DangerFullAccess => {
-                Some(PermissionMode::BypassPermissions)
-            }
-            Some(PermissionMode::Plan) => None,
+            Some(PermissionMode::Plan) => Some(PermissionMode::BypassPermissions),
             Some(PermissionMode::BypassPermissions) => None,
         },
     }
@@ -2339,14 +2333,18 @@ mod tests {
         let mut codex = TeamMember::new("codex", "Codex", BackendKind::Codex, "impl");
         assert_eq!(
             Field::Permission.label_for_backend(codex.backend),
-            "approval policy"
+            "permissions"
         );
-        assert_eq!(field_value(&codex, Field::Permission), "never");
-        codex.permission_mode = cycle_permission_for_backend(codex.backend, codex.sandbox, None);
-        assert_eq!(field_value(&codex, Field::Permission), "untrusted");
-        codex.permission_mode =
-            cycle_permission_for_backend(codex.backend, codex.sandbox, codex.permission_mode);
-        assert_eq!(field_value(&codex, Field::Permission), "on-request");
+        assert!(!Field::for_backend(BackendKind::Codex).contains(&Field::Sandbox));
+        assert_eq!(field_value(&codex, Field::Permission), "Custom permissions");
+        apply_permission_cycle(&mut codex);
+        assert_eq!(field_value(&codex, Field::Permission), "Read Only");
+        apply_permission_cycle(&mut codex);
+        assert_eq!(field_value(&codex, Field::Permission), "Ask for approval");
+        apply_permission_cycle(&mut codex);
+        assert_eq!(field_value(&codex, Field::Permission), "Approve for me");
+        apply_permission_cycle(&mut codex);
+        assert_eq!(field_value(&codex, Field::Permission), "Full Access");
 
         let mut claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "review");
         assert_eq!(
@@ -2354,30 +2352,49 @@ mod tests {
             "permission mode"
         );
         assert!(!Field::for_backend(BackendKind::Claude).contains(&Field::Sandbox));
-        claude.permission_mode = cycle_permission_for_backend(claude.backend, claude.sandbox, None);
+        claude.permission_mode = cycle_permission_for_backend(claude.backend, None);
         assert_eq!(field_value(&claude, Field::Permission), "acceptEdits");
+
+        let mut grok_perm = TeamMember::new("grok", "Grok", BackendKind::Grok, "impl");
+        grok_perm.sandbox = SandboxPolicy::ReadOnly;
+        assert_eq!(field_value(&grok_perm, Field::Permission), "default");
+        apply_permission_cycle(&mut grok_perm);
+        assert_eq!(field_value(&grok_perm, Field::Permission), "auto");
+        assert_eq!(grok_perm.sandbox, SandboxPolicy::WorkspaceWrite);
+        apply_permission_cycle(&mut grok_perm);
+        assert_eq!(field_value(&grok_perm, Field::Permission), "plan");
+        assert_eq!(grok_perm.sandbox, SandboxPolicy::WorkspaceWrite);
+        apply_permission_cycle(&mut grok_perm);
+        assert_eq!(field_value(&grok_perm, Field::Permission), "always-approve");
+        assert_eq!(grok_perm.sandbox, SandboxPolicy::DangerFullAccess);
+        apply_permission_cycle(&mut grok_perm);
+        assert_eq!(field_value(&grok_perm, Field::Permission), "default");
+        assert_eq!(grok_perm.sandbox, SandboxPolicy::WorkspaceWrite);
 
         let mut agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "research");
         assert_eq!(
             Field::Permission.label_for_backend(agy.backend),
             "execution mode"
         );
-        assert_eq!(field_value(&agy, Field::Sandbox), "on");
+        assert!(!Field::for_backend(BackendKind::Agy).contains(&Field::Sandbox));
+        assert!(!Field::for_backend(BackendKind::Grok).contains(&Field::Sandbox));
+        agy.sandbox = SandboxPolicy::WorkspaceWrite;
         assert_eq!(field_value(&agy, Field::Permission), "CLI default");
-        agy.permission_mode = cycle_permission_for_backend(agy.backend, agy.sandbox, None);
+        apply_permission_cycle(&mut agy);
         assert_eq!(field_value(&agy, Field::Permission), "accept-edits");
-        agy.permission_mode =
-            cycle_permission_for_backend(agy.backend, agy.sandbox, agy.permission_mode);
+        assert_eq!(agy.sandbox, SandboxPolicy::WorkspaceWrite);
+        apply_permission_cycle(&mut agy);
         assert_eq!(field_value(&agy, Field::Permission), "plan");
+        assert_eq!(agy.sandbox, SandboxPolicy::ReadOnly);
+        apply_permission_cycle(&mut agy);
+        assert_eq!(agy.sandbox, SandboxPolicy::DangerFullAccess);
         assert_eq!(
-            cycle_permission_for_backend(agy.backend, agy.sandbox, agy.permission_mode),
-            None
+            field_value(&agy, Field::Permission),
+            "dangerously-skip-permissions"
         );
-        agy.sandbox = SandboxPolicy::DangerFullAccess;
-        assert_eq!(
-            cycle_permission_for_backend(agy.backend, agy.sandbox, agy.permission_mode),
-            Some(PermissionMode::BypassPermissions)
-        );
+        apply_permission_cycle(&mut agy);
+        assert_eq!(field_value(&agy, Field::Permission), "CLI default");
+        assert_eq!(agy.sandbox, SandboxPolicy::WorkspaceWrite);
     }
 
     #[test]

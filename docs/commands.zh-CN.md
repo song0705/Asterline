@@ -11,7 +11,6 @@
 /mode brainstorm
 怎样降低索引延迟？
 /runs
-/verify run-2 cargo test
 /new
 /resume
 ```
@@ -409,9 +408,9 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 
 启动 builder/reviewer 循环。Builder 执行工作，Reviewer 输出结构化
 `@@review` 结论；未批准时继续修改，直到批准或用尽 `max_iterations`。用尽后
-运行会进入 blocked。Reviewer 被要求亲自检查 working tree 并运行项目检查；
-批准后 auto-verify（若开启）会再次运行验证命令，这是刻意设计的第二道独立
-关卡，而不是可以关掉的冗余步骤。Reviewer 回复中没有结构化结论时会被提醒
+运行会进入 blocked。Reviewer 被要求亲自检查 working tree，而不是只信
+Builder 的报告。可选的 `reviewer_hint` 会追加到这条提示里。
+Reviewer 回复中没有结构化结论时会被提醒
 一次，之后整段回复按 `request_changes` 处理（会有 Notice 说明）并消耗一次
 迭代。
 
@@ -447,15 +446,14 @@ checklist。`modes.plan.auto_execute` 默认 `true`；设为 `false` 时，最�
 #### `/mode team`
 
 启动 Coordinator 驱动的团队运行。Coordinator 创建并负责清单、向其他成员派发
-任务、整合结果，并可按 `modes.team` 配置在完成时自动验证。验证失败后可以回到
-Coordinator 修复，直到达到配置的迭代上限。
+任务并整合结果。修复循环持续到配置的迭代上限。
 
 ```text
 /mode team
 实现功能、完成审查、更新文档并运行测试
 ```
 
-模式角色、参与者、迭代上限和验证设置定义在 `team.json` 中。Reviewer 使用类似
+模式角色、参与者和迭代上限定义在 `team.json` 中。Reviewer 使用类似
 下面的一行式结论通信：
 
 ```text
@@ -520,24 +518,6 @@ brainstorm 运行重跑当前生成波次（或投票/综合阶段）；处于�
 ```text
 /block run-4 等待 schema 决策
 ```
-
-### `/verify`
-
-```text
-/verify [run-<id>] [command]
-```
-
-在工作区后台执行验证命令，并把结果保存到运行中。不提供命令时，Asterline 会
-探测 `cargo test`、`npm test`、`pytest` 等常见项目检查。不提供运行 ID 时使用
-最近的运行。
-
-```text
-/verify
-/verify run-4 cargo test --all-targets
-```
-
-所选运行仍在活动，或已有另一个验证任务运行时，不能开始新的验证。在已配置的
-模式/团队运行中，失败可以触发自动修复迭代。
 
 ### `/step`
 

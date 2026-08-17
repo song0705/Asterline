@@ -47,25 +47,23 @@ pub fn review_prompt(
     task: &str,
     builder_display: &str,
     builder_output: &str,
-    verify_command: Option<&str>,
+    reviewer_hint: Option<&str>,
 ) -> String {
     let report = if builder_output.trim().is_empty() {
         "(no report text)"
     } else {
         builder_output
     };
-    let gate = match verify_command.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(cmd) => format!(
-            "The project verification gate is `{cmd}` — run it (or the equivalent checks) yourself.\n\n"
-        ),
+    let hint = match reviewer_hint.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => format!("Reviewer note from the user:\n{text}\n\n"),
         None => String::new(),
     };
     format!(
         "You are the reviewer in review mode.\n\n\
          Task:\n{task}\n\n\
          {builder_display} reported:\n{report}\n\n\
-         Inspect the actual changes (`git status` / `git diff`) and run the project's checks \
-         yourself rather than trusting the report text. {gate}\
+         Inspect the actual changes (`git status` / `git diff`) rather than trusting the report text.\n\n\
+         {hint}\
          Judge the work on substance — do not be swayed by how confident or polished the report sounds. \
          Decide whether the work is ready or needs changes.\n\n\
          {REVIEW_PROTOCOL_HINT}"
@@ -398,16 +396,19 @@ mod tests {
             "ship feature",
             "Builder",
             "implemented foo",
-            Some("just check"),
+            Some("look at the parser tests"),
         );
         assert!(prompt.contains("ship feature"));
         assert!(prompt.contains("Builder"));
         assert!(prompt.contains("implemented foo"));
-        assert!(prompt.contains("just check"));
+        assert!(prompt.contains("Reviewer note from the user"));
+        assert!(prompt.contains("look at the parser tests"));
         assert!(prompt.contains("git diff"));
         assert!(prompt.contains("substance"));
         assert!(prompt.contains(REVIEW_PROTOCOL_HINT));
         assert!(prompt.contains("@@review"));
+        let bare = review_prompt("task", "Builder", "done", None);
+        assert!(!bare.contains("Reviewer note from the user"));
     }
 
     #[test]

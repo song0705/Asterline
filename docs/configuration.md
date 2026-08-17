@@ -104,8 +104,7 @@ terminal.
       "builder": "builder",
       "reviewer": "reviewer",
       "max_iterations": 3,
-      "auto_execute": true,
-      "auto_verify": true
+      "auto_execute": true
     },
     "brainstorm": {
       "participants": ["builder", "reviewer", "grok"],
@@ -153,7 +152,7 @@ when omitted, a complete checklist proceeds directly to the Builder. `auto_execu
 to `true`; set it to `false` to require `/approve` before the Builder receives the finalized
 checklist. Defaults for budgets:
 `max_iterations = 3`, `generation_rounds = 3`, `ideas_per_round = 4`,
-`auto_execute = true`, `auto_verify = true`.
+`auto_execute = true`.
 Brainstorm requires at least two distinct resolved participants; repeating an
 ID or referring to the same member once by ID and once by display name is
 rejected.
@@ -177,10 +176,9 @@ Markdown numbering.
 | `generation_rounds` | brainstorm       | Seed/build/stretch wave budget (default 3, minimum 2)       |
 | `ideas_per_round`   | brainstorm       | Requested idea cards per member/wave (default 4, minimum 3) |
 | `coordinator`       | team             | Member who coordinates the whole-team run                   |
-| `max_iterations`    | review/plan/team | Loop budget before blocking or failing verify (def 3)       |
+| `max_iterations`    | review/plan/team | Loop budget before blocking (default 3)                     |
 | `auto_execute`      | plan             | Auto-dispatch final plan (default); false needs `/approve`  |
-| `auto_verify`       | review/plan/team | Runs after Review approval or Plan Builder completion.      |
-| `verify_command`    | review/plan/team | Explicit auto-verify shell command (else heuristic)         |
+| `reviewer_hint`     | review           | Optional extra text appended to the reviewer prompt         |
 
 Each mode has its own configuration shape; unrelated fields are rejected by
 Serde instead of being silently accepted and ignored.
@@ -283,19 +281,23 @@ Team editor.
 | `cwd`                  | App Server `thread/start`/`thread/resume`                          | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
 | `model`                | App Server `model`                                                 | `--model`                                   | Agent `--model`                                                 | `--model`                                                                    |
 | `effort`               | App Server `effort`; picker follows model metadata                 | `--effort` (through `max`)                  | Cache-defined levels pass as Agent `--reasoning-effort`         | Model-specific effort; defined only by its listed model (not a generic menu) |
-| `sandbox`              | `read-only` / `workspace-write` / `danger-full-access`             | Not passed (not shown in `/team`)           | `read-only` / `workspace` / `off` profile mapping               | Terminal sandbox on/off; read-only intent also forces `--mode plan`          |
-| `permission_mode`      | App Server `approvalPolicy` (`never` by default)                   | `--permission-mode` (default omitted)       | Mode plus ACP responses                                         | `--mode`; bypass requires terminal sandbox off                               |
+| `sandbox`              | Folded into `/approvals` presets                                   | Not passed (not shown in `/team`)           | Default `workspace`; not shown in `/team`                       | Default off; not shown in `/team`                                            |
+| `permission_mode`      | Codex `/approvals` presets (`Ask for approval` default)            | `--permission-mode` (default omitted)       | `default` / `auto` / `plan` / `--always-approve`                | `--mode accept-edits`/`plan`; skip-permissions only when `off`               |
 | `allowed_tools`        | Not passed                                                         | `--tools` (hard built-in-tool allowlist)    | Added to ACP session rules; not a hard protocol-level allowlist | Not passed                                                                   |
 | `system_prompt`        | App Server `developerInstructions`                                 | `--append-system-prompt`                    | ACP session `rules`                                             | Prepended to the print prompt                                                |
 | `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                             | Resume or fresh conversation                                                 |
 | `session_id`           | App Server `thread/resume <thread.id>`                             | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
 
-For compatibility with existing `team.json` files, Codex's displayed policies
-are stored through the shared adapter field: omitted/default,
-`dontAsk`/`bypassPermissions` map to `never`; `plan`/`acceptEdits` map to
-`untrusted`; and `auto` maps to `on-request`. Codex command, file-change, and permission-escalation callbacks are
+`/team` shows the names each installed CLI's own UI uses. Codex combines
+sandbox and approval into the `/approvals` presets (`Read Only`, `Ask for
+approval`, `Approve for me`, `Full Access`) and sends App Server `approvalPolicy` (`never` by default)
+only for unmatched Custom leftovers, plus `sandbox` and `approvalsReviewer`.
+Shared `team.json` fields stay on the existing adapter names so older rosters
+still load: omitted/default,
+`dontAsk`/`bypassPermissions` map to Codex `never`; `plan`/`acceptEdits` map
+to `untrusted`; and `auto` maps to `on-request`. Codex command, file-change, and permission-escalation callbacks are
 shown as Asterline pending approvals and return your one-time decision to the
-live App Server thread; the selected sandbox remains an independent boundary.
+live App Server thread.
 For Claude and Grok, choose only permission modes accepted by the installed CLI version. Asterline serializes
 the configured value but does not negotiate vendor-version compatibility before
 launch. Agy 1.1.12 or newer is required;

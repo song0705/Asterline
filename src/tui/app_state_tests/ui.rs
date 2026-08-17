@@ -462,6 +462,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             },
             MemberSummary {
@@ -476,6 +477,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             },
         ],
@@ -673,6 +675,7 @@ fn targeted_skill_completion_excludes_other_backends() {
         effort: None,
         sandbox: SandboxPolicy::ReadOnly,
         permission_mode: Some(PermissionMode::Default),
+        approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
         session_policy: SessionPolicy::Resume,
     });
     state.default_target = Some(DefaultTarget::Member(MemberId::new("claude")));
@@ -756,6 +759,7 @@ fn header_roster_selection() {
             effort: None,
             sandbox: SandboxPolicy::ReadOnly,
             permission_mode: Some(PermissionMode::Default),
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         },
         MemberView {
@@ -770,6 +774,7 @@ fn header_roster_selection() {
             effort: None,
             sandbox: SandboxPolicy::ReadOnly,
             permission_mode: Some(PermissionMode::Default),
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         },
     ];

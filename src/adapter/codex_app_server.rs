@@ -66,6 +66,7 @@ struct CodexAppServerConfig {
     session_name: String,
     sandbox: SandboxPolicy,
     permission_mode: Option<PermissionMode>,
+    approvals_reviewer: crate::domain::team::CodexApprovalsReviewer,
     model: Option<String>,
     system_prompt: Option<String>,
 }
@@ -78,6 +79,7 @@ impl CodexAppServerConfig {
             session_name: native_session_name(&member.display_name),
             sandbox: member.sandbox,
             permission_mode: member.permission_mode,
+            approvals_reviewer: member.approvals_reviewer,
             model: member.model.clone(),
             system_prompt: member.system_prompt.clone(),
         }
@@ -95,6 +97,8 @@ impl CodexAppServerConfig {
             "sandbox": self.sandbox.codex_arg(),
         });
         params["approvalPolicy"] = Value::String(self.codex_approval_policy().to_string());
+        params["approvalsReviewer"] =
+            Value::String(self.approvals_reviewer.app_server_arg().to_string());
         params
     }
 
@@ -156,6 +160,7 @@ pub(crate) fn discover_models(cwd: &Path) -> Result<Vec<DiscoveredModel>, String
         session_name: "Asterline · model catalog".to_string(),
         sandbox: SandboxPolicy::ReadOnly,
         permission_mode: None,
+        approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
         model: None,
         system_prompt: None,
     };
@@ -862,12 +867,8 @@ fn unsupported_native_request_response(method: &str) -> Option<Value> {
 }
 
 fn codex_approval_policy(mode: Option<PermissionMode>) -> &'static str {
-    match mode {
-        None | Some(PermissionMode::Default) => "never",
-        Some(PermissionMode::AcceptEdits | PermissionMode::Plan) => "untrusted",
-        Some(PermissionMode::Auto) => "on-request",
-        Some(PermissionMode::DontAsk | PermissionMode::BypassPermissions) => "never",
-    }
+    mode.map(PermissionMode::codex_approval_policy)
+        .unwrap_or("never")
 }
 
 fn native_session_name(display_name: &str) -> String {
@@ -1924,6 +1925,15 @@ mod tests {
     }
 
     #[test]
+    fn default_codex_member_passes_ask_for_approval() {
+        let member = crate::domain::config::default_member(BackendKind::Codex);
+        let config = CodexAppServerConfig::from_member(&member, Path::new("/tmp"));
+        assert_eq!(config.thread_params()["sandbox"], "workspace-write");
+        assert_eq!(config.thread_params()["approvalPolicy"], "on-request");
+        assert_eq!(config.thread_params()["approvalsReviewer"], "user");
+    }
+
+    #[test]
     fn app_server_forwards_member_sandbox_and_default_policy_to_start_and_resume() {
         let mut member =
             TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
@@ -1960,6 +1970,19 @@ mod tests {
         assert_eq!(input[1]["type"], "localImage");
         assert_eq!(input[1]["path"], img.to_string_lossy().as_ref());
         let _ = std::fs::remove_dir_all(&img_dir);
+    }
+
+    #[test]
+    fn approve_for_me_sends_auto_review_reviewer() {
+        let mut member =
+            TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+        member.apply_codex_permissions_preset(
+            crate::domain::team::CodexPermissionsPreset::ApproveForMe,
+        );
+        let config = CodexAppServerConfig::from_member(&member, Path::new("/tmp"));
+        assert_eq!(config.thread_params()["sandbox"], "workspace-write");
+        assert_eq!(config.thread_params()["approvalPolicy"], "on-request");
+        assert_eq!(config.thread_params()["approvalsReviewer"], "auto_review");
     }
 
     #[test]

@@ -106,7 +106,6 @@ Runs 会保存当前阶段、清单负责人、尝试次数、阻塞原因、备
 /block 等待 staging client secret
 /note 已向平台团队申请 secret
 /continue secret 已经可用
-/verify cargo test
 ```
 
 ### 保存在本地、可以恢复的历史记录

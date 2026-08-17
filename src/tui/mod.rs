@@ -1613,6 +1613,7 @@ mod tests {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             }],
         });
@@ -1667,6 +1668,7 @@ mod tests {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             }],
         });
@@ -2030,6 +2032,7 @@ mod tests {
                 effort: None,
                 sandbox: crate::domain::team::SandboxPolicy::WorkspaceWrite,
                 permission_mode: None,
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: crate::domain::team::SessionPolicy::Resume,
             }],
         });
@@ -2091,6 +2094,7 @@ mod tests {
                 effort: None,
                 sandbox: crate::domain::team::SandboxPolicy::WorkspaceWrite,
                 permission_mode: None,
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: crate::domain::team::SessionPolicy::Resume,
             }],
         });
@@ -2160,7 +2164,7 @@ mod tests {
         handle_action(Action::Submit, &mut state, &handle);
 
         assert_eq!(state.drawer(), None);
-        assert_eq!(state.composer().text(), "/verify run-1");
+        assert_eq!(state.composer().text(), "/mode plan");
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();

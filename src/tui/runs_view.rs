@@ -67,12 +67,9 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
         )),
         RunStatus::Done if run.verification.is_none() => Some((
             if let Some(head) = mode_head {
-                format!("{head}{progress} · /verify to check · /runs details")
+                format!("{head}{progress} · /runs details")
             } else {
-                format!(
-                    "● {} done{progress} · /verify to check · /runs details",
-                    run.id
-                )
+                format!("● {} done{progress} · /runs details", run.id)
             },
             theme::success_color(),
         )),
@@ -1043,6 +1040,7 @@ mod tests {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             }],
         });

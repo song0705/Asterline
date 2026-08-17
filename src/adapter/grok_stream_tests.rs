@@ -60,6 +60,35 @@ fn fake_acp_server(
 }
 
 #[test]
+fn default_grok_member_passes_workspace_sandbox_and_auto() {
+    let member = crate::domain::config::default_member(BackendKind::Grok);
+    let runner = GrokAcpRunner::from_member(&member, Path::new("/tmp/ws"));
+    let args = runner.command_args(None);
+    assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace"]));
+    assert!(args.windows(2).any(|w| w == ["--permission-mode", "auto"]));
+    assert!(!args.contains(&"--always-approve".to_string()));
+}
+
+#[test]
+fn always_approve_is_passed_as_the_grok_flag_not_bypass_permissions() {
+    let mut member = TeamMember::new("grok", "Grok", BackendKind::Grok, "implementation");
+    member.permission_mode = Some(PermissionMode::BypassPermissions);
+    member.apply_visible_mode_sandbox();
+    let runner = GrokAcpRunner::from_member(&member, Path::new("/tmp/ws"));
+    let args = runner.command_args(None);
+    assert!(args.windows(2).any(|w| w == ["--sandbox", "off"]));
+    assert!(args.contains(&"--always-approve".to_string()));
+    assert!(
+        !args
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "bypassPermissions"])
+    );
+    let always = args.iter().position(|a| a == "--always-approve").unwrap();
+    let agent = args.iter().position(|a| a == "agent").unwrap();
+    assert!(always < agent);
+}
+
+#[test]
 fn command_uses_agent_stdio_with_flags_in_their_required_positions() {
     let mut member = TeamMember::new("grok", "Grok", BackendKind::Grok, "implementation");
     member.sandbox = SandboxPolicy::WorkspaceWrite;

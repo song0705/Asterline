@@ -204,15 +204,6 @@ fn parse_slash(rest: &str) -> Submission {
                 })
             }
         }
-        "verify" => {
-            let (first, rest) = split_first_word(arg);
-            let (run_id, command) = if let Some(run_id) = parse_run_id(first) {
-                (Some(run_id), (!rest.is_empty()).then(|| rest.to_string()))
-            } else {
-                (None, (!arg.is_empty()).then(|| arg.to_string()))
-            };
-            Submission::Runtime(UiCommand::VerifyRun { run_id, command })
-        }
         "step" => parse_step_command(arg),
         "focus" => {
             let (member, extra) = split_first_word(arg);
@@ -854,6 +845,7 @@ mod tests {
             "/lead goal",
             "/roundtable topic",
             "/rt topic",
+            "/verify cargo test",
         ] {
             assert_eq!(parse(command), Submission::Help);
         }
@@ -862,38 +854,6 @@ mod tests {
             Submission::FindInChat("needle".to_string())
         );
         assert_eq!(parse("/find"), Submission::FindInChat(String::new()));
-    }
-
-    #[test]
-    fn verify_command_runs_default_or_explicit_check() {
-        assert_eq!(
-            parse("/verify"),
-            Submission::Runtime(UiCommand::VerifyRun {
-                run_id: None,
-                command: None
-            })
-        );
-        assert_eq!(
-            parse("/verify cargo test -q"),
-            Submission::Runtime(UiCommand::VerifyRun {
-                run_id: None,
-                command: Some("cargo test -q".to_string())
-            })
-        );
-        assert_eq!(
-            parse("/verify run-12 cargo test -q"),
-            Submission::Runtime(UiCommand::VerifyRun {
-                run_id: Some(RunId(12)),
-                command: Some("cargo test -q".to_string())
-            })
-        );
-        assert_eq!(
-            parse("/verify run-12"),
-            Submission::Runtime(UiCommand::VerifyRun {
-                run_id: Some(RunId(12)),
-                command: None
-            })
-        );
     }
 
     #[test]

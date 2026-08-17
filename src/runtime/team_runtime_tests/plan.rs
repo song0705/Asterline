@@ -1021,21 +1021,3 @@ fn continue_refuses_when_mode_member_left_roster() {
         "the run stays blocked instead of half-resuming"
     );
 }
-
-#[test]
-fn manual_verify_on_active_mode_run_is_refused() {
-    let mut rt = runtime();
-    let step = rt.on_ui_command(run_mode("review this"));
-    let run_id = find_run_id(&step);
-
-    let step = rt.on_ui_command(UiCommand::VerifyRun {
-        run_id: Some(run_id),
-        command: Some("true".to_string()),
-    });
-
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Notice(text) if text.contains("active mode run")
-    )));
-    assert!(step.verify_actions.is_empty());
-}

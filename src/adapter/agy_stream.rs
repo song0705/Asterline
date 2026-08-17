@@ -137,20 +137,18 @@ impl StreamAdapter for AgyStreamAdapter {
             args.push("--effort".to_string());
             args.push(effort.as_str().to_string());
         }
-        if self.sandbox != SandboxPolicy::DangerFullAccess {
+        // Agy's --sandbox is a boolean terminal jail, not a three-level
+        // workspace policy. Only ReadOnly turns it on. WorkspaceWrite must
+        // still be able to run local commands such as `python3`.
+        if self.sandbox == SandboxPolicy::ReadOnly {
             args.push("--sandbox".to_string());
         }
-        // Agy's --sandbox only restricts terminal execution. Its per-run plan
-        // mode is the strongest CLI-level guard available for a ReadOnly
-        // member, so ReadOnly must win over permissive permission settings.
+        // ReadOnly also forces plan mode so write tools stay blocked even if
+        // a permission setting would otherwise allow edits.
         let mode = if self.sandbox == SandboxPolicy::ReadOnly {
             Some("plan")
         } else {
-            match self.permission_mode {
-                Some(PermissionMode::AcceptEdits) => Some("accept-edits"),
-                Some(PermissionMode::Plan) => Some("plan"),
-                _ => None,
-            }
+            self.permission_mode.and_then(PermissionMode::agy_arg)
         };
         if let Some(mode) = mode {
             args.push("--mode".to_string());
@@ -513,24 +511,53 @@ mod tests {
 
     #[test]
     fn sandboxed_agy_cannot_bypass_permissions() {
-        for sandbox in [SandboxPolicy::ReadOnly, SandboxPolicy::WorkspaceWrite] {
-            let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
-            member.sandbox = sandbox;
-            member.permission_mode = Some(PermissionMode::BypassPermissions);
-            let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        member.sandbox = SandboxPolicy::ReadOnly;
+        member.permission_mode = Some(PermissionMode::BypassPermissions);
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
 
-            let command = adapter.build_command("inspect", None, None);
+        let command = adapter.build_command("inspect", None, None);
 
-            assert!(command.args.contains(&"--sandbox".to_string()));
-            if sandbox == SandboxPolicy::ReadOnly {
-                assert!(command.args.windows(2).any(|w| w == ["--mode", "plan"]));
-            }
-            assert!(
-                !command
-                    .args
-                    .contains(&"--dangerously-skip-permissions".to_string())
-            );
-        }
+        assert!(command.args.contains(&"--sandbox".to_string()));
+        assert!(command.args.windows(2).any(|w| w == ["--mode", "plan"]));
+        assert!(
+            !command
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+    }
+
+    #[test]
+    fn default_agy_member_passes_workspace_write_and_accept_edits() {
+        let member = crate::domain::config::default_member(BackendKind::Agy);
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let command = adapter.build_command("hi", None, None);
+        assert!(!command.args.contains(&"--sandbox".to_string()));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--mode", "accept-edits"])
+        );
+        assert!(
+            !command
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_write_agy_can_run_local_commands() {
+        let mut member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        member.sandbox = SandboxPolicy::WorkspaceWrite;
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let command = adapter.build_command("inspect", None, None);
+        assert!(!command.args.contains(&"--sandbox".to_string()));
+        assert!(
+            !command
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
     }
 
     #[test]

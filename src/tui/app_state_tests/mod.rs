@@ -27,6 +27,7 @@ pub(super) fn ready() -> RuntimeEvent {
             effort: None,
             sandbox: SandboxPolicy::ReadOnly,
             permission_mode: Some(PermissionMode::Default),
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         }],
     }

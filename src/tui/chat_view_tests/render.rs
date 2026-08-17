@@ -912,7 +912,6 @@ fn renders_run_footer_next_step() {
     eprintln!("\n{view}");
 
     assert!(view.contains("run-7 done"));
-    assert!(view.contains("/verify to check"));
     assert!(view.contains("/runs details"));
 }
 

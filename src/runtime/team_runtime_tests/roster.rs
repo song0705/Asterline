@@ -223,7 +223,7 @@ fn team_mode_kicks_off_via_a_coordinator() {
 }
 
 #[test]
-fn team_run_complete_dispatches_auto_verify() {
+fn team_run_complete_finishes_without_engine_verify() {
     let dir = std::env::temp_dir().join(format!("asterline-team-verify-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -234,29 +234,24 @@ fn team_run_complete_dispatches_auto_verify() {
     .unwrap();
 
     let mut rt = runtime_in_workspace(dir.clone());
+    rt.config.modes.team = Some(crate::domain::mode::TeamModeConfig {
+        verify_command: Some("cargo test".to_string()),
+        ..crate::domain::mode::TeamModeConfig::default()
+    });
     let builder = MemberId::new("builder");
     let step = start_team(&mut rt, "ship it");
     let run_id = find_run_id(&step);
 
     let step = complete_ok(&mut rt, &builder, "coordinated; all done");
     assert!(
-        !step.verify_actions.is_empty(),
-        "team finish should schedule verification"
+        step.verify_actions.is_empty(),
+        "team finish must not schedule engine verification"
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
         RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Verifying
+            if run.id == run_id && run.status == RunStatus::Done
     )));
-    assert_eq!(
-        rt.store
-            .run(run_id)
-            .unwrap()
-            .mode
-            .as_ref()
-            .map(|m| m.state.phase.as_str()),
-        Some("verifying")
-    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -271,139 +266,7 @@ fn team_verify_command_config_honored() {
     let builder = MemberId::new("builder");
     start_team(&mut rt, "use just");
     let step = complete_ok(&mut rt, &builder, "done");
-    assert_eq!(
-        step.verify_actions
-            .iter()
-            .map(|a| a.command.as_str())
-            .collect::<Vec<_>>(),
-        vec!["just check"]
-    );
-}
-
-#[test]
-fn team_verify_pass_marks_done() {
-    let dir =
-        std::env::temp_dir().join(format!("asterline-team-verify-pass-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    let builder = MemberId::new("builder");
-    let step = start_team(&mut rt, "pass gate");
-    let run_id = find_run_id(&step);
-    let step = complete_ok(&mut rt, &builder, "done");
-    let command = step.verify_actions[0].command.clone();
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command,
-        ok: true,
-        stdout: b"ok".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(step.actions.is_empty(), "pass must not re-dispatch");
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Done
-    )));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn team_verify_fail_auto_continues_coordinator() {
-    let dir =
-        std::env::temp_dir().join(format!("asterline-team-verify-fail-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    let builder = MemberId::new("builder");
-    let step = start_team(&mut rt, "repair after fail");
-    let run_id = find_run_id(&step);
-    let step = complete_ok(&mut rt, &builder, "first pass");
-    let command = step.verify_actions[0].command.clone();
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: command.clone(),
-        ok: false,
-        stdout: b"team gate failed: missing tests".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(
-        step.actions.iter().any(|a| {
-            a.member == builder
-                && a.prompt.contains("missing tests")
-                && a.prompt.contains(&command)
-                && a.prompt.contains("@@run_step")
-                && a.prompt.contains("failed")
-        }),
-        "coordinator should auto-continue with failure + checklist: {:?}",
-        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
-    );
-    let run = rt.store.run(run_id).unwrap();
-    assert_eq!(run.status, RunStatus::Running);
-    assert_eq!(run.attempt, 2);
-    assert_eq!(run.mode.as_ref().map(|m| m.state.iteration), Some(2));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn team_verify_fail_exhausted_stays_failed() {
-    let dir = std::env::temp_dir().join(format!(
-        "asterline-team-verify-exhausted-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    rt.config.modes.team = Some(crate::domain::mode::TeamModeConfig {
-        max_iterations: Some(1),
-        ..crate::domain::mode::TeamModeConfig::default()
-    });
-    let builder = MemberId::new("builder");
-    let step = start_team(&mut rt, "no budget");
-    let run_id = find_run_id(&step);
-    let step = complete_ok(&mut rt, &builder, "done");
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: step.verify_actions[0].command.clone(),
-        ok: false,
-        stdout: b"boom".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(step.actions.is_empty(), "exhausted must not re-dispatch");
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Notice(text)
-            if text.contains("after 1 attempts") && text.contains("team run failed")
-    )));
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Failed);
-
-    std::fs::remove_dir_all(&dir).ok();
+    assert!(step.verify_actions.is_empty());
 }
 
 #[test]
@@ -419,50 +282,13 @@ fn team_auto_verify_false_marks_done_immediately() {
     let step = complete_ok(&mut rt, &builder, "all done");
     assert!(
         step.verify_actions.is_empty(),
-        "auto_verify false must not verify"
+        "team finish must not schedule engine verification"
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
         RuntimeEvent::RunUpdated { run }
             if run.id == run_id && run.status == RunStatus::Done
     )));
-}
-
-#[test]
-fn team_verify_cancelled_no_auto_continue() {
-    let dir = std::env::temp_dir().join(format!(
-        "asterline-team-verify-cancel-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    let builder = MemberId::new("builder");
-    let step = start_team(&mut rt, "cancel gate");
-    let run_id = find_run_id(&step);
-    let step = complete_ok(&mut rt, &builder, "done");
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: step.verify_actions[0].command.clone(),
-        ok: false,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: true,
-    });
-    assert!(
-        step.actions.is_empty(),
-        "cancelled verification must not auto-continue"
-    );
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -604,95 +430,6 @@ fn run_marks_done_when_its_turn_finishes() {
 }
 
 #[test]
-fn verify_run_records_successful_check() {
-    let dir = std::env::temp_dir().join(format!("asterline-verify-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut rt = runtime_in_workspace(dir.clone());
-
-    start_team(&mut rt, "ship the parser");
-    complete_ok(&mut rt, &MemberId::new("builder"), "done");
-    let step = rt.on_ui_command(UiCommand::VerifyRun {
-        run_id: None,
-        command: Some("printf verified".to_string()),
-    });
-
-    assert_eq!(step.verify_actions.len(), 1);
-    let action = &step.verify_actions[0];
-    assert_eq!(action.command, "printf verified");
-    assert_eq!(action.workspace, dir);
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.status == RunStatus::Verifying
-    )));
-
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id: action.run_id,
-        command: action.command.clone(),
-        ok: true,
-        stdout: b"verified".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.status == RunStatus::Done
-                && run.verification.as_ref().is_some_and(|v| {
-                    v.ok && v.command == "printf verified" && v.summary == "verified"
-                })
-    )));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn verify_run_can_target_an_older_run() {
-    let dir = std::env::temp_dir().join(format!("asterline-verify-target-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut rt = runtime_in_workspace(dir.clone());
-
-    let first = start_team(&mut rt, "ship parser");
-    let first_id = first
-        .events
-        .iter()
-        .find_map(|e| match e {
-            RuntimeEvent::RunUpdated { run } => Some(run.id),
-            _ => None,
-        })
-        .expect("first run id");
-    complete_ok(&mut rt, &MemberId::new("builder"), "first done");
-    let second = start_team(&mut rt, "refactor ui");
-    let second_id = second
-        .events
-        .iter()
-        .find_map(|e| match e {
-            RuntimeEvent::RunUpdated { run } => Some(run.id),
-            _ => None,
-        })
-        .expect("second run id");
-
-    let verify = rt.on_ui_command(UiCommand::VerifyRun {
-        run_id: Some(first_id),
-        command: Some("printf first".to_string()),
-    });
-
-    assert_eq!(verify.verify_actions.len(), 1);
-    assert_eq!(verify.verify_actions[0].run_id, first_id);
-    assert_ne!(verify.verify_actions[0].run_id, second_id);
-    assert!(verify.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == first_id && run.status == RunStatus::Verifying
-    )));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 fn continue_run_resumes_failed_run() {
     let mut rt = runtime();
     let step = start_team(&mut rt, "ship the parser");
@@ -711,19 +448,9 @@ fn continue_run_resumes_failed_run() {
             ok: true,
         },
     );
-    let verify = rt.on_ui_command(UiCommand::VerifyRun {
+    rt.on_ui_command(UiCommand::BlockRun {
         run_id: Some(run_id),
-        command: Some("cargo test".to_string()),
-    });
-    let action = &verify.verify_actions[0];
-    rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: action.command.clone(),
-        ok: false,
-        stdout: b"test failed".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
+        reason: "needs another pass".to_string(),
     });
 
     let step = rt.on_ui_command(UiCommand::ContinueRun {
@@ -742,11 +469,6 @@ fn continue_run_resumes_failed_run() {
             if body == "/continue run-1 fix verification"
     )));
     assert_eq!(step.actions.len(), 1);
-    assert!(
-        step.actions[0]
-            .prompt
-            .contains("Previous verification: cargo test (failed)")
-    );
     assert!(
         step.actions[0]
             .prompt
@@ -1031,57 +753,4 @@ fn agent_run_step_envelope_outside_a_run_is_ignored() {
         RuntimeEvent::Notice(text)
             if text.contains("ignored run step update: no active run")
     )));
-}
-
-#[test]
-fn failed_verification_remains_failed() {
-    let dir = std::env::temp_dir().join(format!("asterline-verify-fail-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut rt = runtime_in_workspace(dir.clone());
-
-    let step = start_team(&mut rt, "ship the parser");
-    let run_id = step
-        .events
-        .iter()
-        .find_map(|e| match e {
-            RuntimeEvent::RunUpdated { run } => Some(run.id),
-            _ => None,
-        })
-        .expect("run id");
-    complete_ok(&mut rt, &MemberId::new("builder"), "done");
-    let verify = rt.on_ui_command(UiCommand::VerifyRun {
-        run_id: None,
-        command: Some("printf nope; exit 2".to_string()),
-    });
-    let action = &verify.verify_actions[0];
-    rt.on_verify_output(VerifyOutput {
-        run_id: action.run_id,
-        command: action.command.clone(),
-        ok: false,
-        stdout: b"nope".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-
-    let step = rt.on_agent_event(
-        &MemberId::new("builder"),
-        AgentEvent::Exited {
-            code: Some(0),
-            ok: true,
-        },
-    );
-
-    assert!(!step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Done
-    )));
-    assert_eq!(
-        rt.store.latest_run().unwrap().unwrap().status,
-        RunStatus::Failed
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
 }

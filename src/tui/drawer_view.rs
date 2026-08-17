@@ -796,6 +796,7 @@ mod tests {
                 effort: None,
                 sandbox: SandboxPolicy::WorkspaceWrite,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             }],
         });
@@ -842,15 +843,9 @@ mod tests {
                 text.contains(':').then_some(text)
             })
             .filter(|line| {
-                [
-                    "name:",
-                    "role:",
-                    "sandbox:",
-                    "approval policy:",
-                    "session id:",
-                ]
-                .iter()
-                .any(|label| line.contains(label))
+                ["name:", "role:", "backend:", "permissions:", "session id:"]
+                    .iter()
+                    .any(|label| line.contains(label))
             })
             .collect::<Vec<_>>();
         let colon_positions = field_lines
@@ -980,6 +975,7 @@ mod tests {
                     effort: None,
                     sandbox: SandboxPolicy::WorkspaceWrite,
                     permission_mode: Some(PermissionMode::Default),
+                    approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                     session_policy: SessionPolicy::Resume,
                 },
                 MemberSummary {
@@ -994,6 +990,7 @@ mod tests {
                     effort: None,
                     sandbox: SandboxPolicy::WorkspaceWrite,
                     permission_mode: Some(PermissionMode::Default),
+                    approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                     session_policy: SessionPolicy::Resume,
                 },
             ],
@@ -1085,22 +1082,16 @@ mod tests {
             .iter()
             .map(line_text)
             .filter(|text| {
-                [
-                    "builder:",
-                    "reviewer:",
-                    "max_iterations:",
-                    "auto_verify:",
-                    "verify_command:",
-                ]
-                .iter()
-                .any(|label| text.contains(label))
+                ["builder:", "reviewer:", "max_iterations:", "reviewer_hint:"]
+                    .iter()
+                    .any(|label| text.contains(label))
             })
             .map(|text| {
                 let byte = text.find(':').expect("field colon");
                 theme::display_width(&text[..byte])
             })
             .collect::<Vec<_>>();
-        assert!(colons.len() >= 5);
+        assert!(colons.len() >= 4);
         assert!(colons.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }

@@ -385,6 +385,7 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
         system_prompt: raw.system_prompt,
         sandbox: raw.sandbox,
         permission_mode: raw.permission_mode,
+        approvals_reviewer: Default::default(),
         allowed_tools: raw.allowed_tools,
         session_policy: raw.session_policy,
         session_id: raw

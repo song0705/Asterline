@@ -88,8 +88,7 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
       "builder": "builder",
       "reviewer": "reviewer",
       "max_iterations": 3,
-      "auto_execute": true,
-      "auto_verify": true
+      "auto_execute": true
     },
     "brainstorm": {
       "participants": ["builder", "reviewer", "grok"],
@@ -132,7 +131,7 @@ builder ≈ 默认目标或第一位非 reviewer；reviewer ≈ role 含 `review
 `builder` 是必填项且不会自动推导。`reviewer` 可省略，省略后可执行 checklist 会直接交给
 Builder。`auto_execute` 默认 `true`；设为 `false` 时，最终 checklist 会等待 `/approve` 后才派给
 Builder。预算默认值为：`max_iterations = 3`、`generation_rounds = 3`、
-`ideas_per_round = 4`、`auto_execute = true`、`auto_verify = true`。Brainstorm 至少要求两位
+`ideas_per_round = 4`、`auto_execute = true`。Brainstorm 至少要求两位
 不同的已解析 participant；重复 ID 或同一成员同时以 ID 和显示名引用都会被拒绝。
 `/mode` 面板里 `s` 选择当前模式并应用其 pending 覆盖，`w` 把当前模式的本对话覆盖写入
 `team.json`。
@@ -152,10 +151,9 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 | `generation_rounds` | brainstorm | 种子/构建/延展轮预算（默认 3，最少 2） |
 | `ideas_per_round` | brainstorm | 每位成员/每轮请求的 idea card（默认 4，最少 3） |
 | `coordinator` | team | 协调整个团队 Run 的成员 |
-| `max_iterations` | review/plan/team | 阻塞或验证失败前的循环预算（默认 3） |
+| `max_iterations` | review/plan/team | 阻塞前的循环预算（默认 3） |
 | `auto_execute` | plan | 自动派发最终计划（默认 true）；false 时须 `/approve` |
-| `auto_verify` | review/plan/team | Review 批准后，或已配置的 Plan Builder 完成后运行验证（默认 true） |
-| `verify_command` | review/plan/team | 显式自动验证 shell 命令（否则启发式） |
+| `reviewer_hint` | review | 可选，追加到审阅成员提示里的说明 |
 
 每种 mode 都有自己的配置形状；不相关字段会被 Serde 拒绝，而不是被静默接受后忽略。
 
@@ -235,16 +233,17 @@ Asterline 的 Team editor 不做这项过滤：选中该成员的 **session id**
 | `cwd` | App Server `thread/start` / `thread/resume` | 进程 cwd | ACP session `cwd` | 进程 cwd 加 `--add-dir`；prompt 标识项目 workspace |
 | `model` | App Server `model` | `--model` | Agent `--model` | `--model` |
 | `effort` | App Server `effort`；picker 跟随模型 metadata | `--effort`（经 `max`） | cache-defined level 作为 Agent `--reasoning-effort` | 模型特定 effort；仅由列出的模型定义 |
-| `sandbox` | `read-only` / `workspace-write` / `danger-full-access` | 不传递（`/team` 不显示） | `read-only` / `workspace` / `off` profile 映射 | terminal sandbox 开/关；read-only 意图也强制 `--mode plan` |
-| `permission_mode` | App Server `approvalPolicy`（默认 `never`） | `--permission-mode`（省略 default） | 模式加 ACP 响应 | `--mode`；bypass 要求 terminal sandbox 关闭 |
+| `sandbox` | 并进 `/approvals` 预设 | 不传递（`/team` 不显示） | 默认 `workspace`；`/team` 不显示 | 默认 off；`/team` 不显示 |
+| `permission_mode` | Codex `/approvals` 预设（默认 `Ask for approval`） | `acceptEdits` / `plan` / `auto` / `dontAsk` / `bypassPermissions` | `default` / `auto` / `plan` / `--always-approve` | `--mode accept-edits`/`plan`；skip-permissions 仅在 `off` 时 |
 | `allowed_tools` | 不传递 | `--tools`（硬 built-in-tool allowlist） | 加入 ACP session rules；不是硬协议级 allowlist | 不传递 |
 | `system_prompt` | App Server `developerInstructions` | `--append-system-prompt` | ACP session `rules` | 加在 print prompt 前 |
 | `session_policy` | Resume 或 fresh | Resume 或 fresh | ACP `session/load` 或 `session/new` | Resume 或 fresh conversation |
 | `session_id` | App Server `thread/resume <thread.id>` | `claude --resume <id>` | ACP `session/load` | `agy --conversation <id>` |
 
-为兼容既有 `team.json`，Codex 显示的策略通过共用 adapter 字段保存：省略/`default`、
-`dontAsk` / `bypassPermissions` 映射为 `never`；`plan` / `acceptEdits` 映射为 `untrusted`；
-`auto` 映射为 `on-request`。Codex 的 command、file-change、permission-escalation 回调显示为
+`/team` 显示的是各本机 CLI 真正接受的名字。`team.json` 仍用原来的共用字段，旧
+roster 可以继续读：省略/`default`、`dontAsk` / `bypassPermissions` 映射为 Codex
+`never`；`plan` / `acceptEdits` 映射为 `untrusted`；`auto` 映射为
+`on-request`。Codex 的 command、file-change、permission-escalation 回调显示为
 Asterline 待审批，并把你的一次性决定返回给 live App Server thread；已选 sandbox 仍是独立
 边界。对 Claude 和 Grok，只选择已安装 CLI 版本接受的 permission mode。Asterline 会序列化
 配置值，但不会在启动前协商厂商版本兼容性。Agy 要求 1.1.12 或更高版本；更早版本会在

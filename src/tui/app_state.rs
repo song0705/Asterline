@@ -22,10 +22,10 @@ use crate::domain::event::{
 };
 use crate::domain::mode::{ModesConfig, TerminalMode};
 use crate::domain::team::{
-    BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
-    TeamMember,
+    BackendKind, CodexApprovalsReviewer, DefaultTarget, Effort, MemberId, PermissionMode,
+    SandboxPolicy, SessionPolicy, TeamMember,
 };
-use crate::run_support::suggested_verify_command;
+
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, AgentSkill, Completion};
 use crate::tui::composer::{Composer, MAX_COMPOSER_BYTES};
@@ -124,6 +124,7 @@ pub struct MemberView {
     pub effort: Option<Effort>,
     pub sandbox: SandboxPolicy,
     pub permission_mode: Option<PermissionMode>,
+    pub approvals_reviewer: CodexApprovalsReviewer,
     pub session_policy: SessionPolicy,
 }
 
@@ -399,6 +400,7 @@ impl AppState {
                         effort: m.effort,
                         sandbox: m.sandbox,
                         permission_mode: m.permission_mode,
+                        approvals_reviewer: m.approvals_reviewer,
                         session_policy: m.session_policy,
                     })
                     .collect();
@@ -2708,7 +2710,6 @@ impl AppState {
             members,
             self.modes.clone(),
             self.mode_overrides.clone(),
-            self.suggested_verify.clone(),
             self.active_mode,
         ));
     }
@@ -2834,6 +2835,7 @@ impl AppState {
         member.model = view.model.clone();
         member.sandbox = view.sandbox;
         member.permission_mode = view.permission_mode;
+        member.approvals_reviewer = view.approvals_reviewer;
         member.session_policy = view.session_policy;
         member.session_id = view.session.clone();
         member.effort = view.effort;
@@ -2966,24 +2968,11 @@ impl AppState {
 
 pub(crate) fn run_action_command(
     run: &RunSummary,
-    workspace: &str,
+    _workspace: &str,
     include_run_id: bool,
 ) -> Option<String> {
     match run.status {
         RunStatus::Running | RunStatus::Verifying => None,
-        RunStatus::Done if run.verification.is_none() => {
-            let workspace = if workspace.is_empty() {
-                Path::new(".")
-            } else {
-                Path::new(workspace)
-            };
-            let mut command = verify_command_prefix(run, include_run_id);
-            if let Some(check) = suggested_verify_command(workspace) {
-                command.push(' ');
-                command.push_str(check);
-            }
-            Some(command)
-        }
         RunStatus::Done => run
             .mode
             .as_ref()
@@ -3001,14 +2990,6 @@ pub(crate) fn run_action_command(
             Some(command)
         }
         RunStatus::Planned => Some("/retry".to_string()),
-    }
-}
-
-fn verify_command_prefix(run: &RunSummary, include_run_id: bool) -> String {
-    if include_run_id {
-        format!("/verify {}", run.id)
-    } else {
-        "/verify".to_string()
     }
 }
 

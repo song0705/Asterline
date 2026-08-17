@@ -186,6 +186,7 @@ fn new_chat_resets_member_sessions_to_fresh() {
             effort: None,
             sandbox: SandboxPolicy::WorkspaceWrite,
             permission_mode: None,
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         }],
         runs: Vec::new(),
@@ -384,7 +385,7 @@ fn runs_drawer_stages_selected_run_action_without_overwriting_draft() {
     state.toggle_drawer(Drawer::Runs);
     assert!(state.stage_selected_run_action());
     assert_eq!(state.drawer(), None);
-    assert_eq!(state.composer().text(), "/verify run-1");
+    assert_eq!(state.composer().text(), "/mode plan");
 
     state.clear_composer();
     state.insert_char('x');
@@ -443,10 +444,10 @@ fn runs_drawer_can_select_an_older_run() {
     assert_eq!(state.selected_run().map(|run| run.id), Some(RunId(1)));
     assert_eq!(
         state.selected_run_action_command().as_deref(),
-        Some("/verify run-1")
+        Some("/mode plan")
     );
     assert!(state.stage_selected_run_action());
-    assert_eq!(state.composer().text(), "/verify run-1");
+    assert_eq!(state.composer().text(), "/mode plan");
 }
 
 #[test]
@@ -555,18 +556,14 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
 }
 
 #[test]
-fn run_action_previews_detected_verify_command() {
-    let dir = std::env::temp_dir().join(format!("asterline-action-preview-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+fn run_action_previews_verify_without_guessing_a_command() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
         modes: Default::default(),
         mode_overrides: Default::default(),
         suggested_verify: None,
         team: "mixed".to_string(),
-        workspace: dir.display().to_string(),
+        workspace: "/tmp/ws".to_string(),
         default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
         runs: Vec::new(),
         members: Vec::new(),
@@ -590,13 +587,11 @@ fn run_action_previews_detected_verify_command() {
 
     assert_eq!(
         state.latest_run_action_command().as_deref(),
-        Some("/verify cargo test")
+        Some("/mode plan")
     );
     state.toggle_drawer(Drawer::Runs);
     assert!(state.stage_selected_run_action());
-    assert_eq!(state.composer().text(), "/verify run-1 cargo test");
-
-    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(state.composer().text(), "/mode plan");
 }
 
 #[test]

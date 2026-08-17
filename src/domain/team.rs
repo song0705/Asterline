@@ -144,6 +144,20 @@ impl SandboxPolicy {
             Self::DangerFullAccess => "off",
         }
     }
+
+    /// Label shown in `/team` and the roster: the token that backend actually
+    /// accepts. Agy's `--sandbox` is a boolean flag, so it is `on` / `off`.
+    pub fn native_label(self, backend: BackendKind) -> &'static str {
+        match backend {
+            BackendKind::Claude => "not passed",
+            BackendKind::Codex => self.codex_arg(),
+            BackendKind::Grok => self.grok_arg(),
+            BackendKind::Agy => match self {
+                Self::ReadOnly => "on",
+                Self::WorkspaceWrite | Self::DangerFullAccess => "off",
+            },
+        }
+    }
 }
 
 /// Claude/Grok permission mode. Serialized values match their
@@ -180,6 +194,113 @@ impl PermissionMode {
 
     pub fn grok_arg(self) -> &'static str {
         self.claude_arg()
+    }
+
+    /// Name shown for Grok: a token the installed CLI actually accepts.
+    /// `default` / `auto` / `plan` are `--permission-mode` values.
+    /// `always-approve` is the dedicated `--always-approve` flag.
+    pub fn grok_label(self) -> &'static str {
+        match self {
+            Self::Default | Self::DontAsk => "default",
+            Self::AcceptEdits | Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::BypassPermissions => "always-approve",
+        }
+    }
+
+    /// Value for `grok --permission-mode`. `always-approve` is a separate flag,
+    /// not a `--permission-mode` token.
+    pub fn grok_permission_mode_arg(self) -> Option<&'static str> {
+        match self {
+            Self::Auto | Self::AcceptEdits => Some("auto"),
+            Self::Plan => Some("plan"),
+            Self::Default | Self::DontAsk => Some("default"),
+            Self::BypassPermissions => None,
+        }
+    }
+
+    /// Value for `agy --mode`. Only `accept-edits` and `plan` exist there.
+    pub fn agy_arg(self) -> Option<&'static str> {
+        match self {
+            Self::AcceptEdits => Some("accept-edits"),
+            Self::Plan => Some("plan"),
+            _ => None,
+        }
+    }
+
+    /// Codex App Server `approvalPolicy` for this stored mode.
+    pub fn codex_approval_policy(self) -> &'static str {
+        match self {
+            Self::Default => "never",
+            Self::AcceptEdits | Self::Plan => "untrusted",
+            Self::Auto => "on-request",
+            Self::DontAsk | Self::BypassPermissions => "never",
+        }
+    }
+
+    /// Label shown in `/team` and the roster: the token that backend actually
+    /// accepts. Omitted Agy `--mode` has no CLI name.
+    pub fn native_label(self, backend: BackendKind) -> &'static str {
+        match backend {
+            BackendKind::Codex => self.codex_approval_policy(),
+            BackendKind::Claude => self.claude_arg(),
+            BackendKind::Grok => self.grok_label(),
+            BackendKind::Agy => match self {
+                Self::AcceptEdits => "accept-edits",
+                Self::Plan => "plan",
+                Self::BypassPermissions => "dangerously-skip-permissions",
+                Self::Default | Self::Auto | Self::DontAsk => "CLI default",
+            },
+        }
+    }
+}
+
+/// Who reviews Codex approval prompts. `auto_review` is "Approve for me".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CodexApprovalsReviewer {
+    #[default]
+    #[serde(rename = "user")]
+    User,
+    #[serde(rename = "auto_review")]
+    AutoReview,
+}
+
+impl CodexApprovalsReviewer {
+    pub fn app_server_arg(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::AutoReview => "auto_review",
+        }
+    }
+}
+
+/// Codex TUI `/approvals` presets. Each one sets sandbox and approval together.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexPermissionsPreset {
+    ReadOnly,
+    AskForApproval,
+    ApproveForMe,
+    FullAccess,
+}
+
+impl CodexPermissionsPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read Only",
+            Self::AskForApproval => "Ask for approval",
+            Self::ApproveForMe => "Approve for me",
+            Self::FullAccess => "Full Access",
+        }
+    }
+}
+
+/// Map a Grok config / Claude-compat token to a CLI-accepted display name.
+pub fn normalize_grok_permission_label(raw: &str) -> &'static str {
+    match raw.trim() {
+        "bypassPermissions" | "always-approve" | "always_approve" | "yolo" => "always-approve",
+        "acceptEdits" | "auto" => "auto",
+        "plan" => "plan",
+        _ => "default",
     }
 }
 
@@ -267,6 +388,7 @@ pub struct TeamMember {
     pub system_prompt: Option<String>,
     pub sandbox: SandboxPolicy,
     pub permission_mode: Option<PermissionMode>,
+    pub approvals_reviewer: CodexApprovalsReviewer,
     pub allowed_tools: Vec<String>,
     pub session_policy: SessionPolicy,
     /// Optional native CLI session/conversation id to resume explicitly.
@@ -286,6 +408,7 @@ impl Serialize for TeamMember {
         let include_system_prompt = self.system_prompt.is_some();
         let include_sandbox = self.sandbox != SandboxPolicy::default();
         let include_permission = self.permission_mode.is_some();
+        let include_reviewer = self.approvals_reviewer != CodexApprovalsReviewer::User;
         let include_allowed_tools = !self.allowed_tools.is_empty();
         let include_session = self.session_policy != SessionPolicy::default();
         let include_session_id = self.session_id.is_some();
@@ -298,6 +421,7 @@ impl Serialize for TeamMember {
             + usize::from(include_system_prompt)
             + usize::from(include_sandbox)
             + usize::from(include_permission)
+            + usize::from(include_reviewer)
             + usize::from(include_allowed_tools)
             + usize::from(include_session)
             + usize::from(include_session_id)
@@ -323,6 +447,9 @@ impl Serialize for TeamMember {
         }
         if include_permission {
             state.serialize_field("permission_mode", &self.permission_mode)?;
+        }
+        if include_reviewer {
+            state.serialize_field("approvals_reviewer", &self.approvals_reviewer)?;
         }
         if include_allowed_tools {
             state.serialize_field("allowed_tools", &self.allowed_tools)?;
@@ -364,6 +491,8 @@ impl<'de> Deserialize<'de> for TeamMember {
             #[serde(default)]
             permission_mode: Option<PermissionMode>,
             #[serde(default)]
+            approvals_reviewer: CodexApprovalsReviewer,
+            #[serde(default)]
             allowed_tools: Vec<String>,
             #[serde(default)]
             session_policy: SessionPolicy,
@@ -393,6 +522,7 @@ impl<'de> Deserialize<'de> for TeamMember {
             system_prompt: input.system_prompt,
             sandbox: input.sandbox,
             permission_mode: input.permission_mode,
+            approvals_reviewer: input.approvals_reviewer,
             allowed_tools: input.allowed_tools,
             session_policy: input.session_policy,
             session_id: input
@@ -422,6 +552,7 @@ impl TeamMember {
             system_prompt: None,
             sandbox: SandboxPolicy::default(),
             permission_mode: None,
+            approvals_reviewer: CodexApprovalsReviewer::User,
             allowed_tools: Vec::new(),
             session_policy: SessionPolicy::default(),
             session_id: None,
@@ -432,6 +563,128 @@ impl TeamMember {
     /// The member's working directory, defaulting to the team workspace.
     pub fn resolved_cwd(&self, workspace: &Path) -> PathBuf {
         self.cwd.clone().unwrap_or_else(|| workspace.to_path_buf())
+    }
+
+    pub fn sandbox_native_label(&self) -> &'static str {
+        self.sandbox.native_label(self.backend)
+    }
+
+    pub fn codex_permissions_preset(&self) -> Option<CodexPermissionsPreset> {
+        if self.backend != BackendKind::Codex {
+            return None;
+        }
+        let policy = self
+            .permission_mode
+            .map(PermissionMode::codex_approval_policy)
+            .unwrap_or("never");
+        match (self.sandbox, policy, self.approvals_reviewer) {
+            (SandboxPolicy::ReadOnly, "on-request", CodexApprovalsReviewer::User) => {
+                Some(CodexPermissionsPreset::ReadOnly)
+            }
+            (SandboxPolicy::WorkspaceWrite, "on-request", CodexApprovalsReviewer::User) => {
+                Some(CodexPermissionsPreset::AskForApproval)
+            }
+            (SandboxPolicy::WorkspaceWrite, "on-request", CodexApprovalsReviewer::AutoReview) => {
+                Some(CodexPermissionsPreset::ApproveForMe)
+            }
+            (SandboxPolicy::DangerFullAccess, "never", _) => {
+                Some(CodexPermissionsPreset::FullAccess)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn apply_codex_permissions_preset(&mut self, preset: CodexPermissionsPreset) {
+        match preset {
+            CodexPermissionsPreset::ReadOnly => {
+                self.sandbox = SandboxPolicy::ReadOnly;
+                self.permission_mode = Some(PermissionMode::Auto);
+                self.approvals_reviewer = CodexApprovalsReviewer::User;
+            }
+            CodexPermissionsPreset::AskForApproval => {
+                self.sandbox = SandboxPolicy::WorkspaceWrite;
+                self.permission_mode = Some(PermissionMode::Auto);
+                self.approvals_reviewer = CodexApprovalsReviewer::User;
+            }
+            CodexPermissionsPreset::ApproveForMe => {
+                self.sandbox = SandboxPolicy::WorkspaceWrite;
+                self.permission_mode = Some(PermissionMode::Auto);
+                self.approvals_reviewer = CodexApprovalsReviewer::AutoReview;
+            }
+            CodexPermissionsPreset::FullAccess => {
+                self.sandbox = SandboxPolicy::DangerFullAccess;
+                self.permission_mode = Some(PermissionMode::DontAsk);
+                self.approvals_reviewer = CodexApprovalsReviewer::User;
+            }
+        }
+    }
+
+    pub fn cycle_codex_permissions(&mut self) {
+        let next = match self.codex_permissions_preset() {
+            Some(CodexPermissionsPreset::ReadOnly) => CodexPermissionsPreset::AskForApproval,
+            Some(CodexPermissionsPreset::AskForApproval) => CodexPermissionsPreset::ApproveForMe,
+            Some(CodexPermissionsPreset::ApproveForMe) => CodexPermissionsPreset::FullAccess,
+            Some(CodexPermissionsPreset::FullAccess) | None => CodexPermissionsPreset::ReadOnly,
+        };
+        self.apply_codex_permissions_preset(next);
+    }
+
+    /// Pair the hidden sandbox with the visible mode. Native pickers do not
+    /// offer a sandbox row; each mode still has one matching confinement.
+    pub fn apply_visible_mode_sandbox(&mut self) {
+        match self.backend {
+            BackendKind::Claude | BackendKind::Codex => {}
+            BackendKind::Grok => {
+                self.sandbox = match self.permission_mode {
+                    Some(PermissionMode::BypassPermissions) => SandboxPolicy::DangerFullAccess,
+                    _ => SandboxPolicy::WorkspaceWrite,
+                };
+            }
+            BackendKind::Agy => {
+                self.sandbox = match self.permission_mode {
+                    Some(PermissionMode::Plan) => SandboxPolicy::ReadOnly,
+                    Some(PermissionMode::BypassPermissions) => SandboxPolicy::DangerFullAccess,
+                    _ => SandboxPolicy::WorkspaceWrite,
+                };
+            }
+        }
+    }
+
+    pub fn permission_native_label(&self) -> String {
+        match self.backend {
+            BackendKind::Codex => self
+                .codex_permissions_preset()
+                .map(CodexPermissionsPreset::label)
+                .unwrap_or("Custom permissions")
+                .to_string(),
+            BackendKind::Claude => self
+                .permission_mode
+                .map(|mode| mode.claude_arg())
+                .unwrap_or("default")
+                .to_string(),
+            BackendKind::Grok => self
+                .permission_mode
+                .map(PermissionMode::grok_label)
+                .unwrap_or("default")
+                .to_string(),
+            BackendKind::Agy => {
+                if self.sandbox == SandboxPolicy::ReadOnly {
+                    return "plan".to_string();
+                }
+                match self.permission_mode {
+                    None
+                    | Some(
+                        PermissionMode::Default | PermissionMode::Auto | PermissionMode::DontAsk,
+                    ) => "CLI default".to_string(),
+                    Some(PermissionMode::BypassPermissions)
+                        if self.sandbox != SandboxPolicy::DangerFullAccess =>
+                    {
+                        "requires sandbox off".to_string()
+                    }
+                    Some(mode) => mode.native_label(self.backend).to_string(),
+                }
+            }
+        }
     }
 }
 
@@ -1029,11 +1282,49 @@ mod tests {
         assert_eq!(SandboxPolicy::ReadOnly.grok_arg(), "read-only");
         assert_eq!(SandboxPolicy::WorkspaceWrite.grok_arg(), "workspace");
         assert_eq!(SandboxPolicy::DangerFullAccess.grok_arg(), "off");
+        assert_eq!(
+            SandboxPolicy::WorkspaceWrite.native_label(BackendKind::Grok),
+            "workspace"
+        );
+        assert_eq!(
+            SandboxPolicy::WorkspaceWrite.native_label(BackendKind::Agy),
+            "off"
+        );
+        assert_eq!(SandboxPolicy::ReadOnly.native_label(BackendKind::Agy), "on");
         assert_eq!(PermissionMode::AcceptEdits.claude_arg(), "acceptEdits");
+        assert_eq!(PermissionMode::AcceptEdits.agy_arg(), Some("accept-edits"));
         assert_eq!(
             PermissionMode::BypassPermissions.claude_arg(),
             "bypassPermissions"
         );
         assert_eq!(PermissionMode::Auto.grok_arg(), "auto");
+        assert_eq!(
+            PermissionMode::BypassPermissions.grok_label(),
+            "always-approve"
+        );
+        assert_eq!(PermissionMode::Default.grok_label(), "default");
+        assert_eq!(
+            PermissionMode::BypassPermissions.grok_permission_mode_arg(),
+            None
+        );
+        assert_eq!(
+            PermissionMode::AcceptEdits.native_label(BackendKind::Grok),
+            "auto"
+        );
+        assert_eq!(
+            PermissionMode::AcceptEdits.native_label(BackendKind::Agy),
+            "accept-edits"
+        );
+        assert_eq!(
+            PermissionMode::AcceptEdits.codex_approval_policy(),
+            "untrusted"
+        );
+        let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+        member.apply_codex_permissions_preset(CodexPermissionsPreset::AskForApproval);
+        assert_eq!(member.permission_native_label(), "Ask for approval");
+        member.cycle_codex_permissions();
+        assert_eq!(member.permission_native_label(), "Approve for me");
+        member.cycle_codex_permissions();
+        assert_eq!(member.permission_native_label(), "Full Access");
     }
 }

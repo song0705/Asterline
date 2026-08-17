@@ -354,12 +354,6 @@ pub enum UiCommand {
         run_id: Option<RunId>,
         reason: String,
     },
-    /// Run verification for the latest run, or a specific run when
-    /// launched from `/runs`.
-    VerifyRun {
-        run_id: Option<RunId>,
-        command: Option<String>,
-    },
     /// Add one checklist step to the latest or specified run.
     AddRunStep {
         run_id: Option<RunId>,
@@ -554,6 +548,7 @@ pub struct MemberSummary {
     pub effort: Option<Effort>,
     pub sandbox: SandboxPolicy,
     pub permission_mode: Option<PermissionMode>,
+    pub approvals_reviewer: crate::domain::team::CodexApprovalsReviewer,
     pub session_policy: SessionPolicy,
 }
 

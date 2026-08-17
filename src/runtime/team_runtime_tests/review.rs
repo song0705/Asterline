@@ -20,9 +20,9 @@ fn review_approve_flow_completes_run() {
         step.events.iter().any(|e| matches!(
             e,
             RuntimeEvent::Notice(text)
-                if text.contains("review run-") && text.contains("started") && text.contains("verify")
+                if text.contains("review run-") && text.contains("started")
         )),
-        "start notice should state the verify plan: {:?}",
+        "start notice should name the review run: {:?}",
         step.events
     );
 
@@ -56,7 +56,7 @@ fn review_approve_flow_completes_run() {
     )));
     assert!(
         step.verify_actions.is_empty(),
-        "no verify file in workspace → no VerifyAction"
+        "review mode does not schedule a verify command"
     );
 
     // Session freed: a second RunMode succeeds.
@@ -244,43 +244,9 @@ fn mode_transition_does_not_dispatch_when_state_persistence_fails() {
 }
 
 #[test]
-fn manual_verification_is_not_dispatched_when_status_write_fails() {
-    let path = std::env::temp_dir().join(format!(
-        "asterline-manual-verify-failure-{}.sqlite3",
-        std::process::id()
-    ));
-    remove_sqlite_test_files(&path);
-    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
-    let external = Connection::open(&path).unwrap();
-    let run = rt.store.create_run("verify durably", None).unwrap();
-    external
-        .execute_batch(
-            "CREATE TRIGGER fail_verifying_event
-             BEFORE INSERT ON run_events
-             WHEN NEW.kind = 'verifying'
-             BEGIN SELECT RAISE(ABORT, 'verification event unavailable'); END;",
-        )
-        .unwrap();
-
-    let verify = rt.on_ui_command(UiCommand::VerifyRun {
-        run_id: Some(run.id),
-        command: Some("true".to_string()),
-    });
-
-    assert!(verify.verify_actions.is_empty());
-    assert!(verify.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(text) if text.contains("could not start verification")
-    )));
-    assert_eq!(rt.store.run(run.id).unwrap().status, RunStatus::Running);
-    drop(external);
-    drop(rt);
-    remove_sqlite_test_files(&path);
-}
-
-#[test]
-fn review_auto_verify_runs_on_approve() {
-    let dir = std::env::temp_dir().join(format!("asterline-review-verify-{}", std::process::id()));
+fn review_approve_does_not_auto_verify() {
+    let dir =
+        std::env::temp_dir().join(format!("asterline-review-no-verify-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -301,104 +267,19 @@ fn review_auto_verify_runs_on_approve() {
         "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
     );
     assert!(
-        !step.verify_actions.is_empty(),
-        "approve with Cargo.toml should schedule verification"
+        step.verify_actions.is_empty(),
+        "review approve must not run a workspace check"
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
         RuntimeEvent::RunUpdated { run }
-            if run.status == RunStatus::Verifying
-    )));
-    let run_id = step.verify_actions[0].run_id;
-
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: step.verify_actions[0].command.clone(),
-        ok: true,
-        stdout: b"ok".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Done
+            if run.status == RunStatus::Done
     )));
 
-    // Session freed.
     let step = rt.on_ui_command(run_mode("next"));
     assert!(step.actions.iter().any(|a| a.member == builder));
 
     std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn verification_result_failure_keeps_the_mode_session_owned() {
-    let dir = std::env::temp_dir().join(format!(
-        "asterline-review-verify-store-failure-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-    let path = dir.join("state.sqlite3");
-    let mut config = team();
-    config.workspace = dir.clone();
-    let mut rt = TeamRuntime::new(config, SqliteStore::open(&path).unwrap()).with_approvals(false);
-    let external = Connection::open(&path).unwrap();
-    let builder = MemberId::new("builder");
-    let reviewer = MemberId::new("reviewer");
-
-    rt.on_ui_command(run_mode("finish durably"));
-    complete_ok(&mut rt, &builder, "done");
-    let approve = complete_ok(
-        &mut rt,
-        &reviewer,
-        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
-    );
-    let verify = &approve.verify_actions[0];
-    let run_id = verify.run_id;
-    let command = verify.command.clone();
-    external
-        .execute_batch(
-            "CREATE TRIGGER fail_verification_done
-             BEFORE UPDATE OF status ON runs
-             WHEN NEW.status = 'done'
-             BEGIN SELECT RAISE(ABORT, 'done unavailable'); END;",
-        )
-        .unwrap();
-
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command,
-        ok: true,
-        stdout: b"ok".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(text) if text.contains("could not save verification result")
-    )));
-    assert!(rt.mode_sessions.contains_key(&run_id));
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Verifying);
-    let second = rt.on_ui_command(run_mode("must wait"));
-    assert!(second.actions.is_empty());
-    assert!(second.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(text) if text.contains("already active")
-    )));
-
-    drop(external);
-    drop(rt);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -560,289 +441,40 @@ fn failed_run_status_failure_does_not_finish_or_start_queued_work() {
 }
 
 #[test]
-fn review_verify_fail_loops_builder_then_passes() {
-    let dir = std::env::temp_dir().join(format!(
-        "asterline-review-verify-loop-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    let builder = MemberId::new("builder");
-    let reviewer = MemberId::new("reviewer");
-
-    rt.on_ui_command(run_mode("ship feature"));
-    complete_ok(&mut rt, &builder, "first attempt");
-    let step = complete_ok(
-        &mut rt,
-        &reviewer,
-        "@@review {\"verdict\":\"approve\",\"summary\":\"looks fine\"}",
-    );
-    assert!(!step.verify_actions.is_empty());
-    let run_id = step.verify_actions[0].run_id;
-    let command = step.verify_actions[0].command.clone();
-
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: command.clone(),
-        ok: false,
-        stdout: b"test failed: edge case".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(
-        step.actions.iter().any(|a| {
-            a.member == builder && a.prompt.contains(&command) && a.prompt.contains("edge case")
-        }),
-        "builder should get verify_failure_prompt with command+summary: {:?}",
-        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
-    );
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Running
-    )));
-    assert_eq!(latest_run(&rt).mode.as_ref().unwrap().state.iteration, 2);
-
-    complete_ok(&mut rt, &builder, "fixed the edge case");
-    let step = complete_ok(
-        &mut rt,
-        &reviewer,
-        "@@review {\"verdict\":\"approve\",\"summary\":\"good now\"}",
-    );
-    assert!(!step.verify_actions.is_empty());
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: step.verify_actions[0].command.clone(),
-        ok: true,
-        stdout: b"ok".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Done
-    )));
-    // Session freed: another review can start.
-    let step = rt.on_ui_command(run_mode("next"));
-    assert!(step.actions.iter().any(|a| a.member == builder));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn review_verify_fail_exhausted_stays_failed() {
-    let dir = std::env::temp_dir().join(format!(
-        "asterline-review-verify-exhausted-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    rt.config.modes.review = Some(ReviewModeConfig {
-        max_iterations: Some(1),
-        ..ReviewModeConfig::default()
-    });
-    let builder = MemberId::new("builder");
-    let reviewer = MemberId::new("reviewer");
-
-    rt.on_ui_command(run_mode("tight"));
-    complete_ok(&mut rt, &builder, "attempt");
-    let step = complete_ok(
-        &mut rt,
-        &reviewer,
-        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
-    );
-    let run_id = step.verify_actions[0].run_id;
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: step.verify_actions[0].command.clone(),
-        ok: false,
-        stdout: b"boom".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(
-        step.actions.is_empty(),
-        "exhausted iterations must not re-dispatch"
-    );
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Notice(text) if text.contains("after 1 iterations") && text.contains("failed")
-    )));
-    let run = rt.store.run(run_id).unwrap();
-    assert_eq!(run.status, RunStatus::Failed);
-    // Session gone: new review can start.
-    let step = rt.on_ui_command(run_mode("again"));
-    assert!(step.actions.iter().any(|a| a.member == builder));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn review_verify_cancelled_no_loopback() {
-    let dir = std::env::temp_dir().join(format!(
-        "asterline-review-verify-cancel-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut rt = runtime_in_workspace(dir.clone());
-    let builder = MemberId::new("builder");
-    let reviewer = MemberId::new("reviewer");
-
-    rt.on_ui_command(run_mode("cancel verify"));
-    complete_ok(&mut rt, &builder, "work");
-    let step = complete_ok(
-        &mut rt,
-        &reviewer,
-        "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
-    );
-    let run_id = step.verify_actions[0].run_id;
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: step.verify_actions[0].command.clone(),
-        ok: false,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: true,
-    });
-    assert!(
-        step.actions.is_empty(),
-        "cancelled verification must not loop back"
-    );
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn review_verify_command_config_reaches_verify_action() {
+fn review_hint_is_appended_to_reviewer_prompt() {
     let mut rt = runtime();
     rt.config.modes.review = Some(ReviewModeConfig {
-        verify_command: Some("just check".to_string()),
+        reviewer_hint: Some("look at the parser tests".to_string()),
         ..ReviewModeConfig::default()
     });
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
-    rt.on_ui_command(run_mode("use just"));
-    complete_ok(&mut rt, &builder, "done");
+    rt.on_ui_command(run_mode("use a hint"));
+    let step = complete_ok(&mut rt, &builder, "done");
+    assert!(
+        step.actions.iter().any(|a| {
+            a.member == reviewer
+                && a.prompt.contains("Reviewer note from the user")
+                && a.prompt.contains("look at the parser tests")
+        }),
+        "reviewer prompt should include the optional hint: {:?}",
+        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
+    );
     let step = complete_ok(
         &mut rt,
         &reviewer,
         "@@review {\"verdict\":\"approve\",\"summary\":\"ok\"}",
     );
-    assert_eq!(
-        step.verify_actions
-            .iter()
-            .map(|a| a.command.as_str())
-            .collect::<Vec<_>>(),
-        vec!["just check"]
-    );
+    assert!(step.verify_actions.is_empty());
 }
 
 #[test]
-fn plan_verify_fail_loops_leader_with_plan_hint() {
-    let dir =
-        std::env::temp_dir().join(format!("asterline-plan-verify-loop-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-
-    let mut config = plan_team();
-    config.workspace = dir.clone();
-    config.modes.plan = Some(PlanModeConfig {
-        builder: Some(MemberId::new("builder")),
-        reviewer: Some(MemberId::new("reviewer")),
-        ..PlanModeConfig::default()
-    });
-    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
-    let planner = MemberId::new("planner");
-    let builder = MemberId::new("builder");
-    let reviewer = MemberId::new("reviewer");
-
-    let step = rt.on_ui_command(run_plan("ship plan"));
-    let run_id = find_run_id(&step);
-    complete_ok(
-        &mut rt,
-        &planner,
-        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Do it\"}",
-    );
-    complete_ok(
-        &mut rt,
-        &reviewer,
-        "@@review {\"verdict\":\"approve\",\"summary\":\"plan is ready\"}",
-    );
-    let step = complete_ok(
-        &mut rt,
-        &builder,
-        "@@run_step {\"action\":\"done\",\"step\":1}\ndone",
-    );
-    assert!(!step.verify_actions.is_empty());
-    let command = step.verify_actions[0].command.clone();
-    let step = rt.on_verify_output(VerifyOutput {
-        run_id,
-        command: command.clone(),
-        ok: false,
-        stdout: b"plan verify failed: missing tests".to_vec(),
-        stderr: Vec::new(),
-        start_error: None,
-        cancelled: false,
-    });
-    assert!(
-        step.actions.iter().any(|a| {
-            a.member == planner
-                && a.prompt.contains(PLAN_MODE_HINT)
-                && a.prompt.contains(&command)
-                && a.prompt.contains("missing tests")
-        }),
-        "leader should get plan_verify_failure_prompt: {:?}",
-        step.actions.iter().map(|a| &a.prompt).collect::<Vec<_>>()
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn plan_verify_command_config_reaches_verify_action() {
+fn plan_builder_completion_finishes_without_engine_verify() {
     let mut rt = plan_runtime();
-    rt.config.modes.plan = Some(PlanModeConfig {
-        builder: Some(MemberId::new("builder")),
-        reviewer: Some(MemberId::new("reviewer")),
-        verify_command: Some("just check".to_string()),
-        ..PlanModeConfig::default()
-    });
     let planner = MemberId::new("planner");
     let builder = MemberId::new("builder");
     let reviewer = MemberId::new("reviewer");
-    rt.on_ui_command(run_plan("use just for plan"));
+    rt.on_ui_command(run_plan("ship plan"));
     complete_ok(
         &mut rt,
         &planner,
@@ -858,13 +490,11 @@ fn plan_verify_command_config_reaches_verify_action() {
         &builder,
         "@@run_step {\"action\":\"done\",\"step\":1}\ndone",
     );
-    assert_eq!(
-        step.verify_actions
-            .iter()
-            .map(|a| a.command.as_str())
-            .collect::<Vec<_>>(),
-        vec!["just check"]
-    );
+    assert!(step.verify_actions.is_empty());
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::RunUpdated { run } if run.status == RunStatus::Done
+    )));
 }
 
 #[test]

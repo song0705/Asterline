@@ -2851,61 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_persists_active_verification_as_blocked() {
-        let dir = std::env::temp_dir().join(format!(
-            "asterline-shutdown-verification-{}-{}",
-            std::process::id(),
-            TEAM_SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("state.sqlite3");
-        let store = SqliteStore::open(&db_path).unwrap();
-        let conversation = store.current_conversation().unwrap();
-        let run = store.create_run("shutdown verification", None).unwrap();
-        let run_id = run.id;
-        let (evt_tx, evt_rx) = mpsc::channel();
-        let (handle, join) = spawn(
-            single_codex_team(),
-            store,
-            HashMap::new(),
-            evt_tx,
-            true,
-            false,
-            None,
-        );
-        let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
-        #[cfg(windows)]
-        let slow_command = "ping.exe 127.0.0.1 -n 6 >NUL";
-        #[cfg(not(windows))]
-        let slow_command = "sleep 5";
-        assert!(handle.send(UiCommand::VerifyRun {
-            run_id: Some(run_id),
-            command: Some(slow_command.to_string()),
-        }));
-        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
-            if matches!(
-                event,
-                RuntimeEvent::RunUpdated { run }
-                    if run.id == run_id && run.status == RunStatus::Verifying
-            ) {
-                break;
-            }
-        }
-
-        assert!(handle.send(UiCommand::Shutdown));
-        join.join().unwrap();
-
-        let reopened = SqliteStore::open(&db_path).unwrap();
-        reopened.set_conversation(conversation).unwrap();
-        let run = reopened.run(run_id).unwrap();
-        assert_eq!(run.status, RunStatus::Blocked);
-        assert_eq!(run.verification.unwrap().summary, "verification cancelled");
-        drop(reopened);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn runtime_thread_runs_run_verification() {
+    fn runtime_thread_finishes_team_run_without_engine_verify() {
         let mut runners: Runners = HashMap::new();
         runners.insert(
             MemberId::new("builder"),
@@ -2942,35 +2888,7 @@ mod tests {
             }
         }
         assert!(saw_run, "team run was created");
-        assert!(saw_team_done, "team run finished before verification");
-
-        handle.send(UiCommand::VerifyRun {
-            run_id: None,
-            command: Some("echo runtime-verified".to_string()),
-        });
-
-        let mut saw_verifying = false;
-        let mut saw_done = false;
-        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
-            match event {
-                RuntimeEvent::RunUpdated { run } if run.status == RunStatus::Verifying => {
-                    saw_verifying = true;
-                }
-                RuntimeEvent::RunUpdated { run }
-                    if run.status == RunStatus::Done
-                        && run.verification.as_ref().is_some_and(|v| {
-                            v.ok && v.command == "echo runtime-verified"
-                                && v.summary == "runtime-verified"
-                        }) =>
-                {
-                    saw_done = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_verifying);
-        assert!(saw_done);
+        assert!(saw_team_done, "team run finished without engine verify");
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
