@@ -43,7 +43,7 @@ fn session_overrides_change_the_next_resolve_not_an_active_mode_session() {
 }
 
 #[test]
-fn new_session_clears_mode_overrides() {
+fn new_session_keeps_mode_overrides() {
     let mut rt = runtime();
     rt.on_ui_command(UiCommand::SetModeOverrides {
         overrides: review_iteration_overrides(6),
@@ -61,7 +61,10 @@ fn new_session_clears_mode_overrides() {
     rt.on_ui_command(UiCommand::NewSession);
     match rt.ready_event() {
         RuntimeEvent::Ready { mode_overrides, .. } => {
-            assert_eq!(mode_overrides, ModesConfig::default());
+            assert_eq!(
+                mode_overrides.review.and_then(|cfg| cfg.max_iterations),
+                Some(6)
+            );
         }
         other => panic!("unexpected {other:?}"),
     }

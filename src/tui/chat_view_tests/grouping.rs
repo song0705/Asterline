@@ -1770,6 +1770,50 @@ fn edits_split_file_change_cards_and_are_hidden_from_tools() {
 }
 
 #[test]
+fn write_tools_are_file_change_cards_not_tools() {
+    let builder = MemberId::new("builder");
+    let state = AppState::new(vec![
+        ChatItem::Tool {
+            member: builder.clone(),
+            name: "Search".to_string(),
+            summary: "DirectoryPath engine/Asterline".to_string(),
+            detail: String::new(),
+            ok: Some(true),
+        },
+        ChatItem::Tool {
+            member: builder.clone(),
+            name: "Write".to_string(),
+            summary: "TargetFile snake game/index.html".to_string(),
+            detail: String::new(),
+            ok: None,
+        },
+        ChatItem::Tool {
+            member: builder,
+            name: "Write".to_string(),
+            summary: "TargetFile css/style.css".to_string(),
+            detail: String::new(),
+            ok: None,
+        },
+    ]);
+    let mut lines = Vec::new();
+    render_chat_history(&state, 80, 0, &mut lines);
+    let text = plain_text(&lines);
+    let joined = text.join("\n");
+
+    assert!(joined.contains("tools"), "{joined}");
+    assert!(joined.contains("Search"), "{joined}");
+    assert!(joined.contains("file changes"), "{joined}");
+    assert!(
+        joined.contains("snake game/index.html") && joined.contains("css/style.css"),
+        "{joined}"
+    );
+    assert!(
+        !text.iter().any(|line| line.contains("Write")),
+        "Write belongs in file changes, not tools: {joined}"
+    );
+}
+
+#[test]
 fn claude_edit_without_a_native_diff_is_a_file_change_card() {
     let state = AppState::new(vec![ChatItem::Tool {
         member: MemberId::new("planer"),

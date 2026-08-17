@@ -96,7 +96,8 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
       "ideas_per_round": 4
     },
     "team": {
-      "coordinator": "builder"
+      "coordinator": "builder",
+      "allow_add_members": false
     }
   },
   "approvals": {
@@ -149,8 +150,9 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 | `leader` | plan | 编写并修订 checklist 的成员 |
 | `participants` | brainstorm | 所有生成轮的 roster |
 | `generation_rounds` | brainstorm | 种子/构建/延展轮预算（默认 3，最少 2） |
-| `ideas_per_round` | brainstorm | 每位成员/每轮请求的 idea card（默认 4，最少 3） |
+| `ideas_per_round` | brainstorm | 每位成员/每轮固定输出的 idea card（默认 4，最少 3）。多出来的卡片会被丢掉。 |
 | `coordinator` | team | 协调整个团队 Run 的成员 |
+| `allow_add_members` | team | 允许用 `@@team_member` 自由加人（默认只能用当前队员） |
 | `max_iterations` | review/plan/team | 阻塞前的循环预算（默认 3） |
 | `auto_execute` | plan | 自动派发最终计划（默认 true）；false 时须 `/approve` |
 | `reviewer_hint` | review | 可选，追加到审阅成员提示里的说明 |
@@ -159,17 +161,12 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 
 ### 审批（`approvals`）
 
-审批门策略。没有 `approvals` 段时，所有内置类别和所有界面都启用。
-
-| 字段 | 含义 |
-| --- | --- |
-| `gate` | 保留的内置类别：`git`、`shell`、`file`。省略即三者全保留 |
-| `keywords` | 自定义类别：名称 → 关键词列表（不区分大小写匹配） |
-| `apply_to` | 界面：`user`、`relay`、`mode`。省略即全部界面 |
-
-`user` 是普通用户消息；`relay` 是 agent-to-agent 路由和 Agent 请求添加 roster；`mode` 是
-协作模式的引擎派发。只要启用 `relay`，roster 新增始终会暂停，与关键词类别无关。设置
-`ASTERLINE_NO_BELL=1` 可关闭审批、暂停路由、阻塞 Run 和成员错误事件的终端 BEL/OSC 9 通知。
+旧的 `team.json` 里可能还有 `approvals` 段（`gate`、`keywords`、`apply_to`）。
+这些字段只为兼容保留，不再拦住用户消息、转交或模式派发。写
+`"approvals": { "manual": true }` 或加上 `--manual-approvals` 时，Codex 工具
+询问会显示输入框上方的卡片；默认自动通过。Plan 的 `auto_execute: false`
+是另一套确认。`@@team_member` 不再审批。设置 `ASTERLINE_NO_BELL=1` 可关闭
+审批、暂停路由、阻塞 Run 和成员错误事件的终端 BEL/OSC 9 通知。
 
 审批门与后端原生 sandbox/权限执行的关系，请参阅[审批与工具级控制](approvals.zh-CN.md)。
 
@@ -369,10 +366,8 @@ ASTERLINE_THEME=light asterline
 Asterline 本地启动后端 CLI，并继承其凭据、环境变量、文件系统访问和网络访问。它不为后端
 进程提供安全边界。
 
-后端原生权限和 sandbox 设置仍然适用。Asterline 也会把它分类为有风险的请求放到自己的
-审批门后。使用 `/approve` 或 `/reject` 处理第一个待处理请求。
-
-`--debug` 会关闭 Asterline 审批门。它不会添加 sandbox，只应在受控开发环境中使用。
+后端原生权限和 sandbox 设置仍然适用。Codex 工具询问默认自动通过；打开
+`--manual-approvals` 或 `approvals.manual` 后才用输入框上方的卡片。
 
 `danger-full-access` sandbox 与 bypass 风格 permission mode 应视为明确的信任决定。不要假定
 团队 role 或模型名限制了底层进程可访问的内容。
@@ -434,7 +429,8 @@ Asterline 校验重复 ID 与名称、启动 runner、保存 roster 并广播更
 | `--workspace <PATH>` | 设置 workspace；默认当前目录 |
 | `--db <PATH>` | 设置 SQLite 数据库路径 |
 | `--no-restore` | 启动时不 replay 已持久化聊天 |
-| `--debug` | 关闭 Asterline 审批门 |
+| `--debug` | 开发模式 |
+| `--manual-approvals` | 显示 Codex 工具审批卡片（默认关闭） |
 | `--fake` | 使用离线 fake agent 而不是后端 CLI |
 | `--banner` | TUI 前打印紧凑启动横幅 |
 | `-h`、`--help` | 打印命令行帮助 |

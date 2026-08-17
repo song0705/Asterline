@@ -28,7 +28,8 @@ pub const BRAINSTORM_SYNTHESIS_HINT: &str = "BRAINSTORM_PHASE: SYNTHESIZE_RANKIN
 
 const BRAINSTORM_GENERATION_RULES: &str = "Generation rules:\n\
 - Suspend judgment: do not critique, rank, reject, vote, or choose a winner.\n\
-- Prefer quantity and variety over polished feasibility.\n\
+- Emit exactly the requested number of cards. Do not emit extra cards.\n\
+- Spend the budget on variety, not volume: each card must be a distinct idea.\n\
 - Welcome bold, surprising, and temporarily impractical ideas.\n\
 - Build on and combine ideas without turning the response into an evaluation.";
 
@@ -265,13 +266,13 @@ pub fn plan_review_prompt(task: &str, steps_summary: &str, verify_command: Optio
 
 /// Body text for a manual `@owner` step dispatch from the TUI (after `@{owner} `).
 pub fn manual_step_dispatch_text(
-    run_id: RunId,
+    run: impl std::fmt::Display,
     instruction: &str,
     number: u32,
     title: &str,
 ) -> String {
     format!(
-        "{instruction} {run_id} step #{number}: {title}. Update the checklist with @@run_step as you progress."
+        "{instruction} {run} step #{number}: {title}. Update the checklist with @@run_step as you progress."
     )
 }
 
@@ -285,8 +286,9 @@ pub fn brainstorm_propose_prompt(
         "You are 1 of {n_participants} equal contributors in the first wave of a brainstorm.\n\n\
          Topic:\n{topic}\n\n\
          {BRAINSTORM_GENERATION_RULES}\n\n\
-         Generate at least {ideas_per_round} short, distinct idea cards. Include at least one \
-         deliberately wild idea. Keep each card atomic and emit it using the deployed skill's \
+         Emit exactly {ideas_per_round} short, distinct idea cards and no more. \
+         Extra cards are discarded. Include one deliberately wild idea among those \
+         {ideas_per_round}. Keep each card atomic and emit it using the deployed skill's \
          `@@brainstorm_card` schema. You are not shown other contributors' ideas in this seed wave.\n\n\
          {BRAINSTORM_PROPOSE_HINT}"
     )
@@ -306,8 +308,9 @@ pub fn brainstorm_build_prompt(
          Topic:\n{topic}\n\n\
          {BRAINSTORM_GENERATION_RULES}\n\n\
          Prior idea batches for inspiration:\n{context}\n\n\
-         Generate at least {ideas_per_round} new atomic idea cards. Include: one independent \
-         NEW direction, one BUILD that extends a prior idea, and one COMBINE or MUTATE idea. \
+         Emit exactly {ideas_per_round} new atomic idea cards and no more. Extra cards are \
+         discarded. Cover these moves across that budget: one independent NEW direction, one \
+         BUILD that extends a prior idea, and one COMBINE or MUTATE idea. \
          Emit every card with `@@brainstorm_card`; state the operation and canonical source IDs \
          on each derived card. Do not discuss \
          strengths, risks, trade-offs, or feasibility.\n\n\
@@ -329,9 +332,10 @@ pub fn brainstorm_stretch_prompt(
          Topic:\n{topic}\n\n\
          {BRAINSTORM_GENERATION_RULES}\n\n\
          Prior idea batches for inspiration:\n{context}\n\n\
-         Generate at least {ideas_per_round} new atomic idea cards using different moves: \
-         invert an assumption, remove a constraint, borrow an analogy from another domain, \
-         and bridge two previously separate directions. Emit every card with `@@brainstorm_card`, \
+         Emit exactly {ideas_per_round} new atomic idea cards and no more. Extra cards are \
+         discarded. Use different moves from this set: invert an assumption, remove a \
+         constraint, borrow an analogy from another domain, bridge two previously separate \
+         directions. Emit every card with `@@brainstorm_card`, \
          label each move, and cite canonical source IDs. Preserve strange but relevant \
          possibilities; do not select a preferred option.\n\n\
          {BRAINSTORM_STRETCH_HINT}"
@@ -504,6 +508,10 @@ mod tests {
 
     #[test]
     fn brainstorm_prompts_include_hints() {
+        let seed = brainstorm_propose_prompt("topic", 3, 3);
+        assert!(seed.contains(BRAINSTORM_PROPOSE_HINT));
+        assert!(seed.contains("exactly 3"));
+        assert!(!seed.contains("at least 3"));
         assert!(brainstorm_propose_prompt("topic", 3, 4).contains(BRAINSTORM_PROPOSE_HINT));
         assert!(
             brainstorm_build_prompt("topic", 2, 3, 4, "R1-A: seed").contains(BRAINSTORM_BUILD_HINT)

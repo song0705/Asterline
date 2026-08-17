@@ -2,30 +2,25 @@
 
 [English](approvals.md)
 
-Asterline 在两个层级控制工作。本页说明每个层级覆盖的范围、如何配置
-Asterline 层，以及为何本版本把逐工具的交互式审批交给各后端 CLI。
+Asterline 不再因为句子里出现 `git`、`shell`、`file` 就拦住整段 prompt。
+用户消息、队员转交和模式派发会立刻开始。Codex 工具询问**默认自动通过**；只有打开
+`--manual-approvals` 或 `team.json` 的 `"approvals": { "manual": true }` 才会
+弹出卡片。
 
-## 第一层：Asterline 审批门
+手动审批打开且有待批事项时，输入框上方会出现卡片：`y` 或 Enter 同意，`n` 拒绝。
+也可以继续用 `/approve` / `/reject`。多条时，输入框为空可用 `←` / `→` 切换。
 
-在 prompt 进入后端进程前，Asterline 会依据 `team.json` 的 `approvals` 策略进行分类
-（参阅[配置参考](configuration.zh-CN.md#审批approvals)）。命中规则的请求会暂停派发，
-直到你执行 `/approve` 或 `/reject`。该门覆盖三个界面：
+仍会停下的（手动审批，外加可选的 Plan 确认）只有：
 
-| 界面 | 被拦截的内容 |
+| 拦截 | 何时 |
 | --- | --- |
-| `user` | 你输入的消息（`@成员 …`、`/ask …`） |
-| `relay` | Agent 转交和 Agent 请求添加成员 |
-| `mode` | 已选择协作模式 Run 内部的引擎派发 |
+| Codex 原生工具 | App Server 询问命令、改文件或提权 |
+| Plan 执行 | `auto_execute` 关闭，且 checklist 已准备好交给 Builder |
 
-拒绝被拦截的模式派发会阻塞该 Run（可稍后用 `/continue` 恢复）。通过 `/retry`
-显式恢复的路由不会再次经过门：这次恢复本身就是你的决定。只要启用了 `relay` 界面，
-`@@team_member` 请求一定会被暂停，而不取决于 prompt 关键词分类，因为它可能改变后端、
-模型、工作目录、sandbox 和权限设置。`--debug` 会完全关闭这一层。
+`@@team_member` 不再审批。`/mode team` 默认只能用当前队员；打开
+`allow_add_members` 后立刻加入。
 
-此门分类的是**提示词**，而不是工具调用：它决定一条指令是否可以开始，不能决定正在
-运行的 Agent 具体可以执行什么。
-
-## 第二层：后端原生工具控制
+## 工具级控制
 
 成员开始运行后，逐工具的强制控制属于后端 CLI：
 
@@ -51,8 +46,8 @@ Asterline 层，以及为何本版本把逐工具的交互式审批交给各后�
 `--permission-prompt-tool` 权限回调，但 Asterline 尚未配置这座桥。
 
 Codex 默认使用 App Server。其结构化的命令、文件变更和权限提升请求会成为普通的
-Asterline 待审批项。使用 `/approve` 或 `/reject` 将一次性决定发回同一个仍存活的
-Codex thread；请求正文会随审批一起记录。Team 编辑器的 **approval policy** 会作为
+Asterline 待审批项。在输入框上方的卡片里按 `y` / `n` 决定；`/approve` 和
+`/reject` 仍会把一次性决定发回同一个仍存活的 Codex thread。请求正文会随审批一起记录。Team 编辑器的 **approval policy** 会作为
 Codex 原生策略传入 App Server：省略/`default`、`dontAsk`、`bypassPermissions` 映射
 为 `never`；`plan` / `acceptEdits` 映射为 `untrusted`；`auto` 映射为 `on-request`。
 Asterline 不会为了单次审批写入 Codex 的会话或持久策略修正；选定的 sandbox 仍限制每一
@@ -65,13 +60,12 @@ Grok 则不同：Asterline 使用其双向 ACP server，并响应
 提权。这些是自动的策略响应，不是模态用户提示。结构化 ACP 流也携带 Grok 工具开始、
 进度、完成、diff 和思考片段。
 
-对于没有回调的后端，本版本使用提示词层面的门（第一层）加上它们的原生非交互控制
-（第二层）。
+对于没有回调的后端，本版本只使用它们的原生非交互控制。Prompt 文本不会再为
+`/approve` 而挂起。
 
 ## 实用配方
 
 - **谨慎审查者**：Claude 使用 `permission_mode: plan`，或 Codex/Grok 使用
   `sandbox: read-only`——成员能读取和推理，但不能修改工作树。
-- **可信构建者，但意图需审批**：`sandbox: workspace-write` 加一个关心命令的
-  `approvals.keywords` 类别（`{"deploy": ["kubectl", "terraform"]}`）。
+- **可信构建者**：`sandbox: workspace-write`（或对应的 Codex 权限预设）。工具询问仍会出现在审批卡片里。
 - **演示 / 离线**：`--fake` 完全不会启动真实 CLI。

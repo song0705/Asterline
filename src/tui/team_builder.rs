@@ -1617,6 +1617,7 @@ impl BuilderState {
                 if self.selected_member().backend != choice.backend {
                     let member = self.selected_member_mut();
                     member.backend = choice.backend;
+                    apply_backend_write_defaults(member);
                     member.session_id = None;
                     member.model = None;
                     member.effort = None;
@@ -1727,17 +1728,21 @@ impl BuilderState {
     }
 
     fn add_member(&mut self) {
-        let backend = self
-            .members
-            .get(self.selected)
+        let template = self.members.get(self.selected).cloned();
+        let backend = template
+            .as_ref()
             .map(|member| member.backend)
             .or_else(|| self.available.first().copied())
             .unwrap_or(BackendKind::Codex);
         let mut member = default_member(backend);
+        if let Some(template) = template.as_ref() {
+            copy_write_permissions(template, &mut member);
+        }
         member.id = MemberId::new(unique_member_id(member.id.as_str(), &self.members, None));
         member.display_name = unique_display_name(&member.display_name, &self.members);
         self.members.push(member);
         self.selected = self.members.len() - 1;
+        self.field = 0;
         self.normalize_field();
     }
 
@@ -2221,6 +2226,19 @@ fn permission_value(member: &TeamMember) -> String {
     member.permission_native_label()
 }
 
+pub(crate) fn apply_backend_write_defaults(member: &mut TeamMember) {
+    let defaults = default_member(member.backend);
+    member.sandbox = defaults.sandbox;
+    member.permission_mode = defaults.permission_mode;
+    member.approvals_reviewer = defaults.approvals_reviewer;
+}
+
+pub(crate) fn copy_write_permissions(from: &TeamMember, to: &mut TeamMember) {
+    to.sandbox = from.sandbox;
+    to.permission_mode = from.permission_mode;
+    to.approvals_reviewer = from.approvals_reviewer;
+}
+
 pub(crate) fn apply_permission_cycle(member: &mut TeamMember) {
     if member.backend == BackendKind::Codex {
         member.cycle_codex_permissions();
@@ -2441,6 +2459,55 @@ mod tests {
         assert_eq!(config.members[2].backend, BackendKind::Codex);
         assert_eq!(config.members[2].model.as_deref(), Some("model-x"));
         assert_eq!(config.members[2].effort, Some(Effort::High));
+    }
+
+    #[test]
+    fn add_member_copies_selected_write_permissions_and_focuses_name() {
+        let available = [BackendKind::Claude];
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &available);
+        state.members[0].permission_mode = Some(PermissionMode::AcceptEdits);
+        state.field = state
+            .fields()
+            .iter()
+            .position(|field| *field == Field::Permission)
+            .unwrap();
+
+        state.add_member();
+
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_field(), Field::Name);
+        assert_eq!(
+            state.members[1].permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
+    }
+
+    #[test]
+    fn changing_backend_resets_write_permissions_to_backend_defaults() {
+        let available = [BackendKind::Codex, BackendKind::Claude];
+        let mut state = BuilderState::new(PathBuf::from("/tmp/ws"), &available);
+        state.members[0].permission_mode = Some(PermissionMode::Plan);
+        state.field = state
+            .fields()
+            .iter()
+            .position(|field| *field == Field::Backend)
+            .unwrap();
+        state.detected = DetectedBackends {
+            codex: true,
+            claude: true,
+            grok: false,
+            agy: false,
+        };
+
+        state.activate_field();
+        state.handle_backend_picker_key(KeyCode::Down);
+        state.handle_backend_picker_key(KeyCode::Enter);
+
+        assert_eq!(state.members[0].backend, BackendKind::Claude);
+        assert_eq!(
+            state.members[0].permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
     }
 
     #[test]

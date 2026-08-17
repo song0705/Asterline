@@ -112,7 +112,8 @@ terminal.
       "ideas_per_round": 4
     },
     "team": {
-      "coordinator": "builder"
+      "coordinator": "builder",
+      "allow_add_members": false
     }
   },
   "approvals": {
@@ -174,8 +175,9 @@ Markdown numbering.
 | `leader`            | plan             | Member who writes and revises the checklist                 |
 | `participants`      | brainstorm       | Roster for all generation waves                             |
 | `generation_rounds` | brainstorm       | Seed/build/stretch wave budget (default 3, minimum 2)       |
-| `ideas_per_round`   | brainstorm       | Requested idea cards per member/wave (default 4, minimum 3) |
+| `ideas_per_round`   | brainstorm       | Exact cards per member/wave (default 4); extras discarded.  |
 | `coordinator`       | team             | Member who coordinates the whole-team run                   |
+| `allow_add_members` | team             | Free add via `@@team_member` (default locked to the roster) |
 | `max_iterations`    | review/plan/team | Loop budget before blocking (default 3)                     |
 | `auto_execute`      | plan             | Auto-dispatch final plan (default); false needs `/approve`  |
 | `reviewer_hint`     | review           | Optional extra text appended to the reviewer prompt         |
@@ -190,24 +192,17 @@ conversation, while `w` writes the current mode's conversation overrides into
 
 ### Approvals (`approvals`)
 
-Policy for the approval gate. With no `approvals` section, all built-in
-categories and all surfaces are enabled.
+Older `team.json` files may still contain an `approvals` section (`gate`,
+`keywords`, `apply_to`). Those fields are kept for compatibility and no longer
+hold user messages, relays, or mode dispatches. Set `"approvals": { "manual":
+true }` (or pass `--manual-approvals`) to show the composer card for Codex
+tool asks; the default is to approve them automatically. Plan
+`auto_execute: false` is a separate confirmation. `@@team_member` is not an
+approval. Set `ASTERLINE_NO_BELL=1` to disable terminal BEL/OSC 9 notifications
+on approval, paused route, blocked run, and member error events.
 
-| Field      | Meaning                                                                 |
-| ---------- | ----------------------------------------------------------------------- |
-| `gate`     | Built-in categories to keep: `git`, `shell`, `file`. Omit for all three |
-| `keywords` | Custom categories: name → keyword list (case-insensitive match)         |
-| `apply_to` | Surfaces: `user`, `relay`, `mode`. Omit for all surfaces                |
-
-`user` is ordinary user messages; `relay` is agent-to-agent routes and
-agent-requested roster additions; `mode` is engine dispatches for collaboration
-modes. Roster additions are always held when the `relay` surface is enabled,
-independent of keyword categories. Set `ASTERLINE_NO_BELL=1` to disable terminal
-BEL/OSC 9 notifications on approval, paused route, blocked run, and member error
-events.
-
-See [approvals and tool-level control](approvals.md) for how this gate relates
-to backend-native sandbox and permission enforcement.
+See [approvals and tool-level control](approvals.md) for how tool callbacks
+relate to backend-native sandbox and permission enforcement.
 
 ### Member fields
 
@@ -465,12 +460,9 @@ Asterline launches backend CLIs locally and inherits their credentials,
 environment variables, filesystem access, and network access. It does not
 provide a security boundary around a backend process.
 
-Backend-native permission and sandbox settings still apply. Asterline also
-places requests it classifies as risky behind its own approval gate. Use
-`/approve` or `/reject` to resolve the first pending request.
-
-`--debug` disables the Asterline approval gate. It does not add a sandbox and
-should only be used in a controlled development environment.
+Backend-native permission and sandbox settings still apply. Codex tool asks
+are approved automatically unless `--manual-approvals` or
+`approvals.manual` is on; then the card above the composer is used.
 
 The `danger-full-access` sandbox and bypass-style permission modes should be
 treated as explicit trust decisions. Never assume a team role or model name
@@ -541,7 +533,8 @@ These updates appear in `/runs` and are recorded in the run timeline.
 | `--workspace <PATH>` | Set the workspace; defaults to the current directory |
 | `--db <PATH>`        | Set the SQLite database path                         |
 | `--no-restore`       | Do not replay persisted chat on startup              |
-| `--debug`            | Disable Asterline's approval gate                    |
+| `--debug`            | Developer mode                                       |
+| `--manual-approvals` | Show the Codex tool-approval card (off by default)   |
 | `--fake`             | Use offline fake agents instead of backend CLIs      |
 | `--banner`           | Print a compact startup banner before the TUI        |
 | `-h`, `--help`       | Print command-line help                              |

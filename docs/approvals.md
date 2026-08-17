@@ -2,35 +2,28 @@
 
 [简体中文](approvals.zh-CN.md)
 
-Asterline gates work at two layers. This page explains what each layer covers,
-how to configure the Asterline layer, and why per-tool interactive approval is
-delegated to the backends in this release.
+Asterline no longer holds a prompt because the text mentions `git`, `shell`,
+or `file`. User messages, relays, and mode dispatches start immediately.
+Codex tool asks are **approved automatically** unless you turn on manual
+approval with `--manual-approvals` or `team.json` `"approvals": { "manual": true }`.
 
-## Layer 1: the Asterline approval gate
+When manual approval is on and something is waiting, a card appears above the
+composer. Press `y` or Enter to agree, `n` to deny. `/approve` and `/reject`
+still resolve the oldest request if you prefer to type them. Multiple cards
+cycle with `←`/`→` while the composer is empty.
 
-Before a prompt reaches a backend process, Asterline classifies it against the
-`approvals` policy in `team.json` (see the
-[configuration reference](configuration.md#approvals-approvals)). A match holds
-the dispatch until you `/approve` or `/reject` it. The gate covers three
-surfaces:
+The remaining holds (only with manual approval, plus optional Plan confirm) are:
 
-| Surface | What is gated                                             |
-| ------- | --------------------------------------------------------- |
-| `user`  | Messages you type (`@member …`, `/ask …`)                 |
-| `relay` | Agent handoffs and agent-requested roster additions       |
-| `mode`  | Engine dispatches inside selected collaboration-mode runs |
+| Hold              | When                                                        |
+| ----------------- | ----------------------------------------------------------- |
+| Codex native tool | App Server asks about a command, file change, or escalation |
+| Plan execute      | `auto_execute` is off; Builder waits for the card           |
 
-Rejecting a gated mode dispatch blocks the run (resume later with `/continue`).
-A route resumed explicitly with `/retry` is not re-gated: the resume itself is
-your decision. An `@@team_member` request is always held when the `relay`
-surface is enabled, regardless of prompt keyword categories, because it can
-change backend, model, working-directory, sandbox, and permission settings.
-`--debug` disables this layer entirely.
+`@@team_member` is not an approval. In `/mode team` the default is the current
+roster only (the add is refused). Enable `allow_add_members` to join
+immediately.
 
-The gate classifies **prompts**, not tool calls: it decides whether an
-instruction may start, not what a running agent may execute.
-
-## Layer 2: backend-native tool control
+## Tool-level control
 
 Once a member runs, tool-by-tool enforcement belongs to the backend CLI:
 
@@ -58,8 +51,9 @@ according to the CLI's own permission configuration and **no
 an MCP-based permission callback, but Asterline does not configure that bridge.
 Codex uses App Server by default. Its structured command, file-change, and
 permission-escalation requests become normal Asterline pending approvals.
-Use `/approve` or `/reject` to send a one-time decision back to the same live
-Codex thread; the request body is recorded with the approval. The Team
+Agree or deny in the card above the composer (`y` / `n`); `/approve` and
+`/reject` still send the same one-time decision back to the live Codex thread.
+The request body is recorded with the approval. The Team
 editor's **approval policy** is passed to App Server as Codex's native policy:
 omitted/default, `dontAsk`, and `bypassPermissions` map to `never`;
 `plan`/`acceptEdits` map to `untrusted`; and `auto` maps to `on-request`.
@@ -77,15 +71,14 @@ client is rejected instead of being silently elevated. These are
 automatic policy responses, not a modal user prompt. The structured ACP stream
 also carries Grok tool starts, progress, completion, diffs, and thought chunks.
 
-For backends without a callback, this release uses prompt-surface gating
-(layer 1) plus their native non-interactive controls (layer 2).
+For backends without a callback, this release uses their native
+non-interactive controls only. Prompt text is not held for `/approve`.
 
 ## Practical recipes
 
 - **Cautious reviewer**: `permission_mode: plan` (claude) or
   `sandbox: read-only` (codex/grok) — the member can read and reason but not
   mutate the tree.
-- **Trusted builder, gated intents**: `sandbox: workspace-write` plus an
-  `approvals.keywords` category for the commands you care about
-  (`{"deploy": ["kubectl", "terraform"]}`).
+- **Trusted builder**: `sandbox: workspace-write` (or the matching Codex
+  permission preset). Tool asks still appear in the approval card.
 - **Demo / offline**: `--fake` never launches real CLIs at all.

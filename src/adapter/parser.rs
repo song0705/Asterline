@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::domain::event::FileChangeItem;
+
 /// Maximum retained text for one assistant message. Stream transports may
 /// produce arbitrarily many individually-valid chunks, so the per-line limit
 /// alone is not a total-memory bound.
@@ -103,10 +105,29 @@ pub fn tool_brief(value: &Value) -> String {
     }
 }
 
+const COMMAND_BRIEF_KEYS: &[&str] = &[
+    "command",
+    "cmd",
+    "command_line",
+    "query",
+    "pattern",
+    "url",
+    "uri",
+];
+const PATH_BRIEF_KEYS: &[&str] = &[
+    "target_file",
+    "file_path",
+    "path",
+    "file",
+    "filename",
+    "directory_path",
+];
+
 fn brief_object(map: &serde_json::Map<String, Value>) -> String {
     for key in [
         "command",
         "cmd",
+        "command_line",
         "query",
         "pattern",
         "url",
@@ -116,16 +137,18 @@ fn brief_object(map: &serde_json::Map<String, Value>) -> String {
         "path",
         "file",
         "filename",
+        "directory_path",
         "title",
         "name",
     ] {
-        let Some(primary) = map.get(key).and_then(Value::as_str).map(str::trim) else {
+        let Some(primary) = map_string_by_names(map, &[key]) else {
             continue;
         };
+        let primary = primary.trim();
         if primary.is_empty() {
             continue;
         }
-        let mut out = if matches!(key, "command" | "cmd" | "query" | "pattern" | "url" | "uri") {
+        let mut out = if COMMAND_BRIEF_KEYS.contains(&key) {
             primary.split_whitespace().collect::<Vec<_>>().join(" ")
         } else {
             shorten_tool_path(primary)
@@ -138,21 +161,15 @@ fn brief_object(map: &serde_json::Map<String, Value>) -> String {
                 out.push_str(&limit.to_string());
             }
         }
-        if !matches!(
-            key,
-            "path" | "target_file" | "file_path" | "file" | "filename"
-        ) && let Some(path) = map
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
+        if !PATH_BRIEF_KEYS.contains(&key)
+            && let Some(path) = map_string_by_names(map, &["path", "directory_path"])
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
         {
             out.push_str(" in ");
             out.push_str(&shorten_tool_path(path));
         }
-        if let Some(glob) = map
-            .get("glob")
-            .and_then(Value::as_str)
+        if let Some(glob) = map_string_by_names(map, &["glob"])
             .map(str::trim)
             .filter(|glob| !glob.is_empty())
         {
@@ -165,7 +182,7 @@ fn brief_object(map: &serde_json::Map<String, Value>) -> String {
 
     let mut parts = Vec::new();
     for (key, value) in map {
-        if SKIP_BRIEF_KEYS.contains(&key.as_str()) {
+        if is_skipped_brief_key(key) {
             continue;
         }
         let piece = match value {
@@ -201,7 +218,118 @@ const SKIP_BRIEF_KEYS: &[&str] = &[
 ];
 
 fn int_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
-    map.get(key).and_then(Value::as_u64)
+    map_value_by_names(map, &[key]).and_then(Value::as_u64)
+}
+
+fn is_skipped_brief_key(key: &str) -> bool {
+    let want = normalize_json_key(key);
+    SKIP_BRIEF_KEYS
+        .iter()
+        .any(|skip| normalize_json_key(skip) == want)
+}
+
+/// Look up a JSON object field, ignoring case and `_`/`-` so Agy `TargetFile`
+/// matches `target_file`.
+pub fn json_string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    map_string_by_names(value.as_object()?, keys)
+}
+
+fn map_string_by_names<'a>(
+    map: &'a serde_json::Map<String, Value>,
+    names: &[&str],
+) -> Option<&'a str> {
+    map_value_by_names(map, names).and_then(Value::as_str)
+}
+
+fn map_value_by_names<'a>(
+    map: &'a serde_json::Map<String, Value>,
+    names: &[&str],
+) -> Option<&'a Value> {
+    for name in names {
+        if let Some(value) = map.get(*name) {
+            return Some(value);
+        }
+    }
+    for name in names {
+        let want = normalize_json_key(name);
+        if let Some((_, value)) = map.iter().find(|(key, _)| normalize_json_key(key) == want) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn normalize_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Recover a file-change card from Write/Edit/Delete tool arguments.
+pub fn file_change_from_params(name: &str, params: &Value) -> Option<FileChangeItem> {
+    let kind = file_tool_kind(name)?;
+    let path = json_string_field(
+        params,
+        &["target_file", "file_path", "path", "file", "filename"],
+    )
+    .map(str::trim)
+    .filter(|path| !path.is_empty())?;
+    let old_text = json_string_field(
+        params,
+        &["old_string", "old_text", "before", "old_contents"],
+    );
+    let new_text = json_string_field(
+        params,
+        &[
+            "new_string",
+            "new_text",
+            "after",
+            "contents",
+            "content",
+            "text",
+        ],
+    );
+    let change_kind = match kind {
+        FileToolKind::Delete => "delete",
+        FileToolKind::Write => {
+            if old_text.is_some() && new_text.is_some() {
+                "update"
+            } else if old_text.is_some() {
+                "delete"
+            } else {
+                "add"
+            }
+        }
+        FileToolKind::Edit => match (old_text, new_text) {
+            (None, Some(_)) => "add",
+            (Some(_), None) => "delete",
+            _ => "update",
+        },
+    };
+    Some(FileChangeItem::new(path, change_kind).with_texts(old_text, new_text))
+}
+
+#[derive(Clone, Copy)]
+enum FileToolKind {
+    Write,
+    Edit,
+    Delete,
+}
+
+fn file_tool_kind(name: &str) -> Option<FileToolKind> {
+    let tail = name.rsplit([':', '/', '.']).next().unwrap_or(name).trim();
+    let key = tail.to_ascii_lowercase().replace('-', "_");
+    let key = key.strip_prefix("mcp_").unwrap_or(&key);
+    match key {
+        "write" | "write_file" | "writefile" | "create" | "create_file" => {
+            Some(FileToolKind::Write)
+        }
+        "edit" | "edit_file" | "str_replace" | "search_replace" | "replace" | "apply_patch"
+        | "applypatch" => Some(FileToolKind::Edit),
+        "delete" | "delete_file" | "remove" | "rm" => Some(FileToolKind::Delete),
+        _ => None,
+    }
 }
 
 fn shorten_tool_path(text: &str) -> String {
@@ -300,6 +428,30 @@ mod tests {
             tool_brief(&json!({"file_path": "src/a.rs", "old_string": "aaa", "new_string": "bbb"})),
             "src/a.rs"
         );
+        assert_eq!(
+            tool_brief(
+                &json!({"TargetFile": "snake game/index.html", "Contents": "<html></html>"})
+            ),
+            "snake game/index.html"
+        );
+        assert_eq!(
+            tool_brief(&json!({"DirectoryPath": "engine/Asterline"})),
+            "engine/Asterline"
+        );
+        assert_eq!(tool_brief(&json!({"CommandLine": "pwd"})), "pwd");
+    }
+
+    #[test]
+    fn write_params_become_an_add_file_change() {
+        let file = file_change_from_params(
+            "Write",
+            &json!({"TargetFile": "css/style.css", "Contents": "body { margin: 0; }\n"}),
+        )
+        .expect("write file change");
+        assert_eq!(file.path, "css/style.css");
+        assert_eq!(file.kind, "add");
+        assert_eq!(file.new_text.as_deref(), Some("body { margin: 0; }\n"));
+        assert!(file.old_text.is_none());
     }
 
     #[test]

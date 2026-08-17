@@ -67,6 +67,20 @@ pub(crate) fn member_status_is_active(status: MemberStatus) -> bool {
     )
 }
 
+fn checklist_notice_run(text: &str) -> Option<&str> {
+    let rest = text.strip_suffix(" checklist")?;
+    let (_, run) = rest.rsplit_once(" updated ")?;
+    run.starts_with("run-").then_some(run)
+}
+
+fn notices_are_redundant(existing: &str, incoming: &str) -> bool {
+    existing == incoming
+        || matches!(
+            (checklist_notice_run(existing), checklist_notice_run(incoming)),
+            (Some(left), Some(right)) if left == right
+        )
+}
+
 fn reasoning_status_header(text: &str) -> Option<String> {
     if let Some((_, after_start)) = text.split_once("**")
         && let Some((header, _)) = after_start.split_once("**")
@@ -132,6 +146,7 @@ pub struct MemberView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingApproval {
     pub id: ApprovalId,
+    pub member: Option<MemberId>,
     pub action: String,
     pub body: String,
 }
@@ -194,6 +209,7 @@ pub struct AppState {
     selected_run_step: Option<u32>,
     runs_detail: bool,
     pending_approvals: Vec<PendingApproval>,
+    selected_approval: usize,
     paused_routes: usize,
     composer: Composer,
     pending_images: Vec<PromptImage>,
@@ -302,6 +318,7 @@ impl AppState {
             selected_run_step: None,
             runs_detail: false,
             pending_approvals: Vec::new(),
+            selected_approval: 0,
             paused_routes: 0,
             composer: Composer::new(),
             pending_images: Vec::new(),
@@ -803,19 +820,24 @@ impl AppState {
                 });
             }
             RuntimeEvent::ApprovalRequested {
-                id, action, body, ..
+                id,
+                member,
+                action,
+                body,
             } => {
                 self.pending_approvals.push(PendingApproval {
                     id,
-                    action: action.clone(),
-                    body: body.clone(),
+                    member,
+                    action,
+                    body,
                 });
-                self.push(ChatItem::Notice {
-                    text: format!("approval needed [{action}]: {body} — /approve or /reject"),
-                });
+                if self.pending_approvals.len() == 1 {
+                    self.selected_approval = 0;
+                }
             }
             RuntimeEvent::ApprovalResolved { id, decision } => {
                 self.pending_approvals.retain(|a| a.id != id);
+                self.clamp_selected_approval();
                 self.push(ChatItem::Notice {
                     text: format!("approval {}", decision.as_str()),
                 });
@@ -851,14 +873,15 @@ impl AppState {
                 self.push_log(entry);
             }
             RuntimeEvent::Notice(text) => {
-                self.push(ChatItem::Notice { text });
+                if !self.should_skip_notice(&text) {
+                    self.push(ChatItem::Notice { text });
+                }
             }
             RuntimeEvent::SessionReset => {
                 // Begin a fresh chat: clear the transcript and in-flight cells,
                 // but keep members, logs, and prompt history. Runs belong to
                 // the previous conversation and remain reachable via /resume.
                 self.active_mode = TerminalMode::Normal;
-                self.mode_overrides = ModesConfig::default();
                 self.mode_editor = None;
                 self.chat.clear();
                 self.touch_chat();
@@ -923,6 +946,19 @@ impl AppState {
                 self.stash_team_editor_catalog();
             }
         }
+    }
+
+    fn should_skip_notice(&self, text: &str) -> bool {
+        for item in self.chat.iter().rev() {
+            match item {
+                ChatItem::Notice { text: last } => {
+                    return notices_are_redundant(last, text);
+                }
+                ChatItem::Agent { text, .. } if text.trim().is_empty() => {}
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn push(&mut self, item: ChatItem) -> usize {
@@ -1632,6 +1668,40 @@ impl AppState {
 
     pub fn first_pending_approval(&self) -> Option<ApprovalId> {
         self.pending_approvals.first().map(|a| a.id)
+    }
+
+    pub fn selected_pending_approval(&self) -> Option<&PendingApproval> {
+        self.pending_approvals.get(self.selected_approval)
+    }
+
+    pub fn selected_approval_index(&self) -> usize {
+        self.selected_approval
+    }
+
+    pub fn select_next_pending_approval(&mut self) {
+        if self.pending_approvals.len() < 2 {
+            return;
+        }
+        self.selected_approval = (self.selected_approval + 1) % self.pending_approvals.len();
+    }
+
+    pub fn select_prev_pending_approval(&mut self) {
+        if self.pending_approvals.len() < 2 {
+            return;
+        }
+        self.selected_approval = if self.selected_approval == 0 {
+            self.pending_approvals.len() - 1
+        } else {
+            self.selected_approval - 1
+        };
+    }
+
+    fn clamp_selected_approval(&mut self) {
+        if self.pending_approvals.is_empty() {
+            self.selected_approval = 0;
+        } else {
+            self.selected_approval = self.selected_approval.min(self.pending_approvals.len() - 1);
+        }
     }
 
     /// Request attaching to the member at `idx`'s live backend session. The
@@ -2995,7 +3065,7 @@ pub(crate) fn run_action_command(
 
 fn continue_command_prefix(run: &RunSummary, include_run_id: bool) -> String {
     if include_run_id {
-        format!("/continue {}", run.id)
+        format!("/continue {}", run.label())
     } else {
         "/continue".to_string()
     }
@@ -3012,7 +3082,7 @@ fn run_step_action_command(run: &RunSummary, step: u32) -> Option<String> {
         RunStepStatus::Blocked => ("doing", Some("blocker resolved")),
         RunStepStatus::Done => ("todo", Some("reopen")),
     };
-    let mut command = format!("/step {action} {} {}", run.id, step.number);
+    let mut command = format!("/step {action} {} {}", run.label(), step.number);
     if let Some(note) = note {
         command.push(' ');
         command.push_str(note);
@@ -3026,7 +3096,7 @@ fn run_step_dispatch_command(run: &RunSummary, step: u32) -> Option<String> {
         .iter()
         .find(|candidate| candidate.number == step)?;
     let Some(owner) = &step.owner else {
-        return Some(format!("/step assign {} {} ", run.id, step.number));
+        return Some(format!("/step assign {} {} ", run.label(), step.number));
     };
 
     let instruction = match step.status {
@@ -3038,7 +3108,7 @@ fn run_step_dispatch_command(run: &RunSummary, step: u32) -> Option<String> {
     Some(format!(
         "@{owner} {}",
         crate::runtime::mode_prompts::manual_step_dispatch_text(
-            run.id,
+            run.label(),
             instruction,
             step.number,
             &step.title,

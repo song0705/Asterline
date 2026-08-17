@@ -155,10 +155,10 @@ Asterline runs backend processes locally and inherits their credentials,
 environment, filesystem access, and network access. Each backend remains subject
 to its provider's data policy and permission model.
 
-Asterline adds approval gates for risky requests, agent-to-agent relays,
-workflow dispatches, and agent-originated roster changes. It does not add a
-second process sandbox beyond the selected backend. Read
-[Approvals and tool control](docs/approvals.md) before relaxing permissions.
+Codex tool asks are approved automatically unless you pass
+`--manual-approvals`. Asterline does not add a second process sandbox beyond
+the selected backend. Read [Approvals and tool control](docs/approvals.md)
+before relaxing permissions.
 
 ## Essential commands
 

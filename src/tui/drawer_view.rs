@@ -633,7 +633,7 @@ fn drawer_team_editor(
     if !state.pending_approvals().is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            " Pending approvals are still handled with /approve or /reject.",
+            " Pending approvals are in the card above the composer (y agree · n deny).",
             theme::muted(),
         ));
     }

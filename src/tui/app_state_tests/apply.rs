@@ -93,6 +93,7 @@ fn runtime_unavailable_disables_stale_controls_and_attach() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(9),
+            number: 0,
             goal: "verify release".to_string(),
             status: RunStatus::Verifying,
             coordinator: None,
@@ -116,6 +117,88 @@ fn runtime_unavailable_disables_stale_controls_and_attach() {
         item,
         ChatItem::Notice { text } if text.contains("runtime has stopped")
     )));
+}
+
+#[test]
+fn consecutive_identical_notices_are_coalesced() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.apply(RuntimeEvent::Notice("same".to_string()));
+    state.apply(RuntimeEvent::Notice("same".to_string()));
+    state.apply(RuntimeEvent::Notice("other".to_string()));
+
+    let notices = state
+        .chat()
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notices, ["same", "other"]);
+}
+
+#[test]
+fn consecutive_checklist_notices_for_the_same_run_are_coalesced() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.apply(RuntimeEvent::Notice(
+        "builder updated run-1 checklist".to_string(),
+    ));
+    state.apply(RuntimeEvent::Notice(
+        "reviewer updated run-1 checklist".to_string(),
+    ));
+    state.apply(RuntimeEvent::Notice(
+        "builder updated run-2 checklist".to_string(),
+    ));
+
+    let notices = state
+        .chat()
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notices,
+        [
+            "builder updated run-1 checklist",
+            "builder updated run-2 checklist"
+        ]
+    );
+}
+
+#[test]
+fn checklist_notices_skip_empty_agent_cells() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    let builder = MemberId::new("builder");
+    state.apply(RuntimeEvent::Notice(
+        "builder updated run-1 checklist".to_string(),
+    ));
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(1),
+        turn: TurnId(1),
+        member: builder.clone(),
+    });
+    state.apply(RuntimeEvent::MessageCompleted {
+        msg: MessageId(1),
+        text: String::new(),
+    });
+    state.apply(RuntimeEvent::Notice(
+        "reviewer updated run-1 checklist".to_string(),
+    ));
+
+    let notices = state
+        .chat()
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notices, ["builder updated run-1 checklist"]);
 }
 
 #[test]
@@ -327,6 +410,7 @@ fn run_updates_insert_then_replace() {
     let mut state = AppState::new(Vec::new());
     let run = RunSummary {
         id: RunId(1),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Running,
         coordinator: Some(MemberId::new("builder")),
@@ -368,6 +452,7 @@ fn runs_drawer_stages_selected_run_action_without_overwriting_draft() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship parser".to_string(),
             status: RunStatus::Done,
             coordinator: Some(MemberId::new("builder")),
@@ -408,6 +493,7 @@ fn runs_drawer_can_select_an_older_run() {
         runs: vec![
             RunSummary {
                 id: RunId(1),
+                number: 0,
                 goal: "ship parser".to_string(),
                 status: RunStatus::Done,
                 coordinator: Some(MemberId::new("builder")),
@@ -422,6 +508,7 @@ fn runs_drawer_can_select_an_older_run() {
             },
             RunSummary {
                 id: RunId(2),
+                number: 0,
                 goal: "refactor ui".to_string(),
                 status: RunStatus::Running,
                 coordinator: Some(MemberId::new("builder")),
@@ -457,6 +544,7 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship checklist".to_string(),
             status: RunStatus::Running,
             coordinator: Some(MemberId::new("builder")),
@@ -571,6 +659,7 @@ fn run_action_previews_verify_without_guessing_a_command() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship parser".to_string(),
             status: RunStatus::Done,
             coordinator: Some(MemberId::new("builder")),
@@ -601,6 +690,7 @@ fn run_action_continues_failed_and_blocked_runs() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship parser".to_string(),
             status: RunStatus::Failed,
             coordinator: Some(MemberId::new("builder")),
@@ -633,6 +723,7 @@ fn run_action_continues_failed_and_blocked_runs() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(2),
+            number: 0,
             goal: "unblock release".to_string(),
             status: RunStatus::Blocked,
             coordinator: Some(MemberId::new("builder")),

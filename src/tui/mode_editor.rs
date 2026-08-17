@@ -45,6 +45,7 @@ enum ModeField {
     BrainstormRounds,
     BrainstormIdeas,
     TeamCoordinator,
+    TeamAllowAddMembers,
     TeamMaxIterations,
 }
 
@@ -70,7 +71,11 @@ impl ModeField {
                 Self::BrainstormRounds,
                 Self::BrainstormIdeas,
             ],
-            TerminalMode::Team => &[Self::TeamCoordinator, Self::TeamMaxIterations],
+            TerminalMode::Team => &[
+                Self::TeamCoordinator,
+                Self::TeamAllowAddMembers,
+                Self::TeamMaxIterations,
+            ],
         }
     }
 
@@ -85,6 +90,7 @@ impl ModeField {
                 "max_iterations"
             }
             Self::PlanAutoExecute => "auto_execute",
+            Self::TeamAllowAddMembers => "allow_add_members",
             Self::ReviewReviewerHint => "reviewer_hint",
             Self::BrainstormRounds => "generation_rounds",
             Self::BrainstormIdeas => "ideas_per_round",
@@ -127,7 +133,7 @@ impl ModeField {
     }
 
     fn is_toggle(self) -> bool {
-        matches!(self, Self::PlanAutoExecute)
+        matches!(self, Self::PlanAutoExecute | Self::TeamAllowAddMembers)
     }
 
     fn is_command(self) -> bool {
@@ -603,7 +609,7 @@ impl ModeEditor {
             | ModeField::BrainstormIdeas => {
                 let _ = self.set_number_field(field, None);
             }
-            ModeField::PlanAutoExecute => {
+            ModeField::PlanAutoExecute | ModeField::TeamAllowAddMembers => {
                 self.set_toggle_field(field, None);
             }
             ModeField::ReviewReviewerHint => self.set_command_field(field, None),
@@ -712,8 +718,10 @@ impl ModeEditor {
     }
 
     fn set_toggle_field(&mut self, field: ModeField, value: Option<bool>) {
-        if field == ModeField::PlanAutoExecute {
-            self.plan_mut().auto_execute = value;
+        match field {
+            ModeField::PlanAutoExecute => self.plan_mut().auto_execute = value,
+            ModeField::TeamAllowAddMembers => self.team_mut().allow_add_members = value,
+            _ => {}
         }
         prune_empty_mode_overrides(&mut self.pending);
     }
@@ -805,6 +813,12 @@ impl ModeEditor {
                 .as_ref()
                 .and_then(|cfg| cfg.coordinator.as_ref())
                 .is_some(),
+            ModeField::TeamAllowAddMembers => self
+                .pending
+                .team
+                .as_ref()
+                .and_then(|cfg| cfg.allow_add_members)
+                .is_some(),
             ModeField::TeamMaxIterations => self
                 .pending
                 .team
@@ -893,6 +907,12 @@ impl ModeEditor {
                 .team
                 .as_ref()
                 .and_then(|cfg| cfg.coordinator.as_ref())
+                .is_some(),
+            ModeField::TeamAllowAddMembers => self
+                .defaults
+                .team
+                .as_ref()
+                .and_then(|cfg| cfg.allow_add_members)
                 .is_some(),
             ModeField::TeamMaxIterations => self
                 .defaults
@@ -999,6 +1019,9 @@ impl ModeEditor {
         let config = self.preview_config();
         match field {
             ModeField::PlanAutoExecute => crate::domain::mode::resolve_plan_auto_execute(&config),
+            ModeField::TeamAllowAddMembers => {
+                crate::domain::mode::resolve_team_allow_add_members(&config)
+            }
             _ => true,
         }
     }
@@ -1056,6 +1079,16 @@ impl ModeEditor {
                         "auto send".to_string()
                     } else {
                         "manual confirm".to_string()
+                    },
+                    None,
+                );
+            }
+            if field == ModeField::TeamAllowAddMembers {
+                return (
+                    if self.effective_auto_verify(field) {
+                        "free add".to_string()
+                    } else {
+                        "roster only".to_string()
                     },
                     None,
                 );

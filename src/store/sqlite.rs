@@ -209,6 +209,7 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS runs (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id      INTEGER NOT NULL DEFAULT 0,
+                number               INTEGER NOT NULL DEFAULT 0,
                 goal                 TEXT NOT NULL,
                 status               TEXT NOT NULL,
                 coordinator          TEXT,
@@ -322,6 +323,28 @@ impl SqliteStore {
                 [],
             )?;
         }
+        if !self.has_column("runs", "number")? {
+            self.conn.execute(
+                "ALTER TABLE runs ADD COLUMN number INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        self.conn.execute(
+            "UPDATE runs
+             SET number = (
+                 SELECT COUNT(*)
+                 FROM runs AS earlier
+                 WHERE earlier.conversation_id = runs.conversation_id
+                   AND earlier.id <= runs.id
+             )
+             WHERE number = 0",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_number_idx
+             ON runs (conversation_id, number)",
+            [],
+        )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS runs_conversation_idx
              ON runs (conversation_id, id)",
@@ -729,7 +752,12 @@ impl SqliteStore {
     /// Start a new chat and clear all resumable backend sessions as one durable
     /// mutation. The in-memory selection changes only after the transaction
     /// commits, so callers can keep their current chat on any failure.
-    pub fn create_fresh_conversation(&self, team: &TeamConfig, mode: TerminalMode) -> Result<i64> {
+    pub fn create_fresh_conversation(
+        &self,
+        team: &TeamConfig,
+        mode: TerminalMode,
+        mode_overrides: &ModesConfig,
+    ) -> Result<i64> {
         let (team_json, sessions_json) = serialize_conversation_snapshot(team, &[])?;
         let id = self.transactional(|| {
             self.conn
@@ -737,13 +765,7 @@ impl SqliteStore {
             let id = self.conn.last_insert_rowid();
             self.write_active_conversation(id)?;
             self.replace_session_rows(&[])?;
-            self.write_conversation_snapshot(
-                id,
-                &team_json,
-                &sessions_json,
-                mode,
-                &ModesConfig::default(),
-            )?;
+            self.write_conversation_snapshot(id, &team_json, &sessions_json, mode, mode_overrides)?;
             Ok(id)
         })?;
         self.conversation.set(id);
@@ -1237,8 +1259,8 @@ impl SqliteStore {
     pub fn create_run(&self, goal: &str, coordinator: Option<&MemberId>) -> Result<RunSummary> {
         let id = self.transactional(|| {
             self.conn.execute(
-                "INSERT INTO runs (conversation_id, goal, status, coordinator)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO runs (conversation_id, number, goal, status, coordinator)
+                 VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE conversation_id = ?1), ?2, ?3, ?4)",
                 params![
                     self.active_conversation(),
                     goal,
@@ -1264,8 +1286,8 @@ impl SqliteStore {
         let id = self.transactional(|| {
             self.conn.execute(
                 "INSERT INTO runs
-                    (conversation_id, goal, status, coordinator, mode, mode_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (conversation_id, number, goal, status, coordinator, mode, mode_state)
+                 VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE conversation_id = ?1), ?2, ?3, ?4, ?5, ?6)",
                 params![
                     self.active_conversation(),
                     goal,
@@ -1294,8 +1316,8 @@ impl SqliteStore {
     ) -> Result<RunSummary> {
         self.conn.execute(
             "INSERT INTO runs
-                (conversation_id, goal, status, coordinator, mode, mode_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (conversation_id, number, goal, status, coordinator, mode, mode_state)
+             VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE conversation_id = ?1), ?2, ?3, ?4, ?5, ?6)",
             params![
                 self.active_conversation(),
                 goal,
@@ -1734,7 +1756,7 @@ impl SqliteStore {
         let run = self
             .conn
             .query_row(
-                "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
+                "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state, number
                  FROM runs
                  WHERE conversation_id = ?1
                  ORDER BY id DESC LIMIT 1",
@@ -1747,7 +1769,7 @@ impl SqliteStore {
 
     pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state, number
              FROM runs
              WHERE conversation_id = ?1
              ORDER BY id DESC LIMIT ?2",
@@ -1762,7 +1784,7 @@ impl SqliteStore {
 
     pub fn run(&self, id: RunId) -> Result<RunSummary> {
         let run = self.conn.query_row(
-            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state, number
              FROM runs WHERE id = ?1",
             params![id.0 as i64],
             map_run,
@@ -1770,10 +1792,35 @@ impl SqliteStore {
         self.with_run_events(run)
     }
 
+    /// Resolve a typed `run-N` handle: conversation-local number first, then
+    /// the raw primary key if that row still belongs to this chat.
+    pub fn resolve_run_ref(&self, typed: RunId) -> Result<RunSummary> {
+        if typed.0 > 0
+            && typed.0 <= u64::from(u32::MAX)
+            && let Some(run) = self.run_by_number(typed.0 as u32)?
+        {
+            return Ok(run);
+        }
+        self.active_run(typed)
+    }
+
+    fn run_by_number(&self, number: u32) -> Result<Option<RunSummary>> {
+        let run = self
+            .conn
+            .query_row(
+                "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state, number
+                 FROM runs WHERE conversation_id = ?1 AND number = ?2",
+                params![self.active_conversation(), number as i64],
+                map_run,
+            )
+            .optional()?;
+        run.map(|run| self.with_run_events(run)).transpose()
+    }
+
     /// Load a run only when it belongs to the currently selected chat.
     pub fn active_run(&self, id: RunId) -> Result<RunSummary> {
         let run = self.conn.query_row(
-            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state
+            "SELECT id, goal, status, coordinator, verification_command, verification_ok, verification_summary, created_at, updated_at, attempt, mode, mode_state, number
              FROM runs WHERE id = ?1 AND conversation_id = ?2",
             params![id.0 as i64, self.active_conversation()],
             map_run,
@@ -1806,7 +1853,7 @@ impl SqliteStore {
 
     fn with_run_events(&self, mut run: RunSummary) -> Result<RunSummary> {
         run.events = self.run_events(run.id, 8)?;
-        run.steps = self.run_steps(run.id, 12)?;
+        run.steps = self.run_steps_all(run.id)?;
         Ok(run)
     }
 
@@ -1834,28 +1881,7 @@ impl SqliteStore {
         rows.collect()
     }
 
-    fn run_steps(&self, id: RunId, limit: usize) -> Result<Vec<RunStepSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT position, status, owner, title, note, updated_at
-               FROM run_steps
-              WHERE run_id = ?1
-              ORDER BY position ASC
-              LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![id.0 as i64, limit as i64], |row| {
-            Ok(RunStepSummary {
-                number: row.get::<_, i64>(0)? as u32,
-                status: RunStepStatus::parse(&row.get::<_, String>(1)?),
-                owner: row.get::<_, Option<String>>(2)?.map(MemberId::new),
-                title: row.get(3)?,
-                note: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })?;
-        rows.collect()
-    }
-
-    /// All checklist steps for a run (no LIMIT), ordered by position.
+    /// All checklist steps for a run, ordered by position.
     pub fn run_steps_all(&self, id: RunId) -> Result<Vec<RunStepSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT position, status, owner, title, note, updated_at
@@ -2113,6 +2139,7 @@ fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
     };
     Ok(RunSummary {
         id: RunId(row.get::<_, i64>(0)? as u64),
+        number: row.get::<_, i64>(12)? as u32,
         goal: row.get(1)?,
         status: RunStatus::parse(&row.get::<_, String>(2)?),
         coordinator: row.get::<_, Option<String>>(3)?.map(MemberId::new),

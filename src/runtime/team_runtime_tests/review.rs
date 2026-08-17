@@ -790,141 +790,21 @@ fn abort_blocks_mode_run() {
 }
 
 #[test]
-fn mode_dispatch_hits_approval_gate_and_reject_blocks() {
-    let mut config = team();
-    // Default approvals gate git keywords on all surfaces including Mode.
-    let mut rt = TeamRuntime::new(config.clone(), SqliteStore::in_memory().unwrap());
-
+fn mode_dispatch_ignores_prompt_keywords() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
     let step = rt.on_ui_command(run_mode("run git status"));
-    let run_id = find_run_id(&step);
     assert!(
-        step.actions.is_empty(),
-        "mode dispatch with git keyword must not auto-run"
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
     );
-    let id = step
-        .events
-        .iter()
-        .find_map(|e| match e {
-            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("ApprovalRequested");
-
-    let step = rt.on_ui_command(UiCommand::Approve {
-        id,
-        decision: ApprovalDecision::Reject,
-    });
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::RunUpdated { run }
-            if run.id == run_id && run.status == RunStatus::Blocked
-    )));
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Notice(text) if text.contains("dispatch rejected by user")
-    )));
-
-    // Separate case: Approve dispatches the builder.
-    config = team();
-    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap());
-    let step = rt.on_ui_command(run_mode("run git status"));
-    let id = step
-        .events
-        .iter()
-        .find_map(|e| match e {
-            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("ApprovalRequested");
-    let step = rt.on_ui_command(UiCommand::Approve {
-        id,
-        decision: ApprovalDecision::Approve,
-    });
     assert!(
         step.actions
             .iter()
-            .any(|a| a.member == MemberId::new("builder")),
-        "approve must dispatch builder"
+            .any(|action| action.member == MemberId::new("builder")),
+        "review dispatch must start without a prompt-keyword gate"
     );
-}
-
-fn brainstorm_approval_runtime() -> TeamRuntime {
-    let mut config = plan_team();
-    config.approvals.gate = Some(Vec::new());
-    config.approvals.keywords.insert(
-        "brainstorm_protocol".to_string(),
-        vec!["deployed $asterline-brainstorm".to_string()],
-    );
-    config.approvals.apply_to = Some(vec![ApprovalSurface::Mode]);
-    TeamRuntime::new(config, SqliteStore::in_memory().unwrap())
-}
-
-#[test]
-fn rejecting_one_mode_approval_rejects_all_run_siblings() {
-    let mut rt = brainstorm_approval_runtime();
-    let started = rt.on_ui_command(run_brainstorm("generate release ideas"));
-    let run_id = find_run_id(&started);
-    let ids: Vec<ApprovalId> = started
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ids.len(), 3);
-
-    let rejected = rt.on_ui_command(UiCommand::Approve {
-        id: ids[0],
-        decision: ApprovalDecision::Reject,
-    });
-
-    assert_eq!(
-        rejected
-            .events
-            .iter()
-            .filter(|event| matches!(
-                event,
-                RuntimeEvent::ApprovalResolved {
-                    decision: ApprovalDecision::Reject,
-                    ..
-                }
-            ))
-            .count(),
-        3
-    );
-    assert!(rt.store.pending_approvals().unwrap().is_empty());
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
-}
-
-#[test]
-fn approving_mode_dispatch_rejects_it_when_run_is_no_longer_active() {
-    let mut rt = brainstorm_approval_runtime();
-    let started = rt.on_ui_command(run_brainstorm("generate release ideas"));
-    let run_id = find_run_id(&started);
-    let id = started
-        .events
-        .iter()
-        .find_map(|event| match event {
-            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("mode approval");
-    rt.store.block_run(run_id, "external stop").unwrap();
-
-    let approval = rt.on_ui_command(UiCommand::Approve {
-        id,
-        decision: ApprovalDecision::Approve,
-    });
-
-    assert!(approval.actions.is_empty());
-    assert!(approval.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::Notice(text)
-            if text.contains("no longer active") && text.contains(&run_id.to_string())
-    )));
-    assert!(rt.store.pending_approvals().unwrap().is_empty());
-    assert_eq!(rt.store.run(run_id).unwrap().status, RunStatus::Blocked);
 }
 
 #[test]

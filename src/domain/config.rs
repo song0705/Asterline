@@ -19,7 +19,7 @@ pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL
 /// Live roster and member status. Rewritten whenever the team or a status changes.
 pub const ASTERLINE_ROSTER_PATH: &str = ".asterline/roster.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 16;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 19;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
@@ -110,7 +110,8 @@ fn is_managed_skill(text: &str) -> bool {
 
 pub fn team_skill_hint() -> String {
     format!(
-        "The Asterline team skill is available at {ASTERLINE_TEAM_SKILL_PATH}. Read this skill when you need its team controls."
+        "The Asterline team skill is available at {ASTERLINE_TEAM_SKILL_PATH}. Read this skill when you need its team controls. \
+         If a tool or plan is waiting for the user to approve in Asterline, wait — do not retry or assume it ran."
     )
 }
 
@@ -992,7 +993,7 @@ mod tests {
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 16"));
+        assert!(text.contains("version: 19"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -1065,12 +1066,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v16() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 16);
+    fn embedded_team_skill_is_protocol_v19() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 19);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 16")
+                .any(|line| line.trim() == "version: 19")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1095,7 +1096,8 @@ mod tests {
                 .contains("Writing the plan, review, or patch \"for the user\" is not delivery")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(ASTERLINE_ROSTER_PATH));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 16);
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 19);
+        assert!(ASTERLINE_TEAM_SKILL.contains("Waiting For User Approval"));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 pub(super) use super::*;
 pub(super) use crate::domain::event::{
-    MemberStatus, RunEventSummary, RunId, RunStatus, RunStepStatus, RunStepSummary, RunSummary,
-    RunVerification, RuntimeEvent,
+    ApprovalId, MemberStatus, RunEventSummary, RunId, RunStatus, RunStepStatus, RunStepSummary,
+    RunSummary, RunVerification, RuntimeEvent,
 };
 pub(super) use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,

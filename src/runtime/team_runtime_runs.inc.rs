@@ -49,10 +49,11 @@ impl TeamRuntime {
             }
         };
         let run_id = run.id;
+        let label = run.label();
         step.events.push(RuntimeEvent::RunUpdated { run });
 
         let teammates = self.team_teammate_list(&id);
-        let prompt = team_start_prompt(&goal, &teammates);
+        let prompt = team_start_prompt(&goal, &teammates, self.team_allows_add_members());
         let turn = match self.store.create_turn() {
             Ok(turn) => turn,
             Err(err) => {
@@ -62,7 +63,7 @@ impl TeamRuntime {
                 return;
             }
         };
-        let display_body = format!("[team {run_id}] → {id}: {goal}");
+        let display_body = format!("[team {label}] → {id}: {goal}");
         if let Err(err) =
             self.store
                 .record_user(turn, std::slice::from_ref(&id), &display_body)
@@ -79,47 +80,14 @@ impl TeamRuntime {
         });
         self.log(
             &id,
-            LogEntry::info("user", format!("team {run_id} → {id}: {goal}")),
+            LogEntry::info("user", format!("team {label} → {id}: {goal}")),
             step,
         );
         step.events.push(RuntimeEvent::Notice(format!(
-            "team {run_id} started → {id}"
+            "team {label} started → {id}"
         )));
         self.run_turns.insert(turn, run_id);
-        let gate = self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Mode);
-        if gate && let Some(kind) = self.matcher.classify(&prompt) {
-            match self.store.insert_approval(Some(turn), None, &kind, &prompt) {
-                Ok(approval_id) => {
-                    self.held_approvals.insert(
-                        approval_id,
-                        HeldApproval {
-                            turn,
-                            targets: vec![id],
-                            prompt: prompt.clone(),
-                            mode_run: Some(run_id),
-                            member_request: None,
-                        },
-                    );
-                    step.events.push(RuntimeEvent::ApprovalRequested {
-                        id: approval_id,
-                        member: None,
-                        action: kind,
-                        body: prompt,
-                    });
-                }
-                Err(err) => {
-                    self.report_store_error("save a team approval request", err, step);
-                    self.block_mode_run(
-                        run_id,
-                        "could not persist the team approval request",
-                        step,
-                    );
-                    self.check_turn_complete(turn, step);
-                }
-            }
-        } else {
-            self.enqueue_prompt(&id, turn, prompt, step);
-        }
+        self.enqueue_prompt(&id, turn, prompt, step);
     }
 
     fn handle_continue_run(
@@ -134,7 +102,7 @@ impl TeamRuntime {
         if let Some(legacy) = &run.legacy_mode {
             step.events.push(RuntimeEvent::Notice(format!(
                 "{} is from an older Asterline (mode \"{legacy}\") — start a fresh run",
-                run.id
+                run.label()
             )));
             return;
         }
@@ -191,8 +159,8 @@ impl TeamRuntime {
         self.failed_runs.remove(&run.id);
 
         let display_body = match &note {
-            Some(note) => format!("/continue {} {note}", run.id),
-            None => format!("/continue {}", run.id),
+            Some(note) => format!("/continue {} {note}", run.label()),
+            None => format!("/continue {}", run.label()),
         };
         if let Err(err) =
             self.store
@@ -210,12 +178,12 @@ impl TeamRuntime {
         });
         self.log(
             &id,
-            LogEntry::info("user", format!("team {} continued → {id}", run.id)),
+            LogEntry::info("user", format!("team {} continued → {id}", run.label())),
             step,
         );
         step.events.push(RuntimeEvent::Notice(format!(
             "team {} continued → {id}",
-            run.id
+            run.label()
         )));
 
         let verification = run.verification.as_ref().map(|v| {
@@ -232,6 +200,7 @@ impl TeamRuntime {
             verification,
             note.as_deref(),
             false,
+            self.team_allows_add_members(),
         );
         self.run_turns.insert(turn, run.id);
         self.enqueue_prompt(&id, turn, prompt, step);
@@ -365,6 +334,7 @@ impl TeamRuntime {
             Some((command, false, summary)),
             None,
             true,
+            self.team_allows_add_members(),
         );
         self.run_turns.insert(turn, run.id);
         self.enqueue_prompt(&id, turn, prompt, step);
@@ -602,11 +572,11 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) -> Option<RunSummary> {
         match run_id {
-            Some(id) => match self.store.active_run(id) {
+            Some(id) => match self.store.resolve_run_ref(id) {
                 Ok(run) => Some(run),
                 Err(_) => {
                     step.events
-                        .push(RuntimeEvent::Notice(format!("{id} was not found")));
+                        .push(RuntimeEvent::Notice(format!("run-{} was not found", id.0)));
                     None
                 }
             },
@@ -822,16 +792,17 @@ fn team_checklist_requirements() -> &'static str {
      3. Before ending your turn, ensure every step is done or blocked and post a final outcome summary."
 }
 
-fn team_start_prompt(goal: &str, teammates: &str) -> String {
+fn team_start_prompt(goal: &str, teammates: &str, allow_add_members: bool) -> String {
     format!(
         "Coordinate this goal with the Asterline team.\n\nGoal: {goal}\n\n\
          {}\n\
+         {}\n\
          {}\n\n\
          Plan the work, emit the checklist first, then delegate to teammates through the team protocol. \
-         Add a teammate first if the roster lacks a needed specialty. \
          Teammates: {}.",
         team_skill_hint(),
         team_checklist_requirements(),
+        team_roster_policy(allow_add_members),
         teammates
     )
 }
@@ -846,6 +817,7 @@ fn team_continue_prompt(
     verification: Option<(&str, bool, &str)>,
     note: Option<&str>,
     verify_repair: bool,
+    allow_add_members: bool,
 ) -> String {
     let verification = verification
         .map(|(command, ok, summary)| {
@@ -866,10 +838,20 @@ fn team_continue_prompt(
     format!(
         "Continue team run {run_id}.\n\nGoal: {goal}\nCurrent status: {status}{verification}{note}{repair}\n\n\
          {}\n\
+         {}\n\
          {}\n\n\
          Review the current state, continue the plan, delegate through the team protocol, \
-         and report what changed. If the roster lacks a needed specialty, add a teammate first.",
+         and report what changed.",
         team_skill_hint(),
-        team_checklist_requirements()
+        team_checklist_requirements(),
+        team_roster_policy(allow_add_members)
     )
+}
+
+fn team_roster_policy(allow_add_members: bool) -> &'static str {
+    if allow_add_members {
+        "You may add a teammate with @@team_member if the roster lacks a specialty; they join immediately."
+    } else {
+        "The roster is locked to the current teammates. Do not emit @@team_member."
+    }
 }

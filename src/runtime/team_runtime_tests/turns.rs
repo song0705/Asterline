@@ -87,7 +87,7 @@ fn user_message_starts_a_run_for_default_member() {
 
 #[test]
 fn native_codex_approval_is_persisted_and_returns_the_user_decision_to_the_runner() {
-    let mut rt = runtime();
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap()).with_approvals(true);
     rt.on_ui_command(user("make the change"));
 
     let requested = rt.on_agent_event(
@@ -140,8 +140,37 @@ fn native_codex_approval_is_persisted_and_returns_the_user_decision_to_the_runne
 }
 
 #[test]
-fn cancelling_a_member_rejects_its_native_codex_approval() {
+fn native_codex_approval_auto_passes_when_manual_approvals_are_off() {
     let mut rt = runtime();
+    rt.on_ui_command(user("make the change"));
+
+    let requested = rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::NativeApprovalRequested {
+            request_id: 41,
+            action: "Codex command".to_string(),
+            body: "git status".to_string(),
+        },
+    );
+    assert!(
+        !requested
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+    );
+    assert!(matches!(
+        requested.runner_controls.as_slice(),
+        [RunnerControl::ResolveNativeApproval {
+            member,
+            request_id: 41,
+            decision: ApprovalDecision::Approve,
+        }] if member == &MemberId::new("builder")
+    ));
+}
+
+#[test]
+fn cancelling_a_member_rejects_its_native_codex_approval() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap()).with_approvals(true);
     rt.on_ui_command(user("make the change"));
     let requested = rt.on_agent_event(
         &MemberId::new("builder"),
@@ -567,6 +596,81 @@ fn new_chat_is_rejected_while_a_member_is_active() {
         RuntimeEvent::Notice(text)
             if text.contains("cannot start a new chat") && text.contains("press Esc")
     )));
+}
+
+#[test]
+fn new_chat_keeps_mode_overrides_and_restarts_run_numbers() {
+    use crate::domain::mode::ModesConfig;
+
+    let mut rt = runtime();
+    let overrides = ModesConfig {
+        review: Some(ReviewModeConfig {
+            reviewer: Some(MemberId::new("reviewer")),
+            max_iterations: Some(6),
+            ..ReviewModeConfig::default()
+        }),
+        ..ModesConfig::default()
+    };
+    rt.on_ui_command(UiCommand::SetModeOverrides {
+        overrides: overrides.clone(),
+    });
+    let first = rt.on_ui_command(run_mode("first review"));
+    let first_run = first
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::RunUpdated { run } => Some(run.clone()),
+            _ => None,
+        })
+        .expect("first review run");
+    assert_eq!(first_run.number, 1);
+    assert_eq!(first_run.label(), "run-1");
+    let builder = first.actions[0].member.clone();
+
+    rt.on_ui_command(UiCommand::Cancel { member: None });
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    let reset = rt.on_ui_command(UiCommand::NewSession);
+    assert!(
+        reset
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset))
+    );
+    assert!(reset.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ModesUpdated { overrides: next, .. } if next == &overrides
+    )));
+    assert_eq!(rt.active_mode(), TerminalMode::Normal);
+
+    let second = rt.on_ui_command(run_mode("second review"));
+    let second_run = second
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::RunUpdated { run } => Some(run.clone()),
+            _ => None,
+        })
+        .expect("second review run");
+    assert_eq!(second_run.number, 1, "new chat must restart at run-1");
+    assert_eq!(second_run.label(), "run-1");
+    assert_ne!(second_run.id, first_run.id);
+    assert!(
+        second.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(text)
+                if text.contains("review run-1 started")
+                    && !text.contains(&format!("review {} started", second_run.id))
+        )),
+        "chat notices must use the conversation-local handle, not the raw id: {:?}",
+        second.events
+    );
 }
 
 #[test]
@@ -1083,12 +1187,12 @@ fn agent_can_add_teammate_with_team_member_envelope() {
 }
 
 #[test]
-fn agent_teammate_addition_requires_relay_approval() {
+fn agent_teammate_addition_skips_relay_approval() {
     let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
     rt.on_ui_command(user("plan it"));
     let builder = MemberId::new("builder");
 
-    let requested = rt.on_agent_event(
+    let added = rt.on_agent_event(
         &builder,
         AgentEvent::MessageCompleted(
             r#"@@team_member {"id":"qa","display_name":"QA","backend":"codex","role":"tests","sandbox":"danger-full-access"}"#
@@ -1096,31 +1200,72 @@ fn agent_teammate_addition_requires_relay_approval() {
         ),
     );
 
-    assert!(rt.config.member(&MemberId::new("qa")).is_none());
-    assert!(requested.runner_changes.is_empty());
-    let approval_id = requested
-        .events
-        .iter()
-        .find_map(|event| match event {
-            RuntimeEvent::ApprovalRequested {
-                id,
-                member: Some(from),
-                action,
-                ..
-            } if from == &builder && action == "team_member" => Some(*id),
-            _ => None,
-        })
-        .expect("teammate approval requested");
-
-    let approved = rt.on_ui_command(UiCommand::Approve {
-        id: approval_id,
-        decision: ApprovalDecision::Approve,
-    });
     assert!(rt.config.member(&MemberId::new("qa")).is_some());
-    assert!(approved.runner_changes.iter().any(|change| matches!(
+    assert!(added.runner_changes.iter().any(|change| matches!(
         change,
         RunnerChange::Upsert { member, .. } if member.id == MemberId::new("qa")
     )));
+    assert!(
+        !added.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ApprovalRequested { action, .. } if action == "team_member"
+        )),
+        "adding a teammate must not wait for /approve"
+    );
+}
+
+#[test]
+fn team_mode_default_refuses_agent_teammate_addition() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
+    start_team(&mut rt, "ship the parser");
+    let builder = MemberId::new("builder");
+
+    let refused = rt.on_agent_event(
+        &builder,
+        AgentEvent::MessageCompleted(
+            r#"@@team_member {"id":"qa","display_name":"QA","backend":"codex","role":"tests"}"#
+                .to_string(),
+        ),
+    );
+
+    assert!(rt.config.member(&MemberId::new("qa")).is_none());
+    assert!(refused.runner_changes.is_empty());
+    assert!(refused.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("locked to the current roster") && text.contains("qa")
+    )));
+}
+
+#[test]
+fn team_mode_free_add_joins_immediately_without_approval() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
+    rt.config.modes.team = Some(TeamModeConfig {
+        allow_add_members: Some(true),
+        ..TeamModeConfig::default()
+    });
+    start_team(&mut rt, "ship the parser");
+    let builder = MemberId::new("builder");
+
+    let added = rt.on_agent_event(
+        &builder,
+        AgentEvent::MessageCompleted(
+            r#"@@team_member {"id":"qa","display_name":"QA","backend":"codex","role":"tests"}"#
+                .to_string(),
+        ),
+    );
+
+    assert!(rt.config.member(&MemberId::new("qa")).is_some());
+    assert!(added.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. } if member.id == MemberId::new("qa")
+    )));
+    assert!(
+        !added
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+    );
 }
 
 #[test]
@@ -1608,21 +1753,17 @@ fn switching_to_fresh_discards_old_session_only_once() {
 }
 
 #[test]
-fn risky_request_is_gated_until_approved() {
-    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap()); // approvals on
+fn prompt_keywords_do_not_hold_a_user_message() {
+    let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
     let step = rt.on_ui_command(user("run git push origin main"));
 
-    let approval_id = step.events.iter().find_map(|e| match e {
-        RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-        _ => None,
-    });
-    let id = approval_id.expect("approval requested");
-    assert!(step.actions.is_empty(), "gated request does not run yet");
-
-    let step = rt.on_ui_command(UiCommand::Approve {
-        id,
-        decision: ApprovalDecision::Approve,
-    });
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. })),
+        "prompt-keyword gating was removed"
+    );
     assert!(
         step.actions
             .iter()

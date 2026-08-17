@@ -23,6 +23,7 @@ use crate::domain::team::{BackendKind, Effort};
 pub(crate) const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_STDERR_LINE_BYTES: usize = 1024 * 1024;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+const CANCEL_GRACE: Duration = Duration::from_millis(400);
 
 pub(crate) struct BoundedLines<R> {
     reader: R,
@@ -175,10 +176,24 @@ impl ChildProcessTree {
         }
     }
 
+    /// Ask the tree to exit. Unix sends SIGTERM so the CLI can drop in-flight
+    /// HTTP; Windows job termination is already immediate.
+    pub(crate) fn request_stop(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        return signal_process_group(self.process_group, libc::SIGTERM);
+        #[cfg(windows)]
+        return self.job.terminate();
+        #[cfg(not(any(unix, windows)))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process-tree termination is unavailable on this platform",
+        ))
+    }
+
     /// Terminate the whole owned tree without locking or borrowing the child.
     pub(crate) fn terminate(&self) -> std::io::Result<()> {
         #[cfg(unix)]
-        return kill_process_group(self.process_group);
+        return signal_process_group(self.process_group, libc::SIGKILL);
         #[cfg(windows)]
         return self.job.terminate();
         #[cfg(not(any(unix, windows)))]
@@ -199,13 +214,18 @@ impl ChildProcessTree {
 }
 
 #[cfg(unix)]
-fn kill_process_group(process_group: u32) -> std::io::Result<()> {
+fn signal_process_group(process_group: u32, signal: i32) -> std::io::Result<()> {
     // SAFETY: children are spawned with PGID equal to their PID, and `killpg`
     // does not retain the integer beyond this call.
-    if unsafe { libc::killpg(process_group as i32, libc::SIGKILL) } == 0 {
+    if unsafe { libc::killpg(process_group as i32, signal) } == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
+        }
     }
 }
 
@@ -331,6 +351,17 @@ pub trait StreamAdapter: Send + Sync {
         effort: Option<Effort>,
     ) -> AdapterCommand;
     fn parser(&self) -> Box<dyn LineParser>;
+    /// Wait before spawning the child. Return `false` if `cancel` fires.
+    fn prepare_run(&self, cancel: &AtomicBool) -> bool {
+        let _ = cancel;
+        true
+    }
+    /// Record that a child has exited so the next spawn can be spaced.
+    fn finish_run(&self) {}
+    /// Backoff before retrying a failed attempt. `None` means do not retry.
+    fn retry_delay(&self, _fatal: &str, _attempt: u32) -> Option<Duration> {
+        None
+    }
 }
 
 /// Parses one backend stdout line into zero or more events. One parser instance
@@ -372,12 +403,97 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
             });
             return;
         }
-        let command = self
-            .adapter
-            .build_command(&req.prompt, req.session.as_ref(), req.effort);
-        let parser = self.adapter.parser();
-        run_streaming(command, parser, req.cancel, events);
+        let mut attempt = 0u32;
+        loop {
+            if req.cancel.load(Ordering::Relaxed) || !self.adapter.prepare_run(&req.cancel) {
+                let _ = events.send(AgentEvent::Exited {
+                    code: None,
+                    ok: false,
+                });
+                return;
+            }
+            let command = self
+                .adapter
+                .build_command(&req.prompt, req.session.as_ref(), req.effort);
+            let parser = self.adapter.parser();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1_024);
+            let cancel = Arc::clone(&req.cancel);
+            let worker = thread::spawn(move || run_streaming(command, parser, cancel, tx));
+            let mut quota_hint = false;
+            let mut retryable_fatal = None;
+            let mut exit = None;
+            while let Ok(event) = rx.recv() {
+                match event {
+                    AgentEvent::Stderr(line) => {
+                        if self.adapter.retry_delay(&line, attempt).is_some() {
+                            quota_hint = true;
+                        }
+                        let _ = events.send(AgentEvent::Stderr(line));
+                    }
+                    AgentEvent::Fatal(message) => {
+                        if self.adapter.retry_delay(&message, attempt).is_some() {
+                            quota_hint = true;
+                            retryable_fatal = Some(message);
+                        } else {
+                            let _ = events.send(AgentEvent::Fatal(message));
+                        }
+                    }
+                    AgentEvent::Exited { code, ok } => exit = Some((code, ok)),
+                    other => {
+                        let _ = events.send(other);
+                    }
+                }
+            }
+            let _ = worker.join();
+            self.adapter.finish_run();
+            let cancelled = req.cancel.load(Ordering::Relaxed);
+            let retry_delay = match retryable_fatal.as_deref() {
+                Some(message) => self.adapter.retry_delay(message, attempt),
+                None if quota_hint && !cancelled => {
+                    self.adapter.retry_delay("RESOURCE_EXHAUSTED", attempt)
+                }
+                None => None,
+            };
+            if let Some(delay) = retry_delay.filter(|_| !cancelled) {
+                attempt = attempt.saturating_add(1);
+                let _ = events.send(AgentEvent::Log(format!(
+                    "agy quota exhausted; retrying in {}s (attempt {attempt})",
+                    delay.as_secs().max(1)
+                )));
+                if sleep_cancelable(delay, &req.cancel) {
+                    continue;
+                }
+            }
+            if let Some(message) = retryable_fatal {
+                let _ = events.send(AgentEvent::Fatal(message));
+            }
+            match exit {
+                Some((code, ok)) => {
+                    let _ = events.send(AgentEvent::Exited { code, ok });
+                }
+                None => {
+                    let _ = events.send(AgentEvent::Exited {
+                        code: None,
+                        ok: false,
+                    });
+                }
+            }
+            return;
+        }
     }
+}
+
+fn sleep_cancelable(duration: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    !cancel.load(Ordering::Relaxed)
 }
 
 /// Spawn `command`, stream its output through `parser`, and report completion.
@@ -488,7 +604,22 @@ pub fn run_streaming(
                     break;
                 }
                 if cancel.load(Ordering::Relaxed) {
-                    if process_tree.terminate().is_err()
+                    let _ = process_tree.request_stop();
+                    let deadline = Instant::now() + CANCEL_GRACE;
+                    while Instant::now() < deadline && !done.load(Ordering::Relaxed) {
+                        let parent_exited = child
+                            .lock()
+                            .ok()
+                            .and_then(|mut child| child.try_wait().ok())
+                            .flatten()
+                            .is_some();
+                        if parent_exited {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    if !done.load(Ordering::Relaxed)
+                        && process_tree.terminate().is_err()
                         && let Ok(mut child) = child.lock()
                     {
                         let _ = child.kill();
@@ -672,12 +803,136 @@ mod tests {
         }
     }
 
+    struct QuotaRetryAdapter {
+        script: String,
+    }
+
+    struct FatalOrDelta;
+
+    impl LineParser for FatalOrDelta {
+        fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
+            if let Some(message) = line.strip_prefix("FATAL:") {
+                vec![AgentEvent::Fatal(message.to_string())]
+            } else {
+                vec![AgentEvent::TextDelta(line.to_string())]
+            }
+        }
+    }
+
+    impl StreamAdapter for QuotaRetryAdapter {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Agy
+        }
+
+        fn build_command(
+            &self,
+            _prompt: &str,
+            _session: Option<&AgentSessionId>,
+            _effort: Option<Effort>,
+        ) -> AdapterCommand {
+            AdapterCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), self.script.clone()],
+                cwd: PathBuf::from("/tmp"),
+                stdin: None,
+            }
+        }
+
+        fn parser(&self) -> Box<dyn LineParser> {
+            Box::new(FatalOrDelta)
+        }
+
+        fn retry_delay(&self, fatal: &str, attempt: u32) -> Option<Duration> {
+            crate::adapter::agy_stream::agy_quota_retry_delay(fatal, attempt)
+        }
+    }
+
     fn collect(rx: mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         while let Ok(event) = rx.recv() {
             out.push(event);
         }
         out
+    }
+
+    #[test]
+    fn retries_agy_eligibility_429_then_succeeds() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-agy-quota-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("first");
+        let runner = ProcessRunner::new(QuotaRetryAdapter {
+            script: format!(
+                "if [ ! -f '{flag}' ]; then printf '%s\\n' 'FATAL:Eligibility check failed: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).'; touch '{flag}'; exit 1; fi; printf 'ok\\n'",
+                flag = flag.display()
+            ),
+        });
+        let (tx, rx) = mpsc::sync_channel(65_536);
+        runner.run(
+            RunRequest {
+                prompt: "x".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            tx,
+        );
+        let events = collect(rx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Log(message) if message.contains("agy quota exhausted")
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TextDelta(text) if text == "ok")),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_))),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Exited { ok: true, .. }))
+        );
+    }
+
+    #[test]
+    fn does_not_retry_non_quota_failures() {
+        let runner = ProcessRunner::new(QuotaRetryAdapter {
+            script: "printf '%s\\n' 'FATAL:model not found'; exit 1".to_string(),
+        });
+        let (tx, rx) = mpsc::sync_channel(65_536);
+        runner.run(
+            RunRequest {
+                prompt: "x".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            tx,
+        );
+        let events = collect(rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Fatal(message) if message.contains("model not found")
+        )));
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, AgentEvent::Log(message) if message.contains("retrying"))
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]

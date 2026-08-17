@@ -197,6 +197,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         .unwrap_or(1);
     let queued_preview = queued_input_preview_lines(state, frame.area().width as usize);
     let queued_height = queued_preview.len() as u16;
+    let approval_height = approval_card_height(state, frame.area().width);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -204,6 +205,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
             Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(queued_height),
+            Constraint::Length(approval_height),
             Constraint::Length(composer_height),
             Constraint::Length(bottom_height),
         ])
@@ -212,18 +214,19 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     render_header(frame, chunks[0], state);
     let mut layout = render_chat(frame, chunks[1], state);
     frame.render_widget(Paragraph::new(queued_preview), chunks[2]);
-    render_composer(frame, chunks[3], state);
+    render_approval_card(frame, chunks[3], state);
+    render_composer(frame, chunks[4], state);
     let composer_inner = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .inner(chunks[3]);
+        .inner(chunks[4]);
     layout.composer_area = Some(composer_inner);
     layout.composer_wrap = (composer_inner.width as usize).saturating_sub(2);
     layout.composer_text_origin = 0;
     if let Some(completion) = completion {
-        render_popup(frame, chunks[4], &completion, state.popup_selected());
-        layout.completion_area = Some(chunks[4]);
+        render_popup(frame, chunks[5], &completion, state.popup_selected());
+        layout.completion_area = Some(chunks[5]);
     } else {
-        render_footer(frame, chunks[4], state);
+        render_footer(frame, chunks[5], state);
     }
 
     if let Some(drawer) = state.drawer() {
@@ -522,6 +525,13 @@ fn ensure_scrollback_cached(state: &AppState, width: usize, cache: &mut ChatPain
     for slot in cache.live_slots.iter_mut().skip(slot_from) {
         slot.at = slot.at.saturating_add(prefix_height);
     }
+    // A cached prefix slot stays attached to a finished reply. Drop it once
+    // that member has a later region in the tail, or the old block lights up
+    // again the moment they start working.
+    cache.live_slots.retain(|slot| {
+        slot.at > prefix_height
+            || !member_has_later_live_region(state.chat(), tail_start, &slot.member)
+    });
     cache.item_revs = revs;
     cache.key = Some(key);
 }
@@ -762,8 +772,17 @@ fn realized_live_slots(
     state: &AppState,
     width: usize,
 ) -> Vec<(usize, Vec<Line<'static>>)> {
+    let mut chosen = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for slot in cache.live_slots.iter().rev() {
+        if seen.insert(slot.member.clone()) {
+            chosen.push(slot);
+        }
+    }
+    chosen.reverse();
+
     let mut out = Vec::new();
-    for slot in &cache.live_slots {
+    for slot in chosen {
         let mut lines = Vec::new();
         if render_live_member_activity(state, width, &slot.member, slot.show_header, &mut lines) {
             if slot.show_header {
@@ -1045,6 +1064,11 @@ fn render_chat_history_range(
             if rendered_live.contains(&member.id) {
                 continue;
             }
+            // Prefix already recorded this member's live row. A tail-only
+            // fallback would reprint Working under a fresh header.
+            if prefix_owns_member_live_region(items, start, &member.id) {
+                continue;
+            }
             match &mut live {
                 #[cfg(test)]
                 LiveRender::Inline => {
@@ -1070,16 +1094,38 @@ fn render_chat_history_range(
 /// finished reply. A later prompt only closes the region when it would also
 /// break grouping — talking to someone else while this member is still
 /// working must leave their thinking in their own block.
+///
+/// Scan the full timeline, not just this paint chunk. A cached prefix does
+/// not see the member's next turn in `order`, and would otherwise keep the
+/// Working row on the completed reply.
 fn live_activity_belongs_after(
     items: &[ChatItem],
     order: &[usize],
     pos: usize,
     member: &MemberId,
 ) -> bool {
-    !order.iter().skip(pos + 1).any(|&j| {
-        let later = &items[j];
-        item_member(later) == Some(member) || user_breaks_member_region(later, member)
+    let Some(&item_index) = order.get(pos) else {
+        return false;
+    };
+    !member_has_later_live_region(items, item_index + 1, member)
+}
+
+fn item_opens_new_member_region(item: &ChatItem, member: &MemberId) -> bool {
+    user_breaks_member_region(item, member) || relay_starts_member_region(item, member)
+}
+
+fn member_has_later_live_region(items: &[ChatItem], after: usize, member: &MemberId) -> bool {
+    items.iter().skip(after).any(|later| {
+        item_member(later) == Some(member) || item_opens_new_member_region(later, member)
     })
+}
+
+fn prefix_owns_member_live_region(items: &[ChatItem], start: usize, member: &MemberId) -> bool {
+    start > 0
+        && items[..start]
+            .iter()
+            .any(|item| item_member(item) == Some(member))
+        && !member_has_later_live_region(items, start, member)
 }
 
 fn render_live_member_activity(
@@ -1173,7 +1219,7 @@ fn render_work_run(
         .iter()
         .copied()
         .filter(|item| {
-            is_edit_tool(item)
+            is_file_change_tool(item)
                 && !matches!(
                     item,
                     ChatItem::Tool {
@@ -1203,7 +1249,7 @@ fn render_work_run(
         .iter()
         .copied()
         .filter(|item| {
-            !is_edit_tool(item)
+            !is_file_change_tool(item)
                 || matches!(
                     item,
                     ChatItem::Tool {
@@ -1246,8 +1292,8 @@ fn render_work_run(
     }
 }
 
-fn is_edit_tool(item: &ChatItem) -> bool {
-    matches!(item, ChatItem::Tool { name, .. } if tool_display::tool_kind(name) == "Edit")
+fn is_file_change_tool(item: &ChatItem) -> bool {
+    matches!(item, ChatItem::Tool { name, .. } if tool_display::is_file_change_tool_name(name))
 }
 
 fn split_files_by_edit(
@@ -1984,16 +2030,76 @@ fn push_wrapped(
     }
 }
 
+fn approval_card_height(state: &AppState, width: u16) -> u16 {
+    let Some(pending) = state.selected_pending_approval() else {
+        return 0;
+    };
+    let inner = width.saturating_sub(4).max(8) as usize;
+    let body_rows = markdown::wrap(&pending.body, inner).len().clamp(1, 4);
+    (4 + body_rows) as u16
+}
+
+fn render_approval_card(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    if area.height == 0 {
+        return;
+    }
+    let Some(pending) = state.selected_pending_approval() else {
+        return;
+    };
+    let count = state.pending_approvals().len();
+    let index = state.selected_approval_index() + 1;
+    let title = if count > 1 {
+        format!(" Approval {index}/{count} ")
+    } else {
+        " Approval ".to_string()
+    };
+    let block = Block::default()
+        .title(Span::styled(title, theme::warning_bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::warning_color()))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let wrap = inner.width as usize;
+    let who = pending
+        .member
+        .as_ref()
+        .map(|member| format!("{member} · "))
+        .unwrap_or_default();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(who, theme::emphasis()),
+        Span::styled(pending.action.clone(), theme::warning_bold()),
+        Span::styled(" is waiting", theme::muted()),
+    ])];
+    for (idx, line) in markdown::wrap(&pending.body, wrap)
+        .into_iter()
+        .take(4)
+        .enumerate()
+    {
+        let style = if idx == 0 {
+            theme::text()
+        } else {
+            theme::muted()
+        };
+        lines.push(Line::from(Span::styled(line, style)));
+    }
+    let hint = if count > 1 {
+        "y agree   n deny   ← → switch"
+    } else {
+        "y agree   n deny"
+    };
+    if (lines.len() as u16) < inner.height {
+        lines.push(Line::from(Span::styled(hint, theme::muted())));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let (border_color, title_text) = if !state.pending_approvals().is_empty() {
-        (
-            theme::warning_color(),
-            format!(
-                " {} pending approval(s) · /approve ",
-                state.pending_approvals().len()
-            ),
-        )
-    } else if state.paused_routes() > 0 {
+    let (border_color, title_text) = if state.paused_routes() > 0 {
         (
             theme::warning_color(),
             format!(" {} route(s) paused · /retry ", state.paused_routes()),

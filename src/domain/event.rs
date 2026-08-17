@@ -612,6 +612,9 @@ pub struct ModeRunStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunSummary {
     pub id: RunId,
+    /// 1-based index inside the current conversation. `run-1` after `/new`.
+    /// Zero means "use `id`" so older fixtures still render as `run-{id}`.
+    pub number: u32,
     pub goal: String,
     pub status: RunStatus,
     pub coordinator: Option<MemberId>,
@@ -629,6 +632,27 @@ pub struct RunSummary {
     /// `/continue` can refuse them with a clear notice instead of treating them
     /// as ordinary TEAM runs.
     pub legacy_mode: Option<String>,
+}
+
+impl RunSummary {
+    /// User-facing handle, reset per conversation (`run-1` after `/new`).
+    pub fn label(&self) -> String {
+        format!("run-{}", self.display_number())
+    }
+
+    pub fn display_number(&self) -> u64 {
+        if self.number == 0 {
+            self.id.0
+        } else {
+            u64::from(self.number)
+        }
+    }
+}
+
+impl fmt::Display for RunSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label())
+    }
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth

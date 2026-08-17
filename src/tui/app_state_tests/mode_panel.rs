@@ -185,21 +185,53 @@ fn w_emits_save_mode_defaults() {
 }
 
 #[test]
-fn session_reset_clears_conversation_overrides() {
+fn team_allow_add_members_toggle_applies_to_this_chat() {
+    let mut state = open_mode_panel();
+    for _ in 0..4 {
+        state.handle_mode_editor_key(KeyCode::Down, KeyModifiers::NONE);
+    }
+    assert_eq!(
+        state.mode_editor().map(|editor| editor.selected_mode()),
+        Some(TerminalMode::Team)
+    );
+    state.handle_mode_editor_key(KeyCode::Enter, KeyModifiers::NONE);
+    state.handle_mode_editor_key(KeyCode::Down, KeyModifiers::NONE);
+    let outcome = state.handle_mode_editor_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(outcome, ModeEditorOutcome::Consumed(Vec::new()));
+    let outcome = state.handle_mode_editor_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    match outcome {
+        ModeEditorOutcome::Consumed(commands) => {
+            assert!(matches!(
+                commands.as_slice(),
+                [
+                    UiCommand::SetModeOverrides { overrides },
+                    UiCommand::SetMode {
+                        mode: TerminalMode::Team
+                    }
+                ] if overrides.team.as_ref().and_then(|cfg| cfg.allow_add_members) == Some(true)
+            ));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn session_reset_keeps_conversation_overrides() {
     let mut state = AppState::new(Vec::new());
+    let overrides = ModesConfig {
+        review: Some(ReviewModeConfig {
+            max_iterations: Some(9),
+            ..ReviewModeConfig::default()
+        }),
+        ..ModesConfig::default()
+    };
     let mut ready = ready_two();
     if let RuntimeEvent::Ready { mode_overrides, .. } = &mut ready {
-        *mode_overrides = ModesConfig {
-            review: Some(ReviewModeConfig {
-                max_iterations: Some(9),
-                ..ReviewModeConfig::default()
-            }),
-            ..ModesConfig::default()
-        };
+        *mode_overrides = overrides.clone();
     }
     state.apply(ready);
     state.apply(RuntimeEvent::SessionReset);
-    assert_eq!(state.mode_overrides(), &ModesConfig::default());
+    assert_eq!(state.mode_overrides(), &overrides);
     assert_eq!(state.active_mode(), TerminalMode::Normal);
     assert!(state.mode_editor().is_none());
 }

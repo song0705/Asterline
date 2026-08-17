@@ -12,7 +12,9 @@ human-readable fields.
 
 Suspend judgment throughout SEED, BUILD, and STRETCH waves. Do not critique,
 rank, reject, vote, choose a winner, or discuss feasibility during these waves.
-Prefer quantity, variety, and atomic ideas.
+The runtime prompt states how many cards to emit this wave. Emit exactly that
+many `@@brainstorm_card` lines — no more, no fewer. Make those cards varied and
+atomic. Extra cards are discarded.
 
 - SEED: generate independent directions and at least one deliberately wild idea.
 - BUILD: include NEW, BUILD, COMBINE, or MUTATE operations. Cite prior candidate

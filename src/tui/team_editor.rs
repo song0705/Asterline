@@ -12,8 +12,9 @@ use crate::domain::team::{BackendKind, DefaultTarget, MemberId, TeamConfig, Team
 use crate::tui::session_picker::SessionPicker;
 use crate::tui::team_builder::{
     BackendPicker, EditState, Field, ModelCatalog, ModelChoices, ModelPicker,
-    apply_permission_cycle, apply_sandbox_cycle, field_value, normalize_member_id,
-    unique_display_name, unique_display_name_except, unique_member_id,
+    apply_backend_write_defaults, apply_permission_cycle, apply_sandbox_cycle,
+    copy_write_permissions, field_value, normalize_member_id, unique_display_name,
+    unique_display_name_except, unique_member_id,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -448,6 +449,7 @@ impl TeamEditor {
                     .is_some_and(|member| member.backend != choice.backend);
                 if changed && let Some(member) = self.selected_member_mut() {
                     member.backend = choice.backend;
+                    apply_backend_write_defaults(member);
                     member.session_id = None;
                     member.model = None;
                     member.effort = None;
@@ -607,16 +609,20 @@ impl TeamEditor {
     }
 
     fn add_member(&mut self) {
-        let backend = self
-            .members
-            .get(self.selected)
+        let template = self.members.get(self.selected).cloned();
+        let backend = template
+            .as_ref()
             .map(|member| member.backend)
             .unwrap_or(BackendKind::Codex);
         let mut member = default_member(backend);
+        if let Some(template) = template.as_ref() {
+            copy_write_permissions(template, &mut member);
+        }
         member.id = MemberId::new(unique_member_id(member.id.as_str(), &self.members, None));
         member.display_name = unique_display_name(&member.display_name, &self.members);
         self.members.push(member);
         self.selected = self.members.len() - 1;
+        self.field = 0;
         self.normalize_field();
         self.dirty = true;
         self.notice = Some("member added; press s to apply".to_string());
@@ -1124,6 +1130,31 @@ mod tests {
     }
 
     #[test]
+    fn add_member_copies_selected_write_permissions_and_focuses_name() {
+        let mut editor = editor();
+        editor.members[0].permission_mode = Some(crate::domain::team::PermissionMode::AcceptEdits);
+        editor.members[0].sandbox = crate::domain::team::SandboxPolicy::WorkspaceWrite;
+        editor.field = editor
+            .fields()
+            .iter()
+            .position(|field| *field == Field::Permission)
+            .unwrap();
+
+        editor.add_member();
+
+        assert_eq!(editor.selected(), 1);
+        assert_eq!(editor.selected_field(), Field::Name);
+        assert_eq!(
+            editor.members[1].permission_mode,
+            Some(crate::domain::team::PermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            editor.members[1].sandbox,
+            crate::domain::team::SandboxPolicy::WorkspaceWrite
+        );
+    }
+
+    #[test]
     fn enter_opens_fields_and_up_down_select_them() {
         let mut editor = editor();
         editor.add_member();
@@ -1215,6 +1246,10 @@ mod tests {
         editor.handle_backend_picker_key(KeyCode::Enter);
 
         assert_eq!(editor.members[0].backend, BackendKind::Claude);
+        assert_eq!(
+            editor.members[0].permission_mode,
+            Some(crate::domain::team::PermissionMode::AcceptEdits)
+        );
         assert_eq!(editor.members[0].model, None);
         assert_eq!(editor.members[0].effort, None);
         assert_eq!(editor.members[0].session_id, None);

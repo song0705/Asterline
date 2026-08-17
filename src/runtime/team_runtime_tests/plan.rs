@@ -442,6 +442,61 @@ fn brainstorm_structured_cards_are_rendered_and_persisted() {
 }
 
 #[test]
+fn brainstorm_discards_cards_beyond_ideas_per_round() {
+    let mut rt = plan_runtime();
+    rt.config.modes.brainstorm = Some(BrainstormModeConfig {
+        ideas_per_round: Some(3),
+        ..BrainstormModeConfig::default()
+    });
+    let planner = MemberId::new("planner");
+    let start = rt.on_ui_command(run_brainstorm("cap extras"));
+    assert!(
+        start
+            .actions
+            .iter()
+            .all(|action| action.prompt.contains("exactly 3")
+                && action.prompt.contains("no more")
+                && !action.prompt.contains("at least 3"))
+    );
+    let run_id = find_run_id(&start);
+    let completed = rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted(
+            (1..=5)
+                .map(|n| {
+                    format!(
+                        "@@brainstorm_card {{\"title\":\"Idea {n}\",\"proposal\":\"p{n}\",\"mechanism\":\"m{n}\",\"operation\":\"SEED\",\"sources\":[]}}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    );
+    assert!(completed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("2 extra brainstorm card") && text.contains("kept 3")
+    )));
+    let rendered = completed
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::MessageCompleted { text, .. } => Some(text),
+            _ => None,
+        })
+        .expect("rendered message");
+    assert!(rendered.contains("### Card 3 · Idea 3"));
+    assert!(!rendered.contains("### Card 4"));
+    let state: serde_json::Value =
+        serde_json::from_str(&rt.store.run_mode_state(run_id).unwrap().unwrap()).unwrap();
+    assert_eq!(state["idea_count"], 3);
+    assert_eq!(
+        state["idea_batches"][0]["cards"].as_array().unwrap().len(),
+        3
+    );
+}
+
+#[test]
 fn brainstorm_retries_append_changed_ideas_without_duplicating_exact_replays() {
     let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
@@ -801,7 +856,8 @@ fn brainstorm_respects_configured_generation_budget() {
         start
             .actions
             .iter()
-            .all(|action| action.prompt.contains("at least 6"))
+            .all(|action| action.prompt.contains("exactly 6")
+                && !action.prompt.contains("at least 6"))
     );
     let stretch = complete_all(
         &mut rt,
@@ -947,7 +1003,7 @@ fn continue_refuses_legacy_roundtable_mode() {
         step.events.iter().any(|e| matches!(
             e,
             RuntimeEvent::Notice(text)
-                if text.contains(&run.id.to_string())
+                if text.contains(&run.label())
                     && text.contains("older Asterline")
                     && text.contains("roundtable")
         )),

@@ -134,7 +134,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         }
         parts.push(Span::styled(
             format!(
-                "● {} pending approval(s) · /approve",
+                "● {} pending approval(s) · y agree · n deny",
                 state.pending_approvals().len()
             ),
             theme::warning_bold(),

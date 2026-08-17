@@ -255,7 +255,9 @@ fn brainstorm_config_is_empty(config: &BrainstormModeConfig) -> bool {
 }
 
 fn team_config_is_empty(config: &TeamModeConfig) -> bool {
-    config.coordinator.is_none() && config.max_iterations.is_none()
+    config.coordinator.is_none()
+        && config.max_iterations.is_none()
+        && config.allow_add_members.is_none()
 }
 
 /// Validate merged knobs for modes that have any override fields set.
@@ -372,6 +374,7 @@ fn merge_team(
                 .clone()
                 .or_else(|| base.coordinator.clone()),
             max_iterations: over.max_iterations.or(base.max_iterations),
+            allow_add_members: over.allow_add_members.or(base.allow_add_members),
             auto_verify: None,
             verify_command: None,
         }),
@@ -441,9 +444,14 @@ pub fn format_mode_binding(config: &TeamConfig, mode: TerminalMode) -> String {
             resolve_team_limits(config),
         ) {
             (Ok(coordinator), Ok(limits)) => format!(
-                "coordinator {} · {} iterations",
+                "coordinator {} · {} iterations · {}",
                 member_label(config, &coordinator),
-                limits.max_iterations
+                limits.max_iterations,
+                if limits.allow_add_members {
+                    "free add"
+                } else {
+                    "roster only"
+                }
             ),
             (Err(err), _) | (_, Err(err)) => err,
         },
@@ -544,6 +552,9 @@ pub struct TeamModeConfig {
     pub coordinator: Option<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
+    /// When true, `@@team_member` joins immediately. Default is the current roster only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_add_members: Option<bool>,
     /// Older team.json files may still carry this. Team no longer runs a command.
     #[serde(default, skip_serializing)]
     pub auto_verify: Option<bool>,
@@ -556,6 +567,7 @@ pub struct TeamModeConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeamLimits {
     pub max_iterations: u32,
+    pub allow_add_members: bool,
     pub auto_verify: bool,
     pub verify_command: Option<String>,
 }
@@ -564,6 +576,7 @@ impl Default for TeamLimits {
     fn default() -> Self {
         Self {
             max_iterations: 3,
+            allow_add_members: false,
             auto_verify: false,
             verify_command: None,
         }
@@ -579,6 +592,7 @@ pub fn resolve_team_limits(config: &TeamConfig) -> Result<TeamLimits, String> {
         .map(|settings| {
             Ok(TeamLimits {
                 max_iterations: positive_or_default("max_iterations", settings.max_iterations, 3)?,
+                allow_add_members: settings.allow_add_members.unwrap_or(false),
                 auto_verify: false,
                 verify_command: None,
             })
@@ -798,6 +812,19 @@ pub fn resolve_plan_auto_execute(config: &TeamConfig) -> bool {
         .as_ref()
         .and_then(|settings| settings.auto_execute)
         .unwrap_or(true)
+}
+
+/// Whether team mode may grow the live roster via `@@team_member`.
+///
+/// The default keeps the current roster. When enabled, a requested teammate
+/// joins immediately and is not held for approval.
+pub fn resolve_team_allow_add_members(config: &TeamConfig) -> bool {
+    config
+        .modes
+        .team
+        .as_ref()
+        .and_then(|settings| settings.allow_add_members)
+        .unwrap_or(false)
 }
 
 fn resolve_bound_member(config: &TeamConfig, id: &MemberId) -> Result<MemberId, String> {
@@ -1190,8 +1217,16 @@ mod tests {
         });
         let limits = resolve_team_limits(&config).unwrap();
         assert_eq!(limits.max_iterations, 5);
+        assert!(!limits.allow_add_members);
         assert!(!limits.auto_verify);
         assert_eq!(limits.verify_command, None);
+
+        config.modes.team = Some(TeamModeConfig {
+            allow_add_members: Some(true),
+            ..TeamModeConfig::default()
+        });
+        assert!(resolve_team_allow_add_members(&config));
+        assert!(resolve_team_limits(&config).unwrap().allow_add_members);
 
         let mut config = mixed_roster();
         config.modes.team = Some(TeamModeConfig {

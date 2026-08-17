@@ -86,11 +86,19 @@ not delete saved conversations; use `/resume` to select one later.
 asterline --no-restore
 ```
 
+### `--manual-approvals`
+
+Show the approval card above the composer for Codex tool asks. Off by
+default: those asks are approved automatically. `team.json` can set the
+same switch with `"approvals": { "manual": true }`.
+
+```bash
+asterline --manual-approvals
+```
+
 ### `--debug`
 
-Enable developer mode and disable Asterline's risky-action approval gate.
-Backend-native permissions still apply. Use this only in a controlled
-environment.
+Developer mode. It no longer changes approval behavior.
 
 ```bash
 asterline --debug
@@ -233,8 +241,11 @@ Broadcast the message to every enabled member.
 
 Persist the current conversation, create a new conversation, clear the visible
 transcript and current run list, create fresh backend session IDs, and reset
-the terminal mode to `normal`. If a member, collaboration run, or verification
-is active, `/new` is rejected; press `Esc` and wait for cancellation first.
+the terminal mode to `normal`. Mode field settings from the previous chat
+(reviewer, builder, limits, and other this-chat overrides) stay in effect for
+the new conversation. New runs in that chat start again at `run-1`. If a
+member, collaboration run, or verification is active, `/new` is rejected;
+press `Esc` and wait for cancellation first.
 
 `/clear` is a direct alias for `/new`; both perform the same full
 new-conversation operation rather than merely hiding history. A normal restart
@@ -326,8 +337,10 @@ attached to a native backend CLI, that CLI's own `/exit` returns to Asterline.
 /approve
 ```
 
-Approve the oldest pending Asterline approval request. If no request is
-pending, Asterline reports that there is nothing to approve.
+Approve the selected pending request (oldest if you have not switched).
+The usual path is the card above the composer: `y` or Enter to agree, `n`
+to deny. If no request is pending, Asterline reports that there is nothing
+to approve.
 
 ### `/reject`
 
@@ -440,9 +453,11 @@ does not open the panel. After selecting `review`, `plan`, `brainstorm`, or
 `team`, enter the task as the next plain message — do **not** add an
 `@member` prefix. That message starts the selected mode with its configured
 participants. `@member <message>` deliberately remains a one-to-one
-instruction and bypasses the collaboration run. `/new` resets the new
-conversation to `normal` and clears this-chat overrides; `/resume` restores
-the selected conversation's mode and overrides.
+instruction and bypasses the collaboration run. `/new` starts the new
+conversation in `normal` but keeps the previous chat's mode field settings
+(reviewer, builder, limits, …) so you do not have to reconfigure them in the
+same project. `/resume` restores the selected conversation's mode and
+overrides.
 
 #### `/mode normal`
 
@@ -498,7 +513,10 @@ How could we make graph retrieval robust without node text?
 
 Start a coordinator-driven team run. The coordinator creates and owns the
 checklist, dispatches work to teammates, and integrates results. Repair
-loops continue until the configured iteration limit is reached.
+loops continue until the configured iteration limit is reached. Team mode
+defaults to the current roster; turn on `allow_add_members` in the Mode
+panel if the coordinator may add teammates (they join immediately, with
+no `/approve` step).
 
 ```text
 /mode team
@@ -515,7 +533,8 @@ Reviewers communicate a one-line verdict such as:
 ## Run commands
 
 Runs belong to the current conversation. `/new` starts with no runs, and
-`/resume` restores only the selected conversation's runs.
+the next run in that chat is `run-1`. `/resume` restores only the selected
+conversation's runs.
 
 ### `/runs`
 

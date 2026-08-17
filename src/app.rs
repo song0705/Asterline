@@ -271,12 +271,13 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         crate::update::spawn_auto_update(events_tx.clone());
     }
     let team_save_path = config.team_path.clone().unwrap_or(saved_team);
+    let manual_approvals = config.manual_approvals || team.approvals.manual;
     let (handle, join) = runtime::spawn_bounded(
         team,
         store,
         runners,
         events_tx,
-        !config.debug,
+        manual_approvals,
         config.fake,
         Some(team_save_path),
     );
@@ -310,6 +311,7 @@ pub struct AppConfig {
     db_path: Option<PathBuf>,
     no_restore: bool,
     debug: bool,
+    manual_approvals: bool,
     fake: bool,
     pick_team: bool,
     banner: bool,
@@ -349,6 +351,7 @@ impl AppConfig {
                 "--db" => config.db_path = Some(Self::value(&args, &mut index, "--db")?.into()),
                 "--no-restore" => config.no_restore = true,
                 "--debug" => config.debug = true,
+                "--manual-approvals" => config.manual_approvals = true,
                 "--fake" => config.fake = true,
                 "--pick-team" => config.pick_team = true,
                 "--banner" => config.banner = true,
@@ -396,7 +399,8 @@ impl AppConfig {
          \x20 --workspace <PATH>  Working directory for members. Default: current directory.\n\
          \x20 --db <PATH>         SQLite path. Default: <workspace>/.asterline/asterline.sqlite3.\n\
          \x20 --no-restore        Do not replay persisted chat history on startup.\n\
-         \x20 --debug             Disable the approval gate (developer mode).\n\
+         \x20 --debug             Developer mode.\n\
+         \x20 --manual-approvals  Show the composer card for Codex tool asks (off by default).\n\
          \x20 --fake              Use offline fake agents instead of real CLIs.\n\
          \x20 --banner            Print a compact startup banner before the TUI.\n\
          \x20 update              Update via Windows Setup or an owning Homebrew Formula.\n\
@@ -452,6 +456,14 @@ mod tests {
         assert!(AppConfig::help().contains("--update"));
         assert!(AppConfig::help().contains("asterline update"));
         assert!(AppConfig::help().contains("--no-auto-update"));
+        assert!(AppConfig::help().contains("--manual-approvals"));
+    }
+
+    #[test]
+    fn parses_manual_approvals_flag() {
+        let config = AppConfig::parse(["--manual-approvals"]).unwrap();
+        assert!(config.manual_approvals);
+        assert!(!AppConfig::parse(["--fake"]).unwrap().manual_approvals);
     }
 
     #[test]

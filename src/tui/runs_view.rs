@@ -30,7 +30,7 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
         return Some((
             format!(
                 "◇ brainstorm {} · ranked result ready · new topic or /mode normal · /runs details",
-                run.id
+                run.label()
             ),
             theme::success_color(),
         ));
@@ -49,7 +49,7 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
             } else {
                 format!(
                     "● {} running{progress} · /runs details · Esc cancel",
-                    run.id
+                    run.label()
                 )
             },
             theme::warning_color(),
@@ -60,7 +60,7 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
             } else {
                 format!(
                     "⏳ {} verifying{progress} · /runs details · Esc cancel",
-                    run.id
+                    run.label()
                 )
             },
             theme::warning_color(),
@@ -69,7 +69,7 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
             if let Some(head) = mode_head {
                 format!("{head}{progress} · /runs details")
             } else {
-                format!("● {} done{progress} · /runs details", run.id)
+                format!("● {} done{progress} · /runs details", run.label())
             },
             theme::success_color(),
         )),
@@ -79,7 +79,7 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
             } else {
                 format!(
                     "● {} failed{progress} · /runs details · /continue to fix",
-                    run.id
+                    run.label()
                 )
             },
             theme::error_color(),
@@ -90,7 +90,7 @@ pub(crate) fn run_footer_hint(state: &AppState) -> Option<(String, Color)> {
             } else {
                 format!(
                     "● {} blocked{progress} · /runs details · /continue when resolved",
-                    run.id
+                    run.label()
                 )
             },
             theme::error_color(),
@@ -111,10 +111,10 @@ fn terminal_mode(mode: CollabMode) -> TerminalMode {
 /// `◇ {mode} {run.id}` when the run is a collaboration mode.
 fn mode_run_head(run: &RunSummary) -> Option<String> {
     if let Some(mode) = &run.mode {
-        return Some(format!("◇ {} {}", mode.mode.as_str(), run.id));
+        return Some(format!("◇ {} {}", mode.mode.as_str(), run.label()));
     }
     if run.legacy_mode.is_some() {
-        return Some(format!("◇ legacy {}", run.id));
+        return Some(format!("◇ legacy {}", run.label()));
     }
     None
 }
@@ -386,7 +386,7 @@ fn drawer_run(run: &RunSummary, selected: bool, detail: bool, width: usize) -> V
     let sep = Span::styled("│ ", row_style.fg(theme::muted_color()));
     lines.push(Line::from(vec![
         cell(
-            &format!(" {marker} {}", run.id),
+            &format!(" {marker} {}", run.label()),
             RUNS_COLUMNS[0],
             theme::accent_color(),
         ),
@@ -447,7 +447,7 @@ fn run_step_lines(
         lines.push(Line::from(vec![
             Span::styled(" Steps: ", theme::muted()),
             Span::styled(
-                format!("/step add {} [@owner] <next step>", run.id),
+                format!("/step add {} [@owner] <next step>", run.label()),
                 theme::muted(),
             ),
         ]));
@@ -455,7 +455,7 @@ fn run_step_lines(
     }
 
     lines.push(Line::from(vec![Span::styled(" Steps:", theme::muted())]));
-    for step in run.steps.iter().take(8) {
+    for step in &run.steps {
         lines.push(run_step_line(
             step,
             selected_step == Some(step.number),
@@ -967,6 +967,7 @@ mod tests {
     fn run(id: u64, status: RunStatus, verification: Option<RunVerification>) -> RunSummary {
         RunSummary {
             id: RunId(id),
+            number: 0,
             goal: format!("goal {id}"),
             status,
             coordinator: Some(MemberId::new("builder")),
@@ -1244,6 +1245,43 @@ mod tests {
             run_owner_summary(&stepped).unwrap().0,
             "@builder 1/2 active · unassigned 1/1 1 blocked"
         );
+    }
+
+    #[test]
+    fn run_step_lines_list_every_step_in_order() {
+        let mut stepped = run(5, RunStatus::Done, None);
+        stepped.steps = (1..=9)
+            .map(|number| RunStepSummary {
+                number,
+                status: RunStepStatus::Done,
+                owner: Some(MemberId::new("researcher")),
+                title: format!("step {number} title"),
+                note: None,
+                updated_at: "2026-06-28 10:00:00".to_string(),
+            })
+            .collect();
+        let lines = run_step_lines(&stepped, Some(9), 80);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let joined = text.join("\n");
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.contains("step ") && line.contains("title"))
+                .count(),
+            9,
+            "{joined}"
+        );
+        let first = joined.find(" 1.").expect(&joined);
+        let last = joined.find(" 9.").expect(&joined);
+        assert!(first < last, "{joined}");
+        assert!(joined.contains("› 9."), "{joined}");
     }
 
     #[test]

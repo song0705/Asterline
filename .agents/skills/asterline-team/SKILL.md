@@ -2,7 +2,7 @@
 name: asterline-team
 description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 16
+  version: 19
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -48,7 +48,11 @@ When the messaging policy above permits it, send necessary work or questions to 
 
 ## Add A Teammate
 
-When the roster lacks a needed specialty, request a new teammate:
+Only emit this when the current prompt says the roster may grow. In
+`/mode team` the default is the current roster; do not emit `@@team_member`
+when the prompt says the roster is locked.
+
+When adding is allowed and the roster lacks a needed specialty, request a new teammate:
 
 ```text
 @@team_member {"display_name":"QA","backend":"codex","role":"tests"}
@@ -104,5 +108,22 @@ Use `add` for new checklist items. Use `todo`, `doing`, `done`, or `block` with
 the 1-based step number shown in `/runs` to update an existing item. Use
 `assign` with a member handle to set ownership, `unassign` to clear it,
 `rename` to fix a step title, and `remove` only for duplicate or obsolete steps.
+
+## Waiting For User Approval
+
+By default Asterline auto-approves Codex tool asks. If the user enabled
+manual approvals, a live tool (especially a Codex command, file change, or
+permission escalation) pauses until they agree in the card above the
+composer. A Plan run with manual execute confirmation waits the same way
+before the Builder is sent the checklist.
+
+When you are waiting:
+
+- Do not retry the same tool, command, or handoff.
+- Do not assume the action succeeded or failed.
+- Do not send another `@@team_message` or `@@team_member` just to nudge.
+- Stop and wait for the next prompt. After approval, the tool result or next
+  dispatch arrives normally. After rejection, treat the action as denied and
+  continue another way.
 
 Everything else you write is shown to the user.

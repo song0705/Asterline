@@ -195,30 +195,36 @@ fn skill_tool_target(name: &str, summary: &str, detail: &str) -> Option<String> 
     None
 }
 
-/// Claude-style edit tools do not emit a separate file-change event. Recover
-/// the edit from their input so the chat has one consistent file-change card
-/// rather than a duplicate `Edit` row in the tools group.
+/// Write/Edit/Delete tools often do not emit a separate file-change event.
+/// Recover one from their input so they paint as file-change cards instead of
+/// a duplicate row under tools.
 pub(crate) fn file_change_from_edit_tool(
     name: &str,
     summary: &str,
     detail: &str,
 ) -> Option<FileChangeItem> {
-    if tool_kind(name) != "Edit" {
+    if !is_file_change_tool_name(name) {
         return None;
     }
     let input = split_json_payload(detail)
         .or_else(|| split_json_payload(summary))
         .map(|(_, value, _)| value);
-    let old_text = input
+    if let Some(file) = input
         .as_ref()
-        .and_then(|value| json_field(value, &["old_string", "oldText", "before"]));
-    let new_text = input
-        .as_ref()
-        .and_then(|value| json_field(value, &["new_string", "newText", "after"]));
+        .and_then(|value| crate::adapter::parser::file_change_from_params(name, value))
+    {
+        return Some(file);
+    }
+    let old_text = input.as_ref().and_then(|value| {
+        crate::adapter::parser::json_string_field(value, &["old_string", "oldText", "before"])
+    });
+    let new_text = input.as_ref().and_then(|value| {
+        crate::adapter::parser::json_string_field(value, &["new_string", "newText", "after"])
+    });
     let path = input
         .as_ref()
         .and_then(|value| {
-            json_field(
+            crate::adapter::parser::json_string_field(
                 value,
                 &["file_path", "target_file", "path", "file", "filename"],
             )
@@ -226,24 +232,53 @@ pub(crate) fn file_change_from_edit_tool(
         .filter(|path| !path.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            let target = tool_target(name, summary, detail);
+            let target = strip_path_label(&tool_target(name, summary, detail));
             if target.is_empty() {
-                "edited file".to_string()
+                fallback_file_change_path(name).to_string()
             } else {
                 target
             }
         });
-    let kind = match (old_text, new_text) {
-        (None, Some(_)) => "add",
-        (Some(_), None) => "delete",
-        _ => "update",
+    let kind = match tool_kind(name).as_str() {
+        "Write" => "add",
+        "Delete" => "delete",
+        _ => match (old_text, new_text) {
+            (None, Some(_)) => "add",
+            (Some(_), None) => "delete",
+            _ => "update",
+        },
     };
     Some(FileChangeItem::new(path, kind).with_texts(old_text, new_text))
 }
 
-fn json_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
+pub(crate) fn is_file_change_tool_name(name: &str) -> bool {
+    matches!(tool_kind(name).as_str(), "Edit" | "Write" | "Delete")
+}
+
+fn fallback_file_change_path(name: &str) -> &'static str {
+    match tool_kind(name).as_str() {
+        "Write" => "new file",
+        "Delete" => "deleted file",
+        _ => "edited file",
+    }
+}
+
+fn strip_path_label(text: &str) -> String {
+    let trimmed = text.trim();
+    for label in [
+        "TargetFile",
+        "target_file",
+        "FilePath",
+        "file_path",
+        "FileName",
+        "filename",
+        "Path",
+    ] {
+        if let Some(rest) = strip_leading_label(trimmed, label) {
+            return rest;
+        }
+    }
+    trimmed.to_string()
 }
 
 fn strip_leading_label(headline: &str, label: &str) -> Option<String> {
@@ -930,6 +965,29 @@ mod tests {
         assert!(body.contains("MultipleMatchesFound"), "{body}");
         assert!(!body.contains("chars"), "{body}");
         assert!(!body.contains("SearchReplace"), "{body}");
+    }
+
+    #[test]
+    fn agy_write_input_becomes_an_add_file_change() {
+        let file = file_change_from_edit_tool("Write", "TargetFile snake game/index.html", "")
+            .expect("write file change");
+
+        assert_eq!(file.path, "snake game/index.html");
+        assert_eq!(file.kind, "add");
+    }
+
+    #[test]
+    fn claude_write_input_becomes_an_add_file_change() {
+        let file = file_change_from_edit_tool(
+            "Write",
+            "src/lib.rs",
+            "input:\n{\"file_path\":\"src/lib.rs\",\"content\":\"pub fn x() {}\\n\"}\n",
+        )
+        .expect("write file change");
+
+        assert_eq!(file.path, "src/lib.rs");
+        assert_eq!(file.kind, "add");
+        assert_eq!(file.new_text.as_deref(), Some("pub fn x() {}\n"));
     }
 
     #[test]

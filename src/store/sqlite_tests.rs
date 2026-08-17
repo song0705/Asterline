@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::event::FileChangeItem;
+use crate::domain::event::{FileChangeItem, RunId};
 use crate::domain::mode::{ModesConfig, ReviewModeConfig};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig, TeamMember};
 
@@ -395,7 +395,7 @@ fn fresh_conversation_atomically_clears_sessions_and_writes_snapshot() {
     ));
 
     let fresh = store
-        .create_fresh_conversation(&team, TerminalMode::Normal)
+        .create_fresh_conversation(&team, TerminalMode::Normal, &Default::default())
         .unwrap();
 
     assert_ne!(fresh, original);
@@ -436,7 +436,7 @@ fn fresh_conversation_rolls_back_when_session_clear_fails() {
 
     assert!(
         store
-            .create_fresh_conversation(&team, TerminalMode::Normal)
+            .create_fresh_conversation(&team, TerminalMode::Normal, &Default::default())
             .is_err()
     );
 
@@ -485,7 +485,7 @@ fn fresh_conversation_rolls_back_when_snapshot_write_fails() {
 
     assert!(
         store
-            .create_fresh_conversation(&team, TerminalMode::Normal)
+            .create_fresh_conversation(&team, TerminalMode::Normal, &Default::default())
             .is_err()
     );
 
@@ -1238,6 +1238,27 @@ fn runs_record_status_and_verification() {
 
     assert_eq!(store.latest_run().unwrap().unwrap().id, run.id);
     assert_eq!(store.recent_runs(10).unwrap().len(), 1);
+}
+
+#[test]
+fn run_numbers_restart_in_a_new_conversation() {
+    let store = store();
+    let first = store.create_conversation().unwrap();
+    store.set_conversation(first).unwrap();
+    let first_a = store.create_run("first-a", None).unwrap();
+    let first_b = store.create_run("first-b", None).unwrap();
+    assert_eq!(first_a.number, 1);
+    assert_eq!(first_b.number, 2);
+    assert_eq!(first_a.label(), "run-1");
+    assert_eq!(first_b.label(), "run-2");
+
+    let second = store.create_conversation().unwrap();
+    store.set_conversation(second).unwrap();
+    let second_a = store.create_run("second-a", None).unwrap();
+    assert_eq!(second_a.number, 1);
+    assert_eq!(second_a.label(), "run-1");
+    assert_ne!(second_a.id, first_a.id);
+    assert_eq!(store.resolve_run_ref(RunId(1)).unwrap().id, second_a.id);
 }
 
 #[test]

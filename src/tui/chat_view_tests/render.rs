@@ -178,6 +178,219 @@ fn cached_working_indicator_moves_to_a_new_targeted_prompt() {
 }
 
 #[test]
+fn cached_working_indicator_does_not_stick_to_a_prior_same_member_turn() {
+    use crate::domain::event::{MessageId, TurnId};
+
+    let builder = MemberId::new("builder");
+    let planer = MemberId::new("planer");
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: String::new(),
+        default_target: Some(DefaultTarget::Member(builder.clone())),
+        runs: Vec::new(),
+        members: vec![
+            member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Agy,
+                "implementation",
+                MemberStatus::Running,
+            ),
+            member_summary(
+                "planer",
+                "Planer",
+                BackendKind::Claude,
+                "planning",
+                MemberStatus::Idle,
+            ),
+        ],
+    });
+    state.apply(RuntimeEvent::UserMessage {
+        turn: TurnId(1),
+        targets: vec![builder.clone()],
+        body: "make the snake game; let planner design first".to_string(),
+    });
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(1),
+        turn: TurnId(1),
+        member: builder.clone(),
+    });
+    state.apply(RuntimeEvent::MessageCompleted {
+        msg: MessageId(1),
+        text: "dispatched the plan to Planer".to_string(),
+    });
+    state.apply(RuntimeEvent::Route {
+        turn: TurnId(1),
+        from: builder.clone(),
+        to: vec![planer.to_string()],
+        body: "please draft the architecture".to_string(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 48)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+    // Freeze the first Builder region in the painted prefix.
+    state.apply(RuntimeEvent::Notice("cache boundary".to_string()));
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+
+    state.apply(RuntimeEvent::MemberStatus {
+        member: builder.clone(),
+        status: MemberStatus::Idle,
+    });
+    state.apply(RuntimeEvent::MemberStatus {
+        member: planer.clone(),
+        status: MemberStatus::Running,
+    });
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(2),
+        turn: TurnId(1),
+        member: planer.clone(),
+    });
+    state.apply(RuntimeEvent::MessageCompleted {
+        msg: MessageId(2),
+        text: "here is the architecture".to_string(),
+    });
+    state.apply(RuntimeEvent::Route {
+        turn: TurnId(1),
+        from: planer.clone(),
+        to: vec![builder.to_string()],
+        body: "architecture ready, please implement".to_string(),
+    });
+    state.apply(RuntimeEvent::MemberStatus {
+        member: planer,
+        status: MemberStatus::Idle,
+    });
+    state.apply(RuntimeEvent::MemberStatus {
+        member: builder.clone(),
+        status: MemberStatus::Running,
+    });
+    state.apply(RuntimeEvent::ToolStarted {
+        member: builder,
+        tool_id: "w1".to_string(),
+        name: "write".to_string(),
+        summary: "snake game/index.html".to_string(),
+    });
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+
+    let view = format!("{}", terminal.backend());
+    assert_eq!(view.matches("Working (").count(), 1, "{view}");
+    let first = view.find("dispatched the plan to Planer").expect(&view);
+    let implement = view.find("snake game/index.html").expect(&view);
+    let working = view.find("Working (").expect(&view);
+    assert!(
+        first < implement && implement < working,
+        "Working must follow the new turn, not the finished Builder reply: {view}"
+    );
+}
+
+#[test]
+fn cached_working_indicator_stays_on_prefix_when_only_others_continue() {
+    use crate::domain::event::{MessageId, TurnId};
+
+    let builder = MemberId::new("builder");
+    let planer = MemberId::new("planer");
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: String::new(),
+        default_target: Some(DefaultTarget::Member(builder.clone())),
+        runs: Vec::new(),
+        members: vec![
+            member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Agy,
+                "implementation",
+                MemberStatus::Running,
+            ),
+            member_summary(
+                "planer",
+                "Planer",
+                BackendKind::Claude,
+                "planning",
+                MemberStatus::Idle,
+            ),
+        ],
+    });
+    state.apply(RuntimeEvent::UserMessage {
+        turn: TurnId(1),
+        targets: vec![builder.clone()],
+        body: "ask Planer to design it".to_string(),
+    });
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(1),
+        turn: TurnId(1),
+        member: builder.clone(),
+    });
+    state.apply(RuntimeEvent::MessageCompleted {
+        msg: MessageId(1),
+        text: "waiting on the plan".to_string(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+    state.apply(RuntimeEvent::Notice("cache boundary".to_string()));
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+
+    state.apply(RuntimeEvent::MemberStatus {
+        member: planer.clone(),
+        status: MemberStatus::Running,
+    });
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(2),
+        turn: TurnId(1),
+        member: planer,
+    });
+    state.apply(RuntimeEvent::MessageCompleted {
+        msg: MessageId(2),
+        text: "planer still drafting".to_string(),
+    });
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+
+    let view = format!("{}", terminal.backend());
+    assert_eq!(view.matches("Working (").count(), 2, "{view}");
+    let waiting = view.find("waiting on the plan").expect(&view);
+    let drafting = view.find("planer still drafting").expect(&view);
+    let mut workings = view.match_indices("Working (").map(|(idx, _)| idx);
+    let builder_working = workings.next().expect(&view);
+    let planer_working = workings.next().expect(&view);
+    assert!(
+        waiting < builder_working && builder_working < drafting && drafting < planer_working,
+        "Builder's Working must stay on the cached reply while Planer works: {view}"
+    );
+}
+
+#[test]
 fn renders_a_clean_layout_snapshot() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
@@ -889,6 +1102,7 @@ fn ready_with_run(run: RunSummary) -> AppState {
 fn renders_run_footer_next_step() {
     let state = ready_with_run(RunSummary {
         id: RunId(7),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Done,
         coordinator: Some(MemberId::new("builder")),
@@ -919,6 +1133,7 @@ fn renders_run_footer_next_step() {
 fn renders_run_footer_step_progress() {
     let state = ready_with_run(RunSummary {
         id: RunId(7),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Running,
         coordinator: Some(MemberId::new("builder")),
@@ -968,6 +1183,7 @@ fn renders_run_footer_step_progress() {
 fn renders_runs_drawer() {
     let mut state = ready_with_run(RunSummary {
         id: RunId(1),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Done,
         coordinator: Some(MemberId::new("builder")),
@@ -1102,6 +1318,7 @@ fn renders_runs_drawer() {
 fn renders_selected_run_step_action() {
     let mut state = ready_with_run(RunSummary {
         id: RunId(1),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Running,
         coordinator: Some(MemberId::new("builder")),
@@ -1144,6 +1361,7 @@ fn renders_selected_run_step_action() {
 fn renders_failed_run_continue_action() {
     let mut state = ready_with_run(RunSummary {
         id: RunId(1),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Failed,
         coordinator: Some(MemberId::new("builder")),
@@ -1300,4 +1518,28 @@ fn large_chat_is_trimmed_before_frame_flattening() {
         flattened <= 16,
         "the frame must only keep the visible viewport: {flattened}"
     );
+}
+
+#[test]
+fn approval_card_renders_above_the_composer() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::ApprovalRequested {
+        id: ApprovalId(1),
+        member: Some(MemberId::new("builder")),
+        action: "command".to_string(),
+        body: "git push origin main".to_string(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+    let view = format!("{}", terminal.backend());
+    assert!(view.contains("Approval"), "{view}");
+    assert!(view.contains("command"), "{view}");
+    assert!(view.contains("git push origin main"), "{view}");
+    assert!(view.contains("y agree"), "{view}");
+    assert!(view.contains("n deny"), "{view}");
 }

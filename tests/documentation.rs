@@ -247,7 +247,7 @@ fn codex_app_server_permission_mapping_is_documented() {
     );
     assert!(
         approvals_doc.contains(
-            "Use `/approve` or `/reject` to send a one-time decision back to the same live\nCodex thread"
+            "Agree or deny in the card above the composer (`y` / `n`); `/approve` and\n`/reject` still send the same one-time decision back to the live Codex thread."
         ),
         "approvals must document that Codex callbacks reach the user rather than being auto-resolved"
     );

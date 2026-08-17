@@ -708,6 +708,9 @@ pub enum ApprovalSurface {
 /// team.json `approvals` section. Defaults: all built-in categories, all surfaces.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalPolicy {
+    /// When true, Codex tool asks wait in the composer card. Default is auto-pass.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
     /// Built-in categories to keep enabled (`git`, `shell`, `file`). None -> all three.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Vec<String>>,
@@ -722,7 +725,7 @@ pub struct ApprovalPolicy {
 impl ApprovalPolicy {
     /// True when every field is at its default (serializes to nothing in team.json).
     pub fn is_default(&self) -> bool {
-        self.gate.is_none() && self.keywords.is_empty() && self.apply_to.is_none()
+        !self.manual && self.gate.is_none() && self.keywords.is_empty() && self.apply_to.is_none()
     }
 }
 
@@ -1269,6 +1272,22 @@ mod tests {
         assert_eq!(parsed.approvals, config.approvals);
         assert!(json.contains("\"approvals\""));
         assert!(json.contains("\"deploy\""));
+    }
+
+    #[test]
+    fn approvals_manual_defaults_off_and_round_trips() {
+        let config = TeamConfig::new("t", "/tmp/ws").with_member(codex("builder", "impl"));
+        assert!(!config.approvals.manual);
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("\"manual\"")
+        );
+
+        let parsed: TeamConfig =
+            serde_json::from_str(r#"{"name":"t","workspace":"/tmp/ws","members":[{"id":"builder","display_name":"Builder","backend":"codex","role":"impl"}],"approvals":{"manual":true}}"#)
+                .unwrap();
+        assert!(parsed.approvals.manual);
     }
 
     #[test]

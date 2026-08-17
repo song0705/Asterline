@@ -94,20 +94,20 @@ fn replace_team_keeps_runtime_unchanged_when_atomic_store_write_fails() {
 }
 
 #[test]
-fn replace_team_resolves_approval_held_for_removed_member() {
+fn replace_team_refuses_to_remove_a_member_waiting_on_a_tool_approval() {
     let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
-    let gated = rt.on_ui_command(UiCommand::UserMessage {
+    rt.on_ui_command(UiCommand::UserMessage {
         target: MessageTarget::Member(MemberId::new("reviewer")),
-        body: "run git status".to_string(),
+        body: "inspect the tree".to_string(),
     });
-    let approval_id = gated
-        .events
-        .iter()
-        .find_map(|event| match event {
-            RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("approval held for reviewer");
+    rt.on_agent_event(
+        &MemberId::new("reviewer"),
+        AgentEvent::NativeApprovalRequested {
+            request_id: 9,
+            action: "Codex command".to_string(),
+            body: "git status".to_string(),
+        },
+    );
 
     let replaced = rt.on_ui_command(UiCommand::ReplaceTeam {
         members: vec![TeamMember::new(
@@ -121,18 +121,9 @@ fn replace_team_resolves_approval_held_for_removed_member() {
 
     assert!(replaced.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::ApprovalResolved {
-            id,
-            decision: ApprovalDecision::Reject,
-        } if *id == approval_id
+        RuntimeEvent::Notice(text) if text.contains("cannot remove reviewer")
     )));
-    assert!(
-        replaced
-            .events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. }))
-    );
-    assert!(rt.store.pending_approvals().unwrap().is_empty());
+    assert_eq!(rt.config.members.len(), 2);
 }
 
 #[test]
@@ -219,6 +210,19 @@ fn team_mode_kicks_off_via_a_coordinator() {
         step.actions[0].prompt.contains("@@run_step"),
         "start prompt must require checklist-first discipline"
     );
+    assert!(
+        step.actions[0]
+            .prompt
+            .contains("The roster is locked to the current teammates"),
+        "default team mode must lock the roster: {}",
+        step.actions[0].prompt
+    );
+    assert!(
+        !step.actions[0]
+            .prompt
+            .contains("Add a teammate first if the roster lacks"),
+        "locked roster must not ask the coordinator to add members"
+    );
     assert!(!step.actions[0].prompt.contains("@@team_message"));
 }
 
@@ -292,24 +296,20 @@ fn team_auto_verify_false_marks_done_immediately() {
 }
 
 #[test]
-fn team_mode_uses_mode_approval_gate() {
+fn team_mode_starts_without_a_prompt_keyword_gate() {
     let mut rt = TeamRuntime::new(team(), SqliteStore::in_memory().unwrap());
     let step = start_team(&mut rt, "run `cargo test`");
-    assert!(step.actions.is_empty());
-    let approval = step.events.iter().find_map(|event| match event {
-        RuntimeEvent::ApprovalRequested { id, .. } => Some(*id),
-        _ => None,
-    });
-    let id = approval.expect("team dispatch should request approval");
-    let step = rt.on_ui_command(UiCommand::Approve {
-        id,
-        decision: ApprovalDecision::Reject,
-    });
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::RunUpdated { run }
-            if run.status == RunStatus::Blocked
-    )));
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+    );
+    assert!(
+        step.actions
+            .iter()
+            .any(|action| action.member == MemberId::new("builder"))
+    );
 }
 
 #[test]
@@ -640,6 +640,37 @@ fn run_steps_update_checklist_without_running_agents() {
         RuntimeEvent::RunUpdated { run }
             if run.id == run_id && run.steps[0].owner.is_none()
     )));
+}
+
+#[test]
+fn batched_run_step_updates_emit_one_checklist_notice() {
+    let mut rt = runtime();
+    start_team(&mut rt, "ship the parser");
+    let step = rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::MessageCompleted(
+            "\
+@@run_step {\"action\":\"add\",\"title\":\"Skeleton\"}
+@@run_step {\"action\":\"add\",\"title\":\"Game loop\"}
+@@run_step {\"action\":\"add\",\"title\":\"Verify\"}"
+                .to_string(),
+        ),
+    );
+    let notices = step
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Notice(text) if text.contains("checklist") => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("updated") && notices[0].contains("checklist"),
+        "{notices:?}"
+    );
+    let run = latest_run(&rt);
+    assert_eq!(run.steps.len(), 3, "{run:?}");
 }
 
 #[test]

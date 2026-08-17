@@ -53,7 +53,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::domain::event::{RuntimeEvent, UiCommand};
+use crate::domain::event::{ApprovalDecision, RuntimeEvent, UiCommand};
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::BackendKind;
 use crate::runtime::{RuntimeCommandSend, RuntimeHandle};
@@ -678,6 +678,9 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     if action == Action::InsertChar('x') && state.toggle_runs_detail() {
         return;
     }
+    if handle_approval_keys(action, state, handle) {
+        return;
+    }
     // Transcript find: n/p jump when active, composer empty, no drawer.
     if state.find_active() && state.composer().is_empty() && state.drawer().is_none() {
         match action {
@@ -1288,6 +1291,43 @@ fn attach_pending_images(state: &AppState, command: UiCommand) -> UiCommand {
     }
 }
 
+fn handle_approval_keys(action: Action, state: &mut AppState, handle: &RuntimeHandle) -> bool {
+    if state.drawer().is_some() || state.find_active() || state.pending_approvals().is_empty() {
+        return false;
+    }
+    if !state.composer().is_empty() {
+        return false;
+    }
+    match action {
+        Action::InsertChar('y' | 'Y') | Action::Submit => {
+            resolve_selected_approval(state, handle, ApprovalDecision::Approve)
+        }
+        Action::InsertChar('n' | 'N') => {
+            resolve_selected_approval(state, handle, ApprovalDecision::Reject)
+        }
+        Action::CursorLeft => {
+            state.select_prev_pending_approval();
+            true
+        }
+        Action::CursorRight => {
+            state.select_next_pending_approval();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn resolve_selected_approval(
+    state: &mut AppState,
+    handle: &RuntimeHandle,
+    decision: ApprovalDecision,
+) -> bool {
+    let Some(id) = state.selected_pending_approval().map(|pending| pending.id) else {
+        return false;
+    };
+    send_runtime(state, handle, UiCommand::Approve { id, decision })
+}
+
 fn send_runtime(state: &mut AppState, handle: &RuntimeHandle, command: UiCommand) -> bool {
     let command = attach_pending_images(state, command);
     match handle.try_send(command) {
@@ -1773,6 +1813,7 @@ mod tests {
             state.apply(RuntimeEvent::RunUpdated {
                 run: RunSummary {
                     id: RunId(1),
+                    number: 0,
                     goal: "ship parser".to_string(),
                     status: RunStatus::Verifying,
                     coordinator: None,
@@ -2145,6 +2186,7 @@ mod tests {
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
             runs: vec![RunSummary {
                 id: RunId(1),
+                number: 0,
                 goal: "ship parser".to_string(),
                 status: RunStatus::Done,
                 coordinator: Some(MemberId::new("builder")),
@@ -2192,6 +2234,7 @@ mod tests {
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
             runs: vec![RunSummary {
                 id: RunId(1),
+                number: 0,
                 goal: "ship parser".to_string(),
                 status: RunStatus::Running,
                 coordinator: Some(MemberId::new("builder")),
@@ -2247,6 +2290,7 @@ mod tests {
             default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
             runs: vec![RunSummary {
                 id: RunId(1),
+                number: 0,
                 goal: "ship parser".to_string(),
                 status: RunStatus::Running,
                 coordinator: Some(MemberId::new("builder")),

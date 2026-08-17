@@ -212,6 +212,37 @@ fn approvals_track_pending_and_resolve() {
 }
 
 #[test]
+fn pending_approvals_can_be_cycled() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::ApprovalRequested {
+        id: ApprovalId(1),
+        member: None,
+        action: "command".to_string(),
+        body: "first".to_string(),
+    });
+    state.apply(RuntimeEvent::ApprovalRequested {
+        id: ApprovalId(2),
+        member: None,
+        action: "patch".to_string(),
+        body: "second".to_string(),
+    });
+    assert_eq!(
+        state.selected_pending_approval().map(|pending| pending.id),
+        Some(ApprovalId(1))
+    );
+    state.select_next_pending_approval();
+    assert_eq!(
+        state.selected_pending_approval().map(|pending| pending.id),
+        Some(ApprovalId(2))
+    );
+    state.select_next_pending_approval();
+    assert_eq!(
+        state.selected_pending_approval().map(|pending| pending.id),
+        Some(ApprovalId(1))
+    );
+}
+
+#[test]
 fn member_status_drives_running_count() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());

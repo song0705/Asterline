@@ -6,14 +6,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::adapter::parser::{
-    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, str_field, summarize, tool_detail,
-    tool_value,
+    MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, file_change_from_params, str_field,
+    summarize, tool_detail, tool_value,
 };
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
 use crate::domain::config::check_agy_version;
@@ -175,6 +176,95 @@ impl StreamAdapter for AgyStreamAdapter {
     fn parser(&self) -> Box<dyn LineParser> {
         Box::new(AgyLineParser::default())
     }
+
+    fn prepare_run(&self, cancel: &AtomicBool) -> bool {
+        wait_for_agy_process_gap(cancel)
+    }
+
+    fn finish_run(&self) {
+        mark_agy_process_exit();
+    }
+
+    fn retry_delay(&self, fatal: &str, attempt: u32) -> Option<Duration> {
+        agy_quota_retry_delay(fatal, attempt)
+    }
+}
+
+fn last_agy_process_exit() -> &'static Mutex<Option<Instant>> {
+    static SLOT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn agy_process_gap() -> Duration {
+    if cfg!(test) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
+fn wait_for_agy_process_gap(cancel: &AtomicBool) -> bool {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let wait = last_agy_process_exit()
+            .lock()
+            .ok()
+            .and_then(|last| last.and_then(|ended| agy_process_gap().checked_sub(ended.elapsed())))
+            .unwrap_or(Duration::ZERO);
+        if wait.is_zero() {
+            return true;
+        }
+        let slice = wait.min(Duration::from_millis(100));
+        thread_sleep_cancelable(slice, cancel);
+    }
+}
+
+fn thread_sleep_cancelable(duration: Duration, cancel: &AtomicBool) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn mark_agy_process_exit() {
+    if let Ok(mut last) = last_agy_process_exit().lock() {
+        *last = Some(Instant::now());
+    }
+}
+
+pub(crate) fn agy_quota_retry_delay(fatal: &str, attempt: u32) -> Option<Duration> {
+    if attempt >= 3 || !is_agy_quota_error(fatal) {
+        return None;
+    }
+    Some(agy_quota_retry_backoff(attempt))
+}
+
+pub(crate) fn is_agy_quota_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("resource_exhausted")
+        || lower.contains("eligibility check failed")
+        || lower.contains("resource has been exhausted")
+        || lower.contains("rate limited")
+        || (lower.contains("429") && lower.contains("quota"))
+}
+
+fn agy_quota_retry_backoff(attempt: u32) -> Duration {
+    if cfg!(test) {
+        let _ = attempt;
+        return Duration::from_millis(25);
+    }
+    Duration::from_secs(match attempt {
+        0 => 2,
+        1 => 5,
+        _ => 10,
+    })
 }
 
 /// Parser for Agy's newline-delimited `stream-json` output.
@@ -288,6 +378,15 @@ impl AgyLineParser {
                 ok: state == "DONE",
                 summary: tool_detail(&summary, TOOL_OUTPUT_MAX),
             });
+            if let Some(file) = tool
+                .get("parameters")
+                .and_then(|params| file_change_from_params(&name, params))
+            {
+                out.push(AgentEvent::FileChange {
+                    files: vec![file],
+                    ok: state == "DONE",
+                });
+            }
         }
     }
 }
@@ -617,12 +716,51 @@ mod tests {
     }
 
     #[test]
+    fn write_tool_emits_a_file_change() {
+        use crate::domain::event::FileChangeItem;
+
+        let mut parser = AgyLineParser::default();
+        let events = parser.parse_line(
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"tool","tool_name":"Write","tool_info":{"name":"Write","parameters":{"TargetFile":"snake game/index.html","Contents":"<html></html>\n"},"output":"Wrote file"}}}"#,
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStarted { name, .. } if name == "Write"
+        )));
+        assert!(events.contains(&AgentEvent::FileChange {
+            files: vec![
+                FileChangeItem::new("snake game/index.html", "add")
+                    .with_texts(None::<String>, Some("<html></html>\n"))
+            ],
+            ok: true,
+        }));
+    }
+
+    #[test]
     fn failed_result_is_fatal() {
         let mut parser = AgyLineParser::default();
         let events = parser.parse_line(
             r#"{"event":"result","result":{"conversation_id":"x","status":"ERROR","error":"rate limited"}}"#,
         );
         assert!(events.contains(&AgentEvent::Fatal("rate limited".to_string())));
+    }
+
+    #[test]
+    fn eligibility_429_is_a_retryable_quota_error() {
+        assert!(is_agy_quota_error(
+            "Eligibility check failed: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
+        ));
+        assert!(is_agy_quota_error("rate limited"));
+        assert!(!is_agy_quota_error(
+            "agy exited without a terminal result event"
+        ));
+        assert!(agy_quota_retry_delay(
+            "Eligibility check failed: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).",
+            0
+        )
+        .is_some());
+        assert!(agy_quota_retry_delay("RESOURCE_EXHAUSTED", 3).is_none());
     }
 
     #[test]
