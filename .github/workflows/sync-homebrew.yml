@@ -118,3 +118,14 @@ jobs:
               --title "asterline $version" \
               --body "Automated Formula update for Asterline v$version."
           fi
+          state=$(gh pr view "$branch" \
+            --repo song0705/homebrew-asterline \
+            --json state \
+            --jq .state)
+          if test "$state" != MERGED; then
+            gh pr merge \
+              "$branch" \
+              --repo song0705/homebrew-asterline \
+              --merge \
+              --delete-branch
+          fi

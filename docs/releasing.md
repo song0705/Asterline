@@ -167,10 +167,11 @@ gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline
 
 After the GitHub Release is published, the workflow downloads its `SHA256SUMS`,
 updates the four prebuilt archive URLs and checksums in `Formula/asterline.rb`,
-validates the Formula on macOS, and opens or updates an
-`automation/asterline-v<version>` pull request in the tap. The Release quality
-gate refuses to start without this secret, so every published version has a
-corresponding Formula-update attempt.
+validates the Formula on macOS, opens or updates an
+`automation/asterline-v<version>` pull request in the tap, and merges it to
+`main` so `brew update` sees the new version without a manual review. The
+Release quality gate refuses to start without this secret, so every published
+version has a corresponding Formula-update attempt.
 
 The Linux archives intentionally target `*-unknown-linux-gnu`, not musl. The
 release workflow uses PyPA's maintained `manylinux_2_28` images, which provide a

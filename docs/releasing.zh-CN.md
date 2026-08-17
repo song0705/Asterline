@@ -146,7 +146,8 @@ gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline
 
 GitHub Release 发布后，workflow 会下载其 `SHA256SUMS`，更新 tap 中
 `Formula/asterline.rb` 的四个预编译归档 URL 和校验和，在 macOS 验证 Formula，然后在 tap
-创建或更新 `automation/asterline-v<version>` 拉取请求。quality gate 缺少此 secret 时会拒绝
+创建或更新 `automation/asterline-v<version>` 拉取请求并合并到 `main`，这样
+`brew update` 不必等人审 PR 就能拿到新版本。quality gate 缺少此 secret 时会拒绝
 启动，确保每个已发布版本都至少尝试更新一次 Formula。
 
 Linux 归档有意使用 `*-unknown-linux-gnu`，而不是 musl。release workflow 使用 PyPA 维护的
