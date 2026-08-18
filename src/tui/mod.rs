@@ -304,8 +304,15 @@ fn run_loop(
             match event {
                 Event::Resize(_, _) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let action = keymap::resolve(key);
+                    if action == Some(Action::Interrupt)
+                        && copy_active_selection(state, last_layout.as_ref())
+                    {
+                        state.disarm_quit();
+                        continue;
+                    }
                     if !state.runtime_available() {
-                        if keymap::resolve(key) == Some(Action::Interrupt) {
+                        if action == Some(Action::Interrupt) {
                             state.quit();
                         }
                         continue;
@@ -316,7 +323,7 @@ fn run_loop(
                     if handle_mode_editor_key(key, state, handle) {
                         continue;
                     }
-                    if let Some(action) = keymap::resolve(key) {
+                    if let Some(action) = action {
                         handle_action(action, state, handle);
                     }
                 }
@@ -448,6 +455,33 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
         }
         _ => {}
     }
+}
+
+/// Return the current non-empty selection, preferring the composer over chat.
+///
+/// Asterline owns mouse selection while mouse capture is enabled, so Ctrl+C
+/// must consult this state before it is allowed to become an interrupt.
+fn active_selection_text(
+    state: &mut AppState,
+    layout: Option<&chat_view::ChatLayout>,
+) -> Option<String> {
+    let composer_text = state.finish_composer_selection();
+    if !composer_text.is_empty() {
+        return Some(composer_text);
+    }
+
+    let selection = state.chat_selection()?;
+    let text = layout?.selected_text(selection);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Copy a current selection and report whether Ctrl+C was consumed.
+fn copy_active_selection(state: &mut AppState, layout: Option<&chat_view::ChatLayout>) -> bool {
+    let Some(text) = active_selection_text(state, layout) else {
+        return false;
+    };
+    copy_to_clipboard(&text);
+    true
 }
 
 pub(crate) fn copy_to_clipboard(text: &str) {
@@ -1444,6 +1478,27 @@ mod tests {
             mouse_event(MouseEventKind::ScrollDown, 1, 1),
         ];
         assert_eq!(coalesce_mouse_drags(events.clone()), events);
+    }
+
+    #[test]
+    fn active_composer_selection_is_returned_for_ctrl_c_copy() {
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("copy me");
+        state.begin_composer_selection(0);
+        state.update_composer_selection("copy me".len());
+
+        assert_eq!(
+            active_selection_text(&mut state, None).as_deref(),
+            Some("copy me")
+        );
+    }
+
+    #[test]
+    fn missing_selection_leaves_ctrl_c_available_for_interrupt() {
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("keep this draft");
+
+        assert_eq!(active_selection_text(&mut state, None), None);
     }
 
     #[test]
