@@ -80,13 +80,15 @@ Asterline 不是把几个聊天窗口叠在一起。每种模式都有负责人�
 
 <table>
   <tr>
-    <td width="50%" valign="top">
+    <td valign="top">
       <h3>Review</h3>
       <p>一个人实现，另一个人对照仓库下结论，改到通过或用尽轮次。</p>
       <img src="docs/assets/review.webp" alt="Review 模式：实现并提交审阅" width="100%">
       <img src="docs/assets/review-done.webp" alt="Review 模式：对照仓库给出结论" width="100%">
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td valign="top">
       <h3>Plan</h3>
       <p>先写出可执行计划，可选审核，再按步骤做、按步骤验收。</p>
       <img src="docs/assets/plan.webp" alt="Plan 模式按步骤执行并验收" width="100%">
@@ -94,13 +96,15 @@ Asterline 不是把几个聊天窗口叠在一起。每种模式都有负责人�
     </td>
   </tr>
   <tr>
-    <td width="50%" valign="top">
+    <td valign="top">
       <h3>Brainstorm</h3>
       <p>先发散出卡片，再私下投票、排名、综合。判断留到后面。</p>
       <img src="docs/assets/brainstorm.webp" alt="Brainstorm 模式生成想法卡片" width="100%">
       <img src="docs/assets/brainstorm-vote.webp" alt="Brainstorm 模式私下投票与综合" width="100%">
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td valign="top">
       <h3>Team</h3>
       <p>Coordinator 拆任务、派人、收结果。默认只用当前名册。</p>
       <img src="docs/assets/team-run.webp" alt="Team 模式：Coordinator 拆任务并加人" width="100%">

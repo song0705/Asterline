@@ -35,7 +35,7 @@ Detail pages stay English at `docs/*.md`, with Chinese counterparts at `docs/*.z
 
 ## Screenshots
 
-The product README opens with the Team editor, then the conversation, mode picker, and two shots per structured mode. The rest of the set also lives in `docs/assets/`, named after the screen:
+The product README opens with the Team editor, then the conversation, mode picker, and one full-width block per structured mode. The rest of the set also lives in `docs/assets/`, named after the screen:
 
 | File                                                | Screen                                 |
 | --------------------------------------------------- | -------------------------------------- |

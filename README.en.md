@@ -82,13 +82,15 @@ Asterline is not several chat windows stacked together. Each mode has owners, st
 
 <table>
   <tr>
-    <td width="50%" valign="top">
+    <td valign="top">
       <h3>Review</h3>
       <p>One member implements; another verdicts against the tree. Bounded revision until pass or the iteration limit.</p>
       <img src="docs/assets/review.webp" alt="Review mode implementing and handing off to a reviewer" width="100%">
       <img src="docs/assets/review-done.webp" alt="Review mode verdict against the tree" width="100%">
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td valign="top">
       <h3>Plan</h3>
       <p>Write an executable plan, optionally review it, then execute and verify step by step.</p>
       <img src="docs/assets/plan.webp" alt="Plan mode executing and verifying steps" width="100%">
@@ -96,13 +98,15 @@ Asterline is not several chat windows stacked together. Each mode has owners, st
     </td>
   </tr>
   <tr>
-    <td width="50%" valign="top">
+    <td valign="top">
       <h3>Brainstorm</h3>
       <p>Generate idea cards first, then vote privately, rank, and synthesize. Judgment comes later.</p>
       <img src="docs/assets/brainstorm.webp" alt="Brainstorm mode generating idea cards" width="100%">
       <img src="docs/assets/brainstorm-vote.webp" alt="Brainstorm mode private voting and synthesis" width="100%">
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td valign="top">
       <h3>Team</h3>
       <p>A coordinator splits work, assigns it, and integrates results. The default roster is locked.</p>
       <img src="docs/assets/team-run.webp" alt="Team mode: coordinator splits work and adds teammates" width="100%">
