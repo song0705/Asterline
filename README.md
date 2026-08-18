@@ -219,6 +219,10 @@ cargo audit
 
 当前版本是 1.0.x，仍在积极迭代。配置、持久化数据、命令和界面细节可能随版本变化。
 
+## 致谢
+
+感谢 [LINUX DO](https://linux.do) 社区。
+
 ## 许可证
 
 Asterline 使用 [MIT License](LICENSE)。

@@ -221,6 +221,10 @@ Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate.
 
 Asterline is on the 1.0.x line and still under active development. Configuration, persisted data, commands, and interface details may change between releases.
 
+## Acknowledgments
+
+Thanks to the [LINUX DO](https://linux.do) community.
+
 ## License
 
 Asterline is available under the [MIT License](LICENSE).
