@@ -304,21 +304,7 @@ fn run_loop(
             match event {
                 Event::Resize(_, _) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if !state.runtime_available() {
-                        if keymap::resolve(key) == Some(Action::Interrupt) {
-                            state.quit();
-                        }
-                        continue;
-                    }
-                    if handle_team_editor_key(key, state, handle) {
-                        continue;
-                    }
-                    if handle_mode_editor_key(key, state, handle) {
-                        continue;
-                    }
-                    if let Some(action) = keymap::resolve(key) {
-                        handle_action(action, state, handle);
-                    }
+                    handle_key_press(key, state, handle, last_layout.as_ref());
                 }
                 Event::Mouse(mouse) => {
                     handle_mouse(mouse, state, last_layout.as_ref());
@@ -448,6 +434,68 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
         }
         _ => {}
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPressOutcome {
+    Ignored,
+    Consumed,
+    SelectionCopied,
+}
+
+fn handle_key_press(
+    key: KeyEvent,
+    state: &mut AppState,
+    handle: &RuntimeHandle,
+    layout: Option<&chat_view::ChatLayout>,
+) -> KeyPressOutcome {
+    let action = keymap::resolve(key);
+    if !state.runtime_available() {
+        if action == Some(Action::Interrupt) {
+            state.quit();
+        }
+        return KeyPressOutcome::Consumed;
+    }
+    if handle_team_editor_key(key, state, handle) {
+        return KeyPressOutcome::Consumed;
+    }
+    if handle_mode_editor_key(key, state, handle) {
+        return KeyPressOutcome::Consumed;
+    }
+    let Some(action) = action else {
+        return KeyPressOutcome::Ignored;
+    };
+    if action == Action::Interrupt
+        && !state.in_history_search()
+        && copy_active_selection(state, layout)
+    {
+        state.disarm_quit();
+        return KeyPressOutcome::SelectionCopied;
+    }
+    handle_action(action, state, handle);
+    KeyPressOutcome::Consumed
+}
+
+fn active_selection_text(
+    state: &mut AppState,
+    layout: Option<&chat_view::ChatLayout>,
+) -> Option<String> {
+    let composer_text = state.finish_composer_selection();
+    if !composer_text.is_empty() {
+        return Some(composer_text);
+    }
+
+    let selection = state.chat_selection()?;
+    let text = layout?.selected_text(selection);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn copy_active_selection(state: &mut AppState, layout: Option<&chat_view::ChatLayout>) -> bool {
+    let Some(text) = active_selection_text(state, layout) else {
+        return false;
+    };
+    copy_to_clipboard(&text);
+    true
 }
 
 pub(crate) fn copy_to_clipboard(text: &str) {
@@ -1411,6 +1459,14 @@ mod tests {
         })
     }
 
+    fn state_with_composer_selection(text: &str) -> AppState {
+        let mut state = AppState::new(Vec::new());
+        state.insert_text(text);
+        state.begin_composer_selection(0);
+        state.update_composer_selection(text.len());
+        state
+    }
+
     #[test]
     fn coalesce_mouse_drags_keeps_the_latest_left_drag() {
         let events = vec![
@@ -1444,6 +1500,150 @@ mod tests {
             mouse_event(MouseEventKind::ScrollDown, 1, 1),
         ];
         assert_eq!(coalesce_mouse_drags(events.clone()), events);
+    }
+
+    #[test]
+    fn active_composer_selection_is_returned_for_ctrl_c_copy() {
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("copy me");
+        state.begin_composer_selection(0);
+        state.update_composer_selection("copy me".len());
+
+        assert_eq!(
+            active_selection_text(&mut state, None).as_deref(),
+            Some("copy me")
+        );
+    }
+
+    #[test]
+    fn active_chat_selection_is_returned_and_blank_chat_selection_is_ignored() {
+        let layout = chat_view::ChatLayout {
+            area: ratatui::layout::Rect::new(0, 0, 20, 2),
+            first_line: 0,
+            total_lines: 2,
+            width: 20,
+            lines: vec!["hello world".into(), "second line".into()],
+            completion_area: None,
+            composer_area: None,
+            composer_wrap: 0,
+            composer_text_origin: 0,
+        };
+        let mut state = AppState::new(Vec::new());
+        state.begin_chat_selection((0, 0));
+        state.update_chat_selection((1, 5));
+        assert_eq!(
+            active_selection_text(&mut state, Some(&layout)).as_deref(),
+            Some("hello world\nsecond")
+        );
+
+        let blank_layout = chat_view::ChatLayout {
+            area: ratatui::layout::Rect::new(0, 0, 3, 1),
+            first_line: 0,
+            total_lines: 1,
+            width: 3,
+            lines: vec!["   ".into()],
+            completion_area: None,
+            composer_area: None,
+            composer_wrap: 0,
+            composer_text_origin: 0,
+        };
+        let mut blank = AppState::new(Vec::new());
+        blank.begin_chat_selection((0, 0));
+        blank.update_chat_selection((0, 2));
+        assert_eq!(active_selection_text(&mut blank, Some(&blank_layout)), None);
+
+        let mut empty = AppState::new(Vec::new());
+        empty.begin_chat_selection((0, 0));
+        assert_eq!(active_selection_text(&mut empty, Some(&layout)), None);
+    }
+
+    #[test]
+    fn ctrl_c_selection_copy_yields_to_higher_priority_routes() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let ctrl_c = KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+
+        let mut main_chat = state_with_composer_selection("copy me");
+        main_chat.request_quit();
+        assert_eq!(
+            handle_key_press(ctrl_c, &mut main_chat, &handle, None),
+            KeyPressOutcome::SelectionCopied
+        );
+        assert!(!main_chat.is_quit_armed());
+        assert!(!main_chat.should_quit());
+
+        let mut no_selection = AppState::new(Vec::new());
+        assert_eq!(
+            handle_key_press(ctrl_c, &mut no_selection, &handle, None),
+            KeyPressOutcome::Consumed
+        );
+        assert!(no_selection.is_quit_armed());
+
+        let mut dead_runtime = state_with_composer_selection("stale selection");
+        dead_runtime.mark_runtime_unavailable();
+        assert_eq!(
+            handle_key_press(ctrl_c, &mut dead_runtime, &handle, None),
+            KeyPressOutcome::Consumed
+        );
+        assert!(dead_runtime.should_quit());
+
+        let mut history_search = state_with_composer_selection("stale selection");
+        history_search.start_history_search();
+        assert_eq!(
+            handle_key_press(ctrl_c, &mut history_search, &handle, None),
+            KeyPressOutcome::Consumed
+        );
+        assert!(!history_search.in_history_search());
+
+        let mut team_editor = state_with_composer_selection("stale selection");
+        team_editor.toggle_drawer(Drawer::Team);
+        team_editor.handle_team_editor_key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        for _ in 0..2 {
+            team_editor.handle_team_editor_key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            );
+        }
+        assert!(
+            team_editor
+                .team_editor()
+                .is_some_and(|editor| editor.editing().is_some())
+        );
+        assert_eq!(
+            handle_key_press(ctrl_c, &mut team_editor, &handle, None),
+            KeyPressOutcome::Consumed
+        );
+        assert_eq!(team_editor.drawer(), Some(Drawer::Team));
+        assert!(
+            team_editor
+                .team_editor()
+                .is_some_and(|editor| editor.editing().is_some())
+        );
+
+        let mut mode_editor = state_with_composer_selection("stale selection");
+        mode_editor.toggle_drawer(Drawer::Mode);
+        assert_eq!(
+            handle_key_press(ctrl_c, &mut mode_editor, &handle, None),
+            KeyPressOutcome::Consumed
+        );
+        assert_eq!(mode_editor.drawer(), None);
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
     }
 
     #[test]

@@ -687,7 +687,7 @@ conversation can be scrolled all the way to its first message.
 | `Ctrl+A` / `Ctrl+E`            | Move to line start/end                                        |
 | `Ctrl+U` / `Cmd+Backspace`     | Clear the current composer line (other lines stay)            |
 | `Ctrl+W`                       | Delete previous word                                          |
-| `Ctrl+C`                       | Cancel, clear composer, or arm quit when idle                 |
+| `Ctrl+C`                       | Copy chat/composer selection; else cancel, clear, or arm quit |
 | `Ctrl+V` / `Cmd+V`             | Attach a clipboard image to the next send (not Ctrl+C)        |
 
 Screenshots and copied images are copied under the process temp directory
